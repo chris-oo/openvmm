@@ -374,7 +374,20 @@ impl<T: CpuIo> hv1_hypercall::InstallIntercept for WhpHypercallExit<'_, '_, T> {
                     // This intercept currently enables capturing VTL0 debugging exceptions for
                     // Hyper-V created and gdbstub enabled VMs. Implementing this would enable
                     // hardware debugging capabilities for HvLite managed VMs.
-                    tracing::error!("HvInterceptTypeException not implemented");
+                    assert_eq!(
+                        access_type_mask,
+                        hvdef::hypercall::HV_INTERCEPT_ACCESS_MASK_NONE
+                    );
+                    assert_eq!(intercept_parameters.exception(), 0x1);
+                    self.vp
+                        .vp
+                        .partition
+                        .vtl0
+                        .intercept_debug_exceptions()
+                        .expect("BUGBUG");
+                    state.install(vtl2::InterceptType::DebugException);
+
+                    tracing::error!("install debug exception");
                 }
                 _ => {
                     tracing::error!(?intercept_type, "unimplemented install intercept type");

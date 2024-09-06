@@ -1710,6 +1710,10 @@ mod x86 {
             whp::abi::WHV_REGISTER_NAME(whp::Register128::Xmm13 as u32),
             whp::abi::WHV_REGISTER_NAME(whp::Register128::Xmm14 as u32),
             whp::abi::WHV_REGISTER_NAME(whp::Register128::Xmm15 as u32),
+            whp::abi::WHV_REGISTER_NAME(whp::Register64::Dr0 as u32),
+            whp::abi::WHV_REGISTER_NAME(whp::Register64::Dr1 as u32),
+            whp::abi::WHV_REGISTER_NAME(whp::Register64::Dr2 as u32),
+            whp::abi::WHV_REGISTER_NAME(whp::Register64::Dr3 as u32),
         ];
     }
 

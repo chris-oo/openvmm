@@ -1443,6 +1443,16 @@ impl VtlPartition {
         self.reset_mappings().map_err(Error::ResetMemoryMapping)?;
         Ok(())
     }
+
+    fn intercept_debug_exceptions(&self) -> Result<(), Error> {
+        //    WHvX64ExceptionTypeDebugTrapOrFault = 0x1,
+        // WHvX64ExceptionTypeBreakpointTrap = 0x3,
+        // let bitmap = (1 << 1) | (1 << 3);
+        let bitmap = 0x1;
+        self.whp
+            .set_property(whp::PartitionProperty::ExceptionExitBitmap(bitmap))
+            .for_op("set debug exception bitmap")
+    }
 }
 
 impl Hv1State {

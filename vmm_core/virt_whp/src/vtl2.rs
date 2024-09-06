@@ -24,6 +24,8 @@ pub(crate) struct Vtl2InterceptState {
     pub retarget_unknown_device_id: AtomicBool,
     /// EOI intercepts are all or nothing.
     pub eoi: AtomicBool,
+    /// Debug intercepts are all or nothing.
+    pub debug_exception: AtomicBool,
 }
 
 impl Vtl2InterceptState {
@@ -34,6 +36,7 @@ impl Vtl2InterceptState {
             unknown_synic_connection: false.into(),
             retarget_unknown_device_id: false.into(),
             eoi: false.into(),
+            debug_exception: false.into(),
         }
     }
 
@@ -45,6 +48,7 @@ impl Vtl2InterceptState {
             unknown_synic_connection,
             retarget_unknown_device_id,
             eoi,
+            debug_exception,
         } = self;
         for v in &io_ports.0 {
             v.store(0, Ordering::Relaxed);
@@ -53,6 +57,7 @@ impl Vtl2InterceptState {
         unknown_synic_connection.store(false, Ordering::Relaxed);
         retarget_unknown_device_id.store(false, Ordering::Relaxed);
         eoi.store(false, Ordering::Relaxed);
+        debug_exception.store(false, Ordering::Relaxed);
     }
 }
 
@@ -63,6 +68,7 @@ pub(crate) enum InterceptType {
     UnknownSynicConnection,
     RetargetUnknownDeviceId,
     Eoi,
+    DebugException,
 }
 
 #[derive(Debug)]
@@ -99,6 +105,7 @@ impl Vtl2InterceptState {
                 !self.retarget_unknown_device_id.swap(true, Ordering::SeqCst)
             }
             InterceptType::Eoi => !self.eoi.swap(true, Ordering::SeqCst),
+            InterceptType::DebugException => !self.debug_exception.swap(true, Ordering::SeqCst),
         }
     }
 
@@ -114,6 +121,7 @@ impl Vtl2InterceptState {
                 .retarget_unknown_device_id
                 .swap(false, Ordering::SeqCst),
             InterceptType::Eoi => self.eoi.swap(true, Ordering::SeqCst),
+            InterceptType::DebugException => self.debug_exception.swap(true, Ordering::SeqCst),
         }
     }
 
@@ -129,10 +137,12 @@ impl Vtl2InterceptState {
                 self.retarget_unknown_device_id.load(Ordering::SeqCst)
             }
             InterceptType::Eoi => self.eoi.load(Ordering::SeqCst),
+            InterceptType::DebugException => self.debug_exception.load(Ordering::SeqCst),
         }
     }
 }
 
+// TODO replace with derive
 impl Inspect for Vtl2InterceptState {
     fn inspect(&self, req: inspect::Request<'_>) {
         req.respond()
@@ -164,7 +174,11 @@ impl Inspect for Vtl2InterceptState {
                 "unknown_synic_connection",
                 self.unknown_synic_connection.load(Ordering::Relaxed),
             )
-            .field("eoi", self.eoi.load(Ordering::Relaxed));
+            .field("eoi", self.eoi.load(Ordering::Relaxed))
+            .field(
+                "debug_exception",
+                self.debug_exception.load(Ordering::Relaxed),
+            );
     }
 }
 
