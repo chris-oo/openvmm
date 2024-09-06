@@ -1498,6 +1498,51 @@ mod x86 {
             info: &whp::abi::WHV_VP_EXCEPTION_CONTEXT,
             exit: whp::Exit<'_>,
         ) -> Result<(), WhpRunVpError> {
+            if info.ExceptionType
+                // == whp::abi::WHV_EXCEPTION_TYPE::WHvX64ExceptionTypeDebugTrapOrFault this doesn't work, why not pub?
+                == whp::abi::WHV_EXCEPTION_TYPE(0x1)
+                && self
+                    .intercept_state()
+                    .map(|s| s.contains(vtl2::InterceptType::DebugException))
+                    .unwrap_or(false)
+            {
+                tracing::error!("inject debug exception into vtl2");
+                self.vtl2_intercept(
+                    HvMessageType::HvMessageTypeExceptionIntercept,
+                    hvdef::HvX64ExceptionInterceptMessage {
+                        header: self.new_intercept_header(0, HvInterceptAccessType::EXECUTE),
+                        vector: 0x1,
+                        // TODO fill in from whp
+                        exception_info: hvdef::HvX64ExceptionInfo::new(),
+                        instruction_byte_count: 0,
+                        error_code: 0,
+                        exception_parameter: 0,
+                        reserved: 0,
+                        instruction_bytes: [0; 16],
+                        ds_segment: hvdef::HvX64SegmentRegister::new_zeroed(),
+                        ss_segment: hvdef::HvX64SegmentRegister::new_zeroed(),
+                        rax: 0,
+                        rcx: 0,
+                        rdx: 0,
+                        rbx: 0,
+                        rsp: 0,
+                        rbp: 0,
+                        rsi: 0,
+                        rdi: 0,
+                        r8: 0,
+                        r9: 0,
+                        r10: 0,
+                        r11: 0,
+                        r12: 0,
+                        r13: 0,
+                        r14: 0,
+                        r15: 0,
+                    }
+                    .as_bytes(),
+                );
+                return Ok(());
+            }
+
             if !info.ExceptionInfo.SoftwareException()
                 && info.ExceptionType.0 == x86defs::Exception::GENERAL_PROTECTION_FAULT.0
             {
