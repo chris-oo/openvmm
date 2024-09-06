@@ -376,7 +376,7 @@ impl<T: CpuIo> hv1_hypercall::InstallIntercept for WhpHypercallExit<'_, '_, T> {
                     // hardware debugging capabilities for HvLite managed VMs.
                     assert_eq!(
                         access_type_mask,
-                        hvdef::hypercall::HV_INTERCEPT_ACCESS_MASK_NONE
+                        hvdef::hypercall::HV_INTERCEPT_ACCESS_MASK_EXECUTE
                     );
                     assert_eq!(intercept_parameters.exception(), 0x1);
                     self.vp
