@@ -1448,7 +1448,8 @@ impl VtlPartition {
         //    WHvX64ExceptionTypeDebugTrapOrFault = 0x1,
         // WHvX64ExceptionTypeBreakpointTrap = 0x3,
         // let bitmap = (1 << 1) | (1 << 3);
-        let bitmap = 0x1;
+        let bitmap = 0x1 << 1;
+        tracing::error!("intercetp debug");
         self.whp
             .set_property(whp::PartitionProperty::ExceptionExitBitmap(bitmap))
             .for_op("set debug exception bitmap")
