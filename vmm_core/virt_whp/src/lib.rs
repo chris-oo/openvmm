@@ -1338,6 +1338,9 @@ impl VtlPartition {
             }
         }
 
+        // MOVE ME TO WHERE DEBUG EXCEPTION REGISTERED
+        extended_exits |= whp::abi::WHV_EXTENDED_VM_EXITS::ExceptionExit;
+
         whp_config
             .set_property(whp::PartitionProperty::ExtendedVmExits(extended_exits))
             .for_op("set extended vm exits")?;
