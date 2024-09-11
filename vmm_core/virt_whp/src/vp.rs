@@ -1506,7 +1506,7 @@ mod x86 {
                     .map(|s| s.contains(vtl2::InterceptType::DebugException))
                     .unwrap_or(false)
             {
-                tracing::error!("inject debug exception into vtl2");
+                tracing::trace!("inject debug exception into vtl2");
                 self.vtl2_intercept(
                     HvMessageType::HvMessageTypeExceptionIntercept,
                     hvdef::HvX64ExceptionInterceptMessage {
