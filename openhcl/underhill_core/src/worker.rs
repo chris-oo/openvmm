@@ -1495,6 +1495,35 @@ async fn new_underhill_vm(
         }
     }
 
+    // HACK make a page shared, then try to access it below vtom
+    {
+        let pfn = 0x100;
+        gm.isolated_memory_protector()
+            .unwrap()
+            .unwrap()
+            .change_host_visibility(true, &[pfn])
+            .unwrap();
+
+        let gpa = pfn * hvdef::HV_PAGE_SIZE;
+        let vtl0_gm = gm.vtl0();
+        if vtl0_gm.read_plain::<u8>(gpa).is_ok() {
+            anyhow::bail!("shared RAM at {gpa:#x} is accessible below VTOM");
+        }
+
+        // But it is accessible above VTOM.
+        if let Some(vtom) = vtom {
+            vtl0_gm
+                .read_plain::<u8>(gpa | vtom)
+                .with_context(|| format!("failed to read shared RAM at {gpa:#x} above VTOM"))?;
+        }
+
+        gm.isolated_memory_protector()
+            .unwrap()
+            .unwrap()
+            .change_host_visibility(false, &[pfn])
+            .unwrap();
+    }
+
     // Set the shared memory allocator to GET that is required by attestation call-out.
     if let Some(allocator) = shared_vis_pages_pool.as_ref().map(|p| p.allocator()) {
         get_client.set_shared_memory_allocator(allocator, gm.untrusted_dma_memory().clone());
