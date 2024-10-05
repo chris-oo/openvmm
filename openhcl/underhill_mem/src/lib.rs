@@ -820,7 +820,7 @@ mod mapping {
                 .filter(|&gpn| inner.shared.check_bitmap(gpn) != shared)
                 .collect::<Vec<_>>();
 
-            tracing::debug!(
+            tracing::error!(
                 orig = orig_gpns.len(),
                 len = gpns.len(),
                 first = gpns.first(),

@@ -1166,6 +1166,57 @@ impl GuestMemory {
         Ok(None)
     }
 
+    fn mapping_range_nocheck(
+        &self,
+        access_type: AccessType,
+        gpa: u64,
+        len: usize,
+    ) -> Result<Option<*mut u8>, GuestMemoryBackingError> {
+        let (region, offset, _) = self.inner.region(gpa, len as u64)?;
+        if let Some(SendPtrU8(ptr)) = region.mapping {
+            unsafe { return Ok(Some(ptr.as_ptr().add(offset as usize))) }
+        }
+        Ok(None)
+    }
+
+    fn run_on_mapping_nocheck<T, P>(
+        &self,
+        access_type: AccessType,
+        gpa: u64,
+        len: usize,
+        mut param: P,
+        mut f: impl FnMut(&mut P, *mut u8) -> Result<T, sparse_mmap::MemoryError>,
+        fallback: impl FnOnce(&mut P) -> Result<T, GuestMemoryBackingError>,
+    ) -> Result<T, GuestMemoryBackingError> {
+        let Some(mapping) = self.mapping_range_nocheck(access_type, gpa, len)? else {
+            return fallback(&mut param);
+        };
+
+        // Try until the fault fails to resolve.
+        loop {
+            match f(&mut param, mapping) {
+                Ok(t) => return Ok(t),
+                Err(fault) => {
+                    match self.inner.imp.page_fault(
+                        gpa + fault.offset() as u64,
+                        len - fault.offset(),
+                        access_type == AccessType::Write,
+                        false,
+                    ) {
+                        PageFaultAction::Fail(err) => {
+                            return Err(GuestMemoryBackingError::new(
+                                gpa + fault.offset() as u64,
+                                err,
+                            ))
+                        }
+                        PageFaultAction::Retry => {}
+                        PageFaultAction::Fallback => return fallback(&mut param),
+                    }
+                }
+            }
+        }
+    }
+
     /// Runs `f` with a pointer to the mapped memory. If `f` fails, tries to
     /// resolve the fault (failing on error), then loops.
     ///
@@ -1320,9 +1371,50 @@ impl GuestMemory {
         )
     }
 
+    /// Reads from guest memory into `dest..dest+len`.
+    ///
+    /// # Safety
+    /// The caller must ensure dest..dest+len is a valid buffer for writes.
+    unsafe fn read_ptr_nocheck(
+        &self,
+        gpa: u64,
+        dest: *mut u8,
+        len: usize,
+    ) -> Result<(), GuestMemoryBackingError> {
+        if len == 0 {
+            return Ok(());
+        }
+        self.run_on_mapping_nocheck(
+            AccessType::Read,
+            gpa,
+            len,
+            (),
+            |(), src| {
+                // SAFETY: src..src+len is guaranteed to point to a reserved VA
+                // range, and dest..dest+len is guaranteed by the caller to be a
+                // valid buffer for writes.
+                unsafe { sparse_mmap::try_copy(src, dest, len) }
+            },
+            |()| {
+                // SAFETY: dest..dest+len is guaranteed by the caller to point to a
+                // valid buffer for writes.
+                unsafe { self.inner.imp.read_fallback(gpa, dest, len) }
+            },
+        )
+    }
+
     fn read_at_inner(&self, gpa: u64, dest: &mut [u8]) -> Result<(), GuestMemoryBackingError> {
         // SAFETY: `dest` is a valid buffer for writes.
         unsafe { self.read_ptr(gpa, dest.as_mut_ptr(), dest.len()) }
+    }
+
+    fn read_at_inner_nocheck(
+        &self,
+        gpa: u64,
+        dest: &mut [u8],
+    ) -> Result<(), GuestMemoryBackingError> {
+        // SAFETY: `dest` is a valid buffer for writes.
+        unsafe { self.read_ptr_nocheck(gpa, dest.as_mut_ptr(), dest.len()) }
     }
 
     /// Reads from guest memory address `gpa` into `dest`.
@@ -1566,6 +1658,19 @@ impl GuestMemory {
             for &gpn in gpns {
                 let mut b = [0];
                 self.read_at_inner(
+                    gpn_to_gpa(gpn).map_err(GuestMemoryBackingError::gpn)?,
+                    &mut b,
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn probe_gpns_nocheck(&self, gpns: &[u64]) -> Result<(), GuestMemoryError> {
+        self.with_op(None, GuestMemoryOperation::Probe, || {
+            for &gpn in gpns {
+                let mut b = [0];
+                self.read_at_inner_nocheck(
                     gpn_to_gpa(gpn).map_err(GuestMemoryBackingError::gpn)?,
                     &mut b,
                 )?;

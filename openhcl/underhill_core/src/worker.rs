@@ -1497,7 +1497,7 @@ async fn new_underhill_vm(
 
     // HACK make a page shared, then try to access it below vtom
     {
-        let pfn = 0x100;
+        let pfn = 0x10;
         gm.isolated_memory_protector()
             .unwrap()
             .unwrap()
@@ -1506,9 +1506,8 @@ async fn new_underhill_vm(
 
         let gpa = pfn * hvdef::HV_PAGE_SIZE;
         let vtl0_gm = gm.vtl0();
-        if vtl0_gm.read_plain::<u8>(gpa).is_ok() {
-            anyhow::bail!("shared RAM at {gpa:#x} is accessible below VTOM");
-        }
+        let res = vtl0_gm.probe_gpns_nocheck(&[pfn]);
+        tracing::error!(?res, "hack read attempt");
 
         // But it is accessible above VTOM.
         if let Some(vtom) = vtom {
