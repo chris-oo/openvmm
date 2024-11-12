@@ -220,8 +220,15 @@ impl PagePool {
             inner: self.inner.clone(),
             typ: self.typ,
             device_id,
-            device_name,
+            _device_name: device_name,
         })
+    }
+
+    pub fn allocator_spawner(&self) -> PagePoolAllocatorSpawner {
+        PagePoolAllocatorSpawner {
+            inner: self.inner.clone(),
+            typ: self.typ,
+        }
     }
 
     // TODO: save method and restore
@@ -236,7 +243,10 @@ pub struct PagePoolAllocator {
     inner: Arc<Mutex<PagePoolInner>>,
     typ: PoolType,
     device_id: usize,
-    device_name: String,
+    // TODO: to be used for save/restore. Keep it around for debug for now,
+    // since otherwise getting the actual name from device_id requires locking
+    // inner.
+    _device_name: String,
 }
 
 impl PagePoolAllocator {
@@ -345,10 +355,10 @@ impl user_driver::vfio::VfioDmaBuffer for PagePoolAllocator {
             .map_file(0, len, gpa_fd.get(), file_offset, true)
             .context("unable to map allocation")?;
 
-        // It is a requirement of the VfioDmaBuffer trait that all allocated buffers be zeroed out
+        // The VfioDmaBuffer trait requires that allocated buffers are zeroed.
         mapping
             .fill_at(0, 0, len)
-            .context("failed to zero shared memory")?;
+            .context("failed to zero allocated memory")?;
 
         let pfns: Vec<_> = (alloc.base_pfn()..alloc.base_pfn() + alloc.size_pages).collect();
 

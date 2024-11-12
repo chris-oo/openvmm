@@ -21,7 +21,7 @@ dependencies = [
  "inspect",
  "pal_async",
  "parking_lot",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
 ]
 
@@ -42,7 +42,7 @@ dependencies = [
  "bitfield-struct",
  "open_enum",
  "static_assertions",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "zerocopy",
 ]
 
@@ -388,7 +388,7 @@ name = "cache_topology"
 version = "0.0.0"
 dependencies = [
  "fs-err",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "windows-sys 0.52.0",
 ]
 
@@ -453,7 +453,7 @@ dependencies = [
  "pal_async",
  "power_resources",
  "test_with_tracing",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "time",
  "tracelimit",
  "tracing",
@@ -471,7 +471,7 @@ dependencies = [
  "closeable_mutex",
  "parking_lot",
  "range_map_vec",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
 ]
 
@@ -527,7 +527,7 @@ dependencies = [
  "pal_async",
  "pci_bus",
  "pci_core",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracelimit",
  "tracing",
  "vmcore",
@@ -694,7 +694,7 @@ dependencies = [
  "resolv-conf",
  "smoltcp",
  "socket2",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
  "windows-sys 0.52.0",
 ]
@@ -973,7 +973,7 @@ dependencies = [
  "mesh_rpc",
  "pal_async",
  "socket2",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "unix_socket",
  "vmsocket",
  "windows-sys 0.52.0",
@@ -1068,7 +1068,7 @@ dependencies = [
  "inspect",
  "scsi_buffers",
  "stackfuture",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "vm_resource",
 ]
 
@@ -1099,7 +1099,7 @@ dependencies = [
  "once_cell",
  "scsi_buffers",
  "stackfuture",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tokio",
  "vhd1_defs",
  "vm_resource",
@@ -1135,7 +1135,7 @@ dependencies = [
  "scsi_buffers",
  "stackfuture",
  "tempfile",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
  "uevent",
  "vm_resource",
@@ -1201,7 +1201,7 @@ dependencies = [
  "parking_lot",
  "scsi_buffers",
  "stackfuture",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
  "vm_resource",
  "zerocopy",
@@ -1223,7 +1223,7 @@ dependencies = [
  "pal_async",
  "scsi_buffers",
  "stackfuture",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracelimit",
  "tracing",
  "vm_resource",
@@ -1243,7 +1243,7 @@ dependencies = [
  "scsi_buffers",
  "stackfuture",
  "tempfile",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "vhd1_defs",
  "vm_resource",
  "zerocopy",
@@ -1263,7 +1263,7 @@ dependencies = [
  "scsi_buffers",
  "stackfuture",
  "tempfile",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "vm_resource",
  "winapi",
 ]
@@ -1458,7 +1458,7 @@ dependencies = [
 name = "fdt"
 version = "0.0.0"
 dependencies = [
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "zerocopy",
  "zerocopy_helpers",
 ]
@@ -1487,7 +1487,7 @@ dependencies = [
  "mesh",
  "open_enum",
  "static_assertions",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracelimit",
  "tracing",
  "vm_topology",
@@ -1515,7 +1515,7 @@ dependencies = [
  "openssl",
  "pal_async",
  "test_with_tracing",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "time",
  "tracelimit",
  "tracing",
@@ -1535,7 +1535,7 @@ version = "0.0.0"
 dependencies = [
  "guid",
  "mesh_protobuf",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "uefi_specs",
 ]
 
@@ -1568,7 +1568,7 @@ dependencies = [
  "mesh",
  "open_enum",
  "scsi_buffers",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracelimit",
  "tracing",
  "vmcore",
@@ -1769,7 +1769,7 @@ dependencies = [
  "parking_lot",
  "tempfile",
  "test_with_tracing",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
  "zerocopy",
 ]
@@ -2052,7 +2052,7 @@ dependencies = [
  "pci_resources",
  "slab",
  "task_control",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
  "vm_resource",
  "vmcore",
@@ -2130,7 +2130,7 @@ name = "get_resources"
 version = "0.0.0"
 dependencies = [
  "mesh",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "vm_resource",
 ]
 
@@ -2256,7 +2256,7 @@ dependencies = [
  "power_resources",
  "serde_json",
  "task_control",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "time",
  "tracing",
  "video_core",
@@ -2280,7 +2280,7 @@ dependencies = [
  "serde",
  "serde_json",
  "task_control",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
  "vm_resource",
  "vmbus_async",
@@ -2313,7 +2313,7 @@ dependencies = [
  "power_resources",
  "serde_json",
  "test_with_tracing",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
  "tracing_helpers",
  "underhill_config",
@@ -2354,7 +2354,7 @@ dependencies = [
  "inspect",
  "pal_event",
  "sparse_mmap",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "zerocopy",
 ]
 
@@ -2365,7 +2365,7 @@ dependencies = [
  "getrandom",
  "inspect",
  "mesh_protobuf",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "winapi",
  "windows-sys 0.52.0",
  "zerocopy",
@@ -2422,7 +2422,7 @@ dependencies = [
  "sidecar_client",
  "signal-hook",
  "tdcall",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracelimit",
  "tracing",
  "vtl_array",
@@ -2441,7 +2441,7 @@ dependencies = [
  "open_enum",
  "pal_async",
  "static_assertions",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
  "ucs2 0.0.0",
  "uefi_nvram_storage",
@@ -2567,7 +2567,7 @@ dependencies = [
  "open_enum",
  "sparse_mmap",
  "test_with_tracing",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracelimit",
  "tracing",
  "zerocopy",
@@ -2640,7 +2640,7 @@ dependencies = [
  "sparse_mmap",
  "state_unit",
  "storvsp",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
  "tracing_helpers",
  "uefi_nvram_storage",
@@ -2687,7 +2687,7 @@ dependencies = [
  "mesh",
  "mesh_worker",
  "net_backend_resources",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "unix_socket",
  "virt",
  "virt_whp",
@@ -2807,7 +2807,7 @@ dependencies = [
  "inspect",
  "mesh",
  "task_control",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
  "vm_resource",
  "vmbus_async",
@@ -2827,7 +2827,7 @@ dependencies = [
  "inspect",
  "mesh",
  "task_control",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracelimit",
  "tracing",
  "vmbus_async",
@@ -2877,7 +2877,7 @@ dependencies = [
  "serde",
  "serde_helpers",
  "serde_json",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "zerocopy",
 ]
 
@@ -2914,7 +2914,7 @@ dependencies = [
  "static_assertions",
  "tempfile",
  "test_with_tracing",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracelimit",
  "tracing",
  "tracing_helpers",
@@ -2996,7 +2996,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
  "tracing-subscriber",
  "underhill_confidentiality",
@@ -3058,7 +3058,7 @@ dependencies = [
  "mesh",
  "pal_async",
  "parking_lot",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
 ]
 
 [[package]]
@@ -3098,7 +3098,7 @@ dependencies = [
  "cfg-if",
  "inspect",
  "libc",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
 ]
 
 [[package]]
@@ -3158,7 +3158,7 @@ dependencies = [
 name = "kmsg"
 version = "0.0.0"
 dependencies = [
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
 ]
 
 [[package]]
@@ -3175,7 +3175,7 @@ dependencies = [
  "pal",
  "parking_lot",
  "signal-hook",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
 ]
 
 [[package]]
@@ -3289,7 +3289,7 @@ dependencies = [
  "object",
  "open_enum",
  "page_table",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
  "vm_topology",
  "x86defs",
@@ -3337,7 +3337,7 @@ checksum = "b5e6163cb8c49088c2c36f57875e58ccd8c87c7427f7fbd50ea6710b2f3f2e8f"
 name = "lx"
 version = "0.0.0"
 dependencies = [
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
 ]
 
 [[package]]
@@ -3447,7 +3447,7 @@ dependencies = [
  "parking_lot",
  "slab",
  "sparse_mmap",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
  "virt",
  "vm_topology",
@@ -3475,7 +3475,7 @@ version = "0.0.0"
 dependencies = [
  "inspect",
  "mesh_protobuf",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
 ]
 
 [[package]]
@@ -3513,7 +3513,7 @@ dependencies = [
  "pal_event",
  "parking_lot",
  "test_with_tracing",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
 ]
 
@@ -3540,7 +3540,7 @@ dependencies = [
  "pal_async",
  "parking_lot",
  "test_with_tracing",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
  "zerocopy",
 ]
@@ -3578,7 +3578,7 @@ dependencies = [
  "prost-build",
  "prost-types",
  "socket2",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "zerocopy",
 ]
 
@@ -3600,7 +3600,7 @@ dependencies = [
  "parking_lot",
  "socket2",
  "test_with_tracing",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
  "tracing_helpers",
  "unicycle",
@@ -3627,7 +3627,7 @@ dependencies = [
  "prost-build",
  "prost-types",
  "test_with_tracing",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tokio",
  "tracing",
  "unicycle",
@@ -3820,7 +3820,7 @@ dependencies = [
  "guid",
  "inspect",
  "mesh",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "vm_resource",
 ]
 
@@ -3837,7 +3837,7 @@ dependencies = [
  "net_backend_resources",
  "pal_async",
  "parking_lot",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
  "vm_resource",
 ]
@@ -3915,7 +3915,7 @@ dependencies = [
  "net_backend_resources",
  "pal_async",
  "parking_lot",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
  "vm_resource",
 ]
@@ -3947,7 +3947,7 @@ dependencies = [
  "static_assertions",
  "task_control",
  "test_with_tracing",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracelimit",
  "tracing",
  "vm_resource",
@@ -4077,7 +4077,7 @@ dependencies = [
  "pci_resources",
  "scsi_buffers",
  "task_control",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracelimit",
  "tracing",
  "unicycle",
@@ -4093,7 +4093,7 @@ version = "0.0.0"
 dependencies = [
  "disk_backend",
  "nvme_spec",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
 ]
 
 [[package]]
@@ -4121,7 +4121,7 @@ dependencies = [
  "slab",
  "task_control",
  "test_with_tracing",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
  "user_driver",
  "vmcore",
@@ -4177,7 +4177,7 @@ dependencies = [
  "pal_async",
  "socket2",
  "term",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "unicycle",
 ]
 
@@ -4307,7 +4307,7 @@ dependencies = [
  "libc",
  "openssl",
  "openssl-sys",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
 ]
 
 [[package]]
@@ -4515,7 +4515,7 @@ dependencies = [
  "memory_range",
  "parking_lot",
  "sparse_mmap",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
  "user_driver",
  "vm_topology",
@@ -4543,7 +4543,7 @@ dependencies = [
  "pal_event",
  "seccompiler",
  "socket2",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
  "widestring",
  "win_import_lib",
@@ -4705,7 +4705,7 @@ dependencies = [
  "chipset_device",
  "inspect",
  "mesh",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracelimit",
  "tracing",
  "vmcore",
@@ -4723,7 +4723,7 @@ dependencies = [
  "mesh",
  "open_enum",
  "parking_lot",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracelimit",
  "tracing",
  "vmcore",
@@ -5422,7 +5422,7 @@ dependencies = [
  "scsi_defs",
  "scsidisk_resources",
  "stackfuture",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracelimit",
  "tracing",
  "tracing_helpers",
@@ -5566,7 +5566,7 @@ dependencies = [
  "open_enum",
  "serial_16550_resources",
  "serial_core",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracelimit",
  "tracing",
  "vm_resource",
@@ -5604,7 +5604,7 @@ dependencies = [
  "inspect",
  "serial_core",
  "serial_debugcon_resources",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracelimit",
  "tracing",
  "vm_resource",
@@ -5635,7 +5635,7 @@ dependencies = [
  "pal_async",
  "serial_core",
  "serial_pl011_resources",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracelimit",
  "tracing",
  "vm_resource",
@@ -5673,7 +5673,7 @@ dependencies = [
  "bitfield-struct",
  "nix 0.26.4",
  "static_assertions",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "zerocopy",
 ]
 
@@ -5728,7 +5728,7 @@ dependencies = [
  "pal_async",
  "parking_lot",
  "sidecar_defs",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
  "zerocopy",
 ]
@@ -5831,7 +5831,7 @@ dependencies = [
  "libc",
  "pal",
  "parking_lot",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "windows-sys 0.52.0",
  "zerocopy",
 ]
@@ -5855,7 +5855,7 @@ dependencies = [
  "pal_async",
  "parking_lot",
  "test_with_tracing",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
  "vmcore",
 ]
@@ -5872,7 +5872,7 @@ version = "0.0.0"
 dependencies = [
  "inspect",
  "mesh_protobuf",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "zerocopy",
 ]
 
@@ -5905,7 +5905,7 @@ dependencies = [
  "storvsp_resources",
  "task_control",
  "test_with_tracing",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracelimit",
  "tracing",
  "tracing_helpers",
@@ -5998,7 +5998,7 @@ version = "0.0.0"
 dependencies = [
  "nix 0.26.4",
  "static_assertions",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "zerocopy",
 ]
 
@@ -6009,7 +6009,7 @@ dependencies = [
  "sev_guest_device",
  "static_assertions",
  "tdx_guest_device",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "zerocopy",
 ]
 
@@ -6081,11 +6081,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "2.0.0"
+version = "2.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "15291287e9bff1bc6f9ff3409ed9af665bec7a5fc8ac079ea96be07bca0e2668"
+checksum = "c006c85c7651b3cf2ada4584faa36773bd07bac24acfb39f3c431b36d7e667aa"
 dependencies = [
- "thiserror-impl 2.0.0",
+ "thiserror-impl 2.0.3",
 ]
 
 [[package]]
@@ -6101,9 +6101,9 @@ dependencies = [
 
 [[package]]
 name = "thiserror-impl"
-version = "2.0.0"
+version = "2.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22efd00f33f93fa62848a7cab956c3d38c8d43095efda1decfc2b3a5dc0b8972"
+checksum = "f077553d607adc1caf65430528a576c757a71ed73944b66ebb58ef2bbd243568"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6280,7 +6280,7 @@ dependencies = [
  "open_enum",
  "pal_async",
  "parking_lot",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tpm_resources",
  "tracelimit",
  "tracing",
@@ -6424,7 +6424,7 @@ name = "ucs2"
 version = "0.0.0"
 dependencies = [
  "mesh_protobuf",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
 ]
 
 [[package]]
@@ -6479,7 +6479,7 @@ name = "uefi_nvram_specvars"
 version = "0.0.0"
 dependencies = [
  "guid",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "ucs2 0.0.0",
  "uefi_specs",
  "zerocopy",
@@ -6494,7 +6494,7 @@ dependencies = [
  "guid",
  "inspect",
  "pal_async",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "ucs2 0.0.0",
  "uefi_specs",
  "wchar",
@@ -6527,7 +6527,7 @@ dependencies = [
  "mesh",
  "pal_async",
  "socket2",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
 ]
 
@@ -6553,7 +6553,7 @@ dependencies = [
  "static_assertions",
  "task_control",
  "test_with_tracing",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracelimit",
  "tracing",
  "tracing_helpers",
@@ -6599,7 +6599,7 @@ dependencies = [
  "static_assertions",
  "tdx_guest_device",
  "tee_call",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "time",
  "tracing",
  "vmgs",
@@ -6620,7 +6620,7 @@ dependencies = [
  "prost",
  "serde",
  "serde_json",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "vtl2_settings_proto",
 ]
 
@@ -6718,7 +6718,7 @@ dependencies = [
  "storvsp",
  "storvsp_resources",
  "tee_call",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "time",
  "tpm",
  "tpm_resources",
@@ -6777,7 +6777,7 @@ dependencies = [
  "guid",
  "libc",
  "pal_async",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
  "tracing-subscriber",
  "vergen",
@@ -6841,7 +6841,7 @@ dependencies = [
  "pal_async",
  "parking_lot",
  "sparse_mmap",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
  "underhill_threadpool",
  "virt",
@@ -6861,7 +6861,7 @@ dependencies = [
  "pal_async",
  "pal_uring",
  "parking_lot",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
 ]
 
@@ -7031,7 +7031,7 @@ dependencies = [
  "parking_lot",
  "pci_core",
  "task_control",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
  "video_core",
  "vmcore",
@@ -7084,7 +7084,7 @@ dependencies = [
  "parking_lot",
  "pci_core",
  "slab",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracelimit",
  "tracing",
  "vm_topology",
@@ -7107,7 +7107,7 @@ dependencies = [
  "memory_range",
  "open_enum",
  "parking_lot",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracelimit",
  "tracing",
  "virt",
@@ -7135,7 +7135,7 @@ dependencies = [
  "parking_lot",
  "pci_core",
  "safe_intrinsics",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracelimit",
  "tracing",
  "virt",
@@ -7164,7 +7164,7 @@ dependencies = [
  "parking_lot",
  "signal-hook",
  "static_assertions",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracelimit",
  "tracing",
  "virt",
@@ -7206,7 +7206,7 @@ dependencies = [
  "pci_core",
  "safe_intrinsics",
  "sidecar_client",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracelimit",
  "tracing",
  "virt",
@@ -7229,7 +7229,7 @@ dependencies = [
  "aarch64emu",
  "guestmem",
  "hvdef",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
  "virt",
  "vm_topology",
@@ -7245,7 +7245,7 @@ dependencies = [
  "inspect",
  "inspect_counters",
  "parking_lot",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracelimit",
  "tracing",
  "virt",
@@ -7273,7 +7273,7 @@ dependencies = [
  "hvdef",
  "iced-x86",
  "pal_async",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracelimit",
  "tracing",
  "virt",
@@ -7305,7 +7305,7 @@ dependencies = [
  "pci_core",
  "range_map_vec",
  "sparse_mmap",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracelimit",
  "tracing",
  "tracing_helpers",
@@ -7343,7 +7343,7 @@ dependencies = [
  "pci_core",
  "task_control",
  "test_with_tracing",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracelimit",
  "tracing",
  "vm_resource",
@@ -7370,7 +7370,7 @@ dependencies = [
  "pal_async",
  "parking_lot",
  "task_control",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
  "virtio",
  "virtio_resources",
@@ -7486,7 +7486,7 @@ dependencies = [
  "serial_core",
  "serial_debugcon_resources",
  "serial_pl011_resources",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "vm_resource",
  "vmotherboard",
 ]
@@ -7500,7 +7500,7 @@ dependencies = [
  "linkme",
  "mesh",
  "pal_async",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
 ]
 
 [[package]]
@@ -7514,7 +7514,7 @@ dependencies = [
  "memory_range",
  "mesh_protobuf",
  "safe_intrinsics",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "x86defs",
 ]
 
@@ -7528,7 +7528,7 @@ dependencies = [
  "inspect",
  "open_enum",
  "task_control",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
  "vm_resource",
  "vmbfs_resources",
@@ -7557,7 +7557,7 @@ dependencies = [
  "inspect_counters",
  "pal_async",
  "smallvec",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "vmbus_channel",
  "vmbus_ring",
  "zerocopy",
@@ -7578,7 +7578,7 @@ dependencies = [
  "pal_event",
  "parking_lot",
  "task_control",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracelimit",
  "tracing",
  "vm_resource",
@@ -7598,7 +7598,7 @@ dependencies = [
  "mesh",
  "pal_async",
  "parking_lot",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
  "vmbus_async",
  "vmbus_channel",
@@ -7618,7 +7618,7 @@ dependencies = [
  "mesh",
  "open_enum",
  "static_assertions",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "zerocopy",
  "zerocopy_helpers",
 ]
@@ -7702,7 +7702,7 @@ dependencies = [
  "inspect",
  "safeatomic",
  "smallvec",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "zerocopy",
 ]
 
@@ -7720,7 +7720,7 @@ dependencies = [
  "pal_async",
  "serial_core",
  "test_with_tracing",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
  "unix_socket",
  "vm_resource",
@@ -7741,7 +7741,7 @@ dependencies = [
  "inspect_counters",
  "serial_core",
  "task_control",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
  "vm_resource",
  "vmbus_async",
@@ -7790,7 +7790,7 @@ dependencies = [
  "safeatomic",
  "slab",
  "test_with_tracing",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracelimit",
  "tracing",
  "unicycle",
@@ -7817,7 +7817,7 @@ dependencies = [
  "parking_lot",
  "safeatomic",
  "sparse_mmap",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
  "vmbus_async",
  "vmbus_channel",
@@ -7842,7 +7842,7 @@ dependencies = [
  "parking_lot",
  "save_restore_derive",
  "slab",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "time",
  "tracelimit",
  "tracing",
@@ -7873,7 +7873,7 @@ dependencies = [
  "openssl",
  "pal_async",
  "tempfile_helpers",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
  "vhd1_defs",
  "vmgs_format",
@@ -7889,7 +7889,7 @@ dependencies = [
  "inspect",
  "mesh_channel",
  "pal_async",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
  "vm_resource",
  "vmcore",
@@ -7942,7 +7942,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "ucs2 0.0.0",
  "uefi_nvram_specvars",
  "uefi_nvram_storage",
@@ -7990,7 +7990,7 @@ dependencies = [
  "power_resources",
  "slab",
  "state_unit",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
  "virt",
  "virt_support_x86emu",
@@ -8112,7 +8112,7 @@ dependencies = [
  "pci_bus",
  "range_map_vec",
  "state_unit",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracelimit",
  "tracing",
  "uefi_nvram_storage",
@@ -8146,7 +8146,7 @@ dependencies = [
  "pal",
  "pal_async",
  "pal_event",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
  "widestring",
  "winapi",
@@ -8161,7 +8161,7 @@ dependencies = [
  "futures",
  "pal_async",
  "socket2",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "zerocopy",
 ]
 
@@ -8217,7 +8217,7 @@ dependencies = [
  "pci_core",
  "task_control",
  "test_with_tracing",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracelimit",
  "tracing",
  "vmbus_async",
@@ -8311,7 +8311,7 @@ dependencies = [
  "inspect",
  "mesh",
  "pal_async",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
  "vmcore",
 ]
@@ -8320,7 +8320,7 @@ dependencies = [
 name = "watchdog_vmgs_format"
 version = "0.0.0"
 dependencies = [
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "vmcore",
 ]
 
@@ -8716,7 +8716,7 @@ dependencies = [
  "arbitrary",
  "futures",
  "iced-x86",
- "thiserror 2.0.0",
+ "thiserror 2.0.3",
  "tracing",
  "x86defs",
  "zerocopy",
