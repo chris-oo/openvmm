@@ -13,6 +13,7 @@ pub use device_dma::PagePoolDmaBuffer;
 
 #[cfg(feature = "vfio")]
 use anyhow::Context;
+use hcl::ioctl::MshvVtlLow;
 use hvdef::HV_PAGE_SIZE;
 use inspect::Inspect;
 use parking_lot::Mutex;
@@ -133,8 +134,9 @@ impl Drop for PagePoolHandle {
 
 /// A page allocator for memory.
 ///
-/// This memory may be private memory, or shared visibility memory on CVMs
-/// depending on the memory range passed into the corresponding new methods.
+/// This memory may be private memory, or shared visibility memory on isolated
+/// VMs. depending on the memory range passed into the corresponding new
+/// methods.
 ///
 /// Pages are allocated via [`SharedPoolAllocator`] from [`Self::allocator`].
 ///
@@ -153,22 +155,7 @@ impl PagePool {
     /// Create a new private pool allocator, with the specified memory. The
     /// memory must not be used by any other entity.
     pub fn new_private_pool(private_pool: &[MemoryRangeWithNode]) -> anyhow::Result<Self> {
-        let mut pages = Vec::new();
-        for range in private_pool {
-            pages.push(State::Free {
-                base_pfn: range.range.start() / HV_PAGE_SIZE,
-                pfn_bias: 0,
-                size_pages: range.range.len() / HV_PAGE_SIZE,
-            });
-        }
-
-        Ok(Self {
-            inner: Arc::new(Mutex::new(PagePoolInner {
-                state: pages,
-                device_ids: Vec::new(),
-            })),
-            typ: PoolType::Private,
-        })
+        Self::new_internal(private_pool, PoolType::Private, 0)
     }
 
     /// Create a shared visibility page pool allocator, with the specified
@@ -182,21 +169,29 @@ impl PagePool {
         shared_pool: &[MemoryRangeWithNode],
         addr_bias: u64,
     ) -> anyhow::Result<Self> {
-        let mut pages = Vec::new();
-        for range in shared_pool {
-            pages.push(State::Free {
+        Self::new_internal(shared_pool, PoolType::Shared, addr_bias)
+    }
+
+    fn new_internal(
+        memory: &[MemoryRangeWithNode],
+        typ: PoolType,
+        addr_bias: u64,
+    ) -> anyhow::Result<Self> {
+        let pages = memory
+            .iter()
+            .map(|range| State::Free {
                 base_pfn: range.range.start() / HV_PAGE_SIZE,
                 pfn_bias: addr_bias / HV_PAGE_SIZE,
                 size_pages: range.range.len() / HV_PAGE_SIZE,
-            });
-        }
+            })
+            .collect();
 
         Ok(Self {
             inner: Arc::new(Mutex::new(PagePoolInner {
                 state: pages,
                 device_ids: Vec::new(),
             })),
-            typ: PoolType::Shared,
+            typ,
         })
     }
 
@@ -206,24 +201,10 @@ impl PagePool {
     /// Users should create a new allocator for each device, as the device name
     /// is used to track allocations in the pool.
     pub fn allocator(&self, device_name: String) -> anyhow::Result<PagePoolAllocator> {
-        let mut inner = self.inner.lock();
-
-        // device_id must be unique
-        if inner.device_ids.iter().any(|id| id == &device_name) {
-            anyhow::bail!("device name {device_name} already in use");
-        }
-
-        inner.device_ids.push(device_name.clone());
-        let device_id = inner.device_ids.len() - 1;
-
-        Ok(PagePoolAllocator {
-            inner: self.inner.clone(),
-            typ: self.typ,
-            device_id,
-            _device_name: device_name,
-        })
+        PagePoolAllocator::new(&self.inner, self.typ, device_name)
     }
 
+    /// Create a spawner that allows creating multiple allocators.
     pub fn allocator_spawner(&self) -> PagePoolAllocatorSpawner {
         PagePoolAllocatorSpawner {
             inner: self.inner.clone(),
@@ -234,22 +215,69 @@ impl PagePool {
     // TODO: save method and restore
 }
 
+/// A spawner for [`PagePoolAllocator`] instances.
+///
+/// Useful when you need to create multiple allocators, without having ownership
+/// of the actual [`PagePool`].
+#[derive(Debug)]
+pub struct PagePoolAllocatorSpawner {
+    inner: Arc<Mutex<PagePoolInner>>,
+    typ: PoolType,
+}
+
+impl PagePoolAllocatorSpawner {
+    /// Create an allocator instance that can be used to allocate pages. The
+    /// specified `device_name` must be unique.
+    ///
+    /// Users should create a new allocator for each device, as the device name
+    /// is used to track allocations in the pool.
+    pub fn allocator(&self, device_name: String) -> anyhow::Result<PagePoolAllocator> {
+        PagePoolAllocator::new(&self.inner, self.typ, device_name)
+    }
+}
+
 /// A page allocator for memory.
 ///
 /// Pages are allocated via the [`Self::alloc`] method and freed by dropping the
 /// associated handle returned.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct PagePoolAllocator {
     inner: Arc<Mutex<PagePoolInner>>,
     typ: PoolType,
     device_id: usize,
-    // TODO: to be used for save/restore. Keep it around for debug for now,
+    // TODO: To be used for save/restore. Keep it around just for debuggging,
     // since otherwise getting the actual name from device_id requires locking
     // inner.
     _device_name: String,
 }
 
 impl PagePoolAllocator {
+    fn new(
+        inner: &Arc<Mutex<PagePoolInner>>,
+        typ: PoolType,
+        device_name: String,
+    ) -> anyhow::Result<Self> {
+        let device_id;
+        {
+            let mut inner = inner.lock();
+
+            // device_id must be unique
+            if inner.device_ids.iter().any(|id| id == &device_name) {
+                anyhow::bail!("device name {device_name} already in use");
+            }
+
+            inner.device_ids.push(device_name.clone());
+            device_id = inner.device_ids.len() - 1;
+        }
+
+        Ok(Self {
+            inner: inner.clone(),
+            typ,
+            device_id,
+            _device_name: device_name,
+        })
+    }
+
     /// Allocate contiguous pages from the page pool with the given tag. If a
     /// contiguous region of free pages is not available, then an error is
     /// returned.
@@ -333,7 +361,7 @@ impl user_driver::vfio::VfioDmaBuffer for PagePoolAllocator {
             )
             .context("failed to allocate shared mem")?;
 
-        let gpa_fd = hcl::ioctl::MshvVtlLow::new().context("failed to open gpa fd")?;
+        let gpa_fd = MshvVtlLow::new().context("failed to open gpa fd")?;
         let mapping = sparse_mmap::SparseMapping::new(len).context("failed to create mapping")?;
 
         let gpa = alloc.base_pfn() * HV_PAGE_SIZE;
@@ -345,8 +373,8 @@ impl user_driver::vfio::VfioDmaBuffer for PagePoolAllocator {
         let file_offset = match self.typ {
             PoolType::Private => gpa,
             PoolType::Shared => {
-                tracing::trace!("setting file offset bit 63");
-                gpa | (1 << 63)
+                tracing::trace!("setting MshvVtlLow::SHARED_MEMORY_FLAG");
+                gpa | MshvVtlLow::SHARED_MEMORY_FLAG
             }
         };
 
