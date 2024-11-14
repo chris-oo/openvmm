@@ -44,6 +44,8 @@ enum InnerError {
     Vfio(#[source] anyhow::Error),
     #[error("failed to initialize nvme device")]
     DeviceInitFailed(#[source] anyhow::Error),
+    #[error("failed to create dma buffer for device")]
+    DmaBuffer(#[source] anyhow::Error),
     #[error("failed to get namespace {nsid}")]
     Namespace {
         nsid: u32,
@@ -79,18 +81,17 @@ impl Inspect for NvmeManager {
 }
 
 impl NvmeManager {
-    pub fn new(
-        driver_source: &VmTaskDriverSource,
-        vp_count: u32,
-        dma_buffer: Arc<dyn VfioDmaBuffer>,
-    ) -> Self {
+    pub fn new<F>(driver_source: &VmTaskDriverSource, vp_count: u32, dma_buffer_spawner: F) -> Self
+    where
+        F: Fn(String) -> anyhow::Result<Arc<dyn VfioDmaBuffer>> + Send + 'static,
+    {
         let (send, recv) = mesh::channel();
         let driver = driver_source.simple();
         let mut worker = NvmeManagerWorker {
             driver_source: driver_source.clone(),
             devices: HashMap::new(),
             vp_count,
-            dma_buffer,
+            dma_buffer_spawner,
         };
         let task = driver.spawn("nvme-manager", async move { worker.run(recv).await });
         Self {
@@ -159,17 +160,20 @@ impl NvmeManagerClient {
 }
 
 #[derive(Inspect)]
-struct NvmeManagerWorker {
+struct NvmeManagerWorker<F> {
     #[inspect(skip)]
     driver_source: VmTaskDriverSource,
     #[inspect(iter_by_key)]
     devices: HashMap<String, nvme_driver::NvmeDriver<VfioDevice>>,
     #[inspect(skip)]
-    dma_buffer: Arc<dyn VfioDmaBuffer>,
+    dma_buffer_spawner: F,
     vp_count: u32,
 }
 
-impl NvmeManagerWorker {
+impl<F> NvmeManagerWorker<F>
+where
+    F: Fn(String) -> anyhow::Result<Arc<dyn VfioDmaBuffer>>,
+{
     async fn run(&mut self, mut recv: mesh::Receiver<Request>) {
         let (join_span, nvme_keepalive) = loop {
             let Some(req) = recv.next().await else {
@@ -232,11 +236,15 @@ impl NvmeManagerWorker {
         let driver = match self.devices.entry(pci_id.to_owned()) {
             hash_map::Entry::Occupied(entry) => entry.into_mut(),
             hash_map::Entry::Vacant(entry) => {
-                let device =
-                    VfioDevice::new(&self.driver_source, entry.key(), self.dma_buffer.clone())
-                        .instrument(tracing::info_span!("vfio_device_open", pci_id))
-                        .await
-                        .map_err(InnerError::Vfio)?;
+                let device = VfioDevice::new(
+                    &self.driver_source,
+                    entry.key(),
+                    (self.dma_buffer_spawner)(format!("nvme_{}", entry.key()))
+                        .map_err(InnerError::DmaBuffer)?,
+                )
+                .instrument(tracing::info_span!("vfio_device_open", pci_id))
+                .await
+                .map_err(InnerError::Vfio)?;
 
                 let driver =
                     nvme_driver::NvmeDriver::new(&self.driver_source, self.vp_count, device)

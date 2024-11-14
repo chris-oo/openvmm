@@ -1751,11 +1751,26 @@ async fn new_underhill_vm(
     );
 
     let nvme_manager = if env_cfg.nvme_vfio {
+        let shared_vis_pool_spawner = shared_vis_pages_pool
+            .as_ref()
+            .map(|p| p.allocator_spawner());
+
+        let vfio_dma_buffer_spawner =
+            move |device_id: String| -> anyhow::Result<Arc<dyn VfioDmaBuffer>> {
+                shared_vis_pool_spawner
+                    .as_ref()
+                    .map(|spawner| {
+                        spawner
+                            .allocator(device_id)
+                            .map(|alloc| Arc::new(alloc) as _)
+                    })
+                    .unwrap_or_else(|| Ok(Arc::new(LockedMemorySpawner) as _))
+            };
+
         let manager = NvmeManager::new(
             &driver_source,
             processor_topology.vp_count(),
-            vfio_dma_buffer(&shared_vis_pages_pool, "nvme_manager".into())
-                .context("nvme vfio dma")?,
+            vfio_dma_buffer_spawner,
         );
 
         resolver.add_async_resolver::<DiskHandleKind, _, NvmeDiskConfig, _>(NvmeDiskResolver::new(
