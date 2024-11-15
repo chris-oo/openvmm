@@ -30,23 +30,16 @@ pub struct PagePoolOutOfMemory {
     tag: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Inspect)]
-#[inspect(external_tag)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum State {
     Free {
-        #[inspect(hex)]
         base_pfn: u64,
-        #[inspect(hex)]
         pfn_bias: u64,
-        #[inspect(hex)]
         size_pages: u64,
     },
     Allocated {
-        #[inspect(hex)]
         base_pfn: u64,
-        #[inspect(hex)]
         pfn_bias: u64,
-        #[inspect(hex)]
         size_pages: u64,
         /// This is an index into the outer [`PagePoolInner`]'s device_ids
         /// vector.
@@ -64,14 +57,54 @@ enum PoolType {
     Shared,
 }
 
-#[derive(Inspect, Debug)]
+#[derive(Debug)]
 struct PagePoolInner {
-    // TODO fix inspect to print string names and numeric ids - self referntial inspect?
-    #[inspect(iter_by_index)]
+    /// The internal state of the pool.
     state: Vec<State>,
-    /// The list of device ids for outstanding allocators. Each are unique.
-    #[inspect(iter_by_index)]
+    /// The list of device ids for outstanding allocators. Each must be unique.
     device_ids: Vec<String>,
+}
+
+// Manually implement inspect so device_ids can be rendered as strings, not
+// their actual usize index.
+impl Inspect for PagePoolInner {
+    fn inspect(&self, req: inspect::Request<'_>) {
+        req.respond()
+            .field("device_ids", inspect::iter_by_index(&self.device_ids))
+            .child("state", |req| {
+                let mut resp = req.respond();
+                for (i, state) in self.state.iter().enumerate() {
+                    resp.child(&i.to_string(), |req| match state {
+                        State::Free {
+                            base_pfn,
+                            pfn_bias,
+                            size_pages,
+                        } => {
+                            req.respond()
+                                .field("state", "free")
+                                .field("base_pfn", inspect::AsHex(base_pfn))
+                                .field("pfn_bias", inspect::AsHex(pfn_bias))
+                                .field("size_pages", inspect::AsHex(size_pages));
+                        }
+                        State::Allocated {
+                            base_pfn,
+                            pfn_bias,
+                            size_pages,
+                            device_id,
+                            tag,
+                        } => {
+                            req.respond()
+                                .field("state", "allocated")
+                                .field("base_pfn", inspect::AsHex(base_pfn))
+                                .field("pfn_bias", inspect::AsHex(pfn_bias))
+                                .field("size_pages", inspect::AsHex(size_pages))
+                                .field("device_id", self.device_ids[*device_id].clone())
+                                .field("tag", tag);
+                        }
+                    });
+                }
+            });
+    }
 }
 
 /// A handle for a page pool allocation. When dropped, the allocation is
@@ -138,7 +171,8 @@ impl Drop for PagePoolHandle {
 /// VMs. depending on the memory range passed into the corresponding new
 /// methods.
 ///
-/// Pages are allocated via [`SharedPoolAllocator`] from [`Self::allocator`].
+/// Pages are allocated via [`PagePoolAllocator`] from [`Self::allocator`] or
+/// [`PagePoolAllocatorSpawner::allocator`].
 ///
 /// This struct is considered the "owner" of the pool allowing for save/restore.
 ///
