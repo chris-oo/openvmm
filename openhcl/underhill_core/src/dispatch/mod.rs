@@ -617,10 +617,6 @@ impl LoadedVm {
     ) -> anyhow::Result<ServicingState> {
         assert!(!self.state_units.is_running());
 
-        if self.shared_vis_pool.is_some() {
-            anyhow::bail!("save not supported for shared pages yet")
-        }
-
         let emuplat = (self.emuplat_servicing.save()).context("emuplat save failed")?;
         let units = self.save_units().await.context("state unit save failed")?;
         let vmgs = self
@@ -630,6 +626,12 @@ impl LoadedVm {
             .context("vmgs save failed")?;
 
         let vmgs_get_storage_meta = self.vmgs_disk.save_meta();
+        let shared_vis_pool = self
+            .shared_vis_pool
+            .as_mut()
+            .map(vmcore::save_restore::SaveRestore::save)
+            .transpose()
+            .context("shared_vis_pool save failed")?;
 
         Ok(ServicingState {
             init_state: servicing::ServicingInitState {
@@ -640,6 +642,7 @@ impl LoadedVm {
                 flush_logs_result: None,
                 vmgs: (vmgs, vmgs_get_storage_meta),
                 overlay_shutdown_device: self.shutdown_relay.is_some(),
+                shared_pool_state: shared_vis_pool,
             },
             units,
         })
