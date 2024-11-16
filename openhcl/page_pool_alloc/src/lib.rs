@@ -278,6 +278,7 @@ impl PagePoolAllocatorSpawner {
 #[derive(Debug)]
 pub struct PagePoolAllocator {
     inner: Arc<Mutex<PagePoolInner>>,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     typ: PoolType,
     device_id: usize,
     // TODO: To be used for save/restore. Keep it around just for debuggging,
