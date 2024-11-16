@@ -65,6 +65,12 @@ mod state {
         /// Intercept the host-provided shutdown IC device.
         #[mesh(7)]
         pub overlay_shutdown_device: bool,
+        /// Shared pool information.
+        ///
+        /// BUGBUG: Think about if this should be an enum or substruct for all
+        /// pools (there will be more in the future).
+        #[mesh(8)]
+        pub shared_pool_state: Option<page_pool_alloc::save_restore::PagePoolState>,
     }
 
     #[derive(Protobuf)]
@@ -127,6 +133,7 @@ pub mod transposed {
             disk_get_vmgs::save_restore::SavedBlockStorageMetadata,
         )>,
         pub overlay_shutdown_device: Option<bool>,
+        pub shared_pool_state: Option<Option<page_pool_alloc::save_restore::PagePoolState>>,
     }
 
     /// A transposed `Option<EmuplatSavedState>`, where each field of
@@ -154,6 +161,7 @@ pub mod transposed {
                     flush_logs_result,
                     vmgs,
                     overlay_shutdown_device,
+                    shared_pool_state,
                 } = state;
 
                 OptionServicingInitState {
@@ -167,6 +175,7 @@ pub mod transposed {
                     flush_logs_result: Some(flush_logs_result),
                     vmgs: Some(vmgs),
                     overlay_shutdown_device: Some(overlay_shutdown_device),
+                    shared_pool_state: Some(shared_pool_state),
                 }
             } else {
                 OptionServicingInitState::default()
