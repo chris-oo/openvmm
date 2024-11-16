@@ -11,8 +11,9 @@ mod device_dma;
 
 pub use device_dma::PagePoolDmaBuffer;
 
-#[cfg(feature = "vfio")]
+#[cfg(all(feature = "vfio", target_os = "linux"))]
 use anyhow::Context;
+#[cfg(all(feature = "vfio", target_os = "linux"))]
 use hcl::ioctl::MshvVtlLow;
 use hvdef::HV_PAGE_SIZE;
 use inspect::Inspect;
@@ -375,7 +376,7 @@ impl PagePoolAllocator {
     }
 }
 
-#[cfg(feature = "vfio")]
+#[cfg(all(feature = "vfio", target_os = "linux"))]
 impl user_driver::vfio::VfioDmaBuffer for PagePoolAllocator {
     fn create_dma_buffer(&self, len: usize) -> anyhow::Result<user_driver::memory::MemoryBlock> {
         if len == 0 {
