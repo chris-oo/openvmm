@@ -34,6 +34,8 @@ pub struct ShimParamsRaw {
     pub parameter_region_offset: i64,
     /// The size of the parameter region.
     pub parameter_region_size: u64,
+    /// The offset to the persisted memory header. This is always a single page.
+    pub persisted_memory_header_offset: i64,
     /// The offset to the VTL2 reserved region.
     pub vtl2_reserved_region_offset: i64,
     /// The size of the VTL2 reserved region.

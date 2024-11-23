@@ -124,6 +124,7 @@ impl ShimParams {
             memory_size,
             parameter_region_offset,
             parameter_region_size,
+
             vtl2_reserved_region_offset,
             vtl2_reserved_region_size,
             sidecar_offset,

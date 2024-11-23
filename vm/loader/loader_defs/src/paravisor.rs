@@ -54,6 +54,11 @@ pub const PARAVISOR_RESERVED_VTL2_PAGE_COUNT_MAX: u64 = PARAVISOR_RESERVED_VTL2_
     + PARAVISOR_RESERVED_VTL2_SNP_VMSA_SIZE_PAGES
     + PARAVISOR_RESERVED_VTL2_SNP_SECRETS_SIZE_PAGES;
 
+/// Total size of the vtl2 persisted header. This is a single page, that is used
+/// to store information that OpenHCL uses to pass information to the next
+/// instance when doing a servicing boot.
+pub const PARAVISOR_PERSISTED_MEMORY_HEADER_SIZE_PAGES: u64 = 1;
+
 // Page indices for reserved vtl2 ranges, ranges that are marked as reserved to
 // both the kernel and usermode. Today, these are SNP specific pages.
 //

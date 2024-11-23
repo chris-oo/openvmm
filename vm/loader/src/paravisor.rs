@@ -137,6 +137,7 @@ where
     // page tables
     // IGVM parameters
     // reserved vtl2 ranges
+    // persisted memory header
     // initrd
     // openhcl_boot
     // sidecar, if configured
@@ -320,6 +321,16 @@ where
     )?;
 
     offset += HV_PAGE_SIZE;
+
+    // Reserve space for the VTL2 persisted memory header. Note that this page
+    // is _not_ imported. The contents of the page are either zeroes (cold
+    // boot), a valid header from a previous OpenHCL instance, or garbage data
+    // from a previous OpenHCL instance that did not support this header.
+    let persisted_memory_header_size = PARAVISOR_PERSISTED_MEMORY_HEADER_SIZE_PAGES * HV_PAGE_SIZE;
+    let persisted_memory_header_start = offset;
+    offset += persisted_memory_header_size;
+
+    tracing::debug!(persisted_memory_header_start);
 
     // Reserve space for the VTL2 reserved region.
     let reserved_region_size = PARAVISOR_RESERVED_VTL2_PAGE_COUNT_MAX * HV_PAGE_SIZE;
@@ -987,6 +998,16 @@ where
     let shim_params_size = HV_PAGE_SIZE;
 
     next_addr += shim_params_size;
+
+    // Reserve space for the VTL2 persisted memory header. Note that this page
+    // is _not_ imported. The contents of the page are either zeroes (cold
+    // boot), a valid header from a previous OpenHCL instance, or garbage data
+    // from a previous OpenHCL instance that did not support this header.
+    let persisted_memory_header_size = PARAVISOR_PERSISTED_MEMORY_HEADER_SIZE_PAGES * HV_PAGE_SIZE;
+    let persisted_memory_header_start = next_addr;
+    next_addr += persisted_memory_header_size;
+
+    tracing::debug!(persisted_memory_header_start);
 
     let parameter_region_size = PARAVISOR_VTL2_CONFIG_REGION_PAGE_COUNT_MAX * HV_PAGE_SIZE;
     let parameter_region_start = next_addr;
