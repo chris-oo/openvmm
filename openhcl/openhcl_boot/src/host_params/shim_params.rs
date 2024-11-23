@@ -7,6 +7,7 @@ use crate::arch::get_isolation_type;
 use core::slice;
 use loader_defs::paravisor::ImportedRegionDescriptor;
 use loader_defs::paravisor::ParavisorCommandLine;
+use loader_defs::paravisor::ParavisorPersistedMemoryHeader;
 use loader_defs::shim::ShimParamsRaw;
 use memory_range::MemoryRange;
 
@@ -95,6 +96,8 @@ pub struct ShimParams {
     pub parameter_region_start: u64,
     /// The size of the parameter region.
     pub parameter_region_size: u64,
+    /// The base address of the persisted memory header.
+    pub persisted_memory_header_start: u64,
     /// The base address of the VTL2 reserved region.
     pub vtl2_reserved_region_start: u64,
     /// The size of the VTL2 reserved region.
@@ -124,7 +127,7 @@ impl ShimParams {
             memory_size,
             parameter_region_offset,
             parameter_region_size,
-
+            persisted_memory_header_offset,
             vtl2_reserved_region_offset,
             vtl2_reserved_region_size,
             sidecar_offset,
@@ -153,6 +156,8 @@ impl ShimParams {
             initrd_crc,
             memory_start_address: shim_base_address.wrapping_add_signed(memory_start_offset),
             memory_size,
+            persisted_memory_header_start: shim_base_address
+                .wrapping_add_signed(persisted_memory_header_offset),
             parameter_region_start: shim_base_address.wrapping_add_signed(parameter_region_offset),
             parameter_region_size,
             vtl2_reserved_region_start: shim_base_address
@@ -202,6 +207,29 @@ impl ShimParams {
         // SAFETY: The initrd base and size are set at file build time, and the
         // host must relocate the whole region if relocations are performed.
         unsafe { slice::from_raw_parts(self.initrd_base as *const u8, self.initrd_size as usize) }
+    }
+
+    /// Get the fixed persisted memory header, if the magic field is valid.
+    ///
+    /// There may not be a valid header if a previous version of OpenHCL did not
+    /// support this region. The boot shim will still report this region as
+    /// reserved to usermode, which is responsible for zeroing out this region
+    /// and persisting the required data.
+    pub fn persisted_memory_header(&self) -> Option<&'static ParavisorPersistedMemoryHeader> {
+        // SAFETY: persisted_memory_header_start is generated from fixed at file
+        // build time values a points to a page that may be a
+        // ParavisorPersistedMemoryHeader struct.
+        let header = unsafe {
+            (self.persisted_memory_header_start as *const ParavisorPersistedMemoryHeader)
+                .as_ref()
+                .expect("should always be non null")
+        };
+
+        if header.magic == ParavisorPersistedMemoryHeader::MAGIC {
+            Some(header)
+        } else {
+            None
+        }
     }
 
     /// Get the [`ParavisorCommandLine`] structure that describes the command

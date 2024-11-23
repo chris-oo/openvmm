@@ -377,3 +377,55 @@ impl ParavisorMeasuredVtl2Config {
     /// Magic value for the measured config, which is "OHCLVTL2".
     pub const MAGIC: u64 = 0x4F48434C56544C32;
 }
+
+/// Persisted memory header for the paravisor.
+///
+/// This is used to pass information from a previous instance of OpenHCL to the
+/// next instance, when doing a servicing boot.
+///
+/// Multiple instances of this header can be chained together.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, AsBytes, FromBytes, FromZeroes)]
+pub struct ParavisorPersistedMemoryHeader {
+    /// Magic value. Must be [`Self::MAGIC`].
+    pub magic: u64,
+    /// A byte buffer to be interpreted as a set of directives.
+    ///
+    /// A directive of type [`PersistedMemoryDirectiveType::NONE`] marks the end
+    /// of valid directives for this header.
+    pub directives: [u8; 4080],
+    /// The gpa to the next header, which must be 4k page aligned. If zero, this
+    /// is the last header.
+    pub next_header_gpa: u64,
+}
+
+const_assert_eq!(
+    size_of::<ParavisorPersistedMemoryHeader>(),
+    HV_PAGE_SIZE as usize
+);
+
+impl ParavisorPersistedMemoryHeader {
+    /// Magic value for the persisted memory header, which is "OHCLPMMH".
+    pub const MAGIC: u64 = 0x4F48434C504D4D48;
+}
+
+open_enum! {
+    /// The type of a persisted memory directive.
+    #[derive(AsBytes, FromBytes, FromZeroes)]
+    pub enum PersistedMemoryDirectiveType : u16 {
+        /// No directive. This marks the end of the valid headers.
+        NONE = 0,
+    }
+}
+
+/// A persisted memory directive header. Each directive is stored as a (Type
+/// Length Value) struct.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, AsBytes, FromBytes, FromZeroes)]
+pub struct PersistedMemoryDirectiveHeader {
+    /// The type of the directive.
+    pub directive_type: u16,
+    /// The length of the directive data. This does not include the length of
+    /// this header.
+    pub directive_length: u16,
+}
