@@ -5,8 +5,10 @@
 
 use crate::arch::get_isolation_type;
 use core::slice;
+use hvdef::HV_PAGE_SIZE;
 use loader_defs::paravisor::ImportedRegionDescriptor;
 use loader_defs::paravisor::ParavisorCommandLine;
+use loader_defs::paravisor::ParavisorPersistedMemoryHeader;
 use loader_defs::shim::ShimParamsRaw;
 use memory_range::MemoryRange;
 
@@ -53,8 +55,8 @@ impl Iterator for ImportedRegionIter<'_> {
             let element = self.imported_regions[0]
                 .pages()
                 .map(|(base_page, count, accepted)| {
-                    let base_address = base_page * hvdef::HV_PAGE_SIZE;
-                    let end_address = base_address + (count * hvdef::HV_PAGE_SIZE);
+                    let base_address = base_page * HV_PAGE_SIZE;
+                    let end_address = base_address + (count * HV_PAGE_SIZE);
                     (MemoryRange::try_new(base_address..end_address).expect(
                     "page number conversion into addresses results in a valid address range",
                 ), accepted)
@@ -95,6 +97,8 @@ pub struct ShimParams {
     pub parameter_region_start: u64,
     /// The size of the parameter region.
     pub parameter_region_size: u64,
+    /// The base address of the persisted memory header.
+    pub persisted_memory_header_start: u64,
     /// The base address of the VTL2 reserved region.
     pub vtl2_reserved_region_start: u64,
     /// The size of the VTL2 reserved region.
@@ -124,6 +128,7 @@ impl ShimParams {
             memory_size,
             parameter_region_offset,
             parameter_region_size,
+            persisted_memory_header_offset,
             vtl2_reserved_region_offset,
             vtl2_reserved_region_size,
             sidecar_offset,
@@ -152,6 +157,8 @@ impl ShimParams {
             initrd_crc,
             memory_start_address: shim_base_address.wrapping_add_signed(memory_start_offset),
             memory_size,
+            persisted_memory_header_start: shim_base_address
+                .wrapping_add_signed(persisted_memory_header_offset),
             parameter_region_start: shim_base_address.wrapping_add_signed(parameter_region_offset),
             parameter_region_size,
             vtl2_reserved_region_start: shim_base_address
@@ -173,27 +180,25 @@ impl ShimParams {
     #[cfg(target_arch = "x86_64")]
     pub fn secrets_start(&self) -> u64 {
         self.vtl2_reserved_region_start
-            + loader_defs::paravisor::PARAVISOR_RESERVED_VTL2_SNP_SECRETS_PAGE_INDEX
-                * hvdef::HV_PAGE_SIZE
+            + loader_defs::paravisor::PARAVISOR_RESERVED_VTL2_SNP_SECRETS_PAGE_INDEX * HV_PAGE_SIZE
     }
 
     /// Get the size of the CPUID page.
     #[cfg(target_arch = "x86_64")]
     pub fn cpuid_start(&self) -> u64 {
         self.vtl2_reserved_region_start
-            + loader_defs::paravisor::PARAVISOR_RESERVED_VTL2_SNP_CPUID_PAGE_INDEX
-                * hvdef::HV_PAGE_SIZE
+            + loader_defs::paravisor::PARAVISOR_RESERVED_VTL2_SNP_CPUID_PAGE_INDEX * HV_PAGE_SIZE
     }
 
     /// Get the base address of the host provided device tree.
     pub fn dt_start(&self) -> u64 {
         self.parameter_region_start
-            + loader_defs::paravisor::PARAVISOR_CONFIG_DEVICE_TREE_PAGE_INDEX * hvdef::HV_PAGE_SIZE
+            + loader_defs::paravisor::PARAVISOR_CONFIG_DEVICE_TREE_PAGE_INDEX * HV_PAGE_SIZE
     }
 
     /// The size of the device tree region.
     pub fn dt_size(&self) -> u64 {
-        loader_defs::paravisor::PARAVISOR_CONFIG_DEVICE_TREE_SIZE_PAGES * hvdef::HV_PAGE_SIZE
+        loader_defs::paravisor::PARAVISOR_CONFIG_DEVICE_TREE_SIZE_PAGES * HV_PAGE_SIZE
     }
 
     /// Get the initrd as a byte slice.
@@ -201,6 +206,32 @@ impl ShimParams {
         // SAFETY: The initrd base and size are set at file build time, and the
         // host must relocate the whole region if relocations are performed.
         unsafe { slice::from_raw_parts(self.initrd_base as *const u8, self.initrd_size as usize) }
+    }
+
+    /// Get the fixed persisted memory header.
+    pub fn persisted_memory_header(&self) -> Option<&'static ParavisorPersistedMemoryHeader> {
+        // SAFETY: persisted_memory_header_start is generated from fixed at file
+        // build time values a points to a page that may be a
+        // ParavisorPersistedMemoryHeader struct.
+        let header = unsafe {
+            (self.persisted_memory_header_start as *const ParavisorPersistedMemoryHeader)
+                .as_ref()
+                .expect("should always be non null")
+        };
+
+        if header.magic == ParavisorPersistedMemoryHeader::MAGIC {
+            Some(header)
+        } else {
+            None
+        }
+    }
+
+    /// Get the memory range describing the page used by the persisted memory
+    /// header.
+    pub fn persisted_memory_header_range(&self) -> MemoryRange {
+        MemoryRange::new(
+            self.persisted_memory_header_start..(self.persisted_memory_header_start + HV_PAGE_SIZE),
+        )
     }
 
     /// Get the [`ParavisorCommandLine`] structure that describes the command
@@ -232,10 +263,10 @@ impl ShimParams {
 
         let imported_region_page_address = self.parameter_region_start
             + (loader_defs::paravisor::PARAVISOR_MEASURED_VTL2_CONFIG_ACCEPTED_MEMORY_PAGE_INDEX
-                * hvdef::HV_PAGE_SIZE);
+                * HV_PAGE_SIZE);
 
         assert!(
-            imported_region_page_address + hvdef::HV_PAGE_SIZE
+            imported_region_page_address + HV_PAGE_SIZE
                 <= self.parameter_region_start + self.parameter_region_size
         );
 
@@ -248,7 +279,7 @@ impl ShimParams {
             ImportedRegionIter {
                 imported_regions: slice::from_raw_parts(
                     imported_region_start as *const ImportedRegionDescriptor,
-                    (hvdef::HV_PAGE_SIZE as usize - size_of::<ImportedRegionsPageHeader>())
+                    (HV_PAGE_SIZE as usize - size_of::<ImportedRegionsPageHeader>())
                         / size_of::<ImportedRegionDescriptor>(),
                 ),
             }
@@ -259,7 +290,7 @@ impl ShimParams {
     pub fn imported_regions_hash(&self) -> &'static [u8] {
         let header_start = self.parameter_region_start
             + (loader_defs::paravisor::PARAVISOR_MEASURED_VTL2_CONFIG_ACCEPTED_MEMORY_PAGE_INDEX
-                * hvdef::HV_PAGE_SIZE);
+                * HV_PAGE_SIZE);
 
         // SAFETY: header_start is a valid address pointing to a valid instance
         // of an imported region page header.

@@ -137,6 +137,7 @@ where
     // page tables
     // IGVM parameters
     // reserved vtl2 ranges
+    // persisted memory header
     // initrd
     // openhcl_boot
     // sidecar, if configured
@@ -321,6 +322,18 @@ where
 
     offset += HV_PAGE_SIZE;
 
+    // BUGBUG: MOVE TO START CANNOT BE AFTER ANY VARIABLE LENGTH REGIONS LIKE KERNEL/INITRD/SHIM
+    //
+    // Reserve space for the VTL2 persisted memory header. Note that this page
+    // is _not_ imported. The contents of the page are either zeroes (cold
+    // boot), a valid header from a previous OpenHCL instance, or garbage data
+    // from a previous OpenHCL instance that did not support this header.
+    let persisted_memory_header_size = PARAVISOR_PERSISTED_MEMORY_HEADER_SIZE_PAGES * HV_PAGE_SIZE;
+    let persisted_memory_header_start = offset;
+    offset += persisted_memory_header_size;
+
+    tracing::debug!(persisted_memory_header_start);
+
     // Reserve space for the VTL2 reserved region.
     let reserved_region_size = PARAVISOR_RESERVED_VTL2_PAGE_COUNT_MAX * HV_PAGE_SIZE;
     let reserved_region_start = offset;
@@ -458,6 +471,7 @@ where
         memory_size,
         parameter_region_offset: calculate_shim_offset(parameter_region_start),
         parameter_region_size,
+        persisted_memory_header_offset: calculate_shim_offset(persisted_memory_header_start),
         vtl2_reserved_region_offset: calculate_shim_offset(reserved_region_start),
         vtl2_reserved_region_size: reserved_region_size,
         sidecar_offset: calculate_shim_offset(sidecar_base),
@@ -988,6 +1002,16 @@ where
 
     next_addr += shim_params_size;
 
+    // Reserve space for the VTL2 persisted memory header. Note that this page
+    // is _not_ imported. The contents of the page are either zeroes (cold
+    // boot), a valid header from a previous OpenHCL instance, or garbage data
+    // from a previous OpenHCL instance that did not support this header.
+    let persisted_memory_header_size = PARAVISOR_PERSISTED_MEMORY_HEADER_SIZE_PAGES * HV_PAGE_SIZE;
+    let persisted_memory_header_start = next_addr;
+    next_addr += persisted_memory_header_size;
+
+    tracing::debug!(persisted_memory_header_start);
+
     let parameter_region_size = PARAVISOR_VTL2_CONFIG_REGION_PAGE_COUNT_MAX * HV_PAGE_SIZE;
     let parameter_region_start = next_addr;
     next_addr += parameter_region_size;
@@ -1034,6 +1058,7 @@ where
         memory_size,
         parameter_region_offset: calculate_shim_offset(parameter_region_start),
         parameter_region_size,
+        persisted_memory_header_offset: calculate_shim_offset(persisted_memory_header_start),
         vtl2_reserved_region_offset: 0,
         vtl2_reserved_region_size: 0,
         sidecar_offset: 0,

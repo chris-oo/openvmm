@@ -14,6 +14,7 @@ use bootloader_fdt_parser::ParsedBootDtInfo;
 use hvdef::HV_PAGE_SIZE;
 use inspect::Inspect;
 use loader_defs::paravisor::ParavisorMeasuredVtl2Config;
+use loader_defs::paravisor::ParavisorPersistedMemoryHeader;
 use loader_defs::paravisor::PARAVISOR_CONFIG_PPTT_PAGE_INDEX;
 use loader_defs::paravisor::PARAVISOR_CONFIG_SLIT_PAGE_INDEX;
 use loader_defs::paravisor::PARAVISOR_MEASURED_VTL2_CONFIG_PAGE_INDEX;
@@ -25,6 +26,7 @@ use memory_range::MemoryRange;
 use sparse_mmap::SparseMapping;
 use vm_topology::memory::MemoryRangeWithNode;
 use zerocopy::AsBytes;
+use zerocopy::FromZeroes;
 
 /// Structure that holds parameters provided at runtime. Some are read from the
 /// guest address space, and others from openhcl_boot provided via devicetree.
@@ -143,12 +145,40 @@ impl<'a> Vtl2ParamsMap<'a> {
         })
     }
 
+    // TODO: RENAME THIS STRUCT TO BE MORE GENERIC
+    fn new_writeable(ranges: &'a [MemoryRange]) -> anyhow::Result<Self> {
+        // TODO: figure out how this will work for multiple ranges...
+        assert_eq!(ranges.len(), 1);
+        let range = ranges[0];
+        let mapping = SparseMapping::new(range.len() as usize)
+            .context("failed to create a sparse mapping")?;
+
+        let dev_mem = fs_err::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/mem")?;
+
+        mapping
+            .map_file(0, range.len() as usize, dev_mem.file(), range.start(), true)
+            .context("failed to memory map range")?;
+
+        Ok(Self {
+            mapping,
+            ranges,
+            zero_on_drop: false,
+        })
+    }
+
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> anyhow::Result<()> {
         Ok(self.mapping.read_at(offset, buf)?)
     }
 
     fn read_plain<T: AsBytes + zerocopy::FromBytes>(&self, offset: usize) -> anyhow::Result<T> {
         Ok(self.mapping.read_plain(offset)?)
+    }
+
+    fn write_at(&self, offset: usize, buf: &[u8]) -> anyhow::Result<()> {
+        Ok(self.mapping.write_at(offset, buf)?)
     }
 }
 
@@ -168,6 +198,77 @@ impl Drop for Vtl2ParamsMap<'_> {
             }
         }
     }
+}
+
+// TODO: This belongs in its own crate, maybe. Maybe when it uses protobuf parsing becomes easy?
+fn write_persisted_info(parsed: &ParsedBootDtInfo) -> anyhow::Result<()> {
+    let ranges = [parsed.vtl2_persisted_header];
+    let mapping =
+        Vtl2ParamsMap::new_writeable(&ranges).context("unable to map persisted header")?;
+
+    // write header and memory to directives
+    let directives = {
+        let mut vtl2_ram = [loader_defs::paravisor::MemEntry::new_zeroed(); 32];
+        let vtl2_mem_iter = parsed
+            .partition_memory_map
+            .iter()
+            .filter_map(|entry| match entry {
+                bootloader_fdt_parser::AddressRange::Memory(memory) if memory.vtl_usage.vtl2() => {
+                    Some(loader_defs::paravisor::MemEntry {
+                        range: loader_defs::paravisor::PageRegionDescriptor {
+                            base_page_number: memory.range.range.start_4k_gpn(),
+                            page_count: memory.range.range.page_count_4k(),
+                        },
+                        vnode: memory.range.vnode,
+                        vtl_type: memory.vtl_usage,
+                        igvm_type: memory.igvm_type,
+                        pad: [0; 3],
+                    })
+                }
+                _ => None,
+            });
+        vtl2_ram
+            .iter_mut()
+            .zip(vtl2_mem_iter)
+            .for_each(|(entry, mem)| *entry = mem);
+
+        let memory = loader_defs::paravisor::MemoryInfoTemp {
+            vtl2_ram,
+            host_alloc: match parsed.memory_allocation_mode {
+                bootloader_fdt_parser::MemoryAllocationMode::Host => 1,
+                bootloader_fdt_parser::MemoryAllocationMode::Vtl2 { .. } => 0,
+            },
+            pad: [0; 7],
+        };
+
+        let header = loader_defs::paravisor::PersistedMemoryDirectiveHeader {
+            directive_type: loader_defs::paravisor::PersistedMemoryDirectiveType::VTL2_MEMORY,
+            directive_length: size_of_val(&memory) as u16,
+        };
+
+        let mut directives = [0; 4080];
+
+        let bytes = header.as_bytes().iter().chain(memory.as_bytes().iter());
+
+        directives
+            .iter_mut()
+            .zip(bytes)
+            .for_each(|(dst, src)| *dst = *src);
+
+        directives
+    };
+
+    let header = ParavisorPersistedMemoryHeader {
+        magic: ParavisorPersistedMemoryHeader::MAGIC,
+        directives,
+        next_header_gpa: 0,
+    };
+
+    mapping
+        .write_at(0, header.as_bytes())
+        .context("unable to write persisted header")?;
+
+    Ok(())
 }
 
 /// Reads the VTL 2 parameters from the config region and VTL2 reserved region.
@@ -271,6 +372,12 @@ pub fn read_vtl2_params() -> anyhow::Result<(RuntimeParameters, MeasuredVtl2Info
     } else {
         Some(measured_config.vtom_offset_bit)
     };
+
+    // BUGBUG: Doesn't belong here, but when we get a servicing call to write
+    // this information there instead. Do it here cause not persisting anything
+    // other than memory info.
+    write_persisted_info(&parsed_openhcl_boot)
+        .context("unable to write persisted info for next servicing boot")?;
 
     let runtime_params = RuntimeParameters {
         parsed_openhcl_boot,

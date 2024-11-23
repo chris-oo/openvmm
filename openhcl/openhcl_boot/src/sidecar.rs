@@ -89,6 +89,7 @@ pub fn start_sidecar<'a>(
     }
 
     // Compute a free list of VTL2 memory per NUMA node.
+    // BUGBUG: Fix for reserved pool. refactor overall reserved memory management (partition info holds?)
     let mut free_memory = off_stack!(ArrayVec<MemoryRange, MAX_NUMA_NODES>, ArrayVec::new_const());
     free_memory.extend((0..max_vnode + 1).map(|_| MemoryRange::EMPTY));
     for (range, r) in memory_range::walk_ranges(

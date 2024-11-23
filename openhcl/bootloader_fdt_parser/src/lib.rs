@@ -160,6 +160,8 @@ pub struct ParsedBootDtInfo {
     pub config_ranges: Vec<MemoryRange>,
     /// The VTL2 reserved range.
     pub vtl2_reserved_range: MemoryRange,
+    /// The VTL2 persisted header.
+    pub vtl2_persisted_header: MemoryRange,
     /// The ranges that were accepted at load time by the host on behalf of the
     /// guest.
     #[inspect(iter_by_index)]
@@ -204,6 +206,7 @@ struct OpenhclInfo {
     partition_memory_map: Vec<AddressRange>,
     accepted_memory: Vec<MemoryRange>,
     vtl2_reserved_range: MemoryRange,
+    vtl2_persisted_header: MemoryRange,
     vtl0_alias_map: Option<u64>,
     memory_allocation_mode: MemoryAllocationMode,
     isolation: IsolationType,
@@ -374,6 +377,30 @@ fn parse_openhcl(node: &Node<'_>) -> anyhow::Result<OpenhclInfo> {
         reserved_range
     };
 
+    // Report the vtl2 persisted header.
+    //
+    // TODO: There should only be one. Needs to support different types if we
+    // are going to use mesh::protobuf for state format.
+    let vtl2_persisted_header = {
+        let mut persisted_iter = memory.iter().filter_map(|entry| {
+            if entry.vtl_usage() == MemoryVtlType::VTL2_PERSISTED {
+                Some(*entry.range())
+            } else {
+                None
+            }
+        });
+
+        let persisted_header = persisted_iter
+            .next()
+            .context("missing VTL2 persisted header")?;
+
+        if persisted_iter.next().is_some() {
+            bail!("multiple VTL2 persisted ranges found");
+        }
+
+        persisted_header
+    };
+
     let vtl0_alias_map = try_find_property(node, "vtl0-alias-map")
         .map(|prop| prop.read_u64(0).map_err(err_to_owned))
         .transpose()
@@ -397,6 +424,7 @@ fn parse_openhcl(node: &Node<'_>) -> anyhow::Result<OpenhclInfo> {
         partition_memory_map: memory,
         accepted_memory,
         vtl2_reserved_range,
+        vtl2_persisted_header,
         vtl0_alias_map,
         memory_allocation_mode,
         isolation,
@@ -493,6 +521,7 @@ impl ParsedBootDtInfo {
         let mut memory_allocation_mode = MemoryAllocationMode::Host;
         let mut isolation = IsolationType::None;
         let mut vtl2_reserved_range = MemoryRange::EMPTY;
+        let mut vtl2_persisted_header = MemoryRange::EMPTY;
 
         let parser = Parser::new(raw)
             .map_err(err_to_owned)
@@ -522,6 +551,7 @@ impl ParsedBootDtInfo {
                         config_ranges: n_config_ranges,
                         partition_memory_map: n_partition_memory_map,
                         vtl2_reserved_range: n_vtl2_reserved_range,
+                        vtl2_persisted_header: n_vtl2_persisted_header,
                         accepted_memory: n_accepted_memory,
                         vtl0_alias_map: n_vtl0_alias_map,
                         memory_allocation_mode: n_memory_allocation_mode,
@@ -535,6 +565,7 @@ impl ParsedBootDtInfo {
                     memory_allocation_mode = n_memory_allocation_mode;
                     isolation = n_isolation;
                     vtl2_reserved_range = n_vtl2_reserved_range;
+                    vtl2_persisted_header = n_vtl2_persisted_header;
                 }
 
                 _ if child.name.starts_with("memory@") => {
@@ -567,6 +598,7 @@ impl ParsedBootDtInfo {
             memory_allocation_mode,
             isolation,
             vtl2_reserved_range,
+            vtl2_persisted_header,
         })
     }
 }
@@ -891,6 +923,14 @@ mod tests {
                 }),
                 AddressRange::Memory(Memory {
                     range: MemoryRangeWithNode {
+                        range: MemoryRange::new(0x50000..0x51000),
+                        vnode: 0,
+                    },
+                    vtl_usage: MemoryVtlType::VTL2_PERSISTED,
+                    igvm_type: MemoryMapEntryType::VTL2_PROTECTABLE,
+                }),
+                AddressRange::Memory(Memory {
+                    range: MemoryRangeWithNode {
                         range: MemoryRange::new(0x1000000..0x2000000),
                         vnode: 0,
                     },
@@ -926,6 +966,7 @@ mod tests {
             },
             isolation: IsolationType::Vbs,
             vtl2_reserved_range: MemoryRange::new(0x40000..0x50000),
+            vtl2_persisted_header: MemoryRange::new(0x50000..0x51000),
         };
 
         let dt = build_dt(&orig_info).unwrap();

@@ -34,6 +34,8 @@ pub struct ShimParamsRaw {
     pub parameter_region_offset: i64,
     /// The size of the parameter region.
     pub parameter_region_size: u64,
+    /// The offset to the persisted memory header. This is always a single page.
+    pub persisted_memory_header_offset: i64,
     /// The offset to the VTL2 reserved region.
     pub vtl2_reserved_region_offset: i64,
     /// The size of the VTL2 reserved region.
@@ -74,6 +76,7 @@ open_enum! {
 open_enum! {
     /// The memory type reported from the bootshim to usermode, for which VTL a
     /// given memory range is for.
+    #[derive(AsBytes, FromBytes, FromZeroes)]
     pub enum MemoryVtlType: u32 {
         /// This memory is for VTL0.
         VTL0 = 0,
@@ -96,6 +99,10 @@ open_enum! {
         /// and usermode. Today, this is only used for SNP: VMSA, CPUID pages,
         /// and secrets pages.
         VTL2_RESERVED = 7,
+        /// This memory holds data that is persisted across OpenHCL servicing
+        /// operations, and used to pass information to the next instance of
+        /// OpenHCL in a servicing boot.
+        VTL2_PERSISTED = 8,
     }
 }
 
@@ -110,6 +117,21 @@ impl MemoryVtlType {
                 | MemoryVtlType::VTL2_SIDECAR_IMAGE
                 | MemoryVtlType::VTL2_SIDECAR_NODE
                 | MemoryVtlType::VTL2_RESERVED
+                | MemoryVtlType::VTL2_PERSISTED
+        )
+    }
+
+    /// Returns true if this range is for VTL2.
+    pub fn vtl2(&self) -> bool {
+        matches!(
+            *self,
+            MemoryVtlType::VTL2_RAM
+                | MemoryVtlType::VTL2_CONFIG
+                | MemoryVtlType::VTL2_SIDECAR_IMAGE
+                | MemoryVtlType::VTL2_SIDECAR_NODE
+                | MemoryVtlType::VTL2_MMIO
+                | MemoryVtlType::VTL2_RESERVED
+                | MemoryVtlType::VTL2_PERSISTED
         )
     }
 }

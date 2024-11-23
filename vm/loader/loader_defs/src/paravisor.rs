@@ -3,6 +3,7 @@
 
 //! Underhill (paravisor) definitions.
 
+use crate::shim::MemoryVtlType;
 use bitfield_struct::bitfield;
 use core::mem::size_of;
 use hvdef::HV_PAGE_SIZE;
@@ -53,6 +54,11 @@ pub const PARAVISOR_RESERVED_VTL2_SNP_SECRETS_SIZE_PAGES: u64 = 1;
 pub const PARAVISOR_RESERVED_VTL2_PAGE_COUNT_MAX: u64 = PARAVISOR_RESERVED_VTL2_SNP_CPUID_SIZE_PAGES
     + PARAVISOR_RESERVED_VTL2_SNP_VMSA_SIZE_PAGES
     + PARAVISOR_RESERVED_VTL2_SNP_SECRETS_SIZE_PAGES;
+
+/// Total size of the vtl2 persisted header. This is a single page, that is used
+/// to store information that OpenHCL uses to pass information to the next
+/// instance when doing a servicing boot.
+pub const PARAVISOR_PERSISTED_MEMORY_HEADER_SIZE_PAGES: u64 = 1;
 
 // Page indices for reserved vtl2 ranges, ranges that are marked as reserved to
 // both the kernel and usermode. Today, these are SNP specific pages.
@@ -371,4 +377,114 @@ pub struct ParavisorMeasuredVtl2Config {
 impl ParavisorMeasuredVtl2Config {
     /// Magic value for the measured config, which is "OHCLVTL2".
     pub const MAGIC: u64 = 0x4F48434C56544C32;
+}
+
+/// Persisted memory header for the paravisor.
+///
+/// This is used to pass information from a previous instance of OpenHCL to the
+/// next instance, when doing a servicing boot.
+///
+/// Multiple instances of this header can be chained together.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, AsBytes, FromBytes, FromZeroes)]
+pub struct ParavisorPersistedMemoryHeader {
+    /// Magic value. Must be [`Self::MAGIC`].
+    pub magic: u64,
+    /// A byte buffer to be interpreted as a set of directives.
+    ///
+    /// A directive of type [`PersistedMemoryDirectiveType::NONE`] marks the end
+    /// of valid directives for this header.
+    pub directives: [u8; 4080],
+    /// The gpa to the next header, which must be 4k page aligned. If zero, this
+    /// is the last header.
+    pub next_header_gpa: u64,
+}
+
+// The header is assumed to be one page in multiple locations. The size of the
+// header cannot change.
+const_assert_eq!(
+    size_of::<ParavisorPersistedMemoryHeader>(),
+    HV_PAGE_SIZE as usize
+);
+
+impl ParavisorPersistedMemoryHeader {
+    /// Magic value for the persisted memory header, which is "OHCLPMMH".
+    pub const MAGIC: u64 = 0x4F48434C504D4D48;
+}
+
+open_enum! {
+    /// The type of a persisted memory directive.
+    #[derive(AsBytes, FromBytes, FromZeroes)]
+    pub enum PersistedMemoryDirectiveType : u16 {
+        /// No directive. This marks the end of the valid headers.
+        NONE = 0,
+        // BUGBUG USE PROTOBUF INSTEAD OF BESPOKE BINARY
+        /// Memory information described by [`MemoryInfoTemp`].
+        VTL2_MEMORY = 1,
+        /// VMBUS information
+        VMBUS = 2,
+    }
+}
+
+/// A persisted memory directive header. Each directive is stored as a (Type
+/// Length Value) struct.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, AsBytes, FromBytes, FromZeroes)]
+pub struct PersistedMemoryDirectiveHeader {
+    /// The type of the directive.
+    pub directive_type: PersistedMemoryDirectiveType,
+    /// The length of the directive data. This does not include the length of
+    /// this header.
+    pub directive_length: u16,
+}
+
+/// mem entry
+#[repr(C)]
+#[derive(Clone, Copy, Debug, AsBytes, FromBytes, FromZeroes)]
+pub struct MemEntry {
+    /// range
+    pub range: PageRegionDescriptor,
+    /// vnode
+    pub vnode: u32,
+    /// shim typ
+    pub vtl_type: MemoryVtlType,
+    /// igvm typ
+    pub igvm_type: igvm_defs::MemoryMapEntryType,
+    /// pad mbz
+    pub pad: [u16; 3],
+}
+
+/// Memory info for [`PersistedMemoryDirectiveType::MEMORY`].
+#[repr(C)]
+#[derive(Clone, Debug, AsBytes, FromBytes, FromZeroes)]
+pub struct MemoryInfoTemp {
+    /// empty entry marks the end
+    /// are sorted
+    pub vtl2_ram: [MemEntry; 32],
+    /// was this host alloc mode, 1 is yes
+    pub host_alloc: u8,
+    /// mbz
+    pub pad: [u8; 7],
+}
+
+/// VMBUS info for a vtl
+#[repr(C)]
+#[derive(Copy, Clone, Debug, AsBytes, FromBytes, FromZeroes)]
+pub struct VmbusInfo {
+    /// mmio, empty range means none.
+    pub mmio: [PageRegionDescriptor; 2],
+    /// connection id
+    pub connection_id: u32,
+    /// pad mbz
+    pub pad: u32,
+}
+
+/// Vmbus info for [`PersistedMemoryDirectiveType::VMBUS`].
+#[repr(C)]
+#[derive(Copy, Clone, Debug, AsBytes, FromBytes, FromZeroes)]
+pub struct PartitionVmbusInfo {
+    /// vtl0
+    pub vtl0: VmbusInfo,
+    /// vtl2
+    pub vtl2: VmbusInfo,
 }
