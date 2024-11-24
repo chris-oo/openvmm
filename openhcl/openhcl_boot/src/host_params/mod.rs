@@ -40,6 +40,9 @@ const MAX_PARTITION_RAM_RANGES: usize = 1024;
 /// Maximum size of the host-provided entropy
 pub const MAX_ENTROPY_SIZE: usize = 256;
 
+/// The maximum number of supported persisted memory page ranges.
+pub const MAX_PERSISTED_MEMORY_RANGES: usize = 1;
+
 /// Information about the guest partition.
 #[derive(Debug)]
 pub struct PartitionInfo {
@@ -56,7 +59,10 @@ pub struct PartitionInfo {
     /// The vtl2 reserved region, that is reserved to both the kernel and
     /// usermode.
     pub vtl2_reserved_region: MemoryRange,
-    ///  The full memory map provided by the host.
+    /// Memory ranges for persisted memory headers. These should be marked as
+    /// reserved by the kernel for usermode to fill in the required information.
+    pub vtl2_persisted_memory_ranges: ArrayVec<MemoryRange, MAX_PERSISTED_MEMORY_RANGES>,
+    /// The full memory map provided by the host.
     pub partition_ram: ArrayVec<MemoryEntry, MAX_PARTITION_RAM_RANGES>,
     /// The partiton's isolation type.
     pub isolation: IsolationType,
@@ -91,6 +97,7 @@ impl PartitionInfo {
             vtl2_full_config_region: MemoryRange::EMPTY,
             vtl2_config_region_reclaim: MemoryRange::EMPTY,
             vtl2_reserved_region: MemoryRange::EMPTY,
+            vtl2_persisted_memory_ranges: ArrayVec::new_const(),
             partition_ram: ArrayVec::new_const(),
             isolation: IsolationType::None,
             bsp_reg: 0,

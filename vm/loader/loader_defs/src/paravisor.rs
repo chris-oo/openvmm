@@ -399,6 +399,8 @@ pub struct ParavisorPersistedMemoryHeader {
     pub next_header_gpa: u64,
 }
 
+// The header is assumed to be one page in multiple locations. The size of the
+// header cannot change.
 const_assert_eq!(
     size_of::<ParavisorPersistedMemoryHeader>(),
     HV_PAGE_SIZE as usize
@@ -415,6 +417,7 @@ open_enum! {
     pub enum PersistedMemoryDirectiveType : u16 {
         /// No directive. This marks the end of the valid headers.
         NONE = 0,
+        // TODO ADD VTL2 memory, VTL0 & VTL2 VMBUS INFO
     }
 }
 

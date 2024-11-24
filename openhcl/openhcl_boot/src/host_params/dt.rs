@@ -20,8 +20,11 @@ use core::fmt::Write;
 use host_fdt_parser::MemoryAllocationMode;
 use host_fdt_parser::MemoryEntry;
 use host_fdt_parser::ParsedDeviceTree;
+use host_fdt_parser::VmbusInfo;
+use hvdef::HV_PAGE_SIZE;
 use igvm_defs::MemoryMapEntryType;
 use loader_defs::paravisor::CommandLinePolicy;
+use loader_defs::paravisor::ParavisorPersistedMemoryHeader;
 use memory_range::subtract_ranges;
 use memory_range::walk_ranges;
 use memory_range::MemoryRange;
@@ -311,6 +314,18 @@ fn parse_host_vtl2_ram(
     vtl2_ram
 }
 
+struct ParsedPersisted {
+    memory_allocation_mode: MemoryAllocationMode,
+    vtl2_ram: &'static [MemoryEntry],
+    vmbus_vtl0: Option<VmbusInfo>,
+    vmbus_vtl2: Option<VmbusInfo>,
+    persisted_ranges: &'static [MemoryRange],
+}
+
+fn parse_persisted(header: &ParavisorPersistedMemoryHeader) -> ParsedPersisted {
+    todo!()
+}
+
 impl PartitionInfo {
     // Read the IGVM provided DT for the vtl2 partition info. If no device tree
     // was provided by the host, `None` is returned.
@@ -348,81 +363,153 @@ impl PartitionInfo {
                 .map_err(|_| DtError::CommandLineSize)?;
         }
 
-        // TODO: Decide if isolated guests always use VTL2 allocation mode.
-
-        match parsed.memory_allocation_mode {
-            MemoryAllocationMode::Host => {
-                storage.vtl2_ram.clear();
-                storage
-                    .vtl2_ram
-                    .try_extend_from_slice(parse_host_vtl2_ram(params, &parsed.memory).as_ref())
-                    .expect("vtl2 ram should only be 64 big");
-                storage.memory_allocation_mode = MemoryAllocationMode::Host;
-            }
-            MemoryAllocationMode::Vtl2 {
-                memory_size,
-                mmio_size,
-            } => {
-                storage.vtl2_ram.clear();
-                storage
-                    .vtl2_ram
-                    .try_extend_from_slice(
-                        allocate_vtl2_ram(params, &parsed.memory, memory_size).as_ref(),
-                    )
-                    .expect("vtl2 ram should only be 64 big");
-                storage.memory_allocation_mode = MemoryAllocationMode::Vtl2 {
-                    memory_size,
-                    mmio_size,
-                };
-            }
-        }
-
+        // Set default mmio information based on what the host has provided.
         storage.vmbus_vtl2 = parsed.vmbus_vtl2.clone().ok_or(DtError::Vtl2Vmbus)?;
         storage.vmbus_vtl0 = parsed.vmbus_vtl0.clone().ok_or(DtError::Vtl0Vmbus)?;
 
-        // The host is responsible for allocating MMIO ranges for non-isolated
-        // guests when it also provides the ram VTL2 should use.
-        //
-        // For isolated guests, or when VTL2 has been asked to carve out its own
-        // memory, carve out a range from the VTL0 allotment.
-        if params.isolation_type != IsolationType::None
-            || matches!(
-                parsed.memory_allocation_mode,
-                MemoryAllocationMode::Vtl2 { .. }
-            )
-        {
-            // Decide the amount of mmio VTL2 should allocate. Enforce a minimum
-            // of 128 MB mmio for VTL2.
-            const MINIMUM_MMIO_SIZE: u64 = 128 * (1 << 20);
-            let mmio_size = core::cmp::max(
+        // See if there was a previous instance of OpenHCL that reported
+        // information via the persisted memory header. There may not be one if
+        // the previous OpenHCL instance was one before this was supported.
+        let persisted_header = params.persisted_memory_header();
+
+        match persisted_header {
+            Some(header) => {
+                // Parse memory, mmio, and any other information from the
+                // persisted header.
+                let parsed_persisted = parse_persisted(header);
+
+                if parsed_persisted.vtl2_ram.is_empty() {
+                    panic!("previous openhcl instance did not report used vtl2 ram")
+                }
+
+                if parsed_persisted.memory_allocation_mode == MemoryAllocationMode::Host {
+                    let host_provided = parse_host_vtl2_ram(params, &parsed.memory);
+                    assert_eq!(
+                        parsed_persisted.vtl2_ram,
+                        host_provided.as_ref(),
+                        "previous host vtl2 ram is not the same as current reported by host"
+                    );
+                }
+
+                storage
+                    .vtl2_ram
+                    .try_extend_from_slice(parsed_persisted.vtl2_ram)
+                    .expect("vtl2 ram should only be 64 big");
+
+                if let Some(vmbus_vtl0) = parsed_persisted.vmbus_vtl0 {
+                    storage.vmbus_vtl0 = vmbus_vtl0;
+                }
+
+                if let Some(vmbus_vtl2) = parsed_persisted.vmbus_vtl2 {
+                    storage.vmbus_vtl2 = vmbus_vtl2;
+                }
+
+                storage
+                    .vtl2_persisted_memory_ranges
+                    .try_extend_from_slice(parsed_persisted.persisted_ranges)
+                    .expect("too many previously persisted ranges");
+
+                // The base persisted header range must be one of the previously
+                // persisted ranges, or we have moved the location of this base
+                // header which is not allowed.
+                let base_header_range = params.persisted_memory_header_range();
+                if storage
+                    .vtl2_persisted_memory_ranges
+                    .iter()
+                    .find(|r| *r == &base_header_range)
+                    .is_none()
+                {
+                    panic!("openhcl memory layout has changed, base persisted header {:?} not present in previous list {:?}", base_header_range, storage.vtl2_persisted_memory_ranges);
+                }
+            }
+            None => {
+                // Even though the persisted region header was not valid, report
+                // the location as usermode should fill in the info for the next
+                // servicing boot.
+                storage
+                    .vtl2_persisted_memory_ranges
+                    .push(params.persisted_memory_header_range());
+
+                // Parse memory, mmio from the host provided dt.
+                //
+                // TODO: Decide if isolated guests always use VTL2 allocation
+                // mode.
+
                 match parsed.memory_allocation_mode {
-                    MemoryAllocationMode::Vtl2 { mmio_size, .. } => mmio_size.unwrap_or(0),
-                    _ => 0,
-                },
-                MINIMUM_MMIO_SIZE,
-            );
+                    MemoryAllocationMode::Host => {
+                        storage.vtl2_ram.clear();
+                        storage
+                            .vtl2_ram
+                            .try_extend_from_slice(
+                                parse_host_vtl2_ram(params, &parsed.memory).as_ref(),
+                            )
+                            .expect("vtl2 ram should only be 64 big");
+                        storage.memory_allocation_mode = MemoryAllocationMode::Host;
+                    }
+                    MemoryAllocationMode::Vtl2 {
+                        memory_size,
+                        mmio_size,
+                    } => {
+                        storage.vtl2_ram.clear();
+                        storage
+                            .vtl2_ram
+                            .try_extend_from_slice(
+                                allocate_vtl2_ram(params, &parsed.memory, memory_size).as_ref(),
+                            )
+                            .expect("vtl2 ram should only be 64 big");
+                        storage.memory_allocation_mode = MemoryAllocationMode::Vtl2 {
+                            memory_size,
+                            mmio_size,
+                        };
+                    }
+                }
 
-            // Decide what mmio vtl2 should use.
-            let vtl2_mmio = storage.select_vtl2_mmio_range(mmio_size)?;
+                // The host is responsible for allocating MMIO ranges for non-isolated
+                // guests when it also provides the ram VTL2 should use.
+                //
+                // For isolated guests, or when VTL2 has been asked to carve out its own
+                // memory, carve out a range from the VTL0 allotment.
+                if params.isolation_type != IsolationType::None
+                    || matches!(
+                        parsed.memory_allocation_mode,
+                        MemoryAllocationMode::Vtl2 { .. }
+                    )
+                {
+                    // Decide the amount of mmio VTL2 should allocate. Enforce a minimum
+                    // of 128 MB mmio for VTL2.
+                    const MINIMUM_MMIO_SIZE: u64 = 128 * (1 << 20);
+                    let mmio_size = core::cmp::max(
+                        match parsed.memory_allocation_mode {
+                            MemoryAllocationMode::Vtl2 { mmio_size, .. } => mmio_size.unwrap_or(0),
+                            _ => 0,
+                        },
+                        MINIMUM_MMIO_SIZE,
+                    );
 
-            // Update vtl0 mmio to exclude vtl2 mmio.
-            let vtl0_mmio = subtract_ranges(storage.vmbus_vtl0.mmio.iter().cloned(), [vtl2_mmio])
-                .collect::<ArrayVec<MemoryRange, 2>>();
+                    // Decide what mmio vtl2 should use.
+                    let vtl2_mmio = storage.select_vtl2_mmio_range(mmio_size)?;
 
-            // TODO: For now, if we have only a single vtl0_mmio range left,
-            // panic. In the future decide if we want to report this as a start
-            // failure in usermode, change allocation strategy, or something
-            // else.
-            assert_eq!(
-                vtl0_mmio.len(),
-                2,
-                "vtl0 mmio ranges are not 2 {:#x?}",
-                vtl0_mmio
-            );
+                    // Update vtl0 mmio to exclude vtl2 mmio.
+                    let vtl0_mmio =
+                        subtract_ranges(storage.vmbus_vtl0.mmio.iter().cloned(), [vtl2_mmio])
+                            .collect::<ArrayVec<MemoryRange, 2>>();
 
-            storage.vmbus_vtl2.mmio.clear();
-            storage.vmbus_vtl2.mmio.push(vtl2_mmio);
-            storage.vmbus_vtl0.mmio = vtl0_mmio;
+                    // TODO: For now, if we have only a single vtl0_mmio range left,
+                    // panic. In the future decide if we want to report this as a start
+                    // failure in usermode, change allocation strategy, or something
+                    // else.
+                    assert_eq!(
+                        vtl0_mmio.len(),
+                        2,
+                        "vtl0 mmio ranges are not 2 {:#x?}",
+                        vtl0_mmio
+                    );
+
+                    storage.vmbus_vtl2.mmio.clear();
+                    storage.vmbus_vtl2.mmio.push(vtl2_mmio);
+                    storage.vmbus_vtl0.mmio = vtl0_mmio;
+                }
+            }
         }
 
         // The host provided device tree is marked as normal ram, as the
@@ -445,6 +532,7 @@ impl PartitionInfo {
             vtl2_full_config_region: vtl2_config_region,
             vtl2_config_region_reclaim: vtl2_config_region_reclaim_struct,
             vtl2_reserved_region,
+            vtl2_persisted_memory_ranges,
             partition_ram: _,
             isolation,
             bsp_reg,
@@ -458,6 +546,8 @@ impl PartitionInfo {
             entropy,
             vtl0_alias_map: _,
         } = storage;
+
+        assert!(!vtl2_persisted_memory_ranges.is_empty());
 
         *isolation = params.isolation_type;
 
