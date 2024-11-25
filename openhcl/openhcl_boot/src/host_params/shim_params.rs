@@ -219,7 +219,7 @@ impl ShimParams {
                 .expect("should always be non null")
         };
 
-        if header.magic != ParavisorPersistedMemoryHeader::MAGIC {
+        if header.magic == ParavisorPersistedMemoryHeader::MAGIC {
             Some(header)
         } else {
             None

@@ -322,6 +322,8 @@ where
 
     offset += HV_PAGE_SIZE;
 
+    // BUGBUG: MOVE TO START CANNOT BE AFTER ANY VARIABLE LENGTH REGIONS LIKE KERNEL/INITRD/SHIM
+    //
     // Reserve space for the VTL2 persisted memory header. Note that this page
     // is _not_ imported. The contents of the page are either zeroes (cold
     // boot), a valid header from a previous OpenHCL instance, or garbage data
