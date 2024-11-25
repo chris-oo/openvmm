@@ -417,7 +417,11 @@ open_enum! {
     pub enum PersistedMemoryDirectiveType : u16 {
         /// No directive. This marks the end of the valid headers.
         NONE = 0,
-        // TODO ADD VTL2 memory, VTL0 & VTL2 VMBUS INFO
+        // BUGBUG USE PROTOBUF INSTEAD OF BESPOKE BINARY
+        /// Memory information described by [`MemoryInfoTemp`].
+        VTL2_MEMORY = 1,
+        /// VMBUS information
+        VMBUS = 2,
     }
 }
 
@@ -427,8 +431,57 @@ open_enum! {
 #[derive(Copy, Clone, Debug, AsBytes, FromBytes, FromZeroes)]
 pub struct PersistedMemoryDirectiveHeader {
     /// The type of the directive.
-    pub directive_type: u16,
+    pub directive_type: PersistedMemoryDirectiveType,
     /// The length of the directive data. This does not include the length of
     /// this header.
     pub directive_length: u16,
+}
+
+/// mem entry
+#[repr(C)]
+#[derive(Clone, Debug, AsBytes, FromBytes, FromZeroes)]
+pub struct MemEntry {
+    /// range
+    pub range: PageRegionDescriptor,
+    /// vnode
+    pub vnode: u32,
+    /// igvm typ
+    pub typ: igvm_defs::MemoryMapEntryType,
+    /// pad mbz
+    pub pad: u16,
+}
+
+/// Memory info for [`PersistedMemoryDirectiveType::MEMORY`].
+#[repr(C)]
+#[derive(Clone, Debug, AsBytes, FromBytes, FromZeroes)]
+pub struct MemoryInfoTemp {
+    /// empty entry marks the end
+    /// are sorted
+    pub vtl2_ram: [MemEntry; 32],
+    /// was this host alloc mode, 1 is yes
+    pub host_alloc: u8,
+    /// mbz
+    pub pad: [u8; 7],
+}
+
+/// VMBUS info for a vtl
+#[repr(C)]
+#[derive(Copy, Clone, Debug, AsBytes, FromBytes, FromZeroes)]
+pub struct VmbusInfo {
+    /// mmio, empty range means none.
+    pub mmio: [PageRegionDescriptor; 2],
+    /// connection id
+    pub connection_id: u32,
+    /// pad mbz
+    pub pad: u32,
+}
+
+/// Vmbus info for [`PersistedMemoryDirectiveType::VMBUS`].
+#[repr(C)]
+#[derive(Copy, Clone, Debug, AsBytes, FromBytes, FromZeroes)]
+pub struct PartitionVmbusInfo {
+    /// vtl0
+    pub vtl0: VmbusInfo,
+    /// vtl2
+    pub vtl2: VmbusInfo,
 }

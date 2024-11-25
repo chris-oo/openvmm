@@ -21,13 +21,13 @@ use host_fdt_parser::MemoryAllocationMode;
 use host_fdt_parser::MemoryEntry;
 use host_fdt_parser::ParsedDeviceTree;
 use host_fdt_parser::VmbusInfo;
-use hvdef::HV_PAGE_SIZE;
 use igvm_defs::MemoryMapEntryType;
 use loader_defs::paravisor::CommandLinePolicy;
 use loader_defs::paravisor::ParavisorPersistedMemoryHeader;
 use memory_range::subtract_ranges;
 use memory_range::walk_ranges;
 use memory_range::MemoryRange;
+use zerocopy_helpers::FromBytesExt;
 
 /// Errors when reading the host device tree.
 #[derive(Debug)]
@@ -322,8 +322,87 @@ struct ParsedPersisted {
     persisted_ranges: &'static [MemoryRange],
 }
 
-fn parse_persisted(header: &ParavisorPersistedMemoryHeader) -> ParsedPersisted {
-    todo!()
+fn parse_persisted(
+    params: &ShimParams,
+    header: &ParavisorPersistedMemoryHeader,
+) -> ParsedPersisted {
+    // TODO: does not handle memory when it's outside of the base range, as that requires updating pfn entries.
+    // maybe needs to support dynamic mapping updates so that we can read other headers.
+
+    use loader_defs::paravisor::MemoryInfoTemp;
+    use loader_defs::paravisor::PartitionVmbusInfo;
+    use loader_defs::paravisor::PersistedMemoryDirectiveHeader;
+    use loader_defs::paravisor::PersistedMemoryDirectiveType;
+
+    let mut vtl2_ram = off_stack!(ArrayVec<MemoryEntry, MAX_NUMA_NODES>, ArrayVec::new_const());
+    let mut persisted_ranges = off_stack!(ArrayVec<MemoryRange, 4>, ArrayVec::new_const());
+    persisted_ranges.push(params.persisted_memory_header_range());
+    let mut memory_allocation_mode = MemoryAllocationMode::Host;
+    let mut buf = header.directives.as_slice();
+
+    loop {
+        let (next_header, remaining) = PersistedMemoryDirectiveHeader::read_from_prefix_split(buf)
+            .expect("no ending none header specified");
+        buf = remaining;
+
+        match next_header.directive_type {
+            PersistedMemoryDirectiveType::NONE => {
+                break;
+            }
+            PersistedMemoryDirectiveType::VTL2_MEMORY => {
+                let (mem, remaining) = MemoryInfoTemp::read_from_prefix_split(remaining)
+                    .expect("no ending none header specified");
+
+                vtl2_ram.extend(mem.vtl2_ram.iter().filter_map(|entry| {
+                    if let Some((base_pfn, page_count)) = entry.range.pages() {
+                        Some(MemoryEntry {
+                            range: MemoryRange::from_4k_gpn_range(
+                                base_pfn..(base_pfn + page_count),
+                            ),
+                            mem_type: entry.typ,
+                            vnode: entry.vnode,
+                        })
+                    } else {
+                        None
+                    }
+                }));
+
+                memory_allocation_mode = if mem.host_alloc == 1 {
+                    MemoryAllocationMode::Host
+                } else {
+                    // NOTE: does not encode if host hint was provided or not
+                    MemoryAllocationMode::Vtl2 {
+                        memory_size: None,
+                        mmio_size: None,
+                    }
+                };
+
+                buf = remaining;
+            }
+            PersistedMemoryDirectiveType::VMBUS => {
+                let (_entry, remaining) = PartitionVmbusInfo::read_from_prefix_split(buf)
+                    .expect("no ending none header specified");
+                // NOTE: ignored
+                buf = remaining;
+            }
+            _ => {
+                // TODO: handle unknown (for servicing going backwards versions)
+                panic!("unknown directive type {:?}", next_header.directive_type);
+            }
+        }
+    }
+
+    if header.next_header_gpa != 0 {
+        panic!("next header chaining not supported");
+    }
+
+    ParsedPersisted {
+        memory_allocation_mode,
+        vtl2_ram: OffStackRef::leak(vtl2_ram),
+        vmbus_vtl0: None,
+        vmbus_vtl2: None,
+        persisted_ranges: OffStackRef::leak(persisted_ranges),
+    }
 }
 
 impl PartitionInfo {
@@ -376,7 +455,7 @@ impl PartitionInfo {
             Some(header) => {
                 // Parse memory, mmio, and any other information from the
                 // persisted header.
-                let parsed_persisted = parse_persisted(header);
+                let parsed_persisted = parse_persisted(params, header);
 
                 if parsed_persisted.vtl2_ram.is_empty() {
                     panic!("previous openhcl instance did not report used vtl2 ram")
@@ -413,11 +492,10 @@ impl PartitionInfo {
                 // persisted ranges, or we have moved the location of this base
                 // header which is not allowed.
                 let base_header_range = params.persisted_memory_header_range();
-                if storage
+                if !storage
                     .vtl2_persisted_memory_ranges
                     .iter()
-                    .find(|r| *r == &base_header_range)
-                    .is_none()
+                    .any(|r| r == &base_header_range)
                 {
                     panic!("openhcl memory layout has changed, base persisted header {:?} not present in previous list {:?}", base_header_range, storage.vtl2_persisted_memory_ranges);
                 }

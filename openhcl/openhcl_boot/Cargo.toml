@@ -18,6 +18,8 @@ fdt.workspace = true
 memory_range.workspace = true
 sidecar_defs.workspace = true
 
+zerocopy_helpers.workspace = true
+
 arrayvec.workspace = true
 cfg-if.workspace = true
 crc32fast.workspace = true

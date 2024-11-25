@@ -180,8 +180,7 @@ impl ShimParams {
     #[cfg(target_arch = "x86_64")]
     pub fn secrets_start(&self) -> u64 {
         self.vtl2_reserved_region_start
-            + loader_defs::paravisor::PARAVISOR_RESERVED_VTL2_SNP_SECRETS_PAGE_INDEX
-                * hvdef::HV_PAGE_SIZE
+            + loader_defs::paravisor::PARAVISOR_RESERVED_VTL2_SNP_SECRETS_PAGE_INDEX * HV_PAGE_SIZE
     }
 
     /// Get the size of the CPUID page.
@@ -291,7 +290,7 @@ impl ShimParams {
     pub fn imported_regions_hash(&self) -> &'static [u8] {
         let header_start = self.parameter_region_start
             + (loader_defs::paravisor::PARAVISOR_MEASURED_VTL2_CONFIG_ACCEPTED_MEMORY_PAGE_INDEX
-                * hvdef::HV_PAGE_SIZE);
+                * HV_PAGE_SIZE);
 
         // SAFETY: header_start is a valid address pointing to a valid instance
         // of an imported region page header.

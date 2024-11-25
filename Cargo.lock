@@ -3402,6 +3402,7 @@ version = "0.0.0"
 dependencies = [
  "bitfield-struct",
  "hvdef",
+ "igvm_defs",
  "inspect",
  "open_enum",
  "static_assertions",
@@ -4342,6 +4343,7 @@ dependencies = [
  "underhill_confidentiality",
  "x86defs",
  "zerocopy",
+ "zerocopy_helpers",
 ]
 
 [[package]]

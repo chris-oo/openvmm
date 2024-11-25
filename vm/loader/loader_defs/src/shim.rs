@@ -76,6 +76,7 @@ open_enum! {
 open_enum! {
     /// The memory type reported from the bootshim to usermode, for which VTL a
     /// given memory range is for.
+    #[derive(AsBytes, FromBytes, FromZeroes)]
     pub enum MemoryVtlType: u32 {
         /// This memory is for VTL0.
         VTL0 = 0,
@@ -98,6 +99,10 @@ open_enum! {
         /// and usermode. Today, this is only used for SNP: VMSA, CPUID pages,
         /// and secrets pages.
         VTL2_RESERVED = 7,
+        /// This memory holds data that is persisted across OpenHCL servicing
+        /// operations, and used to pass information to the next instance of
+        /// OpenHCL in a servicing boot.
+        VTL2_PERSISTED = 8,
     }
 }
 
