@@ -26,6 +26,7 @@ use memory_range::MemoryRange;
 use sparse_mmap::SparseMapping;
 use vm_topology::memory::MemoryRangeWithNode;
 use zerocopy::AsBytes;
+use zerocopy::FromZeroes;
 
 /// Structure that holds parameters provided at runtime. Some are read from the
 /// guest address space, and others from openhcl_boot provided via devicetree.
@@ -199,12 +200,63 @@ impl Drop for Vtl2ParamsMap<'_> {
     }
 }
 
+// TODO: This belongs in its own crate, maybe. Maybe when it uses protobuf parsing becomes easy?
 fn write_persisted_info(parsed: &ParsedBootDtInfo) -> anyhow::Result<()> {
     let ranges = [parsed.vtl2_persisted_header];
     let mapping =
         Vtl2ParamsMap::new_writeable(&ranges).context("unable to map persisted header")?;
 
-    let directives = [0; 4080];
+    // write header and memory to directives
+    let directives = {
+        let mut vtl2_ram = [loader_defs::paravisor::MemEntry::new_zeroed(); 32];
+        let vtl2_mem_iter = parsed
+            .partition_memory_map
+            .iter()
+            .filter_map(|entry| match entry {
+                bootloader_fdt_parser::AddressRange::Memory(memory) if memory.vtl_usage.vtl2() => {
+                    Some(loader_defs::paravisor::MemEntry {
+                        range: loader_defs::paravisor::PageRegionDescriptor {
+                            base_page_number: memory.range.range.start_4k_gpn(),
+                            page_count: memory.range.range.page_count_4k(),
+                        },
+                        vnode: memory.range.vnode,
+                        vtl_type: memory.vtl_usage,
+                        igvm_type: memory.igvm_type,
+                        pad: [0; 3],
+                    })
+                }
+                _ => None,
+            });
+        vtl2_ram
+            .iter_mut()
+            .zip(vtl2_mem_iter)
+            .for_each(|(entry, mem)| *entry = mem);
+
+        let memory = loader_defs::paravisor::MemoryInfoTemp {
+            vtl2_ram,
+            host_alloc: match parsed.memory_allocation_mode {
+                bootloader_fdt_parser::MemoryAllocationMode::Host => 1,
+                bootloader_fdt_parser::MemoryAllocationMode::Vtl2 { .. } => 0,
+            },
+            pad: [0; 7],
+        };
+
+        let header = loader_defs::paravisor::PersistedMemoryDirectiveHeader {
+            directive_type: loader_defs::paravisor::PersistedMemoryDirectiveType::VTL2_MEMORY,
+            directive_length: size_of_val(&memory) as u16,
+        };
+
+        let mut directives = [0; 4080];
+
+        let bytes = header.as_bytes().iter().chain(memory.as_bytes().iter());
+
+        directives
+            .iter_mut()
+            .zip(bytes)
+            .for_each(|(dst, src)| *dst = *src);
+
+        directives
+    };
 
     let header = ParavisorPersistedMemoryHeader {
         magic: ParavisorPersistedMemoryHeader::MAGIC,

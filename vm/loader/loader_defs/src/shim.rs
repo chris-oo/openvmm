@@ -120,4 +120,18 @@ impl MemoryVtlType {
                 | MemoryVtlType::VTL2_PERSISTED
         )
     }
+
+    /// Returns true if this range is for VTL2.
+    pub fn vtl2(&self) -> bool {
+        matches!(
+            *self,
+            MemoryVtlType::VTL2_RAM
+                | MemoryVtlType::VTL2_CONFIG
+                | MemoryVtlType::VTL2_SIDECAR_IMAGE
+                | MemoryVtlType::VTL2_SIDECAR_NODE
+                | MemoryVtlType::VTL2_MMIO
+                | MemoryVtlType::VTL2_RESERVED
+                | MemoryVtlType::VTL2_PERSISTED
+        )
+    }
 }

@@ -3,6 +3,7 @@
 
 //! Underhill (paravisor) definitions.
 
+use crate::shim::MemoryVtlType;
 use bitfield_struct::bitfield;
 use core::mem::size_of;
 use hvdef::HV_PAGE_SIZE;
@@ -439,16 +440,18 @@ pub struct PersistedMemoryDirectiveHeader {
 
 /// mem entry
 #[repr(C)]
-#[derive(Clone, Debug, AsBytes, FromBytes, FromZeroes)]
+#[derive(Clone, Copy, Debug, AsBytes, FromBytes, FromZeroes)]
 pub struct MemEntry {
     /// range
     pub range: PageRegionDescriptor,
     /// vnode
     pub vnode: u32,
+    /// shim typ
+    pub vtl_type: MemoryVtlType,
     /// igvm typ
-    pub typ: igvm_defs::MemoryMapEntryType,
+    pub igvm_type: igvm_defs::MemoryMapEntryType,
     /// pad mbz
-    pub pad: u16,
+    pub pad: [u16; 3],
 }
 
 /// Memory info for [`PersistedMemoryDirectiveType::MEMORY`].

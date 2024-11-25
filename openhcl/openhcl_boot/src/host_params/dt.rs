@@ -25,6 +25,8 @@ use host_fdt_parser::VmbusInfo;
 use igvm_defs::MemoryMapEntryType;
 use loader_defs::paravisor::CommandLinePolicy;
 use loader_defs::paravisor::ParavisorPersistedMemoryHeader;
+use loader_defs::shim::MemoryVtlType;
+use memory_range::merge_adjacent_ranges;
 use memory_range::subtract_ranges;
 use memory_range::walk_ranges;
 use memory_range::MemoryRange;
@@ -315,8 +317,17 @@ fn parse_host_vtl2_ram(
     vtl2_ram
 }
 
+// BUGBUG too many of these different types
+struct VtlMemoryEntry {
+    range: MemoryRange,
+    vtl_type: MemoryVtlType,
+    igvm_type: MemoryMapEntryType,
+    vnode: u32,
+}
+
 struct ParsedPersisted {
     memory_allocation_mode: MemoryAllocationMode,
+    vtl2_mem_layout: &'static [VtlMemoryEntry],
     vtl2_ram: &'static [MemoryEntry],
     vmbus_vtl0: Option<VmbusInfo>,
     vmbus_vtl2: Option<VmbusInfo>,
@@ -335,7 +346,10 @@ fn parse_persisted(
     use loader_defs::paravisor::PersistedMemoryDirectiveHeader;
     use loader_defs::paravisor::PersistedMemoryDirectiveType;
 
-    let mut vtl2_ram = off_stack!(ArrayVec<MemoryEntry, MAX_NUMA_NODES>, ArrayVec::new_const());
+    // TODO: figure out how many entries possible
+    const MAX_MEMLAYOUT_ENTRIES: usize = MAX_NUMA_NODES + 32;
+    let mut vtl2_mem_layout =
+        off_stack!(ArrayVec<VtlMemoryEntry, MAX_MEMLAYOUT_ENTRIES>, ArrayVec::new_const());
     let mut persisted_ranges = off_stack!(ArrayVec<MemoryRange, 4>, ArrayVec::new_const());
     persisted_ranges.push(params.persisted_memory_header_range());
     let mut memory_allocation_mode = MemoryAllocationMode::Host;
@@ -354,13 +368,14 @@ fn parse_persisted(
                 let (mem, remaining) = MemoryInfoTemp::read_from_prefix_split(remaining)
                     .expect("no ending none header specified");
 
-                vtl2_ram.extend(mem.vtl2_ram.iter().filter_map(|entry| {
+                vtl2_mem_layout.extend(mem.vtl2_ram.iter().filter_map(|entry| {
                     if let Some((base_pfn, page_count)) = entry.range.pages() {
-                        Some(MemoryEntry {
+                        Some(VtlMemoryEntry {
                             range: MemoryRange::from_4k_gpn_range(
                                 base_pfn..(base_pfn + page_count),
                             ),
-                            mem_type: entry.typ,
+                            vtl_type: entry.vtl_type,
+                            igvm_type: entry.igvm_type,
                             vnode: entry.vnode,
                         })
                     } else {
@@ -397,8 +412,30 @@ fn parse_persisted(
         panic!("next header chaining not supported");
     }
 
+    // The previous instance reports a full view of VTL2 memory space, with
+    // reserved ranges. While we don't use this today, we will in the future to
+    // reconstruct which ranges should be still marked reserved.
+    //
+    // For now, just collapse them all assuming their IGVM type is the same for
+    // vtl2_ram.
+    let mut vtl2_ram = off_stack!(ArrayVec<MemoryEntry, MAX_NUMA_NODES>, ArrayVec::new_const());
+    vtl2_ram.clear();
+    vtl2_ram.extend(
+        merge_adjacent_ranges(
+            vtl2_mem_layout
+                .iter()
+                .map(|entry| (entry.range, (entry.igvm_type, entry.vnode))),
+        )
+        .map(|(range, (igvm_type, vnode))| MemoryEntry {
+            range,
+            mem_type: igvm_type,
+            vnode,
+        }),
+    );
+
     ParsedPersisted {
         memory_allocation_mode,
+        vtl2_mem_layout: OffStackRef::leak(vtl2_mem_layout),
         vtl2_ram: OffStackRef::leak(vtl2_ram),
         vmbus_vtl0: None,
         vmbus_vtl2: None,
@@ -466,6 +503,7 @@ impl PartitionInfo {
 
                 if parsed_persisted.memory_allocation_mode == MemoryAllocationMode::Host {
                     let host_provided = parse_host_vtl2_ram(params, &parsed.memory);
+
                     assert_eq!(
                         parsed_persisted.vtl2_ram,
                         host_provided.as_ref(),
