@@ -6,6 +6,7 @@
 use super::shim_params::IsolationType;
 use super::shim_params::ShimParams;
 use super::PartitionInfo;
+use crate::boot_logger::debug_log;
 use crate::boot_logger::log;
 use crate::host_params::COMMAND_LINE_SIZE;
 use crate::host_params::MAX_CPU_COUNT;
@@ -450,6 +451,8 @@ impl PartitionInfo {
         // information via the persisted memory header. There may not be one if
         // the previous OpenHCL instance was one before this was supported.
         let persisted_header = params.persisted_memory_header();
+
+        debug_log!("persisted header {:?}", persisted_header);
 
         match persisted_header {
             Some(header) => {

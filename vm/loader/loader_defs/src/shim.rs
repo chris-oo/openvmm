@@ -117,6 +117,7 @@ impl MemoryVtlType {
                 | MemoryVtlType::VTL2_SIDECAR_IMAGE
                 | MemoryVtlType::VTL2_SIDECAR_NODE
                 | MemoryVtlType::VTL2_RESERVED
+                | MemoryVtlType::VTL2_PERSISTED
         )
     }
 }
