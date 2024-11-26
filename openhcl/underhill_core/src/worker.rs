@@ -1574,8 +1574,21 @@ async fn new_underhill_vm(
         }
     }
 
-    // Set the shared memory allocator to GET that is required by attestation call-out.
-    if let Some(allocator) = shared_vis_pages_pool
+    // Set the gpa allocator for the GET. This is either the private pages pool
+    // allocator on non-isolated guests, or the shared memory allocator on
+    // isolated guests.
+    if let Some(allocator) = private_pages_pool
+        .as_ref()
+        .map(|p| p.allocator("get".into()))
+    {
+        assert_eq!(isolation, virt::IsolationType::None);
+
+        // BUGBUG rename get funcs
+        get_client.set_shared_memory_allocator(
+            allocator.context("get memory allocator")?,
+            gm.vtl0().clone(),
+        );
+    } else if let Some(allocator) = shared_vis_pages_pool
         .as_ref()
         .map(|p| p.allocator("get".into()))
     {
