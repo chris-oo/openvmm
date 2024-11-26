@@ -183,6 +183,8 @@ pub struct GuestEmulationDevice {
 
     #[inspect(with = "Option::is_some")]
     save_restore_buf: Option<Vec<u8>>,
+
+    guest_memory: Option<GuestMemory>,
 }
 
 #[derive(Inspect)]
@@ -219,6 +221,7 @@ impl GuestEmulationDevice {
             }),
             save_restore_buf: None,
             waiting_for_vtl0_start: Vec::new(),
+            guest_memory: None,
         }
     }
 
@@ -281,6 +284,10 @@ impl SimpleVmbusDevice for GuestEmulationDevice {
     > {
         // TODO
         None
+    }
+
+    fn install_guest_memory(&mut self, mem: GuestMemory) {
+        self.guest_memory = Some(mem);
     }
 }
 

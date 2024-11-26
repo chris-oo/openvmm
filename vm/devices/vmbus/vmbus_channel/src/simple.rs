@@ -25,6 +25,7 @@ use crate::gpadl_ring::gpadl_channel;
 use crate::gpadl_ring::GpadlRingMem;
 use crate::RawAsyncChannel;
 use async_trait::async_trait;
+use guestmem::GuestMemory;
 use inspect::Inspect;
 use inspect::InspectMut;
 use mesh::payload::Protobuf;
@@ -81,6 +82,10 @@ pub trait SimpleVmbusDevice: 'static + Send {
     ) -> Option<
         &mut dyn SaveRestoreSimpleVmbusDevice<SavedState = Self::SavedState, Runner = Self::Runner>,
     >;
+
+    // BUGBUG: This doesn't belong here. Probably the GED needs to become a full
+    // fledged vmbus device?
+    fn install_guest_memory(&mut self, _gm: GuestMemory) {}
 }
 
 /// Trait implemented by simple vmbus devices that support save/restore.
@@ -205,6 +210,10 @@ impl<T: SimpleVmbusDevice> SimpleDeviceWrapper<T> {
         let channel = gpadl_channel(&self.driver, &self.resources, open_request, 0)?;
         Ok(channel)
     }
+
+    fn install_guest_memory(&mut self, gm: GuestMemory) {
+        self.device.get_mut().0 .0.install_guest_memory(gm);
+    }
 }
 
 #[async_trait]
@@ -223,6 +232,12 @@ impl<T: SimpleVmbusDevice> VmbusDevice for SimpleDeviceWrapper<T> {
         open_request: &OpenRequest,
     ) -> Result<(), anyhow::Error> {
         assert!(self.running);
+        let gm = self
+            .resources
+            .offer_resources
+            .guest_memory(open_request)
+            .clone();
+        self.install_guest_memory(gm);
         let channel = self.build_channel(open_request)?;
         let runner = self.device.task_mut().0.open(channel)?;
         self.insert_runner(runner);
