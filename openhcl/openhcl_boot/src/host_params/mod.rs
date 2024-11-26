@@ -62,6 +62,13 @@ pub struct PartitionInfo {
     /// Memory ranges for persisted memory headers. These should be marked as
     /// reserved by the kernel for usermode to fill in the required information.
     pub vtl2_persisted_memory_ranges: ArrayVec<MemoryRange, MAX_PERSISTED_MEMORY_RANGES>,
+    /// Memory used for the VTL2 pool.
+    /// BUGBUG clean this up, bootshim needs central mgmt
+    pub vtl2_pool_memory: MemoryRange,
+    /// Memory ranges that are in use by the bootshim, and any other persisted ranges.
+    /// BUGBUG: refactor all these ranges ugh.
+    /// BUGBUG: define cap constant
+    pub vtl2_used_ranges: ArrayVec<MemoryRange, 64>,
     /// The full memory map provided by the host.
     pub partition_ram: ArrayVec<MemoryEntry, MAX_PARTITION_RAM_RANGES>,
     /// The partiton's isolation type.
@@ -97,7 +104,9 @@ impl PartitionInfo {
             vtl2_full_config_region: MemoryRange::EMPTY,
             vtl2_config_region_reclaim: MemoryRange::EMPTY,
             vtl2_reserved_region: MemoryRange::EMPTY,
+            vtl2_pool_memory: MemoryRange::EMPTY,
             vtl2_persisted_memory_ranges: ArrayVec::new_const(),
+            vtl2_used_ranges: ArrayVec::new_const(),
             partition_ram: ArrayVec::new_const(),
             isolation: IsolationType::None,
             bsp_reg: 0,

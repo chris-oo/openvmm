@@ -71,6 +71,9 @@ mod state {
         /// pools (there will be more in the future).
         #[mesh(8)]
         pub shared_pool_state: Option<page_pool_alloc::save_restore::PagePoolState>,
+        /// Private pool information.
+        #[mesh(9)]
+        pub private_pool_state: Option<page_pool_alloc::save_restore::PagePoolState>,
     }
 
     #[derive(Protobuf)]
@@ -134,6 +137,7 @@ pub mod transposed {
         )>,
         pub overlay_shutdown_device: Option<bool>,
         pub shared_pool_state: Option<Option<page_pool_alloc::save_restore::PagePoolState>>,
+        pub private_pool_state: Option<Option<page_pool_alloc::save_restore::PagePoolState>>,
     }
 
     /// A transposed `Option<EmuplatSavedState>`, where each field of
@@ -162,6 +166,7 @@ pub mod transposed {
                     vmgs,
                     overlay_shutdown_device,
                     shared_pool_state,
+                    private_pool_state,
                 } = state;
 
                 OptionServicingInitState {
@@ -176,6 +181,7 @@ pub mod transposed {
                     vmgs: Some(vmgs),
                     overlay_shutdown_device: Some(overlay_shutdown_device),
                     shared_pool_state: Some(shared_pool_state),
+                    private_pool_state: Some(private_pool_state),
                 }
             } else {
                 OptionServicingInitState::default()

@@ -1507,6 +1507,39 @@ async fn new_underhill_vm(
         None
     };
 
+    let mut private_pages_pool = {
+        // Determine the ranges the bootshim says we should use for this pool.
+        let private_pages = runtime_params
+            .partition_memory_map()
+            .iter()
+            .filter_map(|entry| match entry {
+                bootloader_fdt_parser::AddressRange::Memory(memory) => {
+                    if memory.vtl_usage == MemoryVtlType::VTL2_GPA_POOL {
+                        Some(memory.range.clone())
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        if private_pages.is_empty() {
+            None
+        } else {
+            let mut pool = PagePool::new_private_pool(&private_pages)
+                .context("failed to create private page pool")?;
+
+            if let Some(pool_state) = servicing_state.private_pool_state.flatten() {
+                use vmcore::save_restore::SaveRestore;
+                pool.restore(pool_state)
+                    .context("failed to restore private page pool")?;
+            }
+
+            Some(pool)
+        }
+    };
+
     // Test with the highest VTL for which we have a GuestMemory object
     let highest_vtl_gm = gm.vtl1().unwrap_or(gm.vtl0());
 
@@ -2858,6 +2891,14 @@ async fn new_underhill_vm(
         .transpose()
         .context("failed to validate restore for shared visibility pool")?;
 
+    // Finalize the private pool. For now, allow leaking as pool users do not
+    // support restoring allocations.
+    private_pages_pool
+        .as_mut()
+        .map(|pool| pool.validate_restore(true))
+        .transpose()
+        .context("failed to validate restore for private pool")?;
+
     // Start the VP tasks on the thread pool.
     crate::vp::spawn_vps(tp, vps, vp_runners, &chipset, isolation)
         .await
@@ -2929,6 +2970,7 @@ async fn new_underhill_vm(
 
         _periodic_telemetry_task: periodic_telemetry_task,
         shared_vis_pool: shared_vis_pages_pool,
+        private_pool: private_pages_pool,
     };
 
     Ok(loaded_vm)

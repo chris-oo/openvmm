@@ -292,12 +292,14 @@ fn shim_parameters(shim_params_raw_offset: isize) -> ShimParams {
 /// 2. Sidecar image.
 /// 3. One reserved range per sidecar node.
 /// 4. Persisted memory regions (NUMBER TBD, really only 1, but assume 10)
+/// 5. VTL2 Private pool (NUMBER TBD)
 pub const MAX_RESERVED_MEM_RANGES: usize = 3 + sidecar_defs::MAX_NODES + 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReservedMemoryType {
     Vtl2Config,
     Vtl2Reserved,
+    Vtl2GpaPool,
     SidecarImage,
     SidecarNode,
     Vtl2PersistedMemory,
@@ -341,6 +343,14 @@ fn reserved_memory_regions(
             .iter()
             .map(|r| (*r, ReservedMemoryType::Vtl2PersistedMemory)),
     );
+
+    // Add any VTL2 private pool.
+    if partition_info.vtl2_pool_memory != MemoryRange::EMPTY {
+        reserved.push((
+            partition_info.vtl2_pool_memory,
+            ReservedMemoryType::Vtl2GpaPool,
+        ));
+    }
 
     reserved
         .as_mut()
@@ -877,6 +887,8 @@ mod test {
             vtl2_config_region_reclaim: MemoryRange::EMPTY,
             vtl2_reserved_region: MemoryRange::EMPTY,
             vtl2_persisted_memory_ranges: ArrayVec::new(),
+            vtl2_pool_memory: MemoryRange::EMPTY,
+            vtl2_used_ranges: ArrayVec::new(),
             partition_ram: ArrayVec::new(),
             isolation: IsolationType::None,
             bsp_reg: cpus[0].reg as u32,

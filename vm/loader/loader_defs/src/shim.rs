@@ -103,6 +103,10 @@ open_enum! {
         /// operations, and used to pass information to the next instance of
         /// OpenHCL in a servicing boot.
         VTL2_PERSISTED = 8,
+        /// This memory is used by VTL2 usermode as a persisted GPA page pool.
+        /// This memory is part of VTL2's address space, not VTL0's. It is
+        /// marked as reserved to the kernel.
+        VTL2_GPA_POOL = 9,
     }
 }
 
@@ -118,6 +122,7 @@ impl MemoryVtlType {
                 | MemoryVtlType::VTL2_SIDECAR_NODE
                 | MemoryVtlType::VTL2_RESERVED
                 | MemoryVtlType::VTL2_PERSISTED
+                | MemoryVtlType::VTL2_GPA_POOL
         )
     }
 
@@ -132,6 +137,7 @@ impl MemoryVtlType {
                 | MemoryVtlType::VTL2_MMIO
                 | MemoryVtlType::VTL2_RESERVED
                 | MemoryVtlType::VTL2_PERSISTED
+                | MemoryVtlType::VTL2_GPA_POOL
         )
     }
 }

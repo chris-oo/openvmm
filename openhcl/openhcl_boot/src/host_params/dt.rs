@@ -26,6 +26,7 @@ use igvm_defs::MemoryMapEntryType;
 use loader_defs::paravisor::CommandLinePolicy;
 use loader_defs::paravisor::ParavisorPersistedMemoryHeader;
 use loader_defs::shim::MemoryVtlType;
+use memory_range::flatten_ranges;
 use memory_range::merge_adjacent_ranges;
 use memory_range::subtract_ranges;
 use memory_range::walk_ranges;
@@ -529,6 +530,14 @@ impl PartitionInfo {
                     .try_extend_from_slice(parsed_persisted.persisted_ranges)
                     .expect("too many previously persisted ranges");
 
+                // Note any previously allocated pool.
+                storage.vtl2_pool_memory = parsed_persisted
+                    .vtl2_mem_layout
+                    .iter()
+                    .find(|entry| entry.vtl_type == MemoryVtlType::VTL2_GPA_POOL)
+                    .map(|entry| entry.range)
+                    .unwrap_or(MemoryRange::EMPTY);
+
                 // The base persisted header range must be one of the previously
                 // persisted ranges, or we have moved the location of this base
                 // header which is not allowed.
@@ -581,6 +590,17 @@ impl PartitionInfo {
                             mmio_size,
                         };
                     }
+                }
+
+                // On a non isolated guest, reserve the top page of the initial
+                // file range for a private pool used by the GET for AK cert.
+                // BUGBUG: clean all this up, central address space mgmt
+                if params.isolation_type == IsolationType::None {
+                    let top_page = MemoryRange::new(
+                        params.memory_start_address + params.memory_size - 0x1000
+                            ..params.memory_start_address + params.memory_size,
+                    );
+                    storage.vtl2_pool_memory = top_page;
                 }
 
                 // The host is responsible for allocating MMIO ranges for non-isolated
@@ -645,6 +665,19 @@ impl PartitionInfo {
             storage.partition_ram.push(*entry);
         }
 
+        // Add all the ranges are not free for further allocation.
+        let mut used_ranges = off_stack!(ArrayVec<MemoryRange, 64>, ArrayVec::new_const());
+        used_ranges.push(params.used);
+        used_ranges.extend(storage.vtl2_persisted_memory_ranges.iter().copied());
+        if storage.vtl2_pool_memory != MemoryRange::EMPTY {
+            used_ranges.push(storage.vtl2_pool_memory);
+        }
+        used_ranges.sort_unstable_by_key(|r| r.start());
+        storage.vtl2_used_ranges.clear();
+        storage
+            .vtl2_used_ranges
+            .extend(flatten_ranges(used_ranges.iter().copied()));
+
         // Set remaining struct fields before returning.
         let Self {
             vtl2_ram: _,
@@ -652,6 +685,8 @@ impl PartitionInfo {
             vtl2_config_region_reclaim: vtl2_config_region_reclaim_struct,
             vtl2_reserved_region,
             vtl2_persisted_memory_ranges,
+            vtl2_pool_memory: _,
+            vtl2_used_ranges,
             partition_ram: _,
             isolation,
             bsp_reg,
@@ -667,6 +702,7 @@ impl PartitionInfo {
         } = storage;
 
         assert!(!vtl2_persisted_memory_ranges.is_empty());
+        assert!(!vtl2_used_ranges.is_empty());
 
         *isolation = params.isolation_type;
 
