@@ -18,6 +18,7 @@ use hcl::ioctl::MshvVtlLow;
 use hvdef::HV_PAGE_SIZE;
 use inspect::Inspect;
 use parking_lot::Mutex;
+use sparse_mmap::SparseMapping;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 use thiserror::Error;
@@ -453,6 +454,7 @@ pub struct PagePoolHandle {
     base_pfn: u64,
     pfn_bias: u64,
     size_pages: u64,
+    mapping: Option<SparseMapping>,
 }
 
 impl PagePoolHandle {
@@ -469,6 +471,46 @@ impl PagePoolHandle {
     /// The number of 4K pages for this allocation.
     pub fn size_pages(&self) -> u64 {
         self.size_pages
+    }
+
+    /// Create a mapping associated with this handle.
+    ///
+    /// BUGBUG: CLEANUP WITH DMA BUFFER TRAIT IMPL
+    pub fn create_mapping(mut self) -> anyhow::Result<Self> {
+        if self.mapping.is_some() {
+            return Ok(self);
+        }
+
+        let len = (self.size_pages * HV_PAGE_SIZE) as usize;
+        let gpa = self.base_pfn() * HV_PAGE_SIZE;
+        let gpa_fd = MshvVtlLow::new().context("failed to open gpa fd")?;
+        let mapping = SparseMapping::new(len).context("failed to create mapping")?;
+
+        // When the pool references shared memory, on hardware isolated
+        // platforms the file_offset must have the shared bit set as these are
+        // decrypted pages. Setting this bit is okay on non-hardware isolated
+        // platforms, as it does nothing.
+        //
+        // BUGBUG: propogate shared/private to individual alloc to remove
+        // locking req. assums pfn_bias == 0 means private.
+        let file_offset = if self.pfn_bias == 0 {
+            gpa
+        } else {
+            tracing::trace!("setting MshvVtlLow::SHARED_MEMORY_FLAG");
+            gpa | MshvVtlLow::SHARED_MEMORY_FLAG
+        };
+
+        tracing::trace!(gpa, file_offset, len, "mapping alloc buffer");
+        mapping
+            .map_file(0, len, gpa_fd.get(), file_offset, true)
+            .context("unable to map allocation")?;
+
+        self.mapping = Some(mapping);
+        Ok(self)
+    }
+
+    pub fn mapping(&self) -> Option<&SparseMapping> {
+        self.mapping.as_ref()
     }
 }
 
@@ -798,6 +840,7 @@ impl PagePoolAllocator {
             base_pfn,
             pfn_bias,
             size_pages,
+            mapping: None,
         })
     }
 
@@ -826,6 +869,7 @@ impl PagePoolAllocator {
                     base_pfn: *base_pfn,
                     pfn_bias: *pfn_bias,
                     size_pages: *size_pages,
+                    mapping: None,
                 };
 
                 *state = State::Allocated {

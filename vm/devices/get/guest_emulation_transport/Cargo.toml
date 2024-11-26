@@ -28,6 +28,7 @@ inspect.workspace = true
 inspect_counters.workspace = true
 mesh.workspace = true
 pal_async.workspace = true
+sparse_mmap. workspace = true
 test_with_tracing.workspace = true
 tracing_helpers.workspace = true
 

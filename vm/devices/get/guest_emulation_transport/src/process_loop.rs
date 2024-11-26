@@ -87,7 +87,7 @@ pub(crate) enum FatalError {
     #[error("failed to allocated shared memory")]
     SharedMemoryAllocationError(#[source] page_pool_alloc::PagePoolOutOfMemory),
     #[error("failed to read the `IGVM_ATTEST` response from shared memory")]
-    ReadSharedMemory(#[source] guestmem::GuestMemoryError),
+    ReadSharedMemory(#[source] sparse_mmap::SparseMappingError),
     #[error("failed to deserialize the asynchronous `IGVM_ATTEST` response")]
     DeserializeIgvmAttestResponse,
     #[error("malformed `IGVM_ATTEST` response - reported size {response_size} was larger than maximum size {maximum_size}")]
@@ -1812,6 +1812,7 @@ async fn request_igvm_attest(
     const ALLOCATED_SHARED_MEMORY_SIZE: usize =
         get_protocol::IGVM_ATTEST_MSG_SHARED_GPA * hvdef::HV_PAGE_SIZE_USIZE;
 
+    // BUGBUG: remove GET shared memory member
     let (Some(shared_pool_allocator), Some(shared_guest_memory)) =
         (&shared_pool_allocator, &shared_guest_memory)
     else {
@@ -1824,6 +1825,7 @@ async fn request_igvm_attest(
     let handle = shared_pool_allocator
         .alloc(size_pages, "igvm_attest".to_string())
         .map_err(FatalError::SharedMemoryAllocationError)?;
+    let handle = handle.create_mapping().expect("BUGBUG add error type");
     // Host expects the vTOM bit to be stripped
     let base_pfn = handle.base_pfn_without_bias();
     let pfns = base_pfn..base_pfn + handle.size_pages();
@@ -1860,8 +1862,10 @@ async fn request_igvm_attest(
     }
 
     let mut buffer = vec![0u8; ALLOCATED_SHARED_MEMORY_SIZE];
-    shared_guest_memory
-        .read_at(request.shared_gpa[0], &mut buffer)
+    handle
+        .mapping()
+        .expect("created with mapping")
+        .read_at(0, &mut buffer)
         .map_err(FatalError::ReadSharedMemory)?;
 
     buffer.truncate(response_length);
