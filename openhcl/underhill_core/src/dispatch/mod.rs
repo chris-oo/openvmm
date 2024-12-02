@@ -177,6 +177,7 @@ pub(crate) struct LoadedVm {
     pub _periodic_telemetry_task: Task<()>,
 
     pub shared_vis_pool: Option<PagePool>,
+    pub private_pool: Option<PagePool>,
 }
 
 pub struct LoadedVmState<T> {
@@ -302,6 +303,7 @@ impl LoadedVm {
                             inspect_helpers::vtl0_memory_map(&self.vtl0_memory_map),
                         );
                         resp.field("shared_vis_pool", &self.shared_vis_pool);
+                        resp.field("private_pool", &self.private_pool);
                         resp.field("memory", &self.memory);
                     }),
                 },
@@ -630,6 +632,12 @@ impl LoadedVm {
             .map(vmcore::save_restore::SaveRestore::save)
             .transpose()
             .context("shared_vis_pool save failed")?;
+        let private_pool = self
+            .private_pool
+            .as_mut()
+            .map(vmcore::save_restore::SaveRestore::save)
+            .transpose()
+            .context("private_pool save failed")?;
 
         Ok(ServicingState {
             init_state: servicing::ServicingInitState {
@@ -641,6 +649,7 @@ impl LoadedVm {
                 vmgs: (vmgs, self.vmgs_disk_metadata.clone()),
                 overlay_shutdown_device: self.shutdown_relay.is_some(),
                 shared_pool_state: shared_vis_pool,
+                private_pool_state: private_pool,
             },
             units,
         })

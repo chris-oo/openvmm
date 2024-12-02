@@ -13,10 +13,20 @@ use underhill_confidentiality::OPENHCL_CONFIDENTIAL_DEBUG_ENV_VAR_NAME;
 const BOOT_LOG: &str = "OPENHCL_BOOT_LOG=";
 const SERIAL_LOGGER: &str = "com3";
 
+/// Enable the private VTL2 GPA pool for page allocations. Today, this reserves
+/// 1 page. This is only enabled via the command line, because in order to
+/// support the VTL2 GPA pool generically, the boot shim must read serialized
+/// data from the previous OpenHCL instance on a servicing boot.
+///
+/// TODO: Remove this commandline once support for reading saved state is
+/// supported in openhcl_boot.
+const ENABLE_VTL2_GPA_POOL: &str = "OPENHCL_ENABLE_VTL2_GPA_POOL=1";
+
 #[derive(Debug, PartialEq)]
 pub struct BootCommandLineOptions {
     pub logger: Option<LoggerType>,
     pub confidential_debug: bool,
+    pub enable_vtl2_gpa_pool: bool,
 }
 
 /// Parse arguments from a command line.
@@ -24,6 +34,7 @@ pub fn parse_boot_command_line(cmdline: &str) -> BootCommandLineOptions {
     let mut result = BootCommandLineOptions {
         logger: None,
         confidential_debug: false,
+        enable_vtl2_gpa_pool: false,
     };
 
     for arg in cmdline.split_whitespace() {
@@ -41,6 +52,8 @@ pub fn parse_boot_command_line(cmdline: &str) -> BootCommandLineOptions {
                     result.logger = Some(LoggerType::Serial);
                 }
             }
+        } else if arg == ENABLE_VTL2_GPA_POOL {
+            result.enable_vtl2_gpa_pool = true;
         }
     }
 
@@ -57,7 +70,8 @@ mod tests {
             parse_boot_command_line("OPENHCL_BOOT_LOG=com3"),
             BootCommandLineOptions {
                 logger: Some(LoggerType::Serial),
-                confidential_debug: false
+                confidential_debug: false,
+                enable_vtl2_gpa_pool: false,
             }
         );
 
@@ -65,7 +79,8 @@ mod tests {
             parse_boot_command_line("OPENHCL_BOOT_LOG=1"),
             BootCommandLineOptions {
                 logger: None,
-                confidential_debug: false
+                confidential_debug: false,
+                enable_vtl2_gpa_pool: false,
             }
         );
 
@@ -73,7 +88,8 @@ mod tests {
             parse_boot_command_line("OPENHCL_BOOT_LOG=random"),
             BootCommandLineOptions {
                 logger: None,
-                confidential_debug: false
+                confidential_debug: false,
+                enable_vtl2_gpa_pool: false,
             }
         );
 
@@ -81,7 +97,8 @@ mod tests {
             parse_boot_command_line("OPENHCL_BOOT_LOG==com3"),
             BootCommandLineOptions {
                 logger: None,
-                confidential_debug: false
+                confidential_debug: false,
+                enable_vtl2_gpa_pool: false,
             }
         );
 
@@ -89,7 +106,8 @@ mod tests {
             parse_boot_command_line("OPENHCL_BOOT_LOGserial"),
             BootCommandLineOptions {
                 logger: None,
-                confidential_debug: false
+                confidential_debug: false,
+                enable_vtl2_gpa_pool: false,
             }
         );
 
@@ -98,7 +116,38 @@ mod tests {
             parse_boot_command_line(&cmdline),
             BootCommandLineOptions {
                 logger: Some(LoggerType::Serial),
-                confidential_debug: true
+                confidential_debug: true,
+                enable_vtl2_gpa_pool: false,
+            }
+        );
+    }
+
+    #[test]
+    fn test_vtl2_gpa_pool_parsing() {
+        assert_eq!(
+            parse_boot_command_line("OPENHCL_ENABLE_VTL2_GPA_POOL=1"),
+            BootCommandLineOptions {
+                logger: None,
+                confidential_debug: false,
+                enable_vtl2_gpa_pool: true,
+            }
+        );
+
+        assert_eq!(
+            parse_boot_command_line("OPENHCL_ENABLE_VTL2_GPA_POOL=0"),
+            BootCommandLineOptions {
+                logger: None,
+                confidential_debug: false,
+                enable_vtl2_gpa_pool: false,
+            }
+        );
+
+        assert_eq!(
+            parse_boot_command_line("OPENHCL_ENABLE_VTL2_GPA_POOL=2"),
+            BootCommandLineOptions {
+                logger: None,
+                confidential_debug: false,
+                enable_vtl2_gpa_pool: false,
             }
         );
     }
