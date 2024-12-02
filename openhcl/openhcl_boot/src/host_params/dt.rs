@@ -388,14 +388,20 @@ impl PartitionInfo {
         let enable_vtl2_gpa_pool =
             crate::cmdline::parse_boot_command_line(storage.cmdline.as_str()).enable_vtl2_gpa_pool;
 
-        if enable_vtl2_gpa_pool {
-            // Reserve just the top page of the initial file range for the
-            // private pool.
-            let top_page = MemoryRange::new(
-                params.memory_start_address + params.memory_size - HV_PAGE_SIZE
+        if let Some(pool_size) = enable_vtl2_gpa_pool {
+            // Reserve the specified number of pages for the pool.
+            let pool = MemoryRange::new(
+                params.memory_start_address + params.memory_size - (pool_size * HV_PAGE_SIZE)
                     ..params.memory_start_address + params.memory_size,
             );
-            storage.vtl2_pool_memory = top_page;
+
+            assert!(
+                !params.used.overlaps(&pool),
+                "specified pool memory {pool} overlaps used shim memory {}",
+                params.used
+            );
+
+            storage.vtl2_pool_memory = pool;
         }
 
         // The host is responsible for allocating MMIO ranges for non-isolated
