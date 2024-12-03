@@ -4,6 +4,7 @@
 //! Module used to parse the host parameters used to setup Underhill. These are
 //! provided via a device tree IGVM parameter.
 
+use crate::arch::address_space::LocalMap;
 use arrayvec::ArrayString;
 use arrayvec::ArrayVec;
 use host_fdt_parser::CpuEntry;
@@ -59,6 +60,9 @@ pub struct PartitionInfo {
     /// The vtl2 reserved region, that is reserved to both the kernel and
     /// usermode.
     pub vtl2_reserved_region: MemoryRange,
+    /// The vtl2 persisted state region. The first page is the persisted state
+    /// header.
+    pub vtl2_persisted_state: MemoryRange,
     /// Memory used for the VTL2 private pool.
     pub vtl2_pool_memory: MemoryRange,
     /// Memory ranges that are in use by the bootshim, and any other persisted
@@ -104,6 +108,7 @@ impl PartitionInfo {
             vtl2_full_config_region: MemoryRange::EMPTY,
             vtl2_config_region_reclaim: MemoryRange::EMPTY,
             vtl2_reserved_region: MemoryRange::EMPTY,
+            vtl2_persisted_state: MemoryRange::EMPTY,
             vtl2_pool_memory: MemoryRange::EMPTY,
             vtl2_used_ranges: ArrayVec::new_const(),
             partition_ram: ArrayVec::new_const(),
