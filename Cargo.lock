@@ -3549,7 +3549,10 @@ version = "0.0.0"
 dependencies = [
  "bitfield-struct",
  "hvdef",
+ "igvm_defs",
  "inspect",
+ "memory_range",
+ "mesh_protobuf",
  "open_enum",
  "static_assertions",
  "zerocopy",
@@ -4525,6 +4528,7 @@ dependencies = [
  "igvm_defs",
  "loader_defs",
  "memory_range",
+ "mesh_protobuf",
  "minimal_rt",
  "minimal_rt_build",
  "safe_intrinsics",
@@ -4534,6 +4538,7 @@ dependencies = [
  "underhill_confidentiality",
  "x86defs",
  "zerocopy",
+ "zerocopy_helpers",
 ]
 
 [[package]]
@@ -7025,6 +7030,7 @@ dependencies = [
  "memory_range",
  "mesh",
  "mesh_process",
+ "mesh_protobuf",
  "mesh_tracing",
  "mesh_worker",
  "net_backend",
