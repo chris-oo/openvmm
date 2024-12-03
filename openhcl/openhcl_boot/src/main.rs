@@ -9,6 +9,7 @@
 // UNSAFETY: Interacting with low level hardware and bootloader primitives.
 #![allow(unsafe_code)]
 
+mod alloc;
 mod arch;
 mod boot_logger;
 mod cmdline;
