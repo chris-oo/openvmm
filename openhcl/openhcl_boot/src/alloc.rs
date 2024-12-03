@@ -2,16 +2,24 @@
 // Licensed under the MIT License.
 
 //! Simple bump allocator using https://os.phil-opp.com/allocator-designs/ as a
-//! reference.
+//! reference and starting point.
+//!
+//! Note that we only allow allocations in a small window for supporting
+//! mesh_protobuf. Any other attempts to allocate will result in a panic.
 
 use core::alloc::GlobalAlloc;
 use core::alloc::Layout;
+use core::cell::RefCell;
 use memory_range::MemoryRange;
 
-pub struct BumpAllocator {
+pub struct Inner {
     mem: MemoryRange,
     next: usize,
-    allocations: usize,
+    allow_alloc: bool,
+}
+
+pub struct BumpAllocator {
+    inner: RefCell<Inner>,
 }
 
 /// Align downwards. Returns the greatest x with alignment `align`
@@ -33,52 +41,53 @@ pub fn align_up(addr: usize, align: usize) -> usize {
 }
 
 impl BumpAllocator {
-    /// Creates a new empty bump allocator.
-    pub const fn new() -> Self {
+    /// Create a new heap allocator with the specified memory range.
+    ///
+    /// # Safety
+    /// The caller must guarantee that the memory range is both valid to
+    /// access via the current pagetable identity map, and that it is unused.
+    pub unsafe fn new(mem: MemoryRange) -> Self {
         BumpAllocator {
-            heap_start: 0,
-            heap_end: 0,
-            next: 0,
-            allocations: 0,
+            inner: RefCell::new(Inner {
+                mem,
+                next: mem.start() as usize,
+                allow_alloc: false,
+            }),
         }
     }
 
-    /// Initializes the bump allocator with the given heap bounds.
-    ///
-    /// This method is unsafe because the caller must ensure that the given
-    /// memory range is unused. Also, this method must be called only once.
-    pub unsafe fn init(&mut self, heap_start: usize, heap_size: usize) {
-        self.heap_start = heap_start;
-        self.heap_end = heap_start.saturating_add(heap_size);
-        self.next = heap_start;
+    pub fn enable_alloc(&self) {
+        let mut inner = self.inner.borrow_mut();
+        inner.allow_alloc = true;
+    }
+
+    pub fn disable_alloc(&self) {
+        let mut inner = self.inner.borrow_mut();
+        inner.allow_alloc = false;
     }
 }
 
 unsafe impl GlobalAlloc for BumpAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let mut bump = self.lock(); // get a mutable reference
+        let mut inner = self.inner.borrow_mut();
 
-        let alloc_start = align_up(bump.next, layout.align());
+        if !inner.allow_alloc {
+            panic!("allocations are not allowed");
+        }
+
+        let alloc_start: usize = align_up(inner.next, layout.align());
         let alloc_end = match alloc_start.checked_add(layout.size()) {
             Some(end) => end,
-            None => return ptr::null_mut(),
+            None => return core::ptr::null_mut(),
         };
 
-        if alloc_end > bump.heap_end {
-            ptr::null_mut() // out of memory
+        if alloc_end > inner.mem.end() as usize {
+            core::ptr::null_mut() // out of memory
         } else {
-            bump.next = alloc_end;
-            bump.allocations += 1;
+            inner.next = alloc_end;
             alloc_start as *mut u8
         }
     }
 
-    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
-        let mut bump = self.lock(); // get a mutable reference
-
-        bump.allocations -= 1;
-        if bump.allocations == 0 {
-            bump.next = bump.heap_start;
-        }
-    }
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
 }
