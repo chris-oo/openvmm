@@ -6,6 +6,7 @@
 use super::shim_params::IsolationType;
 use super::shim_params::ShimParams;
 use super::PartitionInfo;
+use crate::alloc;
 use crate::boot_logger::log;
 use crate::host_params::COMMAND_LINE_SIZE;
 use crate::host_params::MAX_CPU_COUNT;
@@ -471,6 +472,47 @@ impl PartitionInfo {
         if storage.vtl2_pool_memory != MemoryRange::EMPTY {
             used_ranges.push(storage.vtl2_pool_memory);
         }
+        used_ranges.sort_unstable_by_key(|r| r.start());
+        storage.vtl2_used_ranges.clear();
+        storage
+            .vtl2_used_ranges
+            .extend(flatten_ranges(used_ranges.iter().copied()));
+
+        // Determine the range to use for the global allocator. This must be in
+        // the file memory range, as it's the only range that has PTE mappings.
+        let allocator_range = {
+            const GLOBAL_ALLOC_BYTES: u64 = 1024 * HV_PAGE_SIZE;
+            let file_range = [MemoryRange::new(
+                params.memory_start_address..(params.memory_start_address + params.memory_size),
+            )];
+
+            let mut iter = subtract_ranges(
+                file_range.iter().cloned(),
+                storage.vtl2_used_ranges.iter().cloned(),
+            );
+
+            let range = iter.next().expect("no range free for global alloc");
+
+            if range.len() < GLOBAL_ALLOC_BYTES {
+                panic!(
+                    "range {range:#x?} is too small for global allocator {GLOBAL_ALLOC_BYTES:#x}"
+                );
+            }
+
+            let (range, _) = range.split_at_offset(GLOBAL_ALLOC_BYTES);
+            range
+        };
+
+        // SAFETY: The specified range was just allocated from free space, and
+        // is part of the initial file range and has a valid identity mapping.
+        unsafe {
+            alloc::ALLOCATOR.init(allocator_range);
+        }
+
+        // TODO clean this up, use bsearch insert instead?
+        used_ranges.clear();
+        used_ranges.extend(storage.vtl2_used_ranges.iter().cloned());
+        used_ranges.push(allocator_range);
         used_ranges.sort_unstable_by_key(|r| r.start());
         storage.vtl2_used_ranges.clear();
         storage
