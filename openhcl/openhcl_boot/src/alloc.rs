@@ -1,10 +1,12 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-///! Simple bump allocator using `https://os.phil-opp.com/allocator-designs/` as
-///! a reference.
+//! Simple bump allocator using https://os.phil-opp.com/allocator-designs/ as a
+//! reference.
+
 use core::alloc::GlobalAlloc;
 use core::alloc::Layout;
+use memory_range::MemoryRange;
 
 pub struct BumpAllocator {
     mem: MemoryRange,
