@@ -7,19 +7,25 @@
 //! Note that we only allow allocations in a small window for supporting
 //! mesh_protobuf. Any other attempts to allocate will result in a panic.
 
+use crate::boot_logger::debug_log;
+use crate::single_threaded::SingleThreaded;
 use core::alloc::GlobalAlloc;
 use core::alloc::Layout;
 use core::cell::RefCell;
 use memory_range::MemoryRange;
 
+pub static ALLOCATOR: BumpAllocator = BumpAllocator::new();
+
+#[derive(Debug)]
 pub struct Inner {
     mem: MemoryRange,
     next: usize,
     allow_alloc: bool,
+    alloc_count: usize,
 }
 
 pub struct BumpAllocator {
-    inner: RefCell<Inner>,
+    inner: SingleThreaded<RefCell<Inner>>,
 }
 
 /// Align downwards. Returns the greatest x with alignment `align`
@@ -41,19 +47,32 @@ pub fn align_up(addr: usize, align: usize) -> usize {
 }
 
 impl BumpAllocator {
-    /// Create a new heap allocator with the specified memory range.
+    pub const fn new() -> Self {
+        BumpAllocator {
+            inner: SingleThreaded(RefCell::new(Inner {
+                mem: MemoryRange::EMPTY,
+                next: 0,
+                allow_alloc: false,
+                alloc_count: 0,
+            })),
+        }
+    }
+
+    /// Initialize the bump allocator with the specified memory range.
     ///
     /// # Safety
     /// The caller must guarantee that the memory range is both valid to
     /// access via the current pagetable identity map, and that it is unused.
-    pub unsafe fn new(mem: MemoryRange) -> Self {
-        BumpAllocator {
-            inner: RefCell::new(Inner {
-                mem,
-                next: mem.start() as usize,
-                allow_alloc: false,
-            }),
-        }
+    pub unsafe fn init(&self, mem: MemoryRange) {
+        let mut inner = self.inner.borrow_mut();
+        assert_eq!(
+            inner.mem,
+            MemoryRange::EMPTY,
+            "bump allocator memory range previously set {}",
+            inner.mem
+        );
+
+        inner.mem = mem;
     }
 
     pub fn enable_alloc(&self) {
@@ -64,6 +83,12 @@ impl BumpAllocator {
     pub fn disable_alloc(&self) {
         let mut inner = self.inner.borrow_mut();
         inner.allow_alloc = false;
+
+        debug_log!(
+            "BumpAllocator: allocated {} bytes",
+            inner.next - inner.mem.start() as usize
+        );
+        debug_log!("BumpAllocator: {} allocations", inner.alloc_count);
     }
 }
 
@@ -85,6 +110,7 @@ unsafe impl GlobalAlloc for BumpAllocator {
             core::ptr::null_mut() // out of memory
         } else {
             inner.next = alloc_end;
+            inner.alloc_count += 1;
             alloc_start as *mut u8
         }
     }
