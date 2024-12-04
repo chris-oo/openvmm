@@ -3,6 +3,10 @@
 
 //! Loader definitions for the openhcl boot loader (`openhcl_boot`).
 
+extern crate alloc;
+
+use alloc::vec::Vec;
+use memory_range::MemoryRange;
 use open_enum::open_enum;
 use zerocopy::AsBytes;
 use zerocopy::FromBytes;
@@ -74,6 +78,8 @@ open_enum! {
 open_enum! {
     /// The memory type reported from the bootshim to usermode, for which VTL a
     /// given memory range is for.
+    #[derive(mesh_protobuf::Protobuf)]
+    #[mesh(package = "openhcl.openhcl_boot")]
     pub enum MemoryVtlType: u32 {
         /// This memory is for VTL0.
         VTL0 = 0,
@@ -100,6 +106,11 @@ open_enum! {
         /// This memory is part of VTL2's address space, not VTL0's. It is
         /// marked as reserved to the kernel.
         VTL2_GPA_POOL = 8,
+        /// This memory is used to persist information from one OpenHCL instance
+        /// to the next. This memory is marked as reserved to the kernel, and is
+        /// used by usermode to store the information for the next OpenHCL
+        /// instance.
+        VTL2_PERSISTED_STATE = 9,
     }
 }
 
@@ -115,6 +126,46 @@ impl MemoryVtlType {
                 | MemoryVtlType::VTL2_SIDECAR_NODE
                 | MemoryVtlType::VTL2_RESERVED
                 | MemoryVtlType::VTL2_GPA_POOL
+                | MemoryVtlType::VTL2_PERSISTED_STATE
         )
     }
+}
+
+/// This is the header used to tell the bootshim where the protobuf blob is. It
+/// is a C structure to allow it to be parsed in-place, without requiring
+/// deserialization.
+#[repr(C)]
+pub struct PersistedStateHeader {
+    /// A magic value. If this is not set to [`PersistedStateHeader::MAGIC`],
+    /// then the previous instance did not support this region.
+    pub magic: u64,
+    /// Overall region len
+    pub region_len: u64,
+    /// The start gpa for the protobuf blob. This must be 4K aligned.
+    pub protobuf_gpa_start: u64,
+    /// The size of the protobuf blob in bytes.
+    pub protobuf_size: u64,
+}
+
+impl PersistedStateHeader {
+    /// "OHCLPHDR" in ASCII.
+    pub const MAGIC: u64 = 0x4F48434C50484452;
+}
+
+#[derive(mesh_protobuf::Protobuf, Debug)]
+#[mesh(package = "openhcl.openhcl_boot")]
+pub struct MemoryEntry {
+    #[mesh(1)]
+    pub range: MemoryRange,
+    #[mesh(2)]
+    pub vtl_type: MemoryVtlType,
+}
+
+/// The format for saved state between the previous instance of OpenHCL and the
+/// next.
+#[derive(mesh_protobuf::Protobuf, Debug)]
+#[mesh(package = "openhcl.openhcl_boot")]
+pub struct SavedState {
+    #[mesh(1)]
+    pub partition_map: Vec<MemoryEntry>,
 }

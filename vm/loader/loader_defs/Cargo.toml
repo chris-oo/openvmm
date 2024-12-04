@@ -14,6 +14,8 @@ hvdef.workspace = true
 open_enum.workspace = true
 
 inspect = { workspace = true, optional = true }
+mesh_protobuf.workspace = true
+memory_range = { workspace = true, features = ["mesh"] }
 
 bitfield-struct.workspace = true
 static_assertions.workspace = true

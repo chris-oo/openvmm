@@ -3413,6 +3413,8 @@ dependencies = [
  "bitfield-struct",
  "hvdef",
  "inspect",
+ "memory_range",
+ "mesh_protobuf",
  "open_enum",
  "static_assertions",
  "zerocopy",
@@ -4343,6 +4345,7 @@ dependencies = [
  "igvm_defs",
  "loader_defs",
  "memory_range",
+ "mesh_protobuf",
  "minimal_rt",
  "minimal_rt_build",
  "safe_intrinsics",
@@ -4352,6 +4355,7 @@ dependencies = [
  "underhill_confidentiality",
  "x86defs",
  "zerocopy",
+ "zerocopy_helpers",
 ]
 
 [[package]]

@@ -7,6 +7,8 @@ use super::shim_params::IsolationType;
 use super::shim_params::ShimParams;
 use super::PartitionInfo;
 use crate::alloc;
+use crate::alloc::ALLOCATOR;
+use crate::boot_logger::debug_log;
 use crate::boot_logger::log;
 use crate::host_params::COMMAND_LINE_SIZE;
 use crate::host_params::MAX_CPU_COUNT;
@@ -25,6 +27,7 @@ use host_fdt_parser::ParsedDeviceTree;
 use hvdef::HV_PAGE_SIZE;
 use igvm_defs::MemoryMapEntryType;
 use loader_defs::paravisor::CommandLinePolicy;
+use loader_defs::shim::PersistedStateHeader;
 use memory_range::flatten_ranges;
 use memory_range::subtract_ranges;
 use memory_range::walk_ranges;
@@ -384,6 +387,15 @@ impl PartitionInfo {
         storage.vmbus_vtl2 = parsed.vmbus_vtl2.clone().ok_or(DtError::Vtl2Vmbus)?;
         storage.vmbus_vtl0 = parsed.vmbus_vtl0.clone().ok_or(DtError::Vtl0Vmbus)?;
 
+        // HACK: Reserve 1024 pages for the persisted state region. This should
+        // really parse the persisted header first, and decide but do this for
+        // prototyping mesh.
+        const PERSISTED_STATE_REGION_SIZE: u64 = 1024 * HV_PAGE_SIZE;
+        storage.vtl2_persisted_state = MemoryRange::new(
+            params.memory_start_address + params.memory_size - PERSISTED_STATE_REGION_SIZE
+                ..params.memory_start_address + params.memory_size,
+        );
+
         // Decide if we will reserve memory for a VTL2 private pool. Parse this
         // from the final command line.
         let enable_vtl2_gpa_pool =
@@ -391,9 +403,15 @@ impl PartitionInfo {
 
         if let Some(pool_size) = enable_vtl2_gpa_pool {
             // Reserve the specified number of pages for the pool.
+            //
+            // BUGBUG: Select the range excluding the persisted region at the
+            // top of file memory. Figure out a cleaner way to allocate this.
             let pool = MemoryRange::new(
-                params.memory_start_address + params.memory_size - (pool_size * HV_PAGE_SIZE)
-                    ..params.memory_start_address + params.memory_size,
+                params.memory_start_address + params.memory_size
+                    - (pool_size * HV_PAGE_SIZE)
+                    - PERSISTED_STATE_REGION_SIZE
+                    ..params.memory_start_address + params.memory_size
+                        - PERSISTED_STATE_REGION_SIZE,
             );
 
             assert!(
@@ -468,6 +486,7 @@ impl PartitionInfo {
         let mut used_ranges =
             off_stack!(ArrayVec<MemoryRange, MAX_VTL2_USED_RANGES>, ArrayVec::new_const());
         used_ranges.push(params.used);
+        used_ranges.push(storage.vtl2_persisted_state);
 
         if storage.vtl2_pool_memory != MemoryRange::EMPTY {
             used_ranges.push(storage.vtl2_pool_memory);
@@ -509,6 +528,12 @@ impl PartitionInfo {
             alloc::ALLOCATOR.init(allocator_range);
         }
 
+        // BUGBUG: probably need to have the C header describe the whole range,
+        // because allocator range comes later.
+        //
+        // test protobuf
+        protobuf_test(storage.vtl2_persisted_state);
+
         // TODO clean this up, use bsearch insert instead?
         used_ranges.clear();
         used_ranges.extend(storage.vtl2_used_ranges.iter().cloned());
@@ -525,6 +550,7 @@ impl PartitionInfo {
             vtl2_full_config_region: vtl2_config_region,
             vtl2_config_region_reclaim: vtl2_config_region_reclaim_struct,
             vtl2_reserved_region,
+            vtl2_persisted_state: _,
             vtl2_pool_memory: _,
             vtl2_used_ranges,
             partition_ram: _,
@@ -563,4 +589,32 @@ impl PartitionInfo {
 
         Ok(Some(storage))
     }
+}
+
+fn protobuf_test(persisted_region: MemoryRange) {
+    // Parse the fixed header.
+    let header = unsafe {
+        (persisted_region.start() as *const PersistedStateHeader)
+            .as_ref()
+            .expect("BUGBUG should be nonnull")
+    };
+
+    if header.magic != PersistedStateHeader::MAGIC {
+        debug_log!("persisted header is not magic, is {}", header.magic);
+        return;
+    }
+
+    let buf: &[u8] = unsafe {
+        core::slice::from_raw_parts(
+            header.protobuf_gpa_start as *const u8,
+            header.protobuf_size as usize,
+        )
+    };
+
+    ALLOCATOR.enable_alloc();
+
+    let parsed_protobuf: loader_defs::shim::SavedState =
+        mesh_protobuf::decode(buf).expect("BUGBUG protobuf payload must be valid");
+
+    debug_log!("parsed protobuf {:?}", parsed_protobuf);
 }
