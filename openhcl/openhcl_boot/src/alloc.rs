@@ -73,6 +73,8 @@ impl BumpAllocator {
             inner.mem
         );
 
+        debug_log!("BumpAllocator: initializing with {:?}", mem);
+
         inner.mem = mem;
     }
 

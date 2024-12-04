@@ -525,7 +525,7 @@ impl PartitionInfo {
         // SAFETY: The specified range was just allocated from free space, and
         // is part of the initial file range and has a valid identity mapping.
         unsafe {
-            alloc::ALLOCATOR.init(allocator_range);
+            ALLOCATOR.init(allocator_range);
         }
 
         // BUGBUG: probably need to have the C header describe the whole range,
@@ -592,6 +592,8 @@ impl PartitionInfo {
 }
 
 fn protobuf_test(persisted_region: MemoryRange) {
+    debug_log!("persisted region is {:#x?}", persisted_region);
+
     // Parse the fixed header.
     let header = unsafe {
         (persisted_region.start() as *const PersistedStateHeader)
@@ -603,6 +605,8 @@ fn protobuf_test(persisted_region: MemoryRange) {
         debug_log!("persisted header is not magic, is {}", header.magic);
         return;
     }
+
+    debug_log!("persisted header magic is valid");
 
     let buf: &[u8] = unsafe {
         core::slice::from_raw_parts(
