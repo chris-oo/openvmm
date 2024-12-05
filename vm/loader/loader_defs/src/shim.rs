@@ -34,6 +34,10 @@ pub struct ShimParamsRaw {
     pub memory_start_offset: i64,
     /// The size of the VTL2 memory region.
     pub memory_size: u64,
+    /// The offset to the start of the bootshim heap.
+    pub heap_start_offset: i64,
+    /// The size of the bootshim heap.
+    pub heap_size: u64,
     /// The offset to the parameter region.
     pub parameter_region_offset: i64,
     /// The size of the parameter region.
@@ -135,6 +139,7 @@ impl MemoryVtlType {
 /// is a C structure to allow it to be parsed in-place, without requiring
 /// deserialization.
 #[repr(C)]
+#[derive(Debug, AsBytes, FromBytes, FromZeroes)]
 pub struct PersistedStateHeader {
     /// A magic value. If this is not set to [`PersistedStateHeader::MAGIC`],
     /// then the previous instance did not support this region.

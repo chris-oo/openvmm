@@ -107,6 +107,8 @@ pub struct ShimParams {
     /// Memory used by the shim.
     pub used: MemoryRange,
     pub bounce_buffer: Option<MemoryRange>,
+    /// Memory to be used for the heap.
+    pub heap: MemoryRange,
 }
 
 impl ShimParams {
@@ -133,6 +135,8 @@ impl ShimParams {
             used_end,
             bounce_buffer_start,
             bounce_buffer_size,
+            heap_start_offset,
+            heap_size,
         } = raw;
 
         let isolation_type = get_isolation_type(supported_isolation_type);
@@ -143,6 +147,10 @@ impl ShimParams {
             let base = shim_base_address.wrapping_add_signed(bounce_buffer_start);
             Some(MemoryRange::new(base..base + bounce_buffer_size))
         };
+
+        let heap_start_addr = shim_base_address.wrapping_add_signed(heap_start_offset);
+        let heap_end_addr = heap_start_addr + heap_size;
+        let heap = MemoryRange::new(heap_start_addr..heap_end_addr);
 
         Self {
             kernel_entry_address: shim_base_address.wrapping_add_signed(kernel_entry_offset),
@@ -166,6 +174,7 @@ impl ShimParams {
                     ..shim_base_address.wrapping_add_signed(used_end),
             ),
             bounce_buffer,
+            heap,
         }
     }
 

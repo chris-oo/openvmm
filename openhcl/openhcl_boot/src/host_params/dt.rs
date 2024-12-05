@@ -6,7 +6,6 @@
 use super::shim_params::IsolationType;
 use super::shim_params::ShimParams;
 use super::PartitionInfo;
-use crate::alloc;
 use crate::alloc::ALLOCATOR;
 use crate::boot_logger::debug_log;
 use crate::boot_logger::log;
@@ -32,6 +31,7 @@ use memory_range::flatten_ranges;
 use memory_range::subtract_ranges;
 use memory_range::walk_ranges;
 use memory_range::MemoryRange;
+use zerocopy_helpers::FromBytesExt;
 
 /// Errors when reading the host device tree.
 #[derive(Debug)]
@@ -387,14 +387,22 @@ impl PartitionInfo {
         storage.vmbus_vtl2 = parsed.vmbus_vtl2.clone().ok_or(DtError::Vtl2Vmbus)?;
         storage.vmbus_vtl0 = parsed.vmbus_vtl0.clone().ok_or(DtError::Vtl0Vmbus)?;
 
-        // HACK: Reserve 1024 pages for the persisted state region. This should
+        // HACK: Reserve 512 pages for the persisted state region. This should
         // really parse the persisted header first, and decide but do this for
         // prototyping mesh.
-        const PERSISTED_STATE_REGION_SIZE: u64 = 1024 * HV_PAGE_SIZE;
+        const PERSISTED_STATE_REGION_SIZE: u64 = 512 * HV_PAGE_SIZE;
         storage.vtl2_persisted_state = MemoryRange::new(
             params.memory_start_address + params.memory_size - PERSISTED_STATE_REGION_SIZE
                 ..params.memory_start_address + params.memory_size,
         );
+
+        debug_log!(
+            "mem start {:x}, mem size {:x}",
+            params.memory_start_address,
+            params.memory_size
+        );
+
+        debug_log!("used {:#x?}", params.used);
 
         // Decide if we will reserve memory for a VTL2 private pool. Parse this
         // from the final command line.
@@ -497,35 +505,11 @@ impl PartitionInfo {
             .vtl2_used_ranges
             .extend(flatten_ranges(used_ranges.iter().copied()));
 
-        // Determine the range to use for the global allocator. This must be in
-        // the file memory range, as it's the only range that has PTE mappings.
-        let allocator_range = {
-            const GLOBAL_ALLOC_BYTES: u64 = 1024 * HV_PAGE_SIZE;
-            let file_range = [MemoryRange::new(
-                params.memory_start_address..(params.memory_start_address + params.memory_size),
-            )];
-
-            let mut iter = subtract_ranges(
-                file_range.iter().cloned(),
-                storage.vtl2_used_ranges.iter().cloned(),
-            );
-
-            let range = iter.next().expect("no range free for global alloc");
-
-            if range.len() < GLOBAL_ALLOC_BYTES {
-                panic!(
-                    "range {range:#x?} is too small for global allocator {GLOBAL_ALLOC_BYTES:#x}"
-                );
-            }
-
-            let (range, _) = range.split_at_offset(GLOBAL_ALLOC_BYTES);
-            range
-        };
-
-        // SAFETY: The specified range was just allocated from free space, and
-        // is part of the initial file range and has a valid identity mapping.
+        // SAFETY: The specified range was specified and measured at load time.
+        // This means it is guaranteed to exist and have a valid pagetable
+        // mapping.
         unsafe {
-            ALLOCATOR.init(allocator_range);
+            ALLOCATOR.init(params.heap);
         }
 
         // BUGBUG: probably need to have the C header describe the whole range,
@@ -533,16 +517,6 @@ impl PartitionInfo {
         //
         // test protobuf
         protobuf_test(storage.vtl2_persisted_state);
-
-        // TODO clean this up, use bsearch insert instead?
-        used_ranges.clear();
-        used_ranges.extend(storage.vtl2_used_ranges.iter().cloned());
-        used_ranges.push(allocator_range);
-        used_ranges.sort_unstable_by_key(|r| r.start());
-        storage.vtl2_used_ranges.clear();
-        storage
-            .vtl2_used_ranges
-            .extend(flatten_ranges(used_ranges.iter().copied()));
 
         // Set remaining struct fields before returning.
         let Self {
@@ -594,12 +568,17 @@ impl PartitionInfo {
 fn protobuf_test(persisted_region: MemoryRange) {
     debug_log!("persisted region is {:#x?}", persisted_region);
 
+    // BUGBUG move here always, local map struct to partition info
+    let mut local_map =
+        crate::arch::address_space::init_local_map(loader_defs::paravisor::PARAVISOR_LOCAL_MAP_VA);
+
+    // map the persisted region with the local map, as the PTEs are not marked
+    // for relocation.
+    let mapping = local_map.map_pages(persisted_region, false);
+
     // Parse the fixed header.
-    let header = unsafe {
-        (persisted_region.start() as *const PersistedStateHeader)
-            .as_ref()
-            .expect("BUGBUG should be nonnull")
-    };
+    let (header, _) = PersistedStateHeader::read_from_prefix_split(mapping.data)
+        .expect("BUGBUG must be big enough");
 
     if header.magic != PersistedStateHeader::MAGIC {
         debug_log!("persisted header is not magic, is {}", header.magic);
