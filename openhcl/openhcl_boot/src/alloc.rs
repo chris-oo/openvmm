@@ -76,6 +76,7 @@ impl BumpAllocator {
         debug_log!("BumpAllocator: initializing with {:#x?}", mem);
 
         inner.mem = mem;
+        inner.next = mem.start() as usize;
     }
 
     pub fn enable_alloc(&self) {
@@ -103,7 +104,11 @@ unsafe impl GlobalAlloc for BumpAllocator {
             panic!("allocations are not allowed");
         }
 
+        debug_log!("inner {:#x?}", inner);
+
         let alloc_start: usize = align_up(inner.next, layout.align());
+        debug_log!("alloc_start {alloc_start:#x}");
+
         let alloc_end = match alloc_start.checked_add(layout.size()) {
             Some(end) => end,
             None => return core::ptr::null_mut(),
