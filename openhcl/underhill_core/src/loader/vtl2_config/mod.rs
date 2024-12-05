@@ -143,12 +143,40 @@ impl<'a> Vtl2ParamsMap<'a> {
         })
     }
 
+    // TODO: RENAME THIS STRUCT TO BE MORE GENERIC
+    fn new_writeable(ranges: &'a [MemoryRange]) -> anyhow::Result<Self> {
+        // TODO: figure out how this will work for multiple ranges...
+        assert_eq!(ranges.len(), 1);
+        let range = ranges[0];
+        let mapping = SparseMapping::new(range.len() as usize)
+            .context("failed to create a sparse mapping")?;
+
+        let dev_mem = fs_err::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/mem")?;
+
+        mapping
+            .map_file(0, range.len() as usize, dev_mem.file(), range.start(), true)
+            .context("failed to memory map range")?;
+
+        Ok(Self {
+            mapping,
+            ranges,
+            zero_on_drop: false,
+        })
+    }
+
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> anyhow::Result<()> {
         Ok(self.mapping.read_at(offset, buf)?)
     }
 
     fn read_plain<T: AsBytes + zerocopy::FromBytes>(&self, offset: usize) -> anyhow::Result<T> {
         Ok(self.mapping.read_plain(offset)?)
+    }
+
+    fn write_at(&self, offset: usize, buf: &[u8]) -> anyhow::Result<()> {
+        Ok(self.mapping.write_at(offset, buf)?)
     }
 }
 
@@ -168,6 +196,42 @@ impl Drop for Vtl2ParamsMap<'_> {
             }
         }
     }
+}
+
+fn write_persisted_info(parsed: &ParsedBootDtInfo) -> anyhow::Result<()> {
+    use loader_defs::shim::MemoryEntry;
+    use loader_defs::shim::PersistedStateHeader;
+    use loader_defs::shim::SavedState;
+
+    let ranges = [parsed.vtl2_persisted_range];
+    let mapping = Vtl2ParamsMap::new_writeable(&ranges).context("unable to map persisted range")?;
+
+    // Create the serialized data to write.
+    let state = SavedState {
+        partition_map: parsed
+            .partition_memory_map
+            .iter()
+            .map(|r| MemoryEntry {
+                range: *r.range(),
+                vtl_type: r.vtl_usage(),
+            })
+            .collect(),
+    };
+
+    let protobuf = mesh_protobuf::encode(state);
+    let protobuf_offset = size_of::<PersistedStateHeader>();
+
+    let header = PersistedStateHeader {
+        magic: PersistedStateHeader::MAGIC,
+        region_len: parsed.vtl2_persisted_range.len(),
+        protobuf_offset: protobuf_offset as u64,
+        protobuf_size: protobuf.len() as u64,
+    };
+
+    mapping.write_at(0, header.as_bytes())?;
+    mapping.write_at(protobuf_offset, &protobuf)?;
+
+    Ok(())
 }
 
 /// Reads the VTL 2 parameters from the config region and VTL2 reserved region.
@@ -271,6 +335,12 @@ pub fn read_vtl2_params() -> anyhow::Result<(RuntimeParameters, MeasuredVtl2Info
     } else {
         Some(measured_config.vtom_offset_bit)
     };
+
+    // BUGBUG: Doesn't belong here, but when we get a servicing call to write
+    // this information there instead. Do it here cause not persisting anything
+    // other than memory info.
+    write_persisted_info(&parsed_openhcl_boot)
+        .context("unable to write persisted info for next servicing boot")?;
 
     let runtime_params = RuntimeParameters {
         parsed_openhcl_boot,

@@ -146,8 +146,9 @@ pub struct PersistedStateHeader {
     pub magic: u64,
     /// Overall region len
     pub region_len: u64,
-    /// The start gpa for the protobuf blob. This must be 4K aligned.
-    pub protobuf_gpa_start: u64,
+    /// The start offset for the protobuf blob, from the start of the persisted
+    /// header region.
+    pub protobuf_offset: u64,
     /// The size of the protobuf blob in bytes.
     pub protobuf_size: u64,
 }

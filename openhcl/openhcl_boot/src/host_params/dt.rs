@@ -577,7 +577,7 @@ fn protobuf_test(persisted_region: MemoryRange) {
     let mapping = local_map.map_pages(persisted_region, false);
 
     // Parse the fixed header.
-    let (header, _) = PersistedStateHeader::read_from_prefix_split(mapping.data)
+    let (header, remaining) = PersistedStateHeader::read_from_prefix_split(mapping.data)
         .expect("BUGBUG must be big enough");
 
     if header.magic != PersistedStateHeader::MAGIC {
@@ -587,17 +587,14 @@ fn protobuf_test(persisted_region: MemoryRange) {
 
     debug_log!("persisted header magic is valid");
 
-    let buf: &[u8] = unsafe {
-        core::slice::from_raw_parts(
-            header.protobuf_gpa_start as *const u8,
-            header.protobuf_size as usize,
-        )
-    };
+    let protobuf = &remaining[..header.protobuf_size as usize];
 
     ALLOCATOR.enable_alloc();
 
     let parsed_protobuf: loader_defs::shim::SavedState =
-        mesh_protobuf::decode(buf).expect("BUGBUG protobuf payload must be valid");
+        mesh_protobuf::decode(protobuf).expect("BUGBUG protobuf payload must be valid");
 
     debug_log!("parsed protobuf {:?}", parsed_protobuf);
+
+    ALLOCATOR.disable_alloc();
 }
