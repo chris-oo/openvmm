@@ -135,22 +135,25 @@ impl MemoryVtlType {
     }
 }
 
-/// This is the header used to tell the bootshim where the protobuf blob is. It
-/// is a C structure to allow it to be parsed in-place, without requiring
-/// deserialization.
+/// This is the header used to describe the overall persisted state region. The
+/// region by convention is located at the top of the VTL2 file region.
+///
+/// This header should never change, instead for new information to be stored
+/// add it to the protobuf payload described below.
 #[repr(C)]
 #[derive(Debug, AsBytes, FromBytes, FromZeroes)]
 pub struct PersistedStateHeader {
     /// A magic value. If this is not set to [`PersistedStateHeader::MAGIC`],
     /// then the previous instance did not support this region.
     pub magic: u64,
-    /// Overall region len
+    /// Overall region size in bytes, including the header. This should be a
+    /// multiple of 4K.
     pub region_len: u64,
     /// The start offset for the protobuf blob, from the start of the persisted
-    /// header region.
+    /// state region.
     pub protobuf_offset: u64,
     /// The size of the protobuf blob in bytes.
-    pub protobuf_size: u64,
+    pub protobuf_len: u64,
 }
 
 impl PersistedStateHeader {
@@ -158,9 +161,41 @@ impl PersistedStateHeader {
     pub const MAGIC: u64 = 0x4F48434C50484452;
 }
 
+/// A local newtype wrapper that represents a [`igvm_defs::MemoryMapEntryType`].
+///
+/// This is required to make it protobuf deriveable.
+#[derive(mesh_protobuf::Protobuf, Debug)]
+#[mesh(package = "openhcl.openhcl_boot")]
+pub struct IgvmMemoryType(#[mesh(1)] u16);
+
+impl From<igvm_defs::MemoryMapEntryType> for IgvmMemoryType {
+    fn from(igvm_type: igvm_defs::MemoryMapEntryType) -> Self {
+        Self(igvm_type.0)
+    }
+}
+
+impl From<IgvmMemoryType> for igvm_defs::MemoryMapEntryType {
+    fn from(igvm_type: IgvmMemoryType) -> Self {
+        igvm_defs::MemoryMapEntryType(igvm_type.0)
+    }
+}
+
 #[derive(mesh_protobuf::Protobuf, Debug)]
 #[mesh(package = "openhcl.openhcl_boot")]
 pub struct MemoryEntry {
+    #[mesh(1)]
+    pub range: MemoryRange,
+    #[mesh(2)]
+    pub vnode: u32,
+    #[mesh(3)]
+    pub vtl_type: MemoryVtlType,
+    #[mesh(4)]
+    pub igvm_type: IgvmMemoryType,
+}
+
+#[derive(mesh_protobuf::Protobuf, Debug)]
+#[mesh(package = "openhcl.openhcl_boot")]
+pub struct MmioEntry {
     #[mesh(1)]
     pub range: MemoryRange,
     #[mesh(2)]
@@ -173,5 +208,7 @@ pub struct MemoryEntry {
 #[mesh(package = "openhcl.openhcl_boot")]
 pub struct SavedState {
     #[mesh(1)]
-    pub partition_map: Vec<MemoryEntry>,
+    pub partition_memory: Vec<MemoryEntry>,
+    #[mesh(2)]
+    pub partition_mmio: Vec<MmioEntry>,
 }

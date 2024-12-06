@@ -73,8 +73,6 @@ impl BumpAllocator {
             inner.mem
         );
 
-        debug_log!("BumpAllocator: initializing with {:#x?}", mem);
-
         inner.mem = mem;
         inner.next = mem.start() as usize;
     }
@@ -87,12 +85,6 @@ impl BumpAllocator {
     pub fn disable_alloc(&self) {
         let mut inner = self.inner.borrow_mut();
         inner.allow_alloc = false;
-
-        debug_log!(
-            "BumpAllocator: allocated {} bytes",
-            inner.next - inner.mem.start() as usize
-        );
-        debug_log!("BumpAllocator: {} allocations", inner.alloc_count);
     }
 }
 
@@ -104,10 +96,7 @@ unsafe impl GlobalAlloc for BumpAllocator {
             panic!("allocations are not allowed");
         }
 
-        debug_log!("inner {:#x?}", inner);
-
         let alloc_start: usize = align_up(inner.next, layout.align());
-        debug_log!("alloc_start {alloc_start:#x}");
 
         let alloc_end = match alloc_start.checked_add(layout.size()) {
             Some(end) => end,

@@ -18,6 +18,7 @@ mesh_protobuf.workspace = true
 memory_range = { workspace = true, features = ["mesh"] }
 
 bitfield-struct.workspace = true
+igvm_defs.workspace = true
 static_assertions.workspace = true
 zerocopy.workspace = true
 

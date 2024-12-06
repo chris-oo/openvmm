@@ -3412,6 +3412,7 @@ version = "0.0.0"
 dependencies = [
  "bitfield-struct",
  "hvdef",
+ "igvm_defs",
  "inspect",
  "memory_range",
  "mesh_protobuf",

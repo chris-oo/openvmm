@@ -21,6 +21,7 @@ use loader_defs::paravisor::PARAVISOR_RESERVED_VTL2_SNP_CPUID_PAGE_INDEX;
 use loader_defs::paravisor::PARAVISOR_RESERVED_VTL2_SNP_CPUID_SIZE_PAGES;
 use loader_defs::paravisor::PARAVISOR_RESERVED_VTL2_SNP_SECRETS_PAGE_INDEX;
 use loader_defs::paravisor::PARAVISOR_RESERVED_VTL2_SNP_SECRETS_SIZE_PAGES;
+use loader_defs::shim::MemoryVtlType;
 use memory_range::MemoryRange;
 use sparse_mmap::SparseMapping;
 use vm_topology::memory::MemoryRangeWithNode;
@@ -200,6 +201,7 @@ impl Drop for Vtl2ParamsMap<'_> {
 
 fn write_persisted_info(parsed: &ParsedBootDtInfo) -> anyhow::Result<()> {
     use loader_defs::shim::MemoryEntry;
+    use loader_defs::shim::MmioEntry;
     use loader_defs::shim::PersistedStateHeader;
     use loader_defs::shim::SavedState;
 
@@ -208,12 +210,31 @@ fn write_persisted_info(parsed: &ParsedBootDtInfo) -> anyhow::Result<()> {
 
     // Create the serialized data to write.
     let state = SavedState {
-        partition_map: parsed
+        partition_memory: parsed
             .partition_memory_map
             .iter()
-            .map(|r| MemoryEntry {
-                range: *r.range(),
-                vtl_type: r.vtl_usage(),
+            .filter_map(|r| match r {
+                bootloader_fdt_parser::AddressRange::Memory(memory) => Some(MemoryEntry {
+                    range: memory.range.range,
+                    vnode: memory.range.vnode,
+                    vtl_type: memory.vtl_usage,
+                    igvm_type: memory.igvm_type.into(),
+                }),
+                bootloader_fdt_parser::AddressRange::Mmio(_) => None,
+            })
+            .collect(),
+        partition_mmio: parsed
+            .partition_memory_map
+            .iter()
+            .filter_map(|r| match r {
+                bootloader_fdt_parser::AddressRange::Mmio(mmio) => Some(MmioEntry {
+                    range: mmio.range,
+                    vtl_type: match mmio.vtl {
+                        bootloader_fdt_parser::Vtl::Vtl0 => MemoryVtlType::VTL0_MMIO,
+                        bootloader_fdt_parser::Vtl::Vtl2 => MemoryVtlType::VTL2_MMIO,
+                    },
+                }),
+                bootloader_fdt_parser::AddressRange::Memory(_) => None,
             })
             .collect(),
     };
@@ -225,7 +246,7 @@ fn write_persisted_info(parsed: &ParsedBootDtInfo) -> anyhow::Result<()> {
         magic: PersistedStateHeader::MAGIC,
         region_len: parsed.vtl2_persisted_range.len(),
         protobuf_offset: protobuf_offset as u64,
-        protobuf_size: protobuf.len() as u64,
+        protobuf_len: protobuf.len() as u64,
     };
 
     mapping.write_at(0, header.as_bytes())?;

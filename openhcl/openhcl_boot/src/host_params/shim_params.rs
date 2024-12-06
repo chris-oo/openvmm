@@ -3,10 +3,14 @@
 
 //! Parameters that are fixed at IGVM build time by the underhill loader.
 
+use crate::arch::address_space::init_local_map;
+use crate::arch::address_space::LocalMap;
 use crate::arch::get_isolation_type;
+use core::cell::RefCell;
 use core::slice;
 use loader_defs::paravisor::ImportedRegionDescriptor;
 use loader_defs::paravisor::ParavisorCommandLine;
+use loader_defs::paravisor::PARAVISOR_LOCAL_MAP_VA;
 use loader_defs::shim::ShimParamsRaw;
 use memory_range::MemoryRange;
 
@@ -109,6 +113,8 @@ pub struct ShimParams {
     pub bounce_buffer: Option<MemoryRange>,
     /// Memory to be used for the heap.
     pub heap: MemoryRange,
+    /// The local map available for mapping.
+    pub local_map: RefCell<LocalMap<'static>>,
 }
 
 impl ShimParams {
@@ -152,6 +158,9 @@ impl ShimParams {
         let heap_end_addr = heap_start_addr + heap_size;
         let heap = MemoryRange::new(heap_start_addr..heap_end_addr);
 
+        // Initialize the local map with the fixed at build va.
+        let local_map = init_local_map(PARAVISOR_LOCAL_MAP_VA);
+
         Self {
             kernel_entry_address: shim_base_address.wrapping_add_signed(kernel_entry_offset),
             cmdline_base: shim_base_address.wrapping_add_signed(cmdline_offset),
@@ -175,6 +184,7 @@ impl ShimParams {
             ),
             bounce_buffer,
             heap,
+            local_map: RefCell::new(local_map),
         }
     }
 
