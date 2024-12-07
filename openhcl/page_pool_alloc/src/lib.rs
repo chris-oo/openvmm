@@ -299,7 +299,7 @@ impl Inspect for PagePoolInner {
                         match &slot.state {
                             SlotState::Free => {}
                             SlotState::Allocated { device_id, tag } => {
-                                resp.field("device_id", self.device_ids[*device_id].name().clone())
+                                resp.field("device_id", self.device_ids[*device_id].name())
                                     .field("tag", tag);
                             }
                             SlotState::AllocatedPendingRestore { device_id, tag }
