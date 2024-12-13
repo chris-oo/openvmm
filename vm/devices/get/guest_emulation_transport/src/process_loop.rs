@@ -1815,6 +1815,20 @@ async fn request_igvm_attest(
         .collect::<Vec<_>>();
     let allocated_shared_memory_size = size_pages.get() as usize * hvdef::HV_PAGE_SIZE_USIZE;
 
+    // HACK DO NOT MERGE
+    // Unprotect the page
+    let mshv_hvcall = hcl::ioctl::MshvHvcall::new().expect("BUGBUG");
+    mshv_hvcall.set_allowed_hypercalls(&[hvdef::HypercallCode::HvCallModifyVtlProtectionMask]);
+
+    // NEEDS TO ROLL IT BACK AFTER HOST CALL
+    mshv_hvcall
+        .modify_vtl_protection_mask(
+            memory_range::MemoryRange::from_4k_gpn_range(base_pfn..base_pfn + handle.size_pages()),
+            hvdef::HV_MAP_GPA_PERMISSIONS_ALL,
+            hvdef::hypercall::HvInputVtl::CURRENT_VTL,
+        )
+        .expect("BUGBUG");
+
     let mut shared_gpa = [0u64; get_protocol::IGVM_ATTEST_MSG_MAX_SHARED_GPA];
     shared_gpa[..allocated_gpa.len()].copy_from_slice(&allocated_gpa);
 

@@ -21,6 +21,10 @@ vmbus_ring.workspace = true
 vm_resource.workspace = true
 vpci.workspace = true
 
+# HACK
+hcl.workspace = true
+memory_range.workspace = true
+
 chipset_resources.workspace = true
 
 guid = { workspace = true, features = ["inspect"] }
