@@ -13,6 +13,7 @@ use inspect::Inspect;
 use mesh::rpc::Rpc;
 use mesh::rpc::RpcSend;
 use std::sync::Arc;
+use virt::VtlMemoryProtection;
 use vpci::bus_control::VpciBusEvent;
 use zerocopy::AsBytes;
 
@@ -366,9 +367,13 @@ impl GuestEmulationTransportClient {
     }
 
     /// Set the gpa allocator, which is required by ['igvm_attest'].
-    pub fn set_gpa_allocator(&mut self, gpa_allocator: page_pool_alloc::PagePoolAllocator) {
+    pub fn set_gpa_allocator(
+        &mut self,
+        gpa_allocator: page_pool_alloc::PagePoolAllocator,
+        vtl_protect: Option<Arc<dyn VtlMemoryProtection + Send + Sync>>,
+    ) {
         self.control
-            .notify(msg::Msg::SetGpaAllocator(gpa_allocator));
+            .notify(msg::Msg::SetGpaAllocator(gpa_allocator, vtl_protect));
     }
 
     /// Send the attestation request to the IGVM agent on the host.

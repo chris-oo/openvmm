@@ -19,6 +19,7 @@ use guid::Guid;
 use inspect::Inspect;
 use inspect::InspectMut;
 use inspect_counters::Counter;
+use lower_vtl_permissions_guard::PagesAccessibleToLowerVtl;
 use mesh::RecvError;
 use parking_lot::Mutex;
 use std::cmp::min;
@@ -32,6 +33,7 @@ use thiserror::Error;
 use underhill_config::Vtl2SettingsErrorInfo;
 use underhill_config::Vtl2SettingsErrorInfoVec;
 use unicycle::FuturesUnordered;
+use virt::VtlMemoryProtection;
 use vmbus_async::async_dgram::AsyncRecvExt;
 use vmbus_async::async_dgram::AsyncSendExt;
 use vmbus_async::pipe::MessagePipe;
@@ -88,6 +90,8 @@ pub(crate) enum FatalError {
     GpaMemoryAllocationError(#[source] page_pool_alloc::Error),
     #[error("failed to read the `IGVM_ATTEST` response from page pool memory")]
     ReadGpaMemory(#[source] sparse_mmap::SparseMappingError),
+    #[error("unable to lower vtl permissions for pages")]
+    LowerVtlPermissions(#[source] anyhow::Error),
     #[error("failed to deserialize the asynchronous `IGVM_ATTEST` response")]
     DeserializeIgvmAttestResponse,
     #[error("malformed `IGVM_ATTEST` response - reported size {response_size} was larger than maximum size {maximum_size}")]
@@ -144,6 +148,8 @@ pub(crate) mod msg {
     use chipset_resources::battery::HostBatteryUpdate;
     use guid::Guid;
     use mesh::rpc::Rpc;
+    use std::sync::Arc;
+    use virt::VtlMemoryProtection;
     use vpci::bus_control::VpciBusEvent;
 
     #[derive(Debug)]
@@ -161,7 +167,6 @@ pub(crate) mod msg {
     }
 
     /// A list specifying control messages to send to the process loop.
-    #[derive(Debug)]
     pub(crate) enum Msg {
         // GET infrastructure - not part of the GET protocol itself.
         // No direct interaction with the host.
@@ -174,7 +179,14 @@ pub(crate) mod msg {
         /// Inspect the state of the process loop.
         Inspect(inspect::Deferred),
         /// Store the gpa allocator to be used for attestation.
-        SetGpaAllocator(page_pool_alloc::PagePoolAllocator),
+        ///
+        /// An optional VtlMemoryProtection can be sent if the VM has no
+        /// isolation, as the protocol requires the pages the host will DMA into
+        /// have no VTL protections applied.
+        SetGpaAllocator(
+            page_pool_alloc::PagePoolAllocator,
+            Option<Arc<dyn VtlMemoryProtection + Send + Sync>>,
+        ),
 
         // Late bound receivers for Guest Notifications
         /// Take the late-bound GuestRequest receiver for Generation Id updates.
@@ -469,6 +481,7 @@ pub(crate) struct ProcessLoop<T: RingMem> {
     igvm_attest_read_send: mesh::Sender<Vec<u8>>,
     #[inspect(skip)]
     gpa_allocator: Option<Arc<page_pool_alloc::PagePoolAllocator>>,
+    vtl_protect: Option<Arc<dyn VtlMemoryProtection + Send + Sync>>,
     stats: Stats,
 
     guest_notification_listeners: GuestNotificationListeners,
@@ -649,6 +662,7 @@ impl<T: RingMem> ProcessLoop<T> {
                 battery_status: GuestNotificationSender::new(),
             },
             gpa_allocator: None,
+            vtl_protect: None,
         }
     }
 
@@ -981,8 +995,9 @@ impl<T: RingMem> ProcessLoop<T> {
             Msg::Inspect(req) => {
                 req.inspect(self);
             }
-            Msg::SetGpaAllocator(gpa_allocator) => {
+            Msg::SetGpaAllocator(gpa_allocator, vtl_protect) => {
                 self.gpa_allocator = Some(Arc::new(gpa_allocator));
+                self.vtl_protect = vtl_protect;
             }
 
             // Late bound receivers for Guest Notifications
@@ -1063,10 +1078,11 @@ impl<T: RingMem> ProcessLoop<T> {
             }
             Msg::IgvmAttest(req) => {
                 let shared_pool_allocator = self.gpa_allocator.clone();
+                let vtl_protect = self.vtl_protect.clone();
 
                 self.push_igvm_attest_request_handler(|access| {
                     req.handle_must_succeed(|request| {
-                        request_igvm_attest(access, *request, shared_pool_allocator)
+                        request_igvm_attest(access, *request, shared_pool_allocator, vtl_protect)
                     })
                 });
             }
@@ -1798,6 +1814,7 @@ async fn request_igvm_attest(
     mut access: HostRequestPipeAccess,
     request: msg::IgvmAttestRequestData,
     gpa_allocator: Option<Arc<page_pool_alloc::PagePoolAllocator>>,
+    vtl_protect: Option<Arc<dyn VtlMemoryProtection + Send + Sync>>,
 ) -> Result<Result<Vec<u8>, IgvmAttestError>, FatalError> {
     let allocator = gpa_allocator.ok_or(FatalError::GpaAllocatorUnavailable)?;
 
@@ -1811,23 +1828,22 @@ async fn request_igvm_attest(
     let base_pfn = handle.base_pfn_without_bias();
     let pfns = base_pfn..base_pfn + handle.size_pages();
     let allocated_gpa = pfns
+        .clone()
         .map(|pfn| pfn * hvdef::HV_PAGE_SIZE)
         .collect::<Vec<_>>();
     let allocated_shared_memory_size = size_pages.get() as usize * hvdef::HV_PAGE_SIZE_USIZE;
 
-    // HACK DO NOT MERGE
-    // Unprotect the page
-    let mshv_hvcall = hcl::ioctl::MshvHvcall::new().expect("BUGBUG");
-    mshv_hvcall.set_allowed_hypercalls(&[hvdef::HypercallCode::HvCallModifyVtlProtectionMask]);
-
-    // NEEDS TO ROLL IT BACK AFTER HOST CALL
-    mshv_hvcall
-        .modify_vtl_protection_mask(
-            memory_range::MemoryRange::from_4k_gpn_range(base_pfn..base_pfn + handle.size_pages()),
-            hvdef::HV_MAP_GPA_PERMISSIONS_ALL,
-            hvdef::hypercall::HvInputVtl::CURRENT_VTL,
-        )
-        .expect("BUGBUG");
+    // Lower vtl permissions if needed. This is because the host expects the
+    // page to be accessible to all VTLs, which requires may require lowering
+    // VTL permissions depending on where the page was allocated from.
+    #[expect(
+        unused_variables,
+        reason = "this is drop guard to restore vtl protections on allocated pages"
+    )]
+    let lower_vtl_guard = vtl_protect
+        .map(|vtl_protect| PagesAccessibleToLowerVtl::new_from_pages(vtl_protect, pfns.collect()))
+        .transpose()
+        .map_err(FatalError::LowerVtlPermissions)?;
 
     let mut shared_gpa = [0u64; get_protocol::IGVM_ATTEST_MSG_MAX_SHARED_GPA];
     shared_gpa[..allocated_gpa.len()].copy_from_slice(&allocated_gpa);

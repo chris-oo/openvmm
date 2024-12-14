@@ -380,7 +380,7 @@ pub trait PartitionAccessState {
 /// with a lower VTL or make memory accesses trigger an intercept. This is
 /// intended for dynamic state as initial memory protections are applied at VM
 /// start.
-pub trait VtlMemoryProtection {
+pub trait VtlMemoryProtection: Inspect {
     /// Sets lower VTL permissions on a physical page.
     ///
     /// TODO: To remain generic may want to replace hvdef::HvMapGpaFlags with

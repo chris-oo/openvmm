@@ -13,6 +13,7 @@ test_utilities = [ "guest_emulation_device/test_utilities" ]
 get_protocol.workspace = true
 guest_emulation_device = { workspace = true, optional = true }
 hvdef.workspace = true
+lower_vtl_permissions_guard.workspace = true
 page_pool_alloc.workspace = true
 sparse_mmap.workspace = true
 underhill_config.workspace = true
@@ -20,10 +21,6 @@ vmbus_async.workspace = true
 vmbus_ring.workspace = true
 vm_resource.workspace = true
 vpci.workspace = true
-
-# HACK
-hcl.workspace = true
-memory_range.workspace = true
 
 chipset_resources.workspace = true
 
@@ -34,7 +31,9 @@ mesh.workspace = true
 pal_async.workspace = true
 test_with_tracing.workspace = true
 tracing_helpers.workspace = true
+virt.workspace = true
 
+anyhow.workspace = true
 futures.workspace = true
 futures-concurrency.workspace = true
 getrandom.workspace = true

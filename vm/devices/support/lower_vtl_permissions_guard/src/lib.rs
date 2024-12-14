@@ -37,6 +37,19 @@ impl PagesAccessibleToLowerVtl {
         Ok(this)
     }
 
+    pub fn new_from_pages(
+        vtl_protect: Arc<dyn VtlMemoryProtection + Send + Sync>,
+        pages: Vec<u64>,
+    ) -> Result<Self> {
+        let this = Self { vtl_protect, pages };
+        for pfn in &this.pages {
+            this.vtl_protect
+                .modify_vtl_page_setting(*pfn, hvdef::HV_MAP_GPA_PERMISSIONS_ALL)
+                .context("failed to update VTL protections on page")?;
+        }
+        Ok(this)
+    }
+
     pub fn pfns(&self) -> &[u64] {
         &self.pages
     }
