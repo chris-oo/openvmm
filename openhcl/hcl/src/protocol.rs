@@ -275,3 +275,9 @@ pub struct tdx_vp_context {
 
 const _: () = assert!(core::mem::offset_of!(tdx_vp_context, gpr_list) + 272 == 512);
 const _: () = assert!(size_of::<tdx_vp_context>() == 1024);
+
+#[repr(C)]
+pub struct hcl_kick_cpus {
+    pub len: u64,
+    pub cpu_mask: *const u8,
+}

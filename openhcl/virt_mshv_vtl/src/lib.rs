@@ -1452,6 +1452,9 @@ impl<'a> UhProtoPartition<'a> {
 
         let hcl = Hcl::new(hcl_isolation, sidecar).map_err(Error::Hcl)?;
 
+        // HACK
+        hcl.kick_cpus(&[1, 2, 3]);
+
         // Set the hypercalls that this process will use.
         let mut allowed_hypercalls = vec![
             hvdef::HypercallCode::HvCallGetVpRegisters,
