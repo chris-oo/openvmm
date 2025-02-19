@@ -2644,11 +2644,11 @@ struct TdxApicClient<'a, T> {
 
 impl<T: CpuIo> ApicClient for TdxApicClient<'_, T> {
     fn cr8(&mut self) -> u32 {
-        self.apic_page.tpr.value >> 4
+        read_cr8(self.apic_page)
     }
 
     fn set_cr8(&mut self, value: u32) {
-        self.apic_page.tpr.value = value << 4;
+        set_cr8(self.apic_page, value);
     }
 
     fn set_apic_base(&mut self, _value: u64) {
@@ -2670,6 +2670,14 @@ impl<T: CpuIo> ApicClient for TdxApicClient<'_, T> {
     fn pull_offload(&mut self) -> ([u32; 8], [u32; 8]) {
         pull_apic_offload(self.apic_page)
     }
+}
+
+fn read_cr8(page: &ApicPage) -> u32 {
+    page.tpr.value >> 4
+}
+
+fn set_cr8(page: &mut ApicPage, value: u32) {
+    page.tpr.value = value << 4;
 }
 
 fn pull_apic_offload(page: &mut ApicPage) -> ([u32; 8], [u32; 8]) {
@@ -2783,9 +2791,6 @@ impl AccessVpState for UhVpStateAccess<'_, '_, TdxBacked> {
     fn registers(&mut self) -> Result<Registers, Self::Error> {
         let gps = self.vp.runner.tdx_enter_guest_gps();
 
-        tracing::trace!("not getting cr8, must read from apic page or apic tpr");
-        let cr8 = 0;
-
         let cs = self.vp.read_segment(self.vtl, TdxSegmentReg::Cs);
         let ds = self.vp.read_segment(self.vtl, TdxSegmentReg::Ds);
         let es = self.vp.read_segment(self.vtl, TdxSegmentReg::Es);
@@ -2805,6 +2810,7 @@ impl AccessVpState for UhVpStateAccess<'_, '_, TdxBacked> {
             .runner
             .read_vmcs64(self.vtl, VmcsField::VMX_VMCS_GUEST_CR3);
         let cr4 = self.vp.read_cr4(self.vtl);
+        let cr8 = read_cr8(zerocopy::transmute_ref!(self.vp.runner.tdx_apic_page()));
 
         let efer = self.vp.backing.vtls[self.vtl].efer;
 
@@ -2934,9 +2940,11 @@ impl AccessVpState for UhVpStateAccess<'_, '_, TdxBacked> {
 
         self.vp.write_cr4(self.vtl, *cr4)?;
 
-        // BUGBUG: cr8 affects interrupts but hcl asserts setting this to false.
-        // ignore for now
-        tracing::trace!(cr8, "IGNORING cr8 set_registers");
+        // BUGBUG: interrupt update?
+        set_cr8(
+            zerocopy::transmute_mut!(self.vp.runner.tdx_apic_page_mut()),
+            *cr8 as u32,
+        );
 
         self.vp.write_efer(self.vtl, *efer)?;
 
