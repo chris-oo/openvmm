@@ -14,6 +14,8 @@ pub use device_dma::LowerVtlDmaBuffer;
 
 use anyhow::Context;
 use anyhow::Result;
+use guestmem::ranges::PagedRange;
+use guestmem::GuestMemory;
 use inspect::Inspect;
 use std::sync::Arc;
 use user_driver::memory::MemoryBlock;
@@ -109,5 +111,30 @@ impl<T: DmaClient> DmaClient for LowerVtlMemorySpawner<T> {
 
     fn attach_dma_buffer(&self, _len: usize, _base_pfn: u64) -> Result<MemoryBlock> {
         anyhow::bail!("restore is not supported for LowerVtlMemorySpawner")
+    }
+
+    fn unmap_dma_ranges(
+        &self,
+        _transaction: user_driver::DmaTransaction<'_>,
+    ) -> std::result::Result<(), user_driver::MapDmaError> {
+        todo!()
+    }
+
+    fn map_dma_ranges<'a, 'b: 'a>(
+        &'a self,
+        _guest_memory: &'a GuestMemory,
+        _ranges: PagedRange<'b>,
+        _options: user_driver::MapDmaOptions,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::prelude::rust_2024::Future<
+                    Output = std::result::Result<
+                        user_driver::DmaTransaction<'a>,
+                        user_driver::MapDmaError,
+                    >,
+                > + 'a,
+        >,
+    > {
+        todo!()
     }
 }

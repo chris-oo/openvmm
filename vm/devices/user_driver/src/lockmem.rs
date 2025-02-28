@@ -5,6 +5,7 @@
 
 use crate::memory::MappedDmaTarget;
 use anyhow::Context;
+use guestmem::GuestMemory;
 use inspect::Inspect;
 use std::ffi::c_void;
 use std::fs::File;
@@ -137,5 +138,27 @@ impl crate::DmaClient for LockedMemorySpawner {
         _base_pfn: u64,
     ) -> anyhow::Result<crate::memory::MemoryBlock> {
         anyhow::bail!("restore not supported for lockmem")
+    }
+
+    fn map_dma_ranges<'a, 'b: 'a>(
+        &'a self,
+        _guest_memory: &'a GuestMemory,
+        _ranges: guestmem::ranges::PagedRange<'b>,
+        _options: crate::MapDmaOptions,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::prelude::rust_2024::Future<
+                    Output = Result<crate::DmaTransaction<'a>, crate::MapDmaError>,
+                > + 'a,
+        >,
+    > {
+        todo!()
+    }
+
+    fn unmap_dma_ranges(
+        &self,
+        _transaction: crate::DmaTransaction<'_>,
+    ) -> Result<(), crate::MapDmaError> {
+        todo!()
     }
 }
