@@ -149,7 +149,7 @@ impl<T: SimpleVmbusClientDeviceAsync> SimpleVmbusClientDeviceWrapper<T> {
     /// Create a new instance.
     pub fn new(
         driver: impl SpawnDriver + Clone,
-        dma_alloc: Arc<dyn DmaClient>,
+        dma_alloc: DmaClient,
         synic: Arc<dyn vmbus_client::SynicEventClient>,
         device: T,
     ) -> Result<Self> {
@@ -235,7 +235,7 @@ struct SimpleVmbusClientDeviceTask<T: SimpleVmbusClientDeviceAsync> {
     synic: Arc<dyn vmbus_client::SynicEventClient>,
     saved_state: Option<T::SavedState>,
     spawner: Arc<dyn SpawnDriver>,
-    dma_alloc: Arc<dyn DmaClient>,
+    dma_alloc: DmaClient,
 }
 
 impl<T: SimpleVmbusClientDeviceAsync> AsyncRun<SimpleVmbusClientDeviceTaskState>
@@ -270,7 +270,7 @@ impl<T: SimpleVmbusClientDeviceAsync> SimpleVmbusClientDeviceTask<T> {
         device: T,
         synic: Arc<dyn vmbus_client::SynicEventClient>,
         spawner: Arc<dyn SpawnDriver>,
-        dma_alloc: Arc<dyn DmaClient>,
+        dma_alloc: DmaClient,
     ) -> Self {
         Self {
             device: TaskControl::new(RelayDeviceTask(device)),
