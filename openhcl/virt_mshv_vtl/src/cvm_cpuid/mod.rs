@@ -13,6 +13,7 @@ use inspect::Inspect;
 use masking::CpuidResultMask;
 use snp::SnpCpuidInitializer;
 use std::boxed::Box;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use thiserror::Error;
@@ -181,6 +182,7 @@ pub struct ParsedCpuidEntry {
 
 /// Prepares and caches the results that should be returned for hardware CVMs.
 #[derive(Inspect)]
+#[inspect(extra = "Self::inspect_extra")]
 pub struct CpuidResults {
     #[inspect(with = "inspect_helpers::cpuid_table")]
     results: HashMap<CpuidFunction, CpuidEntry>,
@@ -191,7 +193,24 @@ pub struct CpuidResults {
     hit_bug: AtomicBool,
 }
 
-type CpuidSubtable = HashMap<u32, CpuidResult>;
+impl CpuidResults {
+    fn inspect_extra(&self, resp: &mut inspect::Response<'_>) {
+        let order = match self.results[&CpuidFunction::ExtendedStateEnumeration] {
+            CpuidEntry::Leaf(_) => panic!("should not be leaf"),
+            CpuidEntry::Subtable(ref table) => {
+                let mut order = String::new();
+                table.iter().for_each(|(key, _value)| {
+                    order.push_str(&format!("{:x?} ", key));
+                });
+                order
+            }
+        };
+
+        resp.field("extended state iterator order", order);
+    }
+}
+
+type CpuidSubtable = BTreeMap<u32, CpuidResult>;
 
 /// Entry in [`CpuidResults`] for caching leaf value or its subleaves.
 #[derive(Inspect)]
@@ -347,7 +366,7 @@ impl CpuidResults {
                     }
                     std::collections::hash_map::Entry::Vacant(entry) => {
                         if mask.is_subleaf() {
-                            let subtable = HashMap::from([(subleaf, masked_result)]);
+                            let subtable = BTreeMap::from([(subleaf, masked_result)]);
                             entry.insert(CpuidEntry::Subtable(subtable));
                         } else {
                             entry.insert(CpuidEntry::Leaf(masked_result));
