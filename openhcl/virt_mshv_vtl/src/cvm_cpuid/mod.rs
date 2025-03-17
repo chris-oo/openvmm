@@ -412,9 +412,10 @@ impl CpuidResults {
                     result.ebx = self.compacted_xsave_size(guest_state.xfem | guest_state.xss);
                 }
 
-                if subleaf == 1 || subleaf == 2 {
+                if subleaf == 0 || subleaf == 1 {
                     tracing::error!(
                         subleaf,
+                        eax = result.eax,
                         ebx = result.ebx,
                         xfem = guest_state.xfem,
                         xss = guest_state.xss,
@@ -668,6 +669,13 @@ impl CpuidResults {
             for (subleaf, result) in extended_state_subtable {
                 if (1u64 << subleaf) & summary_mask != 0 {
                     area_size = area_size_fn(area_size, *result);
+                    tracing::error!(
+                        summary_mask,
+                        subleaf,
+                        ?result,
+                        area_size,
+                        "calculate xsave size"
+                    );
                 }
             }
         } else {
@@ -687,7 +695,17 @@ impl CpuidResults {
                                 ecx: _,
                                 edx: _,
                             }|
-         -> u32 { current_area_size.max(feature_size + feature_offset) };
+         -> u32 {
+            let max = current_area_size.max(feature_size + feature_offset);
+            tracing::error!(
+                current_area_size,
+                feature_size,
+                feature_offset,
+                max,
+                "xsave size area fn"
+            );
+            max
+        };
 
         self.calculate_xsave_size(xfem, area_size_fn)
     }
@@ -709,11 +727,21 @@ impl CpuidResults {
                 (value + (alignment - 1)) & !(alignment - 1)
             };
 
-            if cpuid::ExtendedStateEnumerationSubleafNEcx::from(ecx).aligned() {
+            let aligned = cpuid::ExtendedStateEnumerationSubleafNEcx::from(ecx).aligned();
+
+            if aligned {
                 area_size = round_up(area_size, xsave::XSAVE_REQUIRED_XSAVE_AREA_ALIGNMENT);
             }
 
             area_size += feature_size; // eax is feature size
+
+            tracing::error!(
+                current_area_size,
+                feature_size,
+                area_size,
+                aligned,
+                "compacted xsave size area fn"
+            );
             area_size
         };
 
