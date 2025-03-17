@@ -416,6 +416,8 @@ impl CpuidResults {
                     tracing::error!(
                         subleaf,
                         ebx = result.ebx,
+                        xfem = guest_state.xfem,
+                        xss = guest_state.xss,
                         "extended state enumeration xsave"
                     );
                 }
