@@ -14,6 +14,7 @@ use masking::CpuidResultMask;
 use snp::SnpCpuidInitializer;
 use std::boxed::Box;
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use thiserror::Error;
 use x86defs::cpuid;
 use x86defs::cpuid::CpuidFunction;
@@ -187,6 +188,7 @@ pub struct CpuidResults {
     max_extended_state: u64,
     arch_support: Box<dyn CpuidArchSupport>,
     vps_per_socket: u32,
+    hit_bug: AtomicBool,
 }
 
 type CpuidSubtable = HashMap<u32, CpuidResult>;
@@ -362,6 +364,7 @@ impl CpuidResults {
             max_extended_state: 0, // will get updated as part of update_extended_state
             arch_support,
             vps_per_socket: 0, // will get updated as part of update_extended_topology
+            hit_bug: AtomicBool::new(false),
         };
 
         // Validate results before updating leaves because the updates might
@@ -412,7 +415,7 @@ impl CpuidResults {
                     result.ebx = self.compacted_xsave_size(guest_state.xfem | guest_state.xss);
                 }
 
-                if subleaf == 0 || subleaf == 1 {
+                if subleaf == 0 || subleaf == 1 && !self.hit_bug() {
                     tracing::error!(
                         subleaf,
                         eax = result.eax,
@@ -421,6 +424,12 @@ impl CpuidResults {
                         xss = guest_state.xss,
                         "extended state enumeration xsave"
                     );
+
+                    if subleaf == 1 && result.ebx == 0x29d0 {
+                        self.hit_bug
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                        tracing::error!("hit xsave bug, no longer logging");
+                    }
                 }
             }
             _ => self.arch_support.process_guest_result(
@@ -669,13 +678,15 @@ impl CpuidResults {
             for (subleaf, result) in extended_state_subtable {
                 if (1u64 << subleaf) & summary_mask != 0 {
                     area_size = area_size_fn(area_size, *result);
-                    tracing::error!(
-                        summary_mask,
-                        subleaf,
-                        ?result,
-                        area_size,
-                        "calculate xsave size"
-                    );
+                    if !self.hit_bug() {
+                        tracing::error!(
+                            summary_mask,
+                            subleaf,
+                            ?result,
+                            area_size,
+                            "calculate xsave size"
+                        );
+                    }
                 }
             }
         } else {
@@ -697,13 +708,15 @@ impl CpuidResults {
                             }|
          -> u32 {
             let max = current_area_size.max(feature_size + feature_offset);
-            tracing::error!(
-                current_area_size,
-                feature_size,
-                feature_offset,
-                max,
-                "xsave size area fn"
-            );
+            if !self.hit_bug() {
+                tracing::error!(
+                    current_area_size,
+                    feature_size,
+                    feature_offset,
+                    max,
+                    "xsave size area fn"
+                );
+            }
             max
         };
 
@@ -735,13 +748,16 @@ impl CpuidResults {
 
             area_size += feature_size; // eax is feature size
 
-            tracing::error!(
-                current_area_size,
-                feature_size,
-                area_size,
-                aligned,
-                "compacted xsave size area fn"
-            );
+            if self.hit_bug() {
+                tracing::error!(
+                    current_area_size,
+                    feature_size,
+                    area_size,
+                    aligned,
+                    "compacted xsave size area fn"
+                );
+            }
+
             area_size
         };
 
@@ -811,5 +827,9 @@ impl CpuidResults {
         }
 
         extended_address_space_sizes.ebx = updated_sizes.into();
+    }
+
+    fn hit_bug(&self) -> bool {
+        self.hit_bug.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
