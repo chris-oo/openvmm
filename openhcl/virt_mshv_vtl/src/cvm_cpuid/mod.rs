@@ -411,6 +411,14 @@ impl CpuidResults {
                     // XsavesMaxSizeEnabled
                     result.ebx = self.compacted_xsave_size(guest_state.xfem | guest_state.xss);
                 }
+
+                if subleaf == 1 || subleaf == 2 {
+                    tracing::error!(
+                        subleaf,
+                        ebx = result.ebx,
+                        "extended state enumeration xsave"
+                    );
+                }
             }
             _ => self.arch_support.process_guest_result(
                 leaf,
