@@ -4,6 +4,7 @@
 //! Processor support for TDX partitions.
 
 mod tlb_flush;
+mod virtual_register;
 
 use super::BackingPrivate;
 use super::BackingSharedParams;
@@ -74,6 +75,8 @@ use virt_support_x86emu::emulate::TranslateMode;
 use virt_support_x86emu::emulate::emulate_io;
 use virt_support_x86emu::emulate::emulate_translate_gva;
 use virt_support_x86emu::translate::TranslationRegisters;
+use virtual_register::ShadowedRegister;
+use virtual_register::VirtualRegister;
 use vmcore::vmtime::VmTimeAccess;
 use x86defs::RFlags;
 use x86defs::X64_CR0_ET;
@@ -162,164 +165,6 @@ impl TdxExit<'_> {
     }
     fn cpl(&self) -> u8 {
         self.0.r12 as u8 & 3
-    }
-}
-
-/// Registers that can be virtual and shadowed.
-#[derive(Debug, Inspect)]
-enum ShadowedRegister {
-    Cr0,
-    Cr4,
-}
-
-impl ShadowedRegister {
-    fn name(&self) -> &'static str {
-        match self {
-            Self::Cr0 => "cr0",
-            Self::Cr4 => "cr4",
-        }
-    }
-
-    fn physical_vmcs_field(&self) -> VmcsField {
-        match self {
-            Self::Cr0 => VmcsField::VMX_VMCS_GUEST_CR0,
-            Self::Cr4 => VmcsField::VMX_VMCS_GUEST_CR4,
-        }
-    }
-
-    fn shadow_vmcs_field(&self) -> VmcsField {
-        match self {
-            Self::Cr0 => VmcsField::VMX_VMCS_CR0_READ_SHADOW,
-            Self::Cr4 => VmcsField::VMX_VMCS_CR4_READ_SHADOW,
-        }
-    }
-
-    fn guest_owned_mask(&self) -> u64 {
-        // Control register bits that are guest owned by default. A bit is guest
-        // owned when the physical register bit is always set to the virtual
-        // register bit (subject to validation of the virtual register).
-        match self {
-            Self::Cr0 => {
-                X64_CR0_ET
-                    | x86defs::X64_CR0_MP
-                    | x86defs::X64_CR0_EM
-                    | x86defs::X64_CR0_TS
-                    | x86defs::X64_CR0_WP
-                    | x86defs::X64_CR0_AM
-                    | X64_CR0_PE
-                    | X64_CR0_PG
-            }
-            Self::Cr4 => {
-                x86defs::X64_CR4_VME
-                    | x86defs::X64_CR4_PVI
-                    | x86defs::X64_CR4_TSD
-                    | x86defs::X64_CR4_DE
-                    | x86defs::X64_CR4_PSE
-                    | x86defs::X64_CR4_PAE
-                    | x86defs::X64_CR4_PGE
-                    | x86defs::X64_CR4_PCE
-                    | x86defs::X64_CR4_FXSR
-                    | x86defs::X64_CR4_XMMEXCPT
-                    | x86defs::X64_CR4_UMIP
-                    | x86defs::X64_CR4_LA57
-                    | x86defs::X64_CR4_RWFSGS
-                    | x86defs::X64_CR4_PCIDE
-                    | x86defs::X64_CR4_OSXSAVE
-                    | x86defs::X64_CR4_SMEP
-                    | x86defs::X64_CR4_SMAP
-                    | x86defs::X64_CR4_CET
-            }
-        }
-    }
-}
-
-/// A virtual register that is shadowed by the virtstack.
-///
-/// Some bits are owned by the guest while others are owned by the virtstack,
-/// due to TDX requirements.
-#[derive(Inspect)]
-struct VirtualRegister {
-    /// The register being shadowed.
-    register: ShadowedRegister,
-    /// The VTL this register is shadowed for.
-    vtl: GuestVtl,
-    /// The value the guest sees.
-    shadow_value: u64,
-    /// Additional constraints on bits.
-    allowed_bits: Option<u64>,
-}
-
-#[derive(Debug, Error)]
-enum VirtualRegisterError {
-    #[error("invalid value {0} for register {1}")]
-    InvalidValue(u64, &'static str),
-}
-
-impl VirtualRegister {
-    fn new(
-        reg: ShadowedRegister,
-        vtl: GuestVtl,
-        initial_value: u64,
-        allowed_bits: Option<u64>,
-    ) -> Self {
-        Self {
-            register: reg,
-            vtl,
-            shadow_value: initial_value,
-            allowed_bits,
-        }
-    }
-
-    /// Write a new value to the virtual register. This updates host owned bits
-    /// in the shadowed value, and updates guest owned bits in the physical
-    /// register in the vmcs.
-    fn write<'a>(
-        &mut self,
-        value: u64,
-        runner: &mut ProcessorRunner<'a, Tdx<'a>>,
-    ) -> Result<(), VirtualRegisterError> {
-        tracing::trace!(?self.register, value, "write virtual register");
-
-        if value & !self.allowed_bits.unwrap_or(u64::MAX) != 0 {
-            return Err(VirtualRegisterError::InvalidValue(
-                value,
-                self.register.name(),
-            ));
-        }
-
-        // If guest owned bits of the physical register have changed, then update
-        // the guest owned bits of the physical field.
-        let old_physical_reg = runner.read_vmcs64(self.vtl, self.register.physical_vmcs_field());
-
-        tracing::trace!(old_physical_reg, "old_physical_reg");
-
-        let guest_owned_mask = self.register.guest_owned_mask();
-        if (old_physical_reg ^ value) & guest_owned_mask != 0 {
-            let new_physical_reg =
-                (old_physical_reg & !guest_owned_mask) | (value & guest_owned_mask);
-
-            tracing::trace!(new_physical_reg, "new_physical_reg");
-
-            runner.write_vmcs64(
-                self.vtl,
-                self.register.physical_vmcs_field(),
-                !0,
-                new_physical_reg,
-            );
-        }
-
-        self.shadow_value = value;
-        runner.write_vmcs64(self.vtl, self.register.shadow_vmcs_field(), !0, value);
-        Ok(())
-    }
-
-    fn read<'a>(&self, runner: &ProcessorRunner<'a, Tdx<'a>>) -> u64 {
-        let physical_reg = runner.read_vmcs64(self.vtl, self.register.physical_vmcs_field());
-
-        // Get the bits owned by the host from the shadow and the bits owned by the
-        // guest from the physical value.
-        let guest_owned_mask = self.register.guest_owned_mask();
-        (self.shadow_value & !self.register.guest_owned_mask()) | (physical_reg & guest_owned_mask)
     }
 }
 
@@ -669,6 +514,28 @@ impl BackingPrivate for TdxBacked {
                 !0,
                 !(ShadowedRegister::Cr4.guest_owned_mask() & allowed_cr4_bits),
             );
+
+            let physical_cr0 = params
+                .runner
+                .read_vmcs64(vtl, VmcsField::VMX_VMCS_GUEST_CR0);
+            let shadow_cr0 = params
+                .runner
+                .read_vmcs64(vtl, VmcsField::VMX_VMCS_CR0_READ_SHADOW);
+            let cr0_guest_host_mask: u64 = params
+                .runner
+                .read_vmcs64(vtl, VmcsField::VMX_VMCS_CR0_GUEST_HOST_MASK);
+            tracing::error!(physical_cr0, shadow_cr0, cr0_guest_host_mask, "cr0 values");
+
+            let physical_cr4 = params
+                .runner
+                .read_vmcs64(vtl, VmcsField::VMX_VMCS_GUEST_CR4);
+            let shadow_cr4 = params
+                .runner
+                .read_vmcs64(vtl, VmcsField::VMX_VMCS_CR4_READ_SHADOW);
+            let cr4_guest_host_mask = params
+                .runner
+                .read_vmcs64(vtl, VmcsField::VMX_VMCS_CR4_GUEST_HOST_MASK);
+            tracing::error!(physical_cr4, shadow_cr4, cr4_guest_host_mask, "cr4 values");
 
             // Configure the MSR bitmap for this VP.  Since the default MSR bitmap
             // is all ones, only those values that are not all ones need to be set in

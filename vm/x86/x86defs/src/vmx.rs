@@ -97,6 +97,7 @@ impl FieldWidth {
 }
 
 #[bitfield(u32)]
+#[derive(PartialEq, Eq)]
 pub struct VmcsField {
     #[bits(1)]
     pub access_high: u32,
