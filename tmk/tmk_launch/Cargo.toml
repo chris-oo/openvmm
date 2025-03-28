@@ -5,6 +5,8 @@ rust-version.workspace = true
 edition.workspace = true
 
 [dependencies]
+hvdef.workspace = true
+
 uefi = "0.34.1"
 uefi-raw = "0.10.0"
 

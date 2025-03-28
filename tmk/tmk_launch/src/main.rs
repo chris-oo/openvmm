@@ -47,6 +47,7 @@ mod raw {
 mod ivm_protocol {
     use crate::raw::Boolean;
     use core::ffi::c_void;
+    use hvdef::HvMapGpaFlags;
     use uefi::Guid;
     use uefi::Status;
     use uefi::guid;
@@ -60,7 +61,7 @@ mod ivm_protocol {
     struct IvmProtocol {
         pub make_address_range_host_visible: unsafe extern "efiapi" fn(
             *mut Self,
-            hv_map_gpa_flags: u32,
+            hv_map_gpa_flags: HvMapGpaFlags,
             base_address: usize, // is void*
             byte_count: u32,
             zero_pages: Boolean,
@@ -79,8 +80,35 @@ mod ivm_protocol {
     #[derive(Debug)]
     #[repr(transparent)]
     #[unsafe_protocol(IvmProtocol::GUID)]
-    struct Ivm(IvmProtocol);
+    pub struct Ivm(IvmProtocol);
+
+    impl Ivm {
+        /// Make a range of memory visible to the host.
+        pub unsafe fn make_address_range_host_visible(
+            &mut self,
+            hv_map_gpa_flags: HvMapGpaFlags,
+            base_address: usize,
+            byte_count: u32,
+            zero_pages: Boolean,
+        ) -> Status {
+            unsafe {
+                (self.0.make_address_range_host_visible)(
+                    &mut self.0,
+                    hv_map_gpa_flags,
+                    base_address,
+                    byte_count,
+                    zero_pages,
+                    core::ptr::null_mut(),
+                )
+            }
+        }
+    }
 }
+
+use crate::ivm_protocol::Ivm;
+use hvdef::HvMapGpaFlags;
+use uefi::boot::MemoryType;
+use uefi::boot::PAGE_SIZE;
 
 fn main() {
     let initial_cr0: u64;
@@ -104,4 +132,24 @@ fn main() {
         }
     }
     println!("\rRead CR0: {:#x}", read_cr0);
+
+    let mut ivm = uefi::boot::open_protocol_exclusive::<Ivm>(uefi::boot::image_handle()).unwrap();
+    let page = uefi::boot::allocate_pages(
+        uefi::boot::AllocateType::AnyPages,
+        MemoryType::LOADER_DATA,
+        1,
+    )
+    .unwrap();
+    println!("\rAllocated page: {:#x}", page.addr());
+
+    let result = unsafe {
+        ivm.make_address_range_host_visible(
+            HvMapGpaFlags::new().with_readable(true).with_writable(true),
+            page.addr().into(),
+            PAGE_SIZE as u32,
+            true.into(),
+        )
+    };
+
+    println!("\r page host visible result {:?}", result);
 }
