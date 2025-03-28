@@ -5,9 +5,10 @@ rust-version.workspace = true
 edition.workspace = true
 
 [dependencies]
+log.workspace = true
 hvdef.workspace = true
 
-uefi = "0.34.1"
+uefi = { version = "0.34.1",  features = [ "panic_handler", "logger" ] }
 uefi-raw = "0.10.0"
 
 [lints]
