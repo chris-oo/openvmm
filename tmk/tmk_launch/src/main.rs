@@ -166,5 +166,12 @@ fn main() -> Status {
 
     log::info!("\r page host visible result {:?}", result);
 
+    // write at the addr
+    unsafe {
+        core::ptr::write_volatile(page.as_ptr(), 0x42);
+    }
+
+    log::info!("\r write succeeded, somehow");
+
     Status::SUCCESS
 }
