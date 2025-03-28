@@ -1,6 +1,8 @@
 //! TODO
 
 #![allow(unsafe_code)]
+#![no_main]
+#![no_std]
 
 mod raw {
     /// TODO: Lifted from uefi_raw because it's not in a crates.io release yet.
@@ -109,38 +111,54 @@ use crate::ivm_protocol::Ivm;
 use hvdef::HvMapGpaFlags;
 use uefi::boot::MemoryType;
 use uefi::boot::PAGE_SIZE;
+use uefi::prelude::*;
 
-fn main() {
+#[entry]
+fn main() -> Status {
+    uefi::helpers::init().unwrap();
+
     let initial_cr0: u64;
     unsafe {
-        std::arch::asm! {
+        core::arch::asm! {
             "mov {r}, cr0",
             r = out(reg) initial_cr0,
         }
     }
-    println!("\rInitial CR0: {:#x}", initial_cr0);
+    log::info!("\rInitial CR0: {:#x}", initial_cr0);
 
     let new_cr0 = initial_cr0 & !0x10u64 | 0x40u64;
-    println!("\rSetting CR0 to: {:#x}", new_cr0);
+    log::info!("\rSetting CR0 to: {:#x}", new_cr0);
 
     let read_cr0: u64;
     unsafe {
-        std::arch::asm! {
+        core::arch::asm! {
             "mov cr0, {r}",
             "mov {r}, cr0",
             r = inout(reg) new_cr0 => read_cr0,
         }
     }
-    println!("\rRead CR0: {:#x}", read_cr0);
+    log::info!("\rRead CR0: {:#x}", read_cr0);
 
-    let mut ivm = uefi::boot::open_protocol_exclusive::<Ivm>(uefi::boot::image_handle()).unwrap();
-    let page = uefi::boot::allocate_pages(
+    let result = uefi::boot::allocate_pages(
         uefi::boot::AllocateType::AnyPages,
         MemoryType::LOADER_DATA,
         1,
-    )
-    .unwrap();
-    println!("\rAllocated page: {:#x}", page.addr());
+    );
+    log::info!("\rAllocate pages result: {:?}", result);
+    let page = result.unwrap();
+    log::info!("\rAllocated page: {:#x}", page.addr());
+
+    let mut ivm = unsafe {
+        uefi::boot::open_protocol::<Ivm>(
+            uefi::boot::OpenProtocolParams {
+                handle: uefi::boot::image_handle(),
+                agent: uefi::boot::image_handle(),
+                controller: None,
+            },
+            uefi::boot::OpenProtocolAttributes::GetProtocol,
+        )
+        .unwrap()
+    };
 
     let result = unsafe {
         ivm.make_address_range_host_visible(
@@ -151,5 +169,7 @@ fn main() {
         )
     };
 
-    println!("\r page host visible result {:?}", result);
+    log::info!("\r page host visible result {:?}", result);
+
+    Status::SUCCESS
 }

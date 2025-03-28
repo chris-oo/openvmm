@@ -6795,6 +6795,7 @@ name = "tmk_launch"
 version = "0.1.0"
 dependencies = [
  "hvdef",
+ "log",
  "uefi",
  "uefi-raw",
 ]
