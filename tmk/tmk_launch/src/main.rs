@@ -111,6 +111,8 @@ use crate::ivm_protocol::Ivm;
 use hvdef::HvMapGpaFlags;
 use uefi::boot::MemoryType;
 use uefi::boot::PAGE_SIZE;
+use uefi::boot::get_handle_for_protocol;
+use uefi::boot::open_protocol_exclusive;
 use uefi::prelude::*;
 
 #[entry]
@@ -148,16 +150,9 @@ fn main() -> Status {
     let page = result.unwrap();
     log::info!("\rAllocated page: {:#x}", page.addr());
 
-    let mut ivm = unsafe {
-        uefi::boot::open_protocol::<Ivm>(
-            uefi::boot::OpenProtocolParams {
-                handle: uefi::boot::image_handle(),
-                agent: uefi::boot::image_handle(),
-                controller: None,
-            },
-            uefi::boot::OpenProtocolAttributes::GetProtocol,
-        )
-        .unwrap()
+    let mut ivm = {
+        let handle = get_handle_for_protocol::<Ivm>().unwrap();
+        open_protocol_exclusive::<Ivm>(handle).unwrap()
     };
 
     let result = unsafe {
