@@ -904,6 +904,7 @@ impl UhPartitionInner {
 
     fn inspect_extra(&self, resp: &mut inspect::Response<'_>) {
         let mut wake_vps = false;
+        let mut kick_vps = false;
         resp.field_mut(
             "enter_modes",
             &mut inspect::adhoc_mut(|req| {
@@ -922,11 +923,26 @@ impl UhPartitionInner {
             }),
         );
 
+        resp.field_mut(
+            "kick_vps",
+            &mut inspect::adhoc_mut(|req| {
+                let update = req.is_update();
+                if update {
+                    kick_vps = true;
+                }
+            }),
+        );
+
         // Wake VPs to propagate updates.
         if wake_vps {
             for vp in self.vps.iter() {
                 vp.wake_vtl2();
             }
+        }
+
+        if kick_vps {
+            let vps: Vec<_> = self.vps.iter().map(|vp| vp.vp_index().index()).collect();
+            self.hcl.kick_cpus(&vps);
         }
     }
 
@@ -1451,9 +1467,6 @@ impl<'a> UhProtoPartition<'a> {
         let sidecar = sidecar_client::SidecarClient::new(driver).map_err(Error::Sidecar)?;
 
         let hcl = Hcl::new(hcl_isolation, sidecar).map_err(Error::Hcl)?;
-
-        // HACK
-        hcl.kick_cpus(&[1, 2, 3]);
 
         // Set the hypercalls that this process will use.
         let mut allowed_hypercalls = vec![
