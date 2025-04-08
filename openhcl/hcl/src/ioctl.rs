@@ -1581,7 +1581,9 @@ impl HclVp {
             // SAFETY: `proxy_irr_blocked` is not accessed by any other VPs/kernel at this point (`HclVp` creation)
             // so we know we have exclusive access.
             let proxy_irr_blocked = unsafe { &mut (*run.as_ptr()).proxy_irr_blocked };
-            proxy_irr_blocked.fill(!0);
+            // proxy_irr_blocked.fill(!0);
+            // HACK: workaround vmbus relay broken
+            proxy_irr_blocked.fill(0);
         }
 
         let backing = match isolation_type {
