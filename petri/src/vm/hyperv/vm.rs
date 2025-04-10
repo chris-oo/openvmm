@@ -73,6 +73,10 @@ impl HyperVVM {
             vhd_path: None,
         })?;
 
+        // Remove the default network adapter.
+        powershell::run_remove_vm_network_adapter(&vmid)
+            .context("remove default network adapter")?;
+
         tracing::info!(name, vmid = vmid.to_string(), "Created Hyper-V VM");
 
         Ok(Self {
