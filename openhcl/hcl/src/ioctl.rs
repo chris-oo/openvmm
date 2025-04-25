@@ -3227,12 +3227,15 @@ impl Hcl {
         }
     }
 
-    pub fn kick_cpus(&self, cpus: &[u32]) {
+    pub fn kick_cpus(&self, cpus: &[u32], cancel_run: bool, wait_for_other_cpus: bool) {
         let cpu_bitmap = cpus.iter().fold(0u64, |bitmap, &cpu| bitmap | 1 << cpu);
 
         let data = protocol::hcl_kick_cpus {
             len: size_of_val(&cpu_bitmap) as u64,
             cpu_mask: cpu_bitmap.as_bytes().as_ptr(),
+            flags: protocol::hcl_kick_cpus_flags::new()
+                .with_cancel_run(cancel_run)
+                .with_wait_for_other_cpus(wait_for_other_cpus),
         };
 
         tracing::error!("kicking cpus");

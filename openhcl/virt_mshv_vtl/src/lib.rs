@@ -904,7 +904,13 @@ impl UhPartitionInner {
 
     fn inspect_extra(&self, resp: &mut inspect::Response<'_>) {
         let mut wake_vps = false;
-        let mut kick_vps = false;
+        enum KickVps {
+            KickNoWait = 0,
+            KickWait = 1,
+            KickCancel = 2,
+            KickWaitCancel = 3,
+        }
+        let mut kick_vps = None;
         resp.field_mut(
             "enter_modes",
             &mut inspect::adhoc_mut(|req| {
@@ -926,9 +932,17 @@ impl UhPartitionInner {
         resp.field_mut(
             "kick_vps",
             &mut inspect::adhoc_mut(|req| {
-                let update = req.is_update();
-                if update {
-                    kick_vps = true;
+                if let Ok(req) = req.update() {
+                    let val = req.new_value();
+                    let val: u8 = val.parse().unwrap_or(255);
+                    match val {
+                        0 => kick_vps = Some(KickVps::KickNoWait),
+                        1 => kick_vps = Some(KickVps::KickWait),
+                        2 => kick_vps = Some(KickVps::KickCancel),
+                        3 => kick_vps = Some(KickVps::KickWaitCancel),
+                        _ => {}
+                    }
+                    req.succeed(kick_vps.is_some().into());
                 }
             }),
         );
@@ -940,9 +954,15 @@ impl UhPartitionInner {
             }
         }
 
-        if kick_vps {
+        if let Some(kick_vps) = kick_vps {
             let vps: Vec<_> = self.vps.iter().map(|vp| vp.vp_index().index()).collect();
-            self.hcl.kick_cpus(&vps);
+            let (cancel_run, wait_for_other_cpus) = match kick_vps {
+                KickVps::KickNoWait => (false, false),
+                KickVps::KickWait => (false, true),
+                KickVps::KickCancel => (true, false),
+                KickVps::KickWaitCancel => (true, true),
+            };
+            self.hcl.kick_cpus(&vps, cancel_run, wait_for_other_cpus);
         }
     }
 
