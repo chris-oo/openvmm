@@ -775,7 +775,7 @@ impl<T: CpuIo, B: HardwareIsolatedBacking> hv1_hypercall::ModifySparseGpaPageHos
             return Err((HvError::AccessDenied, 0));
         }
 
-        tracing::error!(
+        tracing::trace!(
             ?visibility,
             pages = ?gpa_pages,
             "modify_gpa_visibility"
@@ -791,10 +791,22 @@ impl<T: CpuIo, B: HardwareIsolatedBacking> hv1_hypercall::ModifySparseGpaPageHos
             _ => return Err((HvError::InvalidParameter, 0)),
         };
 
-        self.vp
+        let result = self
+            .vp
             .cvm_partition()
             .isolated_memory_protector
-            .change_host_visibility(shared, gpa_pages, &mut self.vp.tlb_flush_lock_access())
+            .change_host_visibility(shared, gpa_pages, &mut self.vp.tlb_flush_lock_access());
+
+        if result.is_err() {
+            tracing::error!(
+                ?result,
+                ?visibility,
+                pages = ?gpa_pages,
+                "modify_gpa_visibility"
+            );
+        }
+
+        result
     }
 }
 
