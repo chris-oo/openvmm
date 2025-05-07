@@ -550,7 +550,11 @@ impl ProtectIsolatedMemory for HardwareIsolatedMemoryProtector {
                     err
                 );
             }
-            todo!("roll back bitmap changes and report partial success");
+
+            // HACK just return error back
+            tracing::error!(?err, shared, ?gpns, "modify_gpa_vis failed!");
+            return Err((err, 0));
+            // todo!("roll back bitmap changes and report partial success");
         }
 
         if !shared {
