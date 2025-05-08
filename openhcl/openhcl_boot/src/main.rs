@@ -950,6 +950,7 @@ mod test {
                 mmio: ArrayVec::new(),
                 connection_id: 0,
             },
+            vtl2_usermode_mmio: None,
             com3_serial_available: false,
             gic: None,
             memory_allocation_mode: host_fdt_parser::MemoryAllocationMode::Host,

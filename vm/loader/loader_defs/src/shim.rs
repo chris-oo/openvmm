@@ -101,6 +101,9 @@ open_enum! {
         /// This memory is part of VTL2's address space, not VTL0's. It is
         /// marked as reserved to the kernel.
         VTL2_GPA_POOL = 8,
+        /// This range is mmio for VTL2 usermode. It is not reported to the
+        /// kernel as useable.
+        VTL2_MMIO_USERMODE = 9,
     }
 }
 

@@ -49,8 +49,10 @@ pub struct Memory {
 pub enum Vtl {
     /// VTL0.
     Vtl0,
-    /// VTL2.
-    Vtl2,
+    /// VTL2 kernel mode mmio..
+    Vtl2Kernel,
+    /// VTL2 usermode mmio.
+    Vtl2Usermode,
 }
 
 /// Information about guest mmio.
@@ -87,7 +89,8 @@ impl AddressRange {
             AddressRange::Memory(memory) => memory.vtl_usage,
             AddressRange::Mmio(Mmio { vtl, .. }) => match vtl {
                 Vtl::Vtl0 => MemoryVtlType::VTL0_MMIO,
-                Vtl::Vtl2 => MemoryVtlType::VTL2_MMIO,
+                Vtl::Vtl2Kernel => MemoryVtlType::VTL2_MMIO,
+                Vtl::Vtl2Usermode => MemoryVtlType::VTL2_MMIO_USERMODE,
             },
         }
     }
@@ -255,7 +258,8 @@ fn parse_memory_openhcl(node: &Node<'_>) -> anyhow::Result<AddressRange> {
 
         let vtl = match vtl_usage {
             MemoryVtlType::VTL0_MMIO => Vtl::Vtl0,
-            MemoryVtlType::VTL2_MMIO => Vtl::Vtl2,
+            MemoryVtlType::VTL2_MMIO => Vtl::Vtl2Kernel,
+            MemoryVtlType::VTL2_MMIO_USERMODE => Vtl::Vtl2Usermode,
             _ => bail!(
                 "invalid vtl_usage {vtl_usage:?} type for mmio node {}",
                 node.name
@@ -401,7 +405,7 @@ fn parse_openhcl(node: &Node<'_>) -> anyhow::Result<OpenhclInfo> {
             AddressRange::Memory(_) => None,
             AddressRange::Mmio(mmio) => match mmio.vtl {
                 Vtl::Vtl0 => Some(mmio.range),
-                Vtl::Vtl2 => None,
+                Vtl::Vtl2Kernel | Vtl::Vtl2Usermode => None,
             },
         })
         .collect();
@@ -915,7 +919,7 @@ mod tests {
                 }),
                 AddressRange::Mmio(Mmio {
                     range: MemoryRange::new(0x3000000..0x4000000),
-                    vtl: Vtl::Vtl2,
+                    vtl: Vtl::Vtl2Kernel,
                 }),
             ],
             vtl0_mmio: vec![

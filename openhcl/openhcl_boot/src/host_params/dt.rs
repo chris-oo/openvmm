@@ -431,6 +431,23 @@ impl PartitionInfo {
             storage.vmbus_vtl0.mmio = vtl0_mmio;
         }
 
+        // Determine if a section of VTL2's mmio should be reserved for
+        // usermode.
+        let reserve_usermode_mmio = true;
+        if reserve_usermode_mmio {
+            // Split the VTL2 mmio range, with the lower part reserved for
+            // usermode.
+            const MMIO_USERMODE_SIZE: u64 = 64 * 1024 * 1024;
+            let (usermode_mmio, vtl2_remaining) = storage
+                .vmbus_vtl2
+                .mmio
+                .pop()
+                .unwrap()
+                .split_at_offset(MMIO_USERMODE_SIZE);
+            storage.vtl2_usermode_mmio = Some(usermode_mmio);
+            storage.vmbus_vtl2.mmio.push(vtl2_remaining);
+        }
+
         // The host provided device tree is marked as normal ram, as the
         // bootshim is responsible for constructing anything usermode needs from
         // it, and passing it via the device tree provided to the kernel.
@@ -521,6 +538,7 @@ impl PartitionInfo {
             cpus,
             vmbus_vtl0: _,
             vmbus_vtl2: _,
+            vtl2_usermode_mmio: _,
             cmdline: _,
             com3_serial_available: com3_serial,
             gic,

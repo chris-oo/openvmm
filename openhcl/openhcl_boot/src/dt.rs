@@ -594,6 +594,17 @@ pub fn write_dt(
             .end_node()?;
     }
 
+    // Add usermode mmio range, if any.
+    if let Some(usermode_mmio) = &partition_info.vtl2_usermode_mmio {
+        let name = format_fixed!(64, "memory@{:x}", usermode_mmio.start());
+        openhcl_builder = openhcl_builder
+            .start_node(&name)?
+            .add_str(p_device_type, memory_openhcl_type)?
+            .add_u64_array(p_reg, &[usermode_mmio.start(), usermode_mmio.len()])?
+            .add_u32(p_openhcl_memory, MemoryVtlType::VTL2_MMIO_USERMODE.0)?
+            .end_node()?;
+    }
+
     // Report accepted ranges underhil openhcl node.
     for range in accepted_ranges {
         let name = format_fixed!(64, "accepted-memory@{:x}", range.start());

@@ -80,6 +80,9 @@ pub struct PartitionInfo {
     pub vmbus_vtl2: VmbusInfo,
     /// VMBUS info for VTL0.
     pub vmbus_vtl0: VmbusInfo,
+    /// Usermode mmio for VTL2. This is not reported in either `vmbus_vtl2` or
+    /// `vmbus_vtl0`.
+    pub vtl2_usermode_mmio: Option<MemoryRange>,
     /// Command line to be used for the underhill kernel.
     pub cmdline: ArrayString<COMMAND_LINE_SIZE>,
     /// Com3 serial device is available
@@ -118,6 +121,7 @@ impl PartitionInfo {
                 mmio: ArrayVec::new_const(),
                 connection_id: 0,
             },
+            vtl2_usermode_mmio: None,
             cmdline: ArrayString::new_const(),
             com3_serial_available: false,
             gic: None,
