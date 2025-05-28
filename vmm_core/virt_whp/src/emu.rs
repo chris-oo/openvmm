@@ -12,6 +12,7 @@ use virt::VpIndex;
 use virt::io::CpuIo;
 use virt_support_x86emu::emulate::EmuTranslateError;
 use virt_support_x86emu::emulate::EmuTranslateResult;
+use virt_support_x86emu::emulate::ProbeResult;
 use virt_support_x86emu::emulate::TranslateGvaSupport;
 use virt_support_x86emu::emulate::TranslateMode;
 use virt_support_x86emu::emulate::emulate_translate_gva;
@@ -195,6 +196,10 @@ impl<T: CpuIo> virt_support_x86emu::emulate::EmulatorSupport for WhpEmulationSta
             WhpVpRefEmulation::MemoryAccessContext(access) => Some(access.Gpa),
             WhpVpRefEmulation::IoPortAccessContext(_) => None,
         }
+    }
+
+    fn probe_gpa(&self, _gpa: u64, _gm: &guestmem::GuestMemory) -> ProbeResult {
+        ProbeResult::Emulate
     }
 
     fn initial_gva_translation(
