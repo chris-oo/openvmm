@@ -1,7 +1,7 @@
 //! TODO
 //!
+//! cargo build --target x86_64-unknown-uefi -p tmk_launch
 //! cargo xtask guest-test uefi --bootx64 target/x86_64-unknown-uefi/debug/tmk_launch.efi
-//!
 //! qemu-img convert -O vhdx target/x86_64-unknown-uefi/debug/tmk_launch.img tmk_launch.vhdx
 
 #![allow(unsafe_code)]
