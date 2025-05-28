@@ -282,6 +282,10 @@ impl EmulatorSupport for MockSupport {
         None
     }
 
+    fn probe_gpa(&self, _gpa: u64, _gm: &GuestMemory) -> ProbeResult {
+        ProbeResult::Emulate
+    }
+
     /// The gva translation included in the intercept message header, if valid.
     fn initial_gva_translation(&mut self) -> Option<InitialTranslation> {
         Some(InitialTranslation {

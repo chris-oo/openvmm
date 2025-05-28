@@ -92,10 +92,7 @@ pub trait EmulatorSupport {
 
     /// Probe the gpa of the physical address that caused the fault. The action
     /// returned is what the emulator should do next.
-    fn probe_gpa(&self, gpa: u64, gm: &GuestMemory) -> ProbeResult {
-        let _ = (gpa, gm);
-        ProbeResult::Emulate
-    }
+    fn probe_gpa(&self, gpa: u64, gm: &GuestMemory) -> ProbeResult;
 
     /// The gva translation included in the intercept message header, if valid.
     fn initial_gva_translation(&mut self) -> Option<InitialTranslation>;

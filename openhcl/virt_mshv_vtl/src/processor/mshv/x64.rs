@@ -1163,6 +1163,14 @@ impl<T: CpuIo> EmulatorSupport for UhEmulationState<'_, '_, T, HypervisorBackedX
         }
     }
 
+    fn probe_gpa(
+        &self,
+        _gpa: u64,
+        _gm: &guestmem::GuestMemory,
+    ) -> virt_support_x86emu::emulate::ProbeResult {
+        virt_support_x86emu::emulate::ProbeResult::Emulate
+    }
+
     fn initial_gva_translation(
         &mut self,
     ) -> Option<virt_support_x86emu::emulate::InitialTranslation> {
