@@ -170,8 +170,13 @@ impl TdxExit<'_> {
     fn gla(&self) -> u64 {
         self.0.rdx
     }
-    fn gpa(&self) -> u64 {
-        self.0.r8
+    fn gpa(&self) -> Option<u64> {
+        // Only valid for EPT exits.
+        if self.code().vmx_exit().basic_reason() == VmxExitBasic::EPT_VIOLATION {
+            Some(self.0.r8)
+        } else {
+            None
+        }
     }
     fn _exit_interruption_info(&self) -> InterruptionInformation {
         (self.0.r9 as u32).into()
@@ -2774,13 +2779,7 @@ impl<T: CpuIo> X86EmulatorSupport for UhEmulationState<'_, '_, T, TdxBacked> {
 
     fn physical_address(&self) -> Option<u64> {
         let exit_info = TdxExit(self.vp.runner.tdx_vp_enter_exit_info());
-
-        // The gpa field on exit_info is only valid for EPT violations.
-        if exit_info.code().vmx_exit().basic_reason() == VmxExitBasic::EPT_VIOLATION {
-            Some(exit_info.gpa())
-        } else {
-            None
-        }
+        exit_info.gpa()
     }
 
     fn probe_gpa(&self, gpa: u64, gm: &guestmem::GuestMemory) -> ProbeResult {
@@ -2874,7 +2873,7 @@ impl<T: CpuIo> X86EmulatorSupport for UhEmulationState<'_, '_, T, TdxBacked> {
         {
             Some(virt_support_x86emu::emulate::InitialTranslation {
                 gva: exit_info.gla(),
-                gpa: exit_info.gpa(),
+                gpa: exit_info.gpa().expect("already checked is EPT exit above"),
                 translate_mode: match ept_info.access_mask() {
                     0x1 => TranslateMode::Read,
                     // As defined in "Table 28-7. Exit Qualification for EPT
