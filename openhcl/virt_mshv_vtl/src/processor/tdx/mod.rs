@@ -167,8 +167,13 @@ impl TdxExit<'_> {
     fn qualification(&self) -> u64 {
         self.0.rcx
     }
-    fn gla(&self) -> u64 {
-        self.0.rdx
+    fn gla(&self) -> Option<u64> {
+        // Only valid for EPT exits.
+        if self.code().vmx_exit().basic_reason() == VmxExitBasic::EPT_VIOLATION {
+            Some(self.0.rdx)
+        } else {
+            None
+        }
     }
     fn gpa(&self) -> Option<u64> {
         // Only valid for EPT exits.
@@ -2872,7 +2877,7 @@ impl<T: CpuIo> X86EmulatorSupport for UhEmulationState<'_, '_, T, TdxBacked> {
             && ept_info.gva_valid()
         {
             Some(virt_support_x86emu::emulate::InitialTranslation {
-                gva: exit_info.gla(),
+                gva: exit_info.gla().expect("already checked is EPT exit above"),
                 gpa: exit_info.gpa().expect("already checked is EPT exit above"),
                 translate_mode: match ept_info.access_mask() {
                     0x1 => TranslateMode::Read,
