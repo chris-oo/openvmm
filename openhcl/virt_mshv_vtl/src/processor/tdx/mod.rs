@@ -69,6 +69,7 @@ use virt_support_apic::ApicClient;
 use virt_support_apic::OffloadNotSupported;
 use virt_support_x86emu::emulate::EmulatedMemoryOperation;
 use virt_support_x86emu::emulate::EmulatorSupport as X86EmulatorSupport;
+use virt_support_x86emu::emulate::ProbeResult;
 use virt_support_x86emu::emulate::TranslateMode;
 use virt_support_x86emu::emulate::emulate_insn_memory_op;
 use virt_support_x86emu::emulate::emulate_io;
@@ -1998,7 +1999,6 @@ impl UhProcessor<'_, TdxBacked> {
                 &mut self.backing.vtls[intercepted_vtl].exit_stats.wbinvd
             }
             VmxExitBasic::EPT_VIOLATION => {
-                let gpa = exit_info.gpa();
                 let ept_info = VmxEptExitQualification::from(exit_info.qualification());
                 // If this was an EPT violation while handling an iret, and
                 // that iret cleared the NMI blocking state, restore it.
@@ -2016,7 +2016,16 @@ impl UhProcessor<'_, TdxBacked> {
                         .into();
                     assert!(!old_interruptibility.blocked_by_nmi());
                 } else {
-                    self.handle_ept(intercepted_vtl, dev, gpa, ept_info).await?;
+                    // Emulate the access.
+                    self.emulate(
+                        dev,
+                        self.backing.vtls[intercepted_vtl]
+                            .interruption_information
+                            .valid(),
+                        intercepted_vtl,
+                        TdxEmulationCache::default(),
+                    )
+                    .await?;
                 }
 
                 &mut self.backing.vtls[intercepted_vtl].exit_stats.ept_violation
@@ -2359,94 +2368,6 @@ impl UhProcessor<'_, TdxBacked> {
             .with_interruption_type(INTERRUPT_TYPE_HARDWARE_EXCEPTION)
             .with_deliver_error_code(true);
         self.backing.vtls[vtl].exception_error_code = 0;
-    }
-
-    fn inject_mc(&mut self, vtl: GuestVtl) {
-        self.backing.vtls[vtl].interruption_information = InterruptionInformation::new()
-            .with_valid(true)
-            .with_vector(x86defs::Exception::MACHINE_CHECK.0)
-            .with_interruption_type(INTERRUPT_TYPE_HARDWARE_EXCEPTION);
-    }
-
-    async fn handle_ept(
-        &mut self,
-        intercepted_vtl: GuestVtl,
-        dev: &impl CpuIo,
-        gpa: u64,
-        ept_info: VmxEptExitQualification,
-    ) -> Result<(), VpHaltReason<UhRunVpError>> {
-        // vtom may be 0 if we are hiding isolation
-        let vtom = self.partition.caps.vtom.unwrap_or(0);
-        let is_shared = (gpa & vtom) == vtom && vtom != 0;
-        let canonical_gpa = gpa & !vtom;
-
-        // Only emulate the access if the gpa is expected to be accessible. This
-        // means, the gpa was described to VTL0 in some form as memory or mmio,
-        // and the hardware did not generate an exit for a private/shared
-        // violation.
-        let address_type = self
-            .partition
-            .lower_vtl_memory_layout
-            .probe_address(canonical_gpa);
-
-        match address_type {
-            Some(AddressType::Mmio) => {
-                // Emulate the access.
-                self.emulate(
-                    dev,
-                    self.backing.vtls[intercepted_vtl]
-                        .interruption_information
-                        .valid(),
-                    intercepted_vtl,
-                    TdxEmulationCache::default(),
-                )
-                .await?;
-            }
-            Some(AddressType::Ram) => {
-                // TODO TDX: This path changes when we support VTL page
-                // protections and MNF. That will require injecting events to
-                // VTL1 or other handling.
-                //
-                // For now, we just check if the exit was suprious or if we
-                // should inject a machine check. An exit is considered spurious
-                // if the gpa is accessible.
-                if self.partition.gm[intercepted_vtl].check_gpa_readable(gpa) {
-                    tracelimit::warn_ratelimited!(gpa, "possible spurious EPT violation, ignoring");
-                } else {
-                    // TODO: It would be better to show what exact bitmap check
-                    // failed, but that requires some refactoring of how the
-                    // different bitmaps are stored. Do this when we support VTL
-                    // protections or MNF.
-                    //
-                    // If we entered this path, it means the bitmap check on
-                    // `check_gpa_readable` failed so we can assume that if the
-                    // address is shared, the actual state of the page is
-                    // private, and vice versa. This is because the address
-                    // should have already been checked to be valid memory
-                    // described to the guest or not.
-                    tracelimit::warn_ratelimited!(
-                        gpa,
-                        is_shared,
-                        ?ept_info,
-                        "guest accessed inaccessible gpa, injecting MC"
-                    );
-                    self.inject_mc(intercepted_vtl);
-                }
-            }
-            None => {
-                // The guest should never attempt to access address that are not
-                // described in mmio or ram. Inject a machine check.
-                tracelimit::warn_ratelimited!(
-                    gpa,
-                    is_shared,
-                    ?ept_info,
-                    "guest accessed gpa not described in memory layout, injecting MC"
-                );
-                self.inject_mc(intercepted_vtl);
-            }
-        }
-
-        Ok(())
     }
 
     fn handle_tdvmcall(&mut self, dev: &impl CpuIo, intercepted_vtl: GuestVtl) {
@@ -2852,7 +2773,94 @@ impl<T: CpuIo> X86EmulatorSupport for UhEmulationState<'_, '_, T, TdxBacked> {
     }
 
     fn physical_address(&self) -> Option<u64> {
-        Some(TdxExit(self.vp.runner.tdx_vp_enter_exit_info()).gpa())
+        let exit_info = TdxExit(self.vp.runner.tdx_vp_enter_exit_info());
+
+        // The gpa field on exit_info is only valid for EPT violations.
+        if exit_info.code().vmx_exit().basic_reason() == VmxExitBasic::EPT_VIOLATION {
+            Some(exit_info.gpa())
+        } else {
+            None
+        }
+    }
+
+    fn probe_gpa(&self, gpa: u64, gm: &guestmem::GuestMemory) -> ProbeResult {
+        let vtom = self.vp.partition.caps.vtom.unwrap_or(0);
+        let hide_isolation = self.vp.cvm_partition().hide_isolation;
+        let is_shared = (gpa & vtom) == vtom && vtom != 0;
+        let canonical_gpa = gpa & !vtom;
+
+        // Only emulate the access if the gpa is expected to be accessible. This
+        // means, the gpa was described to VTL0 in some form as memory or mmio,
+        // and the hardware did not generate an exit for a private/shared
+        // violation.
+        let address_type = self
+            .vp
+            .partition
+            .lower_vtl_memory_layout
+            .probe_address(canonical_gpa);
+
+        match address_type {
+            Some(AddressType::Mmio) => {
+                // Emulate the access.
+                ProbeResult::Emulate
+            }
+            Some(AddressType::Ram) => {
+                // TODO TDX: This path changes when we support VTL page
+                // protections and MNF. That will require injecting events to
+                // VTL1 or other handling.
+                //
+                // For now, we just check if the exit was suprious or if we
+                // should inject a machine check. An exit is considered spurious
+                // if the gpa is accessible.
+                if gm.check_gpa_readable(gpa) {
+                    tracelimit::warn_ratelimited!(gpa, "possible spurious EPT violation, ignoring");
+                    ProbeResult::EarlyReturn
+                } else {
+                    // TODO: It would be better to show what exact bitmap check
+                    // failed, but that requires some refactoring of how the
+                    // different bitmaps are stored. Do this when we support VTL
+                    // protections or MNF.
+                    //
+                    // If we entered this path, it means the bitmap check on
+                    // `check_gpa_readable` failed so we can assume that if the
+                    // address is shared, the actual state of the page is
+                    // private, and vice versa. This is because the address
+                    // should have already been checked to be valid memory
+                    // described to the guest or not.
+                    tracelimit::warn_ratelimited!(
+                        gpa,
+                        is_shared,
+                        "guest accessed inaccessible gpa, injecting MC"
+                    );
+                    ProbeResult::InjectMachineCheck
+                }
+            }
+            None => {
+                if hide_isolation {
+                    // If isolation is being hidden, the guest is not modifying
+                    // visibility that would result in the need to inject
+                    // machine checks and instead all RAM should be accessible.
+                    // There may be other devices that are being emulated by the
+                    // paravisor (such as xapic) that do not exist in memory
+                    // layout, so allow all emulation.
+                    //
+                    // TODO: If we update the memory layout to be more precise
+                    // and include all devices, then we could revisit this
+                    // check.
+                    ProbeResult::Emulate
+                } else {
+                    // A guest which is told about isolation should never
+                    // attempt to access address that are not described in mmio
+                    // or ram. Inject a machine check.
+                    tracelimit::warn_ratelimited!(
+                        gpa,
+                        is_shared,
+                        "guest accessed gpa not described in memory layout, injecting MC"
+                    );
+                    ProbeResult::InjectMachineCheck
+                }
+            }
+        }
     }
 
     fn initial_gva_translation(

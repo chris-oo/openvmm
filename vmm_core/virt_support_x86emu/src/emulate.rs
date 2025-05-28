@@ -25,6 +25,17 @@ use x86emu::Segment;
 use zerocopy::FromBytes;
 use zerocopy::IntoBytes;
 
+/// What the emulator should do after probing a gpa. See
+/// [`EmulatorSupport::probe_gpa`].
+pub enum ProbeResult {
+    /// The emulator should continue attempting to emulate the instruction.
+    Emulate,
+    /// The emulator should return early, without doing anything else.
+    EarlyReturn,
+    /// The emulator should inject a machine check.
+    InjectMachineCheck,
+}
+
 /// Support routines for the emulator.
 pub trait EmulatorSupport {
     /// The hypervisor error type.
@@ -77,6 +88,13 @@ pub trait EmulatorSupport {
 
     /// The physical address that caused the fault.
     fn physical_address(&self) -> Option<u64>;
+
+    /// Probe the gpa of the physical address that caused the fault. The action
+    /// returned is what the emulator should do next.
+    fn probe_gpa(&self, gpa: u64, gm: &GuestMemory) -> ProbeResult {
+        let _ = (gpa, gm);
+        ProbeResult::Emulate
+    }
 
     /// The gva translation included in the intercept message header, if valid.
     fn initial_gva_translation(&mut self) -> Option<InitialTranslation>;
@@ -278,6 +296,17 @@ pub async fn emulate<T: EmulatorSupport>(
     gm: &GuestMemory,
     dev: &impl CpuIo,
 ) -> Result<(), VpHaltReason<T::Error>> {
+    if let Some(gpa) = support.physical_address() {
+        match support.probe_gpa(gpa, gm) {
+            ProbeResult::Emulate => {}
+            ProbeResult::EarlyReturn => return Ok(()),
+            ProbeResult::InjectMachineCheck => {
+                support.inject_pending_event(mc_event());
+                return Ok(());
+            }
+        }
+    }
+
     let vendor = support.vendor();
 
     let mut bytes = [0; 16];
@@ -1012,6 +1041,11 @@ fn make_exception_event(
 /// Generates a general protection fault pending event
 fn gpf_event() -> hvdef::HvX64PendingEvent {
     make_exception_event(Exception::GENERAL_PROTECTION_FAULT, Some(0), None)
+}
+
+/// Generates a machine check pending event
+fn mc_event() -> hvdef::HvX64PendingEvent {
+    make_exception_event(Exception::MACHINE_CHECK, None, None)
 }
 
 /// Generates the appropriate event for a VTL access error based

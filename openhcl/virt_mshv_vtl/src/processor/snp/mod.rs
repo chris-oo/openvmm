@@ -61,6 +61,7 @@ use virt::x86::SegmentRegister;
 use virt::x86::TableRegister;
 use virt_support_apic::ApicClient;
 use virt_support_x86emu::emulate::EmulatorSupport as X86EmulatorSupport;
+use virt_support_x86emu::emulate::ProbeResult;
 use virt_support_x86emu::emulate::emulate_io;
 use virt_support_x86emu::emulate::emulate_translate_gva;
 use virt_support_x86emu::translate::TranslationRegisters;
@@ -1737,12 +1738,18 @@ impl<T: CpuIo> X86EmulatorSupport for UhEmulationState<'_, '_, T, SnpBacked> {
     }
 
     fn physical_address(&self) -> Option<u64> {
+        // TODO SNP: Is this correct? Should this only be valid on NPFs?
         Some(self.vp.runner.vmsa(self.vtl).exit_info2())
     }
 
-    fn initial_gva_translation(
-        &mut self,
-    ) -> Option<virt_support_x86emu::emulate::InitialTranslation> {
+    fn probe_gpa(&self, gpa: u64, gm: &guestmem::GuestMemory) -> ProbeResult {
+        // TODO SNP: Implement this correctly. See TDX's implementation for an
+        // example.
+        let _ = (gpa, gm);
+        ProbeResult::Emulate
+    }
+
+    fn initial_gva_translation(&self) -> Option<virt_support_x86emu::emulate::InitialTranslation> {
         None
     }
 
