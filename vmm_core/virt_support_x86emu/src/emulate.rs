@@ -27,6 +27,7 @@ use zerocopy::IntoBytes;
 
 /// What the emulator should do after probing a gpa. See
 /// [`EmulatorSupport::probe_gpa`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeResult {
     /// The emulator should continue attempting to emulate the instruction.
     Emulate,

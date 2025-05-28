@@ -9,6 +9,7 @@ use virt::VpIndex;
 use virt_support_x86emu::emulate::EmuTranslateError;
 use virt_support_x86emu::emulate::EmuTranslateResult;
 use virt_support_x86emu::emulate::EmulatorSupport;
+use virt_support_x86emu::emulate::ProbeResult;
 use virt_support_x86emu::emulate::emulate;
 use x86defs::RFlags;
 use x86defs::cpuid::Vendor;
@@ -19,6 +20,9 @@ struct MockSupport {
     state: CpuState,
     instruction_bytes: Vec<u8>,
     interruption_pending: bool,
+    physical_address: Option<u64>,
+    probe_result: Option<(u64, ProbeResult)>,
+    pending_event: Option<hvdef::HvX64PendingEvent>,
 }
 
 impl EmulatorSupport for MockSupport {
@@ -95,7 +99,19 @@ impl EmulatorSupport for MockSupport {
     }
 
     fn physical_address(&self) -> Option<u64> {
-        todo!()
+        self.physical_address
+    }
+
+    fn probe_gpa(&self, gpa: u64, _gm: &GuestMemory) -> ProbeResult {
+        if let Some((probe_gpa, probe_result)) = self.probe_result {
+            if probe_gpa == gpa {
+                probe_result
+            } else {
+                panic!("unexpected probe gpa {:#x}", gpa);
+            }
+        } else {
+            ProbeResult::Emulate
+        }
     }
 
     /// The gva translation included in the intercept message header, if valid.
@@ -110,8 +126,11 @@ impl EmulatorSupport for MockSupport {
     }
 
     /// Generates an event (exception, guest nested page fault, etc.) in the guest.
-    fn inject_pending_event(&mut self, _event_info: hvdef::HvX64PendingEvent) {
-        todo!()
+    fn inject_pending_event(&mut self, event_info: hvdef::HvX64PendingEvent) {
+        if self.pending_event.is_some() {
+            panic!("pending event already set: {:?}", self.pending_event);
+        }
+        self.pending_event = Some(event_info);
     }
 
     fn is_gpa_mapped(&self, _gpa: u64, _write: bool) -> bool {
@@ -153,11 +172,73 @@ async fn basic_mov() {
         state: long_protected_mode(false),
         instruction_bytes,
         interruption_pending: false,
+        physical_address: None,
+        probe_result: None,
+        pending_event: None,
     };
 
     emulate(&mut support, &gm, &MockCpu).await.unwrap();
 
     assert_eq!(support.gp(Gp::RAX), TEST_VALUE);
+}
+
+#[async_test]
+async fn probe_return() {
+    const TEST_ADDRESS: u64 = 0x100;
+
+    let gm = GuestMemory::allocate(4096);
+
+    let mut asm = CodeAssembler::new(64).unwrap();
+    asm.mov(
+        iced_x86::code_asm::rax,
+        iced_x86::code_asm::ptr(TEST_ADDRESS),
+    )
+    .unwrap();
+
+    let instruction_bytes = asm.assemble(0).unwrap();
+
+    let mut support = MockSupport {
+        state: long_protected_mode(false),
+        instruction_bytes,
+        interruption_pending: false,
+        physical_address: Some(TEST_ADDRESS),
+        probe_result: Some((TEST_ADDRESS, ProbeResult::EarlyReturn)),
+        pending_event: None,
+    };
+
+    emulate(&mut support, &gm, &MockCpu).await.unwrap();
+
+    assert_eq!(support.gp(Gp::RAX), 0xbadc0ffee0ddf00d);
+}
+
+#[async_test]
+async fn probe_mc() {
+    const TEST_ADDRESS: u64 = 0x100;
+
+    let gm = GuestMemory::allocate(4096);
+
+    let mut asm = CodeAssembler::new(64).unwrap();
+    asm.mov(
+        iced_x86::code_asm::rax,
+        iced_x86::code_asm::ptr(TEST_ADDRESS),
+    )
+    .unwrap();
+
+    let instruction_bytes = asm.assemble(0).unwrap();
+
+    let mut support = MockSupport {
+        state: long_protected_mode(false),
+        instruction_bytes,
+        interruption_pending: false,
+        physical_address: Some(TEST_ADDRESS),
+        probe_result: Some((TEST_ADDRESS, ProbeResult::InjectMachineCheck)),
+        pending_event: None,
+    };
+
+    emulate(&mut support, &gm, &MockCpu).await.unwrap();
+
+    assert_eq!(support.gp(Gp::RAX), 0xbadc0ffee0ddf00d);
+    validate_machine_check_event(support.pending_event.unwrap());
 }
 
 #[async_test]
@@ -183,6 +264,9 @@ async fn not_enough_bytes() {
         state: long_protected_mode(false),
         instruction_bytes: instruction_bytes[..2].into(),
         interruption_pending: false,
+        physical_address: None,
+        probe_result: None,
+        pending_event: None,
     };
 
     gm.write_at(support.state.rip, &instruction_bytes).unwrap();
@@ -215,13 +299,15 @@ async fn trap_from_interrupt() {
         state: long_protected_mode(false),
         instruction_bytes,
         interruption_pending: true,
+        physical_address: None,
+        probe_result: None,
+        pending_event: None,
     };
 
     emulate(&mut support, &gm, &MockCpu).await.unwrap();
 }
 
 #[async_test]
-#[should_panic]
 async fn trap_from_debug() {
     const TEST_ADDRESS: u64 = 0x100;
     const TEST_VALUE: u64 = 0x123456789abcdef0;
@@ -246,7 +332,12 @@ async fn trap_from_debug() {
         state,
         instruction_bytes,
         interruption_pending: false,
+        physical_address: None,
+        probe_result: None,
+        pending_event: None,
     };
 
     emulate(&mut support, &gm, &MockCpu).await.unwrap();
+    let event = support.pending_event.unwrap();
+    validate_debug_trap_event(event);
 }

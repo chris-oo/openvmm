@@ -114,7 +114,7 @@ impl EmulatorSupport for MockSupport {
     }
 
     fn physical_address(&self) -> Option<u64> {
-        todo!()
+        None
     }
 
     /// The gva translation included in the intercept message header, if valid.

@@ -121,3 +121,27 @@ pub fn validate_gpf_event(pending_event: hvdef::HvX64PendingEvent) {
 
     assert_eq!(event.exception_parameter(), 0);
 }
+
+/// Validates the given event is a machine check
+pub fn validate_machine_check_event(pending_event: hvdef::HvX64PendingEvent) {
+    let event = hvdef::HvX64PendingExceptionEvent::from(u128::from(pending_event.reg_0));
+    assert!(event.event_pending());
+
+    assert_eq!(event.event_type(), hvdef::HV_X64_PENDING_EVENT_EXCEPTION);
+
+    assert_eq!(event.vector(), x86defs::Exception::MACHINE_CHECK.0.into());
+
+    assert!(!event.deliver_error_code());
+}
+
+/// Validates that the given event is a debug trap
+pub fn validate_debug_trap_event(pending_event: hvdef::HvX64PendingEvent) {
+    let event = hvdef::HvX64PendingExceptionEvent::from(u128::from(pending_event.reg_0));
+    assert!(event.event_pending());
+
+    assert_eq!(event.event_type(), hvdef::HV_X64_PENDING_EVENT_EXCEPTION);
+
+    assert_eq!(event.vector(), x86defs::Exception::DEBUG.0.into());
+
+    assert!(!event.deliver_error_code());
+}
