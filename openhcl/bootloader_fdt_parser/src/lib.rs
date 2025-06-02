@@ -171,6 +171,10 @@ pub struct ParsedBootDtInfo {
     pub private_pool_ranges: Vec<MemoryRangeWithNode>,
     /// The host provided portion of the command line.
     pub host_provided_cmdline: String,
+    /// The physical address of the boot log buffer, if one is configured.
+    pub boot_log_address: Option<u64>,
+    /// The size of the boot log buffer, if one is configured.
+    pub boot_log_size: Option<u64>,
 }
 
 fn err_to_owned(e: fdt::parser::Error<'_>) -> anyhow::Error {
@@ -210,6 +214,8 @@ struct OpenhclInfo {
     isolation: IsolationType,
     private_pool_ranges: Vec<MemoryRangeWithNode>,
     host_provided_cmdline: String,
+    boot_log_address: Option<u64>,
+    boot_log_size: Option<u64>,
 }
 
 fn parse_memory_openhcl(node: &Node<'_>) -> anyhow::Result<AddressRange> {
@@ -284,6 +290,8 @@ fn parse_accepted_memory(node: &Node<'_>) -> anyhow::Result<MemoryRange> {
 fn parse_openhcl(node: &Node<'_>) -> anyhow::Result<OpenhclInfo> {
     let mut memory = Vec::new();
     let mut accepted_memory = Vec::new();
+    let mut boot_log_address = None;
+    let mut boot_log_size = None;
 
     for child in node.children() {
         let child = child.map_err(err_to_owned).context("child invalid")?;
@@ -298,6 +306,16 @@ fn parse_openhcl(node: &Node<'_>) -> anyhow::Result<OpenhclInfo> {
             }
 
             name if name.starts_with("memory-allocation-mode") => {}
+
+            "boot-log" => {
+                // Parse the boot log buffer address and size
+                if let Some(reg_property) = try_find_property(&child, "reg") {
+                    if reg_property.len() >= 16 { // At least 2 u64 values (address and size)
+                        boot_log_address = Some(reg_property.read_u64(0).map_err(err_to_owned)?);
+                        boot_log_size = Some(reg_property.read_u64(8).map_err(err_to_owned)?);
+                    }
+                }
+            }
 
             _ => {
                 // Ignore other nodes.
@@ -427,6 +445,8 @@ fn parse_openhcl(node: &Node<'_>) -> anyhow::Result<OpenhclInfo> {
         isolation,
         private_pool_ranges,
         host_provided_cmdline,
+        boot_log_address,
+        boot_log_size,
     })
 }
 
@@ -551,6 +571,8 @@ impl ParsedBootDtInfo {
                         isolation: n_isolation,
                         private_pool_ranges: n_private_pool_ranges,
                         host_provided_cmdline: n_host_provided_cmdline,
+                        boot_log_address: n_boot_log_address,
+                        boot_log_size: n_boot_log_size,
                     } = parse_openhcl(&child)?;
                     vtl0_mmio = n_vtl0_mmio;
                     config_ranges = n_config_ranges;
@@ -562,6 +584,12 @@ impl ParsedBootDtInfo {
                     vtl2_reserved_range = n_vtl2_reserved_range;
                     private_pool_ranges = n_private_pool_ranges;
                     host_provided_cmdline = n_host_provided_cmdline;
+                    
+                    // Add boot log buffer information to the ParsedBootDtInfo struct
+                    if let (Some(address), Some(size)) = (n_boot_log_address, n_boot_log_size) {
+                        boot_log_address = Some(address);
+                        boot_log_size = Some(size);
+                    }
                 }
 
                 _ if child.name.starts_with("memory@") => {
@@ -595,7 +623,20 @@ impl ParsedBootDtInfo {
             vtl2_reserved_range,
             private_pool_ranges,
             host_provided_cmdline,
+            boot_log_address: None,
+            boot_log_size: None,
         })
+    }
+
+    /// Get the boot log buffer information
+    /// 
+    /// Returns the address and size of the boot log buffer if it exists
+    pub fn get_boot_log_info(&self) -> Option<(u64, u64)> {
+        if let (Some(address), Some(size)) = (self.boot_log_address, self.boot_log_size) {
+            Some((address, size))
+        } else {
+            None
+        }
     }
 }
 
@@ -660,6 +701,25 @@ impl BootTimes {
             sidecar_end,
         })
     }
+}
+
+/// Find a node by name in a given parent node.
+fn find_node<'a>(parent: &Node<'a>, name: &str) -> anyhow::Result<Node<'a>> {
+    for child in parent
+        .children()
+        .map_err(err_to_owned)
+        .context("error iterating children")?
+    {
+        let child = child
+            .map_err(err_to_owned)
+            .context("child node invalid")?;
+        
+        if child.name == name {
+            return Ok(child);
+        }
+    }
+    
+    bail!("node '{}' not found", name)
 }
 
 mod inspect_helpers {
@@ -965,6 +1025,8 @@ mod tests {
                 vnode: 0,
             }],
             host_provided_cmdline: "TEST_HOST=1".to_string(),
+            boot_log_address: None,
+            boot_log_size: None,
         };
 
         let dt = build_dt(&orig_info).unwrap();
@@ -1040,5 +1102,57 @@ mod tests {
         let parsed = BootTimes::new_from_raw(&dt).unwrap();
 
         assert_eq!(orig_info, parsed);
+    }
+
+    #[test]
+    fn test_boot_log_in_parsed_dt() {
+        // Create test address and size values
+        let test_address: u64 = 0x12345678;
+        let test_size: u64 = 4096;
+        let test_position: u32 = 42;
+        
+        // Create a buffer for the device tree
+        let mut buf = vec![0; 4096];
+        
+        let mut builder = Builder::new(fdt::builder::BuilderConfig {
+            blob_buffer: &mut buf,
+            string_table_cap: 1024,
+            memory_reservations: &[],
+        }).unwrap();
+        
+        let p_address_cells = builder.add_string("#address-cells").unwrap();
+        let p_size_cells = builder.add_string("#size-cells").unwrap();
+        let p_reg = builder.add_string("reg").unwrap();
+        let p_position = builder.add_string("position").unwrap();
+        let p_isolation_type = builder.add_string("isolation-type").unwrap();
+        let p_memory_allocation_mode = builder.add_string("memory-allocation-mode").unwrap();
+        
+        let root_builder = builder
+            .start_node("").unwrap()
+            .add_u32(p_address_cells, 2).unwrap()
+            .add_u32(p_size_cells, 2).unwrap();
+            
+        let openhcl = root_builder
+            .start_node("openhcl").unwrap()
+            .add_str(p_isolation_type, "none").unwrap()
+            .add_str(p_memory_allocation_mode, "host").unwrap();
+            
+        // Add boot-log node with address, size, and position
+        let boot_log = openhcl
+            .start_node("boot-log").unwrap()
+            .add_u64_array(p_reg, &[test_address, test_size]).unwrap()
+            .add_u32(p_position, test_position).unwrap()
+            .end_node().unwrap();
+            
+        let openhcl = boot_log.end_node().unwrap();
+        let root = openhcl.end_node().unwrap();
+        
+        root.build(0).unwrap();
+        
+        let parsed = ParsedBootDtInfo::new_from_raw(&buf).unwrap();
+        
+        // Verify that the parsed values match what we put in
+        assert_eq!(parsed.boot_log_address, Some(test_address));
+        assert_eq!(parsed.boot_log_size, Some(test_size));
     }
 }

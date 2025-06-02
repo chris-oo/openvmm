@@ -15,6 +15,7 @@ mod cmdline;
 mod dt;
 mod host_params;
 mod hypercall;
+mod log_buffer;
 mod rt;
 mod sidecar;
 mod single_threaded;
@@ -24,9 +25,11 @@ use crate::arch::setup_vtl2_vp;
 #[cfg(target_arch = "x86_64")]
 use crate::arch::tdx::get_tdx_tsc_reftime;
 use crate::arch::verify_imported_regions_hash;
+use crate::boot_logger::BOOT_LOGGER;
 use crate::boot_logger::boot_logger_init;
 use crate::boot_logger::log;
 use crate::hypercall::hvcall;
+use crate::log_buffer::{LOG_BUFFER_SIZE, LogBuffer};
 use crate::single_threaded::off_stack;
 use arrayvec::ArrayString;
 use arrayvec::ArrayVec;
@@ -352,6 +355,8 @@ enum ReservedMemoryType {
     /// memory is persisted, both location and contents, across servicing.
     /// Today, we only support a single range.
     Vtl2GpaPool,
+    /// Boot log buffer memory region
+    BootLogBuffer,
 }
 
 /// Construct a slice representing the reserved memory ranges to be reported to
@@ -392,6 +397,13 @@ fn reserved_memory_regions(
             ReservedMemoryType::Vtl2GpaPool,
         ));
     }
+
+    // Add boot log buffer
+    let log_buffer_ptr = &BOOT_LOGGER.log_buffer as *const LogBuffer as u64;
+    reserved.push((
+        MemoryRange::new(log_buffer_ptr..log_buffer_ptr + LOG_BUFFER_SIZE as u64),
+        ReservedMemoryType::BootLogBuffer,
+    ));
 
     reserved
         .as_mut()

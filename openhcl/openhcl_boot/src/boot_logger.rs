@@ -11,6 +11,7 @@
 #[cfg(target_arch = "x86_64")]
 use crate::arch::tdx::TdxIoAccess;
 use crate::host_params::shim_params::IsolationType;
+use crate::log_buffer::LogBuffer;
 use crate::single_threaded::SingleThreaded;
 use core::cell::RefCell;
 use core::fmt;
@@ -48,10 +49,13 @@ impl Logger {
 
 pub struct BootLogger {
     logger: SingleThreaded<RefCell<Logger>>,
+    /// In-memory log buffer that's always used regardless of other loggers
+    pub log_buffer: LogBuffer,
 }
 
 pub static BOOT_LOGGER: BootLogger = BootLogger {
     logger: SingleThreaded(RefCell::new(Logger::None)),
+    log_buffer: LogBuffer::new(),
 };
 
 /// Initialize the boot logger. This replaces any previous init calls.
@@ -74,6 +78,10 @@ pub fn boot_logger_init(isolation_type: IsolationType, logger_type: LoggerType) 
 
 impl Write for &BootLogger {
     fn write_str(&mut self, s: &str) -> fmt::Result {
+        // Always write to the log buffer regardless of other loggers
+        self.log_buffer.write_str(s)?;
+
+        // Also write to any configured logger
         self.logger.borrow_mut().write_str(s)
     }
 }

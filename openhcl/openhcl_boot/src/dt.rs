@@ -6,9 +6,11 @@
 
 use crate::MAX_RESERVED_MEM_RANGES;
 use crate::ReservedMemoryType;
+use crate::boot_logger::BOOT_LOGGER;
 use crate::host_params::COMMAND_LINE_SIZE;
 use crate::host_params::PartitionInfo;
 use crate::host_params::shim_params::IsolationType;
+use crate::log_buffer::LOG_BUFFER_SIZE;
 use crate::sidecar::SidecarConfig;
 use crate::single_threaded::off_stack;
 use arrayvec::ArrayString;
@@ -511,6 +513,7 @@ pub fn write_dt(
                     ReservedMemoryType::SidecarNode => MemoryVtlType::VTL2_SIDECAR_NODE,
                     ReservedMemoryType::Vtl2Reserved => MemoryVtlType::VTL2_RESERVED,
                     ReservedMemoryType::Vtl2GpaPool => MemoryVtlType::VTL2_GPA_POOL,
+                    ReservedMemoryType::BootLogBuffer => MemoryVtlType::VTL2_RESERVED, // Use VTL2_RESERVED for boot log buffer
                 },
             )
         }),
@@ -617,6 +620,17 @@ pub fn write_dt(
             .add_prop_array(p_reg, &[entropy])?
             .end_node()?;
     }
+
+    // Add boot logger buffer address and size
+    // Pass the address of the log buffer instead of its contents
+    let log_buffer_ptr = &BOOT_LOGGER.log_buffer as *const LogBuffer as u64;
+    let position_prop = openhcl_builder.add_string("position")?;
+    
+    openhcl_builder = openhcl_builder
+        .start_node("boot-log")?
+        .add_u64_array(p_reg, &[log_buffer_ptr, LOG_BUFFER_SIZE as u64])?
+        .add_u32(position_prop, BOOT_LOGGER.log_buffer.get_position() as u32)?
+        .end_node()?;
 
     let root_builder = openhcl_builder.end_node()?;
 
