@@ -8,6 +8,8 @@ use crate::arch::x86_64::address_space::tdx_unshare_large_page;
 use crate::host_params::PartitionInfo;
 use crate::hvcall;
 use crate::single_threaded::SingleThreaded;
+use crate::single_threaded::off_stack;
+use crate::zeroed;
 use core::arch::asm;
 use core::cell::Cell;
 use loader_defs::shim::TdxTrampolineContext;
@@ -192,14 +194,22 @@ pub fn get_tdx_tsc_reftime() -> Option<u64> {
 /// e820 entries
 pub fn tdx_prepare_ap_trampoline() {
     let context_ptr: *mut TdxTrampolineContext = RESET_VECTOR_PAGE as *mut TdxTrampolineContext;
+    let mut local_context = off_stack!(TdxTrampolineContext, zeroed());
+    unsafe {
+        *local_context = *context_ptr;
+    }
+
     // SAFETY: The TdxTrampolineContext is known to be stored at the architectural reset vector address
-    let tdxcontext: &mut TdxTrampolineContext = unsafe { context_ptr.as_mut().unwrap() };
-    tdxcontext.gdtr_limit = 0;
-    tdxcontext.idtr_limit = 0;
-    tdxcontext.code_selector = 0;
-    tdxcontext.task_selector = 0;
-    tdxcontext.cr0 |= x86defs::X64_CR0_PG | x86defs::X64_CR0_PE | x86defs::X64_CR0_NE;
-    tdxcontext.cr4 |= x86defs::X64_CR4_PAE | x86defs::X64_CR4_MCE;
+    // let tdxcontext: &mut TdxTrampolineContext = unsafe { context_ptr.as_mut().unwrap() };
+    local_context.gdtr_limit = 0;
+    local_context.idtr_limit = 0;
+    local_context.code_selector = 0;
+    local_context.task_selector = 0;
+    local_context.cr0 |= x86defs::X64_CR0_PG | x86defs::X64_CR0_PE | x86defs::X64_CR0_NE;
+    local_context.cr4 |= x86defs::X64_CR4_PAE | x86defs::X64_CR4_MCE;
+    unsafe {
+        context_ptr.write_volatile(*local_context);
+    }
 }
 
 pub fn setup_vtl2_vp(partition_info: &PartitionInfo) {
