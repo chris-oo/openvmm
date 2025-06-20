@@ -499,7 +499,11 @@ mod x86_boot {
         // a refactor, this should be moved somewhere more appropriate when possible
         #[cfg(target_arch = "x86_64")]
         if IsolationType::Tdx == isolation_type {
-            add_e820_entry(entries.next(), page_tables.unwrap(), E820_RESERVED)?;
+            use crate::boot_logger::debug_log;
+
+            let page_tables = page_tables.unwrap();
+            debug_log!("ptables: {:x?}", page_tables);
+            add_e820_entry(entries.next(), page_tables, E820_RESERVED)?;
             n += 1;
             add_e820_entry(
                 entries.next(),

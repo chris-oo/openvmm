@@ -85,7 +85,7 @@ pub fn tdcall_hypercall(
     control: hvdef::hypercall::Control,
     input_gpa: u64,
     output_gpa: u64,
-) -> Result<(), TdVmCallR10Result> {
+) -> Result<u64, TdVmCallR10Result> {
     let input = TdcallInput {
         leaf: TdCallLeaf::VP_VMCALL,
         rcx: 0x0d04, // pass RDX, R8, R10, R11
@@ -115,10 +115,11 @@ pub fn tdcall_hypercall(
     // TD.VMCALL for Hypercall passes return code in r11
     let result = TdVmCallR10Result(output.r11);
 
-    match result {
-        TdVmCallR10Result::SUCCESS => Ok(()),
-        val => Err(val),
-    }
+    // match result {
+    //     TdVmCallR10Result::SUCCESS => Ok(()),
+    //     val => Err(val),
+    // }
+    Ok(output.r11)
 }
 
 /// Perform a tdcall based MSR read. This is done by issuing a TDG.VP.VMCALL.

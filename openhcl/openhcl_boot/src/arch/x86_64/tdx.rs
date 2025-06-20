@@ -5,6 +5,7 @@
 
 use crate::arch::x86_64::address_space::TdxHypercallPage;
 use crate::arch::x86_64::address_space::tdx_unshare_large_page;
+use crate::boot_logger::debug_log;
 use crate::host_params::PartitionInfo;
 use crate::hvcall;
 use crate::single_threaded::SingleThreaded;
@@ -12,6 +13,9 @@ use crate::single_threaded::off_stack;
 use crate::zeroed;
 use core::arch::asm;
 use core::cell::Cell;
+use core::sync::atomic::Ordering;
+use core::sync::atomic::compiler_fence;
+use core::sync::atomic::fence;
 use loader_defs::shim::TdxTrampolineContext;
 use memory_range::MemoryRange;
 use safe_intrinsics::cpuid;
@@ -159,7 +163,16 @@ pub fn invoke_tdcall_hypercall(
 ) -> hvdef::hypercall::HypercallOutput {
     let result = tdcall_hypercall(&mut TdcallInstruction, control, io.input(), io.output());
     match result {
-        Ok(()) => 0.into(),
+        Ok(r11) => {
+            let hv_status = hvdef::hypercall::HypercallOutput::from(r11);
+            debug_log!(
+                "td hypercall invoked with control: {:?}, r11: {:?}, status: {:?}",
+                control,
+                r11,
+                hv_status
+            );
+            0.into()
+        }
         Err(val) => {
             let TdVmCallR10Result(return_code) = val;
             return_code.into()
@@ -198,6 +211,7 @@ pub fn tdx_prepare_ap_trampoline() {
     unsafe {
         *local_context = context_ptr.read_volatile();
     }
+    debug_log!("local context preset: {:#?}", *local_context);
 
     // SAFETY: The TdxTrampolineContext is known to be stored at the architectural reset vector address
     // let tdxcontext: &mut TdxTrampolineContext = unsafe { context_ptr.as_mut().unwrap() };
@@ -207,13 +221,21 @@ pub fn tdx_prepare_ap_trampoline() {
     local_context.task_selector = 0;
     local_context.cr0 |= x86defs::X64_CR0_PG | x86defs::X64_CR0_PE | x86defs::X64_CR0_NE;
     local_context.cr4 |= x86defs::X64_CR4_PAE | x86defs::X64_CR4_MCE;
+    fence(Ordering::SeqCst);
+    debug_log!("local context: {:#?}", *local_context);
     unsafe {
         context_ptr.write_volatile(*local_context);
     }
+
+    unsafe {
+        *local_context = context_ptr.read_volatile();
+    }
+    debug_log!("local context post write: {:#?}", *local_context);
 }
 
 pub fn setup_vtl2_vp(partition_info: &PartitionInfo) {
     for cpu in 1..partition_info.cpus.len() {
+        debug_log!("Enabling VTL2 for CPU {}", cpu);
         hvcall()
             .tdx_enable_vp_vtl2(cpu as u32)
             .expect("enabling vp should not fail");
@@ -221,6 +243,7 @@ pub fn setup_vtl2_vp(partition_info: &PartitionInfo) {
 
     // Start VPs on Tdx-isolated VMs by sending TDVMCALL-based hypercall HvCallStartVirtualProcessor
     for cpu in 1..partition_info.cpus.len() {
+        debug_log!("Starting VP {}", cpu);
         hvcall()
             .tdx_start_vp(cpu as u32)
             .expect("start vp should not fail");
