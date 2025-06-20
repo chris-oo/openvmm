@@ -221,6 +221,9 @@ pub fn tdx_prepare_ap_trampoline() {
     local_context.task_selector = 0;
     local_context.cr0 |= x86defs::X64_CR0_PG | x86defs::X64_CR0_PE | x86defs::X64_CR0_NE;
     local_context.cr4 |= x86defs::X64_CR4_PAE | x86defs::X64_CR4_MCE;
+    local_context.rsp = 0;
+    local_context.rbp = 0;
+    local_context.rsi = 0;
     fence(Ordering::SeqCst);
     debug_log!("local context: {:#?}", *local_context);
     unsafe {
