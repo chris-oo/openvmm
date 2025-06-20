@@ -196,7 +196,7 @@ pub fn tdx_prepare_ap_trampoline() {
     let context_ptr: *mut TdxTrampolineContext = RESET_VECTOR_PAGE as *mut TdxTrampolineContext;
     let mut local_context = off_stack!(TdxTrampolineContext, zeroed());
     unsafe {
-        *local_context = *context_ptr;
+        *local_context = context_ptr.read_volatile();
     }
 
     // SAFETY: The TdxTrampolineContext is known to be stored at the architectural reset vector address
