@@ -401,6 +401,9 @@ mod mapping {
                 // user-mode-only accesses to locked memory (e.g., for vmbus ring
                 // buffers). We can't fail this for now because TDX cannot register
                 // encrypted memory.
+                panic!(
+                    "explicit panic on expose_va called for no registrar {address:#x}, {len:#x}",
+                );
                 Ok(())
             }
         }
