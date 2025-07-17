@@ -1471,6 +1471,9 @@ pub trait ProtectIsolatedMemory: Send + Sync {
 
     /// Registers a page as an overlay page by first validating it has the
     /// required permissions, optionally modifying them, then locking them.
+    ///
+    /// TODO: Consider not using HvError because it erases at lot of error
+    /// sources.
     fn register_overlay_page(
         &self,
         vtl: GuestVtl,

@@ -942,6 +942,14 @@ impl ProtectIsolatedMemory for HardwareIsolatedMemoryProtector {
             if registered.overlay_permissions.into_bits() | needed_perms.into_bits()
                 != registered.overlay_permissions.into_bits()
             {
+                let current_perms = registered.overlay_permissions;
+                tracelimit::warn_ratelimited!(
+                    CVM_ALLOWED,
+                    gpn,
+                    ?needed_perms,
+                    ?current_perms,
+                    "overlay page already registered with different permissions",
+                );
                 return Err(HvError::OperationDenied);
             }
             registered.ref_count += 1;
@@ -951,16 +959,39 @@ impl ProtectIsolatedMemory for HardwareIsolatedMemoryProtector {
         // Check that the required permissions are present.
         let current_perms = self.query_lower_vtl_permissions(vtl, gpn)?;
         if current_perms.into_bits() | check_perms.into_bits() != current_perms.into_bits() {
+            tracelimit::warn_ratelimited!(
+                CVM_ALLOWED,
+                gpn,
+                ?check_perms,
+                ?current_perms,
+                "overlay page does not have the required permissions",
+            );
             return Err(HvError::OperationDenied);
         }
 
         // Protections cannot be applied to a host-visible page.
         if inner.valid_shared.check_valid(gpn) {
+            tracelimit::warn_ratelimited!(
+                CVM_ALLOWED,
+                gpn,
+                ?check_perms,
+                ?current_perms,
+                "overlay page is host-visible",
+            );
             return Err(HvError::OperationDenied);
         }
 
         // Or a locked page.
-        self.check_gpn_not_locked(&inner, vtl, gpn)?;
+        if let Err(e) = self.check_gpn_not_locked(&inner, vtl, gpn) {
+            tracelimit::warn_ratelimited!(
+                CVM_ALLOWED,
+                gpn,
+                ?check_perms,
+                ?current_perms,
+                "overlay page is locked",
+            );
+            return Err(e);
+        }
 
         // Everything's validated, change the permissions.
         if let Some(new_perms) = new_perms {
@@ -970,7 +1001,18 @@ impl ProtectIsolatedMemory for HardwareIsolatedMemoryProtector {
                 vtl,
                 new_perms,
             )
-            .map_err(|_| HvError::OperationDenied)?;
+            .map_err(|e| {
+                tracelimit::warn_ratelimited!(
+                    CVM_ALLOWED,
+                    gpn,
+                    ?new_perms,
+                    ?current_perms,
+                    error = &e as &dyn std::error::Error,
+                    "failed to apply overlay page permissions",
+                );
+
+                HvError::OperationDenied
+            })?;
         }
 
         // Nothing from this point on can fail, so we can safely register the overlay page.
