@@ -2227,7 +2227,10 @@ impl<'a, N: 'a + Notifier> ServerWithNotifier<'a, N> {
             target_message_vp: Some(request.target_message_vp),
             notify_relay: true,
         }) {
-            tracelimit::error_ratelimited!(?err, "server failed to change state");
+            tracelimit::error_ratelimited!(
+                error = err.as_ref() as &dyn std::error::Error,
+                "server failed to change state"
+            );
             self.inner.state = ConnectionState::Disconnected;
             self.send_version_response(Some((
                 version,

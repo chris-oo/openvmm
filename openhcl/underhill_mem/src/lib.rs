@@ -931,6 +931,8 @@ impl ProtectIsolatedMemory for HardwareIsolatedMemoryProtector {
         new_perms: Option<HvMapGpaFlags>,
         tlb_access: &mut dyn TlbFlushLockAccess,
     ) -> Result<(), HvError> {
+        tracing::error!(?vtl, gpn, ?check_perms, ?new_perms, "register overlay page");
+
         let mut inner = self.inner.lock();
 
         // If the page is already registered as an overlay page, just check
@@ -943,7 +945,7 @@ impl ProtectIsolatedMemory for HardwareIsolatedMemoryProtector {
                 != registered.overlay_permissions.into_bits()
             {
                 let current_perms = registered.overlay_permissions;
-                tracelimit::warn_ratelimited!(
+                tracing::error!(
                     CVM_ALLOWED,
                     gpn,
                     ?needed_perms,
@@ -952,15 +954,30 @@ impl ProtectIsolatedMemory for HardwareIsolatedMemoryProtector {
                 );
                 return Err(HvError::OperationDenied);
             }
+
+            tracing::error!("alreayd reg perms");
+
             registered.ref_count += 1;
             return Ok(());
+        }
+
+        tracing::error!("alredy reg check");
+
+        // Protections cannot be applied to a host-visible page.
+        if inner.valid_shared.check_valid(gpn) {
+            tracing::error!(
+                CVM_ALLOWED,
+                gpn,
+                ?check_perms,
+                "overlay page is host-visible",
+            );
+            return Err(HvError::OperationDenied);
         }
 
         // Check that the required permissions are present.
         let current_perms = self.query_lower_vtl_permissions(vtl, gpn)?;
         if current_perms.into_bits() | check_perms.into_bits() != current_perms.into_bits() {
-            tracelimit::warn_ratelimited!(
-                CVM_ALLOWED,
+            tracing::error!(
                 gpn,
                 ?check_perms,
                 ?current_perms,
@@ -969,21 +986,11 @@ impl ProtectIsolatedMemory for HardwareIsolatedMemoryProtector {
             return Err(HvError::OperationDenied);
         }
 
-        // Protections cannot be applied to a host-visible page.
-        if inner.valid_shared.check_valid(gpn) {
-            tracelimit::warn_ratelimited!(
-                CVM_ALLOWED,
-                gpn,
-                ?check_perms,
-                ?current_perms,
-                "overlay page is host-visible",
-            );
-            return Err(HvError::OperationDenied);
-        }
+        tracing::error!("host vis");
 
         // Or a locked page.
         if let Err(e) = self.check_gpn_not_locked(&inner, vtl, gpn) {
-            tracelimit::warn_ratelimited!(
+            tracing::error!(
                 CVM_ALLOWED,
                 gpn,
                 ?check_perms,
@@ -992,6 +999,8 @@ impl ProtectIsolatedMemory for HardwareIsolatedMemoryProtector {
             );
             return Err(e);
         }
+
+        tracing::error!("locked check");
 
         // Everything's validated, change the permissions.
         if let Some(new_perms) = new_perms {
@@ -1002,7 +1011,7 @@ impl ProtectIsolatedMemory for HardwareIsolatedMemoryProtector {
                 new_perms,
             )
             .map_err(|e| {
-                tracelimit::warn_ratelimited!(
+                tracing::error!(
                     CVM_ALLOWED,
                     gpn,
                     ?new_perms,
@@ -1014,6 +1023,8 @@ impl ProtectIsolatedMemory for HardwareIsolatedMemoryProtector {
                 HvError::OperationDenied
             })?;
         }
+
+        tracing::error!("apply perms");
 
         // Nothing from this point on can fail, so we can safely register the overlay page.
         inner.overlay_pages[vtl].push(OverlayPage {

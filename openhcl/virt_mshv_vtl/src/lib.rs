@@ -1016,8 +1016,12 @@ impl virt::SynicMonitor for UhPartition {
         let _vtl = GuestVtl::try_from(vtl).unwrap();
         let old_gpa = self.inner.monitor_page.set_gpa(gpa);
 
+        tracelimit::warn_ratelimited!(?old_gpa, "test log");
+
         if let Some(old_gpa) = old_gpa {
             let old_gpn = old_gpa.checked_div(HV_PAGE_SIZE).unwrap();
+
+            tracing::error!("unregistering old");
 
             match &self.inner.backing_shared {
                 #[cfg(guest_arch = "x86_64")]
@@ -1090,21 +1094,24 @@ impl virt::SynicMonitor for UhPartition {
                     )
                     .map_err(|e| anyhow::anyhow!(e)),
                 #[cfg(guest_arch = "x86_64")]
-                BackingShared::Tdx(tdx_backed_shared) => tdx_backed_shared
-                    .cvm
-                    .isolated_memory_protector
-                    .register_overlay_page(
-                        _vtl,
-                        gpn,
-                        _check_perms,
-                        Some(new_perms),
-                        &mut TdxBacked::tlb_flush_lock_access(
-                            None,
-                            self.inner.as_ref(),
-                            tdx_backed_shared,
-                        ),
-                    )
-                    .map_err(|e| anyhow::anyhow!(e)),
+                BackingShared::Tdx(tdx_backed_shared) => {
+                    tracing::error!("tdx monitor page");
+                    tdx_backed_shared
+                        .cvm
+                        .isolated_memory_protector
+                        .register_overlay_page(
+                            _vtl,
+                            gpn,
+                            _check_perms,
+                            Some(new_perms),
+                            &mut TdxBacked::tlb_flush_lock_access(
+                                None,
+                                self.inner.as_ref(),
+                                tdx_backed_shared,
+                            ),
+                        )
+                        .map_err(|e| anyhow::anyhow!(e))
+                }
                 BackingShared::Hypervisor(_) => self
                     .inner
                     .hcl
