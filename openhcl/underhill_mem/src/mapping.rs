@@ -748,3 +748,64 @@ impl GuestMemoryMapping {
             .fill_at(range.start() as usize, 0, range.len() as usize)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hvdef::HV_PAGE_SIZE;
+    use hvdef::HV_PAGE_SIZE_USIZE;
+    use vm_topology::memory::MemoryRangeWithNode;
+
+    /// Test memory layout matching the log output:
+    /// vtl0_ram="0x0-0x8000000(0), 0x34400000-0xf8000000(0), 0x100000000-0xfe0000000(0), 0x1000000000-0x6054400000(0), 0x6054400000-0xc032400000(1)"
+    #[test]
+    fn test_memory_layout_access_patterns() {
+        // Create the memory layout based on the log output
+        let memory_ranges = vec![
+            MemoryRangeWithNode {
+                range: MemoryRange::new(0x0..0x8000000),
+                vnode: 0,
+            },
+            MemoryRangeWithNode {
+                range: MemoryRange::new(0x34400000..0xf8000000),
+                vnode: 0,
+            },
+            MemoryRangeWithNode {
+                range: MemoryRange::new(0x100000000..0xfe0000000),
+                vnode: 0,
+            },
+            MemoryRangeWithNode {
+                range: MemoryRange::new(0x1000000000..0x6054400000),
+                vnode: 0,
+            },
+            MemoryRangeWithNode {
+                range: MemoryRange::new(0x6054400000..0xc032400000),
+                vnode: 1,
+            },
+        ];
+
+        let memory_layout = MemoryLayout::new_from_ranges(&memory_ranges, &[])
+            .expect("Failed to create memory layout");
+
+        let guest_valid_mem =
+            GuestValidMemory::new(&memory_layout, GuestValidMemoryType::Encrypted, true).unwrap();
+
+        // Test accessible address: 0x604ffffffe
+        let accessible_address = 0x604ffffffe;
+
+        // Test inaccessible range: 0x6050000000-0x60543fffff
+        let inaccessible_start = 0x6050000000;
+        let inaccessible_end = 0x60543fffff;
+        let inaccessible_range = MemoryRange::new(inaccessible_start..inaccessible_end + 1);
+
+        assert_eq!(
+            guest_valid_mem.check_valid(accessible_address / HV_PAGE_SIZE),
+            true
+        );
+
+        assert_eq!(
+            guest_valid_mem.check_valid(inaccessible_start / HV_PAGE_SIZE),
+            true
+        );
+    }
+}
