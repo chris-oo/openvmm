@@ -792,6 +792,7 @@ mod tests {
 
         // Test accessible address: 0x604ffffffe
         let accessible_address = 0x604ffffffe;
+        let accessible_high = 0x6054400000;
 
         // Test inaccessible range: 0x6050000000-0x60543fffff
         let inaccessible_start = 0x6050000000;
@@ -804,8 +805,16 @@ mod tests {
         );
 
         assert_eq!(
-            guest_valid_mem.check_valid(inaccessible_start / HV_PAGE_SIZE),
+            guest_valid_mem.check_valid(accessible_high / HV_PAGE_SIZE),
             true
         );
+
+        let start_result = guest_valid_mem.check_valid(inaccessible_start / HV_PAGE_SIZE);
+        let end_result = guest_valid_mem.check_valid(inaccessible_end / HV_PAGE_SIZE);
+
+        println!("Inaccessible start: {}, end: {}", start_result, end_result);
+
+        assert_eq!(start_result, true);
+        assert_eq!(end_result, true);
     }
 }
