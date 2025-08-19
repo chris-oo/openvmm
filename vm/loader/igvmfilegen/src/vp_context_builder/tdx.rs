@@ -152,6 +152,10 @@ impl VpContextBuilder for TdxHardwareContext {
                 byte_offset + instruction.len()
             };
 
+        // hack spin forever
+        // jmp self
+        // byte_offset = copy_instr(&mut reset_page, byte_offset, &[0xEB, 0xFE]);
+
         // jmp InitialCode
         byte_offset = copy_instr(&mut reset_page, byte_offset, &[0xE9]);
         let mut relative_offset =
