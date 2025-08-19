@@ -251,7 +251,8 @@ impl IgvmLoaderRegister for X86Register {
                     });
                 }
 
-                let vp_context_builder = Box::new(TdxHardwareContext::new(!with_paravisor));
+                // let vp_context_builder = Box::new(TdxHardwareContext::new(!with_paravisor));
+                let vp_context_builder = Box::new(TdxHardwareContext::new(false));
 
                 (platform_header, init_headers, vp_context_builder)
             }

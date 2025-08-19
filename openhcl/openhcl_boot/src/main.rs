@@ -673,8 +673,6 @@ fn shim_main(shim_params_raw_offset: isize) -> ! {
         log!("openhcl_boot: early debugging enabled");
     }
 
-    loop {}
-
     let hw_debug_bit = get_hw_debug_bit(p.isolation_type);
     let can_trust_host = p.isolation_type == IsolationType::None
         || static_options.confidential_debug

@@ -122,6 +122,8 @@ impl VpContextBuilder for TdxHardwareContext {
     }
 
     fn finalize(&mut self, state: &mut Vec<VpContextState>) {
+        tracing::error!(?self.trampoline_context, "initial regs");
+
         // Construct and load an initial temporary GDT to use for the transition
         // to long mode.  A single selector (0008:) is defined as a 64-bit code
         // segment.
