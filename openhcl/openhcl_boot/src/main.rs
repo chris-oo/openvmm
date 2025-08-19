@@ -168,6 +168,8 @@ fn build_kernel_command_line(
         "hv_storvsc.storvsc_ringbuffer_size=0x8000",
         // Disable eager mimalloc commit to prevent core dumps from being overly large
         "MIMALLOC_ARENA_EAGER_COMMIT=0",
+        // earlypritnk
+        "earlyprintk=ttys2,keep",
     ];
 
     const X86_KERNEL_PARAMETERS: &[&str] = &[
@@ -240,11 +242,8 @@ fn build_kernel_command_line(
     // com1. This is overridden by any user customizations in the static or
     // dynamic command line, as this console argument provided by the bootloader
     // comes first.
-    let console = if partition_info.com3_serial_available && can_trust_host {
-        "ttyS2,115200"
-    } else {
-        "ttynull"
-    };
+    // let console = if partition_info.com3_serial_available && can_trust_host {
+    let console = if false { "ttyS2,115200" } else { "ttynull" };
     write!(cmdline, "console={console} ")?;
 
     if params.isolation_type != IsolationType::None {
@@ -863,6 +862,17 @@ fn shim_main(shim_params_raw_offset: isize) -> ! {
         p.isolation_type,
     )
     .unwrap();
+
+    let mut counter = 0u64;
+    log!("spinning forever");
+
+    loop {
+        counter += 1;
+
+        if counter % 1000000000 == 0 {
+            log!("still spinning... {}", counter);
+        }
+    }
 
     rt::verify_stack_cookie();
 

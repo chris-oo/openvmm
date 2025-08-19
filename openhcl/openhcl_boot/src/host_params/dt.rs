@@ -387,7 +387,9 @@ impl PartitionInfo {
             }
         }
 
-        storage.vmbus_vtl2 = parsed.vmbus_vtl2.clone().ok_or(DtError::Vtl2Vmbus)?;
+        // storage.vmbus_vtl2 = parsed.vmbus_vtl2.clone().ok_or(DtError::Vtl2Vmbus)?;
+        // hack use vtl0 vmbus since we are vtl0 loading
+        storage.vmbus_vtl2 = parsed.vmbus_vtl0.clone().expect("must have vtl0 vmbus");
         storage.vmbus_vtl0 = parsed.vmbus_vtl0.clone().ok_or(DtError::Vtl0Vmbus)?;
 
         // The host is responsible for allocating MMIO ranges for non-isolated
