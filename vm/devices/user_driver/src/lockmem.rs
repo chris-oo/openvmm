@@ -32,12 +32,16 @@ struct Mapping {
 
 impl Mapping {
     fn new(len: usize) -> std::io::Result<Self> {
+        // overallocate such that we are guaranteed to have a 2mb region
+        let size_2m = 0x200000;
+        let larger_len = if len < size_2m { len } else { len + size_2m };
+
         // SAFETY: No file descriptor or address is being passed.
         // The result is being validated.
         let addr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
-                len,
+                larger_len,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_LOCKED,
                 // | libc::MAP_HUGETLB
@@ -50,18 +54,61 @@ impl Mapping {
             return Err(std::io::Error::last_os_error());
         }
 
-        tracing::error!(?addr, len, "addr mmap");
+        tracing::error!(?addr, len, larger_len, "addr mmap");
 
-        let MADV_COLLAPSE = 25;
-        let result = unsafe { libc::madvise(addr, len, MADV_COLLAPSE) };
+        // figure out the address that is 2MB aligned. then unmap the head.
+        let addr = addr as usize;
+        let aligned_address = if len > size_2m {
+            (addr + size_2m - 1) & !(size_2m - 1)
+        } else {
+            addr
+        };
+
+        // munmap up to unaligned
+        if addr != aligned_address {
+            let result = unsafe { libc::munmap(addr as *mut c_void, aligned_address - addr) };
+            if result < 0 {
+                let last_error = std::io::Error::last_os_error();
+                tracing::error!(
+                    ?last_error,
+                    ?result,
+                    ?addr,
+                    aligned_address,
+                    "munmap head failed"
+                );
+                return Err(last_error);
+            }
+        }
+
+        // madvise original allocation, which will only succeed if len was 2mb aligned
+        let head_len = aligned_address - addr;
+        let tail_len = larger_len - head_len - len;
+        const MADV_COLLAPSE: libc::c_int = 25;
+        let result = unsafe { libc::madvise(aligned_address as *mut c_void, len, MADV_COLLAPSE) };
         // let result = unsafe { libc::madvise(addr, len, libc::MADV_HUGEPAGE) };
+
+        // TODO: mlock instead of MAP_LOCKED? or should we instead use MAP_HUGETLB? ask kernel folks what's better and implications of each
 
         if result < 0 {
             let last_error = std::io::Error::last_os_error();
             tracing::error!(?last_error, ?result, ?addr, len, "madvise failed");
         }
 
-        Ok(Self { addr, len })
+        // unmap any ranges larger than the alloc than we needed
+        if tail_len > 0 {
+            tracing::error!(?aligned_address, len, tail_len, "munmap tail");
+            let result = unsafe { libc::munmap((addr as usize + len) as *mut c_void, tail_len) };
+            if result < 0 {
+                let last_error = std::io::Error::last_os_error();
+                tracing::error!(?last_error, ?result, ?addr, len, "munmap tail failed");
+                return Err(last_error);
+            }
+        }
+
+        Ok(Self {
+            addr: aligned_address as *mut c_void,
+            len,
+        })
     }
 
     fn lock(&self) -> std::io::Result<()> {
