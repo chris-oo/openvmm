@@ -40,12 +40,25 @@ impl Mapping {
                 len,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_LOCKED,
+                // | libc::MAP_HUGETLB
+                // | libc::MAP_HUGE_2MB,
                 -1,
                 0,
             )
         };
         if addr == libc::MAP_FAILED {
             return Err(std::io::Error::last_os_error());
+        }
+
+        tracing::error!(?addr, len, "addr mmap");
+
+        let MADV_COLLAPSE = 25;
+        let result = unsafe { libc::madvise(addr, len, MADV_COLLAPSE) };
+        // let result = unsafe { libc::madvise(addr, len, libc::MADV_HUGEPAGE) };
+
+        if result < 0 {
+            let last_error = std::io::Error::last_os_error();
+            tracing::error!(?last_error, ?result, ?addr, len, "madvise failed");
         }
 
         Ok(Self { addr, len })
@@ -89,13 +102,15 @@ impl Drop for Mapping {
 }
 
 impl LockedMemory {
-    pub fn new(len: usize) -> anyhow::Result<Self> {
+    pub fn new(mut len: usize) -> anyhow::Result<Self> {
         if len % PAGE_SIZE != 0 {
             anyhow::bail!("not a page-size multiple");
         }
+
         let mapping = Mapping::new(len).context("failed to create mapping")?;
         mapping.lock().context("failed to lock mapping")?;
         let pages = mapping.pages()?;
+
         Ok(Self {
             mapping,
             pfns: pages,
