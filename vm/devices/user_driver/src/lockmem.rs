@@ -34,6 +34,34 @@ impl Mapping {
     fn new(len: usize) -> std::io::Result<Self> {
         // overallocate such that we are guaranteed to have a 2mb region
         let size_2m = 0x200000;
+
+        if len % size_2m == 0 {
+            // try to allocate with hugetlb and huge 2mb
+            let addr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE
+                        | libc::MAP_ANONYMOUS
+                        | libc::MAP_LOCKED
+                        | libc::MAP_HUGETLB
+                        | libc::MAP_HUGE_2MB,
+                    -1,
+                    0,
+                )
+            };
+            if addr == libc::MAP_FAILED {
+                tracing::error!(
+                    ?len,
+                    "mmap with hugetlb failed, falling back to normal mmap"
+                );
+            } else {
+                tracing::error!(?addr, len, "addr mmap with hugetlb");
+                return Ok(Self { addr, len });
+            }
+        }
+
         let larger_len = if len < size_2m { len } else { len + size_2m };
 
         // SAFETY: No file descriptor or address is being passed.
