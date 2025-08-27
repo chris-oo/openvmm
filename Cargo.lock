@@ -5316,6 +5316,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "inspect",
+ "libc",
  "memory_range",
  "mesh",
  "parking_lot",
@@ -5325,6 +5326,7 @@ dependencies = [
  "tracing",
  "user_driver",
  "vmcore",
+ "zerocopy 0.8.25",
 ]
 
 [[package]]
