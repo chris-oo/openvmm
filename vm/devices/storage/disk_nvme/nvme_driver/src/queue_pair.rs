@@ -194,6 +194,11 @@ impl QueuePair {
     /// Number of pages per queue if not bounce buffering.
     const PER_QUEUE_PAGES_NO_BOUNCE_BUFFER: usize = 64;
 
+    /// FIXME: figure out a better way to determine if we clamped the queue sizes
+    /// to a single page. I think maybe want to have the _caller_ provide sq/cq
+    /// in the right size, but that requires some other kind of failure path via
+    /// allocate_dma_buffer or something? dunno
+    /// Returns a new queue pair, with the number of entries per queue and queue
     pub fn new(
         spawner: impl SpawnDriver,
         device: &impl DeviceBacking,
@@ -221,6 +226,8 @@ impl QueuePair {
             "nvme queues"
         );
 
+        // FIXME: allocate_dma_buffer needs to have an option about if memory
+        // should be page contiguous or not
         let mem = dma_client
             .allocate_dma_buffer(rounded_2mb)
             .context("failed to allocate memory for queues")?;
@@ -262,9 +269,15 @@ impl QueuePair {
         let sq_mem_pages = sq_mem_block.pfns();
         tracing::error!(?sq_mem_pages, "sq pages");
 
+        let mut fallback_queue_size = false;
+
         for (curr, next) in sq_mem_pages.iter().zip(sq_mem_pages.iter().skip(1)) {
             if *curr + 1 != *next {
-                anyhow::bail!("submission queue memory must be contiguous");
+                fallback_queue_size = true;
+                tracing::warn!(
+                    qid,
+                    "non-contiguous submission queue memory detected, falling back to single page queues"
+                );
             }
         }
 
@@ -275,11 +288,30 @@ impl QueuePair {
 
         for (curr, next) in cq_mem_pages.iter().zip(cq_mem_pages.iter().skip(1)) {
             if *curr + 1 != *next {
-                anyhow::bail!("completion queue memory must be contiguous");
+                fallback_queue_size = true;
+                tracing::warn!(
+                    qid,
+                    "non-contiguous completion queue memory detected, falling back to single page queues"
+                );
             }
         }
 
         let cq_addr = cq_mem_block.pfns()[0] * PAGE_SIZE64;
+
+        let (sq_entries, cq_entries) = if fallback_queue_size {
+            // clamp both to the same value, if they were both the same value.
+            const MAX_SQ_PER_PAGE: usize = PAGE_SIZE / 64;
+            // const MAX_CQ_PER_PAGE: usize = PAGE_SIZE / 16;
+            const SINGLE_PAGE_QUEUE_SIZE: u16 = MAX_SQ_PER_PAGE as u16;
+            tracing::warn!(
+                qid,
+                SINGLE_PAGE_QUEUE_SIZE,
+                "clamping both queues to single page size"
+            );
+            (SINGLE_PAGE_QUEUE_SIZE, SINGLE_PAGE_QUEUE_SIZE)
+        } else {
+            (sq_entries, cq_entries)
+        };
 
         let mut queue_handler = match saved_state {
             Some(s) => QueueHandler::restore(sq_mem_block, cq_mem_block, s)?,
@@ -344,6 +376,16 @@ impl QueuePair {
             sq_addr,
             cq_addr,
         })
+    }
+
+    // FIXME: determine better pattern for this
+    pub fn sq_entries(&self) -> u16 {
+        self.sq_entries
+    }
+
+    // FIXME: see above
+    pub fn cq_entries(&self) -> u16 {
+        self.cq_entries
     }
 
     pub fn sq_addr(&self) -> u64 {

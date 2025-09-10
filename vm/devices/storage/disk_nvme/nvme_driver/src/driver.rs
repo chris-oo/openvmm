@@ -302,6 +302,9 @@ impl<T: DeviceBacking> NvmeDriver<T> {
         )
         .context("failed to create admin queue pair")?;
 
+        let admin_sqes = admin.sq_entries();
+        let admin_cqes = admin.cq_entries();
+
         let admin = worker.admin.insert(admin);
 
         // Register the admin queue with the controller.
@@ -918,6 +921,9 @@ impl<T: DeviceBacking> DriverWorkerTask<T> {
             self.bounce_buffer,
         )
         .with_context(|| format!("failed to create io queue pair {qid}"))?;
+
+        assert_eq!(queue.sq_entries(), queue.cq_entries());
+        state.qsize = queue.sq_entries();
 
         let io_sq_addr = queue.sq_addr();
         let io_cq_addr = queue.cq_addr();
