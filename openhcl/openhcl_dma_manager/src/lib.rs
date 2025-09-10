@@ -286,12 +286,20 @@ impl DmaManagerInner {
                     allocation_visibility: AllocationVisibility::Private,
                     persistent_allocations: false,
                     shared_spawner: _,
-                    private_spawner: _,
+                    private_spawner,
                 } => match lower_vtl_policy {
                     LowerVtlPermissionPolicy::Any => {
                         // No persistence needed means the `LockedMemorySpawner`
                         // using normal VTL2 ram is fine.
-                        DmaClientBacking::LockedMemory(LockedMemorySpawner)
+                        match private_spawner {
+                            Some(private) => DmaClientBacking::PrivatePoolWithFallback((
+                                private
+                                    .allocator(device_name.into())
+                                    .context("failed to create private allocator")?,
+                                LockedMemorySpawner,
+                            )),
+                            None => DmaClientBacking::LockedMemory(LockedMemorySpawner),
+                        }
                     }
                     LowerVtlPermissionPolicy::Vtl0 => {
                         // `LockedMemorySpawner` uses private VTL2 ram, so
@@ -416,6 +424,7 @@ enum DmaClientBacking {
     SharedPool(#[inspect(skip)] PagePoolAllocator),
     PrivatePool(#[inspect(skip)] PagePoolAllocator),
     LockedMemory(#[inspect(skip)] LockedMemorySpawner),
+    PrivatePoolWithFallback(#[inspect(skip)] (PagePoolAllocator, LockedMemorySpawner)),
     PrivatePoolLowerVtl(#[inspect(skip)] LowerVtlMemorySpawner<PagePoolAllocator>),
     LockedMemoryLowerVtl(#[inspect(skip)] LowerVtlMemorySpawner<LockedMemorySpawner>),
 }
@@ -429,6 +438,15 @@ impl DmaClientBacking {
             DmaClientBacking::SharedPool(allocator) => allocator.allocate_dma_buffer(total_size),
             DmaClientBacking::PrivatePool(allocator) => allocator.allocate_dma_buffer(total_size),
             DmaClientBacking::LockedMemory(spawner) => spawner.allocate_dma_buffer(total_size),
+            DmaClientBacking::PrivatePoolWithFallback((allocator, spawner)) => {
+                allocator.allocate_dma_buffer(total_size).or_else(|_| {
+                    tracing::warn!(
+                        size = total_size,
+                        "falling back to locked memory for dma allocation"
+                    );
+                    spawner.allocate_dma_buffer(total_size)
+                })
+            }
             DmaClientBacking::PrivatePoolLowerVtl(spawner) => {
                 spawner.allocate_dma_buffer(total_size)
             }
@@ -442,7 +460,12 @@ impl DmaClientBacking {
         match self {
             DmaClientBacking::SharedPool(allocator) => allocator.attach_pending_buffers(),
             DmaClientBacking::PrivatePool(allocator) => allocator.attach_pending_buffers(),
-            DmaClientBacking::LockedMemory(spawner) => spawner.attach_pending_buffers(),
+            DmaClientBacking::PrivatePoolWithFallback(_) => {
+                anyhow::bail!("cannot attach pending buffers with fallback allocator")
+            }
+            DmaClientBacking::LockedMemory(_) => {
+                anyhow::bail!("cannot attach pending buffers with locked memory")
+            }
             DmaClientBacking::PrivatePoolLowerVtl(spawner) => spawner.attach_pending_buffers(),
             DmaClientBacking::LockedMemoryLowerVtl(spawner) => spawner.attach_pending_buffers(),
         }
