@@ -42,6 +42,19 @@ pub struct BumpAllocator {
     inner: SingleThreaded<RefCell<Inner>>,
 }
 
+impl core::fmt::Debug for BumpAllocator {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let inner = self.inner.borrow();
+        f.debug_struct("BumpAllocator")
+            .field("start", &inner.start)
+            .field("next", &inner.next)
+            .field("end", &inner.end)
+            .field("allow_alloc", &inner.allow_alloc)
+            .field("alloc_count", &inner.alloc_count)
+            .finish()
+    }
+}
+
 impl BumpAllocator {
     pub const fn new() -> Self {
         BumpAllocator {
@@ -150,7 +163,14 @@ unsafe impl GlobalAlloc for BumpAllocator {
         // TODO: renable allocation tracing when we support tracing levels via
         // the log crate.
 
-        if alloc_end > inner.end {
+        log!("alloc layout {:#x?}", layout);
+        log!("alloc align offset {:#x?}", align_offset);
+        log!("alloc start {:#x?}", alloc_start);
+        log!("alloc end {:#x?}", alloc_end);
+        log!("alloc next {:#x?}", inner.next);
+        log!("alloc end of range {:#x?}", inner.end);
+
+        if alloc_end >= inner.end {
             core::ptr::null_mut() // out of memory
         } else {
             inner.next = alloc_end;
@@ -159,10 +179,46 @@ unsafe impl GlobalAlloc for BumpAllocator {
         }
     }
 
+    // putting no code in here blows up
     unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
         // TODO: renable allocation tracing when we support tracing levels via
         // the log crate.
+        // log!("dealloc called on {:#x?} of size {}", _ptr, _layout.size());
+        // let mut inner = self.inner.borrow_mut();
+        // inner.dealloc_count += 1;
+        self.inner.borrow();
     }
+
+    // unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+    //     // SAFETY: the caller must ensure that the `new_size` does not overflow.
+    //     // `layout.align()` comes from a `Layout` and is thus guaranteed to be valid.
+    //     let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
+    //     // SAFETY: the caller must ensure that `new_layout` is greater than zero.
+    //     let new_ptr = unsafe { self.alloc(new_layout) };
+    //     log!(
+    //         "realloc old ptr {:#x?} layout {:#x?} new size {}",
+    //         ptr,
+    //         layout,
+    //         new_size
+    //     );
+    //     if !new_ptr.is_null() {
+    //         log!("realloc copy ptr {:#x?} new_ptr {:#x?}", ptr, new_ptr);
+
+    //         // SAFETY: the previously allocated block cannot overlap the newly allocated block.
+    //         // The safety contract for `dealloc` must be upheld by the caller.
+    //         unsafe {
+    //             core::ptr::copy_nonoverlapping(
+    //                 ptr,
+    //                 new_ptr,
+    //                 core::cmp::min(layout.size(), new_size),
+    //             );
+    //             self.dealloc(ptr, layout);
+    //         }
+
+    //         log!("realloc copy done ptr {:#x?} new_ptr {:#x?}", ptr, new_ptr);
+    //     }
+    //     new_ptr
+    // }
 
     // TODO: consider implementing realloc for the Vec grow case, which is the
     // main usecase we see. This would mean supporting realloc if the allocation
@@ -191,7 +247,7 @@ unsafe impl core::alloc::Allocator for &BumpAllocator {
     }
 
     unsafe fn deallocate(&self, ptr: core::ptr::NonNull<u8>, layout: Layout) {
-        log!("deallocate called on {:#x?} of size {}", ptr, layout.size());
+        // log!("deallocate called on {:#x?} of size {}", ptr, layout.size());
     }
 }
 
@@ -204,13 +260,13 @@ mod tests {
     // `RUSTFLAGS="--cfg nightly" cargo +nightly miri test -p openhcl_boot`
     #[test]
     fn test_alloc() {
-        let buffer: Box<[u8]> = Box::new([0; 0x1000 * 20]);
+        let buffer: Box<[u8]> = Box::new([0; 0x1000 * 16]);
         let addr = Box::into_raw(buffer) as *mut u8;
         let allocator = BumpAllocator {
             inner: SingleThreaded(RefCell::new(Inner {
                 start: addr,
                 next: addr,
-                end: unsafe { addr.add(0x1000 * 20) },
+                end: unsafe { addr.add(0x1000 * 16) },
                 allow_alloc: State::Allowed,
                 alloc_count: 0,
             })),
@@ -244,7 +300,39 @@ mod tests {
         }
 
         // Recreate the box, then drop it so miri is satisfied.
-        let _buf = unsafe { Box::from_raw(core::ptr::slice_from_raw_parts_mut(addr, 0x1000 * 20)) };
+        let _buf = unsafe { Box::from_raw(core::ptr::slice_from_raw_parts_mut(addr, 0x1000 * 16)) };
+
+        allocator.log_stats();
+    }
+
+    #[test]
+    fn test_alloc_out_of_space() {
+        let buffer: Box<[u8]> = Box::new([0; 0x1000]);
+        let addr = Box::into_raw(buffer) as *mut u8;
+        let allocator = BumpAllocator {
+            inner: SingleThreaded(RefCell::new(Inner {
+                start: addr,
+                next: addr,
+                end: unsafe { addr.add(0x1000) },
+                allow_alloc: State::Allowed,
+                alloc_count: 0,
+            })),
+        };
+        dbg!(&allocator);
+        allocator.enable_alloc();
+
+        unsafe {
+            let ptr1 = allocator.alloc(Layout::from_size_align(0x800, 8).unwrap());
+            dbg!(&allocator);
+            assert!(!ptr1.is_null());
+
+            let ptr2 = allocator.alloc(Layout::from_size_align(0x900, 16).unwrap());
+            dbg!(&allocator);
+            assert!(ptr2.is_null());
+        }
+
+        // Recreate the box, then drop it so miri is satisfied.
+        let _buf = unsafe { Box::from_raw(core::ptr::slice_from_raw_parts_mut(addr, 0x1000)) };
 
         allocator.log_stats();
     }

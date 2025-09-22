@@ -525,6 +525,7 @@ fn shim_main(shim_params_raw_offset: isize) -> ! {
         enable_enlightened_panic();
     }
 
+    boot_logger_runtime_init(p.isolation_type, true);
     // Enable the in-memory log.
     boot_logger_memory_init(p.log_buffer);
 

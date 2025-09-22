@@ -334,6 +334,14 @@ fn init_heap(params: &ShimParams) {
         let box_int = Box::new(42);
         log!("box int {box_int}");
         drop(box_int);
+
+        let mut vec = alloc::vec::Vec::new();
+
+        for i in 0..1000 {
+            log!("push {i}");
+            vec.push(i);
+        }
+
         bump_alloc::ALLOCATOR.disable_alloc();
         bump_alloc::ALLOCATOR.log_stats();
     }
