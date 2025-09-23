@@ -314,7 +314,7 @@ fn parse_host_vtl2_ram(
 }
 
 #[cfg_attr(minimal_rt, allow(dead_code))]
-fn init_heap(params: &ShimParams) {
+pub fn init_heap(params: &ShimParams) {
     // Initialize the temporary heap.
     //
     // This is only to be enabled for mesh decode.
@@ -326,7 +326,7 @@ fn init_heap(params: &ShimParams) {
     }
 
     // TODO: test using heap, as no mesh decode yet.
-    #[cfg(debug_assertions)]
+    // #[cfg(debug_assertions)]
     {
         use alloc::boxed::Box;
         bump_alloc::ALLOCATOR.enable_alloc();
@@ -419,7 +419,7 @@ impl PartitionInfo {
         storage.vmbus_vtl2 = parsed.vmbus_vtl2.clone().ok_or(DtError::Vtl2Vmbus)?;
         storage.vmbus_vtl0 = parsed.vmbus_vtl0.clone().ok_or(DtError::Vtl0Vmbus)?;
 
-        init_heap(params);
+        // init_heap(params);
 
         // The host is responsible for allocating MMIO ranges for non-isolated
         // guests when it also provides the ram VTL2 should use.

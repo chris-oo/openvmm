@@ -39,6 +39,8 @@ const MAX_PARTITION_RAM_RANGES: usize = 1024;
 /// Maximum size of the host-provided entropy
 pub const MAX_ENTROPY_SIZE: usize = 256;
 
+pub use dt::init_heap;
+
 /// Information about the guest partition.
 #[derive(Debug)]
 pub struct PartitionInfo {

@@ -529,6 +529,8 @@ fn shim_main(shim_params_raw_offset: isize) -> ! {
     // Enable the in-memory log.
     boot_logger_memory_init(p.log_buffer);
 
+    crate::host_params::init_heap(&p);
+
     let boot_reftime = get_ref_time(p.isolation_type);
 
     // The support code for the fast hypercalls does not set

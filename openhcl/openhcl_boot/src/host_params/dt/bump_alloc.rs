@@ -82,9 +82,15 @@ impl BumpAllocator {
             inner.start
         );
 
-        inner.start = mem.start() as *mut u8;
-        inner.next = mem.start() as *mut u8;
-        inner.end = mem.end() as *mut u8;
+        let buf =
+            unsafe { core::slice::from_raw_parts_mut(mem.start() as *mut u8, mem.len() as usize) };
+        inner.start = buf.as_mut_ptr();
+        inner.next = buf.as_mut_ptr();
+        inner.end = buf.as_mut_ptr().wrapping_add(buf.len());
+
+        // inner.start = mem.start() as *mut u8;
+        // inner.next = mem.start() as *mut u8;
+        // inner.end = mem.end() as *mut u8;
     }
 
     /// Enable allocations. This panics if allocations were ever previously
@@ -175,18 +181,21 @@ unsafe impl GlobalAlloc for BumpAllocator {
         } else {
             inner.next = alloc_end;
             inner.alloc_count += 1;
+            assert_eq!(alloc_start.addr() % layout.align(), 0);
             alloc_start
         }
     }
 
     // putting no code in here blows up
+    #[inline(never)]
     unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
         // TODO: renable allocation tracing when we support tracing levels via
         // the log crate.
         // log!("dealloc called on {:#x?} of size {}", _ptr, _layout.size());
         // let mut inner = self.inner.borrow_mut();
         // inner.dealloc_count += 1;
-        self.inner.borrow();
+        // self.inner.borrow();
+        core::hint::black_box(());
     }
 
     // unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
