@@ -324,7 +324,7 @@ impl VpciDeviceDescription {
             .call_failable(WorkerRequest::QueryResourceRequirements, self.id)
             .await?;
 
-        tracing::debug!(
+        tracing::info!(
             bars = format_args!("{:#x?}", requirements.bars),
             "queried requirements"
         );
@@ -344,6 +344,8 @@ impl VpciDeviceDescription {
         let dev = InUseDevice { req, id };
 
         dev.req.call_failable(WorkerRequest::Init, id).await?;
+
+        tracing::info!(?hw_ids, ?id, "initialized device");
 
         let mut high64 = false;
         let mut bar_rao = [0; 6];
@@ -1106,7 +1108,7 @@ impl WorkerState {
     ) -> anyhow::Result<()> {
         let entry = self.tx.vacant_entry();
         let tx_id = index_to_tx_id(entry.key());
-        tracing::trace!(
+        tracing::info!(
             tx_id,
             message = std::any::type_name_of_val(&msg),
             "sending transaction"

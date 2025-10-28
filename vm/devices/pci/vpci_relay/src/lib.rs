@@ -280,6 +280,8 @@ impl VpciRelay {
             .context("failed to initialize vpci device")?;
         let vpci_device = Arc::new(vpci_device);
 
+        tracing::info!(%instance_id, vendor_id = hw_ids.vendor_id, device_id = hw_ids.device_id, "vpci relay device initialized");
+
         let device_name = format!("assigned_device:vpci-{instance_id}");
         let (device_unit, device) = chipset
             .add_dyn_device(&self.driver_source, state_units, device_name, async |_| {
