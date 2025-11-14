@@ -303,6 +303,9 @@ pub struct UnderhillEnvCfg {
     pub attempt_ak_cert_callback: Option<bool>,
     /// Enable the VPCI relay
     pub enable_vpci_relay: Option<bool>,
+
+    // HACK
+    pub loaded_from_restore: bool,
 }
 
 /// Bundle of config + runtime objects for hooking into the underhill remote
@@ -355,6 +358,11 @@ impl Worker for UnderhillVmWorker {
 
     fn new(params: Self::Parameters) -> anyhow::Result<Self> {
         pal_async::local::block_with_io(async |driver| {
+            if params.env_cfg.loaded_from_restore {
+                tracing::warn!("hack hanging forever");
+                future::pending::<()>().await;
+            }
+
             let (get_infra, get_watchdog_task) = construct_get().await?;
             let get_client = get_infra.get_client.clone();
 

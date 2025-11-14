@@ -79,6 +79,8 @@ pub struct PartitionInfo {
     pub gic: Option<GicInfo>,
     /// PMU GSIV on AArch64.
     pub pmu_gsiv: Option<u32>,
+
+    pub loaded_from_restore: bool,
 }
 
 impl PartitionInfo {
@@ -107,6 +109,7 @@ impl PartitionInfo {
             boot_options: BootCommandLineOptions::new(),
             gic: None,
             pmu_gsiv: None,
+            loaded_from_restore: false,
         }
     }
 }

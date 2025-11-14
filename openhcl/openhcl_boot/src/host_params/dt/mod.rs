@@ -834,6 +834,7 @@ impl PartitionInfo {
         let persisted_state_header = read_persisted_region_header(params);
         let topology = if let Some(header) = persisted_state_header {
             log!("found persisted state header");
+            storage.loaded_from_restore = true;
             topology_from_persisted_state(header, params, parsed, address_space)?
         } else {
             topology_from_host_dt(params, parsed, &options, address_space)?
@@ -856,6 +857,7 @@ impl PartitionInfo {
             vtl0_alias_map,
             nvme_keepalive,
             boot_options,
+            loaded_from_restore: _,
         } = storage;
 
         // Set ram and memory alloction mode.

@@ -308,6 +308,10 @@ fn build_kernel_command_line(
         partition_info.vmbus_vtl2.connection_id
     )?;
 
+    if partition_info.loaded_from_restore {
+        write!(cmdline, "OPENHCL_LOADED_FROM_RESTORE=1 ")?;
+    }
+
     // If we're isolated we can't trust the host-provided cmdline
     if can_trust_host {
         // Prepend the computed parameters to the original command line.
@@ -917,6 +921,7 @@ mod test {
             vtl0_alias_map: None,
             nvme_keepalive: false,
             boot_options: BootCommandLineOptions::new(),
+            loaded_from_restore: false,
         }
     }
 

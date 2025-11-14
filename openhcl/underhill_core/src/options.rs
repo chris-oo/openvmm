@@ -219,6 +219,8 @@ pub struct Options {
 
     /// (OPENHCL_ENABLE_VPCI_RELAY=1) Enable the VPCI relay.
     pub enable_vpci_relay: Option<bool>,
+
+    pub loaded_from_restore: bool,
 }
 
 impl Options {
@@ -362,6 +364,7 @@ impl Options {
         let strict_encryption_policy = parse_env_bool_opt("HCL_STRICT_ENCRYPTION_POLICY");
         let attempt_ak_cert_callback = parse_env_bool_opt("HCL_ATTEMPT_AK_CERT_CALLBACK");
         let enable_vpci_relay = parse_env_bool_opt("OPENHCL_ENABLE_VPCI_RELAY");
+        let loaded_from_restore = parse_env_bool_opt("OPENHCL_LOADED_FROM_RESTORE");
 
         let mut args = std::env::args().chain(extra_args);
         // Skip our own filename.
@@ -424,6 +427,7 @@ impl Options {
             strict_encryption_policy,
             attempt_ak_cert_callback,
             enable_vpci_relay,
+            loaded_from_restore: loaded_from_restore.unwrap_or(false),
         })
     }
 
