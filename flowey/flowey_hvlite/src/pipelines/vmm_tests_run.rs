@@ -26,6 +26,7 @@ use std::path::PathBuf;
 const QUICK_TESTS: &[&str] = &[
     "frontpage",
     "apicid_offset",
+    "alpine.*boot",
     "mana_nic",
     "vpci_filter",
     "validate_mnf_usage_in_guest",
