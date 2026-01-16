@@ -22,6 +22,8 @@ pub struct ResolvedArtifactSelections {
     pub unknown: Vec<String>,
     /// Target triple from the artifacts file (if present)
     pub target_from_file: Option<String>,
+    /// Whether any tests need release IGVM files from GitHub
+    pub needs_release_igvm: bool,
 }
 
 impl Default for ResolvedArtifactSelections {
@@ -144,7 +146,7 @@ impl ResolvedArtifactSelections {
             | "petri_artifacts_vmm_test::artifacts::openhcl_igvm::LATEST_RELEASE_STANDARD_AARCH64" =>
             {
                 // These are downloaded from GitHub releases, not built
-                // The download is handled separately
+                self.needs_release_igvm = true;
                 true
             }
 
