@@ -257,6 +257,11 @@ impl ResolvedArtifactSelections {
                 self.downloads.insert(KnownTestArtifacts::FreeBsd13_2X64Vhd);
                 true
             }
+            "petri_artifacts_vmm_test::artifacts::test_vhd::ALPINE_3_23_X64" => {
+                self.downloads.insert(KnownTestArtifacts::Alpine323X64Vhd);
+                self.build.pipette_linux = true;
+                true
+            }
             "petri_artifacts_vmm_test::artifacts::test_vhd::UBUNTU_2404_SERVER_X64" => {
                 self.downloads
                     .insert(KnownTestArtifacts::Ubuntu2404ServerX64Vhd);
