@@ -143,7 +143,7 @@ impl IntoPipeline for VmmTestsCli {
         let target_architecture = target.as_triple().architecture;
 
         // Handle artifacts-file mode: read discovered artifacts from JSON file
-        let (resolved_filter, resolved_artifacts, resolved_build) =
+        let (resolved_filter, resolved_artifacts, resolved_build, needs_release_igvm) =
             if let Some(artifacts_path) = artifacts_file {
                 let filter = filter.expect("--filter is required with --artifacts-file");
                 log::info!(
@@ -183,13 +183,14 @@ impl IntoPipeline for VmmTestsCli {
                     filter,
                     resolved.downloads.into_iter().collect(),
                     resolved.build,
+                    resolved.needs_release_igvm,
                 )
             } else if let Some(filter) = filter {
                 // Custom mode with explicit artifacts
-                (filter, artifacts, BuildSelections::default())
+                (filter, artifacts, BuildSelections::default(), true)
             } else {
                 // Flags mode - not using artifacts-file, return early to use existing logic
-                (String::new(), Vec::new(), BuildSelections::default())
+                (String::new(), Vec::new(), BuildSelections::default(), true)
             };
 
         // When running Windows binaries under WSL, the output directory must be
@@ -224,6 +225,7 @@ impl IntoPipeline for VmmTestsCli {
                     target_lexicon::OperatingSystem::Linux => VmmTestsDepSelections::Linux,
                     _ => unreachable!(),
                 },
+                needs_release_igvm,
             }
         } else if !resolved_filter.is_empty() {
             // Custom mode with explicit artifacts (filter was specified without artifacts-file)
@@ -244,6 +246,7 @@ impl IntoPipeline for VmmTestsCli {
                     target_lexicon::OperatingSystem::Linux => VmmTestsDepSelections::Linux,
                     _ => unreachable!(),
                 },
+                needs_release_igvm,
             }
         } else {
             // Flags mode
