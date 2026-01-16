@@ -52,6 +52,20 @@ Windows file system. For example, from WSL2:
 cargo xflowey vmm-tests --target windows-x64 --dir /mnt/e/vmm_tests
 ```
 
+### Quick Tests
+
+For rapid local validation during development, you can run a curated subset of
+fast-running tests using the `--quick` flag:
+
+```bash
+cargo xflowey vmm-test-run --quick --dir /mnt/e/vmm_tests
+```
+
+This runs a preset selection of fast tests (typically using `linux_direct` guests
+that don't require a full OS boot) that are ideal for rapid developer iteration.
+
+The `--quick` flag conflicts with `--filter` — use one or the other, not both.
+
 This command will build or download all the test dependencies and copy them
 to a self-contained folder that can be copied to another system for testing.
 The folder will contain scripts for installing dependencies
