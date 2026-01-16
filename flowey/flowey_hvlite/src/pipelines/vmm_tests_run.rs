@@ -225,6 +225,9 @@ impl VmmTestsRunCli {
         if let Some(kernel) = custom_kernel {
             test_cmd.arg("--custom-kernel").arg(kernel);
         }
+        if quick {
+            test_cmd.arg("--skip-vhd-prompt");
+        }
 
         test_cmd.current_dir(crate::repo_root());
 
