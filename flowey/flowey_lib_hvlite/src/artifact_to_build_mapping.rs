@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 use vmm_test_images::KnownTestArtifacts;
 
 /// Result of resolving artifact requirements to build/download selections.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ResolvedArtifactSelections {
     /// What to build
     pub build: BuildSelections,
@@ -22,6 +22,18 @@ pub struct ResolvedArtifactSelections {
     pub unknown: Vec<String>,
     /// Target triple from the artifacts file (if present)
     pub target_from_file: Option<String>,
+}
+
+impl Default for ResolvedArtifactSelections {
+    fn default() -> Self {
+        Self {
+            build: BuildSelections::none(),
+            downloads: BTreeSet::new(),
+            unknown: Vec::new(),
+            target_from_file: None,
+            needs_release_igvm: false,
+        }
+    }
 }
 
 impl ResolvedArtifactSelections {
