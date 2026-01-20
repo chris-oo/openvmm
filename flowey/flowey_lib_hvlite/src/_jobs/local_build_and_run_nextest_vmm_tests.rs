@@ -141,6 +141,26 @@ impl Default for BuildSelections {
     }
 }
 
+impl BuildSelections {
+    /// No selections (build nothing)
+    pub fn none() -> Self {
+        Self {
+            prep_steps: false,
+            openhcl: false,
+            openvmm: false,
+            pipette_windows: false,
+            pipette_linux: false,
+            guest_test_uefi: false,
+            tmks: false,
+            tmk_vmm_windows: false,
+            tmk_vmm_linux: false,
+            vmgstool: false,
+            tpm_guest_tests_windows: false,
+            tpm_guest_tests_linux: false,
+        }
+    }
+}
+
 flowey_request! {
     pub struct Params {
         pub target: CommonTriple,
