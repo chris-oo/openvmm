@@ -20,13 +20,26 @@ use std::path::PathBuf;
 /// - Complete in under 30 seconds
 /// - Test core functionality that benefits from frequent validation
 ///
-/// To update this list, add or remove test names below. The names should match
-/// the test function name (the part after the last underscore in the full test name).
-/// For example, `multiarch::openvmm_uefi_x64_frontpage` has test name `frontpage`.
+/// # Adding new tests
+///
+/// Each entry is a regex pattern that matches against the test name portion of the
+/// full nextest test path. Test paths look like `module::backend_config_testname`,
+/// e.g., `multiarch::openvmm_uefi_x64_frontpage` or `tpm::hyperv_openhcl_uefi_x64_alpine_3_23_x64_boot_with_tpm`.
+///
+/// The filter is built by prefixing each pattern with `_` and suffixing with `$`,
+/// then combining them with `|`. For example, `["foo", "bar.*baz"]` becomes
+/// `test(/_foo$|_bar.*baz$/)`.
+///
+/// Pattern examples:
+/// - `"frontpage"` - matches tests ending in `_frontpage`
+/// - `"alpine.*boot.*"` - matches `_alpine_3_23_x64_boot`, `_alpine_3_23_x64_boot_with_tpm`, etc.
+/// - `"servicing_keepalive_no_device"` - matches the exact test name suffix
+///
+/// To test your pattern, run: `cargo nextest list -E 'test(/_yourpattern$/)'`
 const QUICK_TESTS: &[&str] = &[
     "frontpage",
     "apicid_offset",
-    "alpine.*boot",
+    "alpine.*boot.*",
     "mana_nic",
     "vpci_filter",
     "validate_mnf_usage_in_guest",
