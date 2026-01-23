@@ -159,6 +159,7 @@ impl BuildSelections {
             vmgstool: false,
             tpm_guest_tests_windows: false,
             tpm_guest_tests_linux: false,
+            test_igvm_agent_rpc_server: false,
         }
     }
 }
