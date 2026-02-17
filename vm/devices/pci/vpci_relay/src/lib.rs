@@ -275,6 +275,8 @@ impl VpciRelay {
             let prog_if = hw_ids.prog_if;
             let sub_class = hw_ids.sub_class;
             let base_class = hw_ids.base_class;
+
+            // HACK: allow all devices
             tracing::warn!(
                 %instance_id,
                 vendor_id = hw_ids.vendor_id,
@@ -282,9 +284,18 @@ impl VpciRelay {
                 ?prog_if,
                 ?sub_class,
                 ?base_class,
-                "device not allowed on VPCI bus"
+                "HACK device allowed but normally would be filtered"
             );
-            return Ok(());
+            // tracing::warn!(
+            //     %instance_id,
+            //     vendor_id = hw_ids.vendor_id,
+            //     device_id = hw_ids.device_id,
+            //     ?prog_if,
+            //     ?sub_class,
+            //     ?base_class,
+            //     "device not allowed on VPCI bus"
+            // );
+            // return Ok(());
         }
 
         tracing::info!(%instance_id, vendor_id = hw_ids.vendor_id, device_id = hw_ids.device_id, "vpci relay device arrived");
