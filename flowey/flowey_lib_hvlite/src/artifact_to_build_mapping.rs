@@ -202,6 +202,12 @@ impl ResolvedArtifactSelections {
                 true
             }
 
+            // Host tools
+            "petri_artifacts_vmm_test::artifacts::host_tools::TEST_IGVM_AGENT_RPC_SERVER_WINDOWS_X64" => {
+                self.build.test_igvm_agent_rpc_server = true;
+                true
+            }
+
             // Loadable firmware artifacts (these come from deps, not built)
             "petri_artifacts_vmm_test::artifacts::loadable::LINUX_DIRECT_TEST_KERNEL_X64"
             | "petri_artifacts_vmm_test::artifacts::loadable::LINUX_DIRECT_TEST_INITRD_X64"
