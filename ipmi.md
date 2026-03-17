@@ -87,8 +87,20 @@ States are encoded in S1:S0 bits of the status register:
 
 IPMI messages follow this structure:
 ```
-[NetFn/LUN] [Command] [Data...]
+Request:  [NetFn/LUN] [Command] [Data...]
+Response: [NetFn/LUN] [Command] [CompletionCode] [Data...]
 ```
+
+The response NetFn is the request NetFn OR'd with `0x04` (response bit). For
+example, a request with NetFn=App (`0x06`) gets a response with NetFn=`0x07`.
+The NetFn/LUN byte is `(NetFn << 2) | LUN`, so a response to App/LUN0 is
+`0x1C` (= `0x07 << 2`).
+
+Standard completion codes:
+- `0x00` — Command completed normally
+- `0xC1` — Invalid/unsupported command
+- `0xC7` — Request data length invalid
+- `0xD4` — Insufficient privilege level
 
 For SEL operations, the relevant commands (NetFn = Storage 0x0A):
 
@@ -190,11 +202,13 @@ rust-version.workspace = true
 
 [dependencies]
 chipset_device.workspace = true
+chipset_device_resources.workspace = true
 inspect.workspace = true
 ipmi_kcs_resources.workspace = true
 mesh.workspace = true
 open_enum.workspace = true
 thiserror.workspace = true
+tracelimit.workspace = true
 tracing.workspace = true
 vm_resource.workspace = true
 vmcore.workspace = true
@@ -214,12 +228,12 @@ workspace = true
 use open_enum::open_enum;
 
 open_enum! {
-    /// KCS interface states (encoded in status register S1:S0).
+    /// KCS interface states (encoded in status register S1:S0, bits 7:6).
     pub enum KcsState: u8 {
-        IDLE_STATE  = 0x00,
-        READ_STATE  = 0x40, // S0=1 (bit 6)
-        WRITE_STATE = 0x80, // S1=1 (bit 7)
-        ERROR_STATE = 0xC0, // S1=1, S0=1
+        IDLE_STATE  = 0x00, // S1:S0 = 00
+        READ_STATE  = 0x40, // S1:S0 = 01
+        WRITE_STATE = 0x80, // S1:S0 = 10
+        ERROR_STATE = 0xC0, // S1:S0 = 11
     }
 }
 
@@ -233,13 +247,9 @@ open_enum! {
     }
 }
 
-open_enum! {
-    /// I/O port offsets from KCS base address.
-    pub enum KcsPort: u16 {
-        DATA_REG      = 0xCA2,
-        STATUS_CMD_REG = 0xCA3,
-    }
-}
+/// KCS I/O port addresses.
+const KCS_DATA_REG: u16 = 0xCA2;
+const KCS_STATUS_CMD_REG: u16 = 0xCA3;
 ```
 
 The state machine implementation must:
@@ -277,6 +287,27 @@ Commands to implement:
 | Get SEL Entry (0x43) | Find by Record ID, return 16-byte record + next ID |
 | Add SEL Entry (0x44) | Accept 16-byte record, assign Record ID, store |
 | Clear SEL (0x47) | Two-phase erase (initiate + confirm) per spec |
+
+**Clear SEL Protocol Detail** (IPMI v2.0, Section 31.9):
+
+The Clear SEL command uses a two-phase handshake to prevent accidental erasure:
+
+1. **Initiate**: Host sends `Clear SEL` with data bytes `[0x43, 0x4C, 0x52, 0xAA]`
+   - `0x43, 0x4C, 0x52` = ASCII `"CLR"` (reservation check)
+   - `0xAA` = initiate erase action
+   - Response: completion code `0x00` + erasure status byte (`0x01` = in progress)
+2. **Get Status** (optional): Host sends `Clear SEL` with `[0x43, 0x4C, 0x52, 0x00]`
+   - `0x00` = get erasure status
+   - Response: `0x00` + status (`0x01` = in progress, `0x02` = erase complete)
+3. For a virtual device, erasure completes instantly — return `0x02` immediately
+   after the initiate call.
+
+The first two bytes of the Clear SEL command data are the Reservation ID
+(little-endian), followed by `"CLR"` + action byte. A valid sequence is:
+```
+[ResvID_lo, ResvID_hi, 0x43, 0x4C, 0x52, 0xAA]  // initiate
+[ResvID_lo, ResvID_hi, 0x43, 0x4C, 0x52, 0x00]  // get status
+```
 | Get SEL Time (0x48) | Return current BMC time |
 | Set SEL Time (0x49) | Update time offset |
 
@@ -287,6 +318,7 @@ valid response.
 #### `lib.rs` — ChipsetDevice Implementation
 
 ```rust
+#[derive(InspectMut)]
 pub struct IpmiKcsDevice {
     // KCS protocol state
     state: KcsState,
@@ -294,10 +326,13 @@ pub struct IpmiKcsDevice {
     data_out: u8,
     write_buffer: Vec<u8>,
     read_buffer: VecDeque<u8>,
-    read_pos: usize,
 
     // IPMI layer
     sel: SelStore,
+
+    // Static region for get_static_regions()
+    #[inspect(skip)]
+    pio_region: (&'static str, RangeInclusive<u16>),
 }
 
 impl ChipsetDevice for IpmiKcsDevice {
@@ -308,9 +343,7 @@ impl ChipsetDevice for IpmiKcsDevice {
 
 impl PortIoIntercept for IpmiKcsDevice {
     fn get_static_regions(&mut self) -> &[(&str, RangeInclusive<u16>)] {
-        &[
-            ("kcs", 0xCA2..=0xCA3),
-        ]
+        std::slice::from_ref(&self.pio_region)
     }
 
     fn io_read(&mut self, io_port: u16, data: &mut [u8]) -> IoResult {
@@ -328,6 +361,26 @@ impl ChangeDeviceState for IpmiKcsDevice {
     async fn stop(&mut self) {}
     async fn reset(&mut self) {
         // Reset to idle, clear buffers, optionally preserve SEL
+    }
+}
+
+mod save_restore {
+    use super::*;
+    use vmcore::save_restore::NoSavedState;
+    use vmcore::save_restore::RestoreError;
+    use vmcore::save_restore::SaveError;
+    use vmcore::save_restore::SaveRestore;
+
+    impl SaveRestore for IpmiKcsDevice {
+        type SavedState = NoSavedState;
+
+        fn save(&mut self) -> Result<Self::SavedState, SaveError> {
+            Ok(NoSavedState)
+        }
+
+        fn restore(&mut self, NoSavedState: Self::SavedState) -> Result<(), RestoreError> {
+            Ok(())
+        }
     }
 }
 ```
@@ -351,8 +404,9 @@ impl ResolveResource<ChipsetDeviceHandleKind, IpmiKcsHandle> for IpmiKcsResolver
     fn resolve(
         &self,
         _resource: IpmiKcsHandle,
-        _input: ResolveChipsetDeviceHandleParams<'_>,
+        input: ResolveChipsetDeviceHandleParams<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        input.configure.omit_saved_state();
         Ok(IpmiKcsDevice::new().into())
     }
 }
@@ -399,10 +453,17 @@ pub fn with_ipmi_kcs(mut self) -> Self {
 1. **`ipmi_kcs_resources`** — Resource handle crate (tiny, no logic)
 2. **`ipmi_kcs/src/protocol.rs`** — KCS state machine with unit tests
 3. **`ipmi_kcs/src/sel.rs`** — SEL storage with unit tests
-4. **`ipmi_kcs/src/lib.rs`** — Device wiring (ChipsetDevice + PortIoIntercept)
-5. **`ipmi_kcs/src/resolver.rs`** — Resolver registration
+4. **`ipmi_kcs/src/lib.rs`** — Device wiring (ChipsetDevice + PortIoIntercept +
+   SaveRestore with `NoSavedState` + `#[derive(InspectMut)]`)
+5. **`ipmi_kcs/src/resolver.rs`** — Resolver registration (calls `omit_saved_state()`)
 6. **Integration** — Workspace Cargo.toml, openvmm_resources, petri modify.rs
-7. **SaveRestore** — Implement state persistence (can be deferred)
+
+> **Note**: `SaveRestore` must be implemented from the start (even as a
+> no-op using `NoSavedState`) because the `From<T> for ResolvedChipsetDevice`
+> bound requires `T: ChangeDeviceState + ChipsetDevice + ProtobufSaveRestore
+> + InspectMut`. The device will not compile without it. Real state
+> persistence can be added later by replacing `NoSavedState` with a proper
+> `SavedState` struct.
 
 ### 2.5 Key Implementation Notes
 
@@ -441,68 +502,53 @@ Alpine 3.23 cloud images **do** package IPMI tools and kernel modules:
 UEFI-only). For UEFI boot, the IPMI device needs proper ACPI/SMBIOS tables
 to be discoverable — which is deferred to Phase 2.
 
-#### Recommended Approach: Custom Linux Direct Test Kernel
+#### Recommended Approach: Static Rust Test Binary (Option B)
 
 For Phase 1 (Linux Direct, no ACPI), the most practical approach is:
 
-**Option A — Direct I/O Port Access from Pipette (Preferred)**
+Build a **static Rust test binary** (`x86_64-unknown-linux-musl`) that exercises
+the KCS protocol via direct I/O port access. This binary:
+1. Calls `iopl(3)` to enable I/O port access from userspace
+2. Uses inline assembly or libc `inb()`/`outb()` for port I/O
+3. Implements the KCS write/read protocol
+4. Sends "Get Device ID", "Add SEL Entry", "Get SEL Entry" commands
+5. Validates responses and prints JSON results to stdout
 
-Instead of relying on kernel IPMI drivers, write a **small Rust helper binary**
-compiled into the test initrd (or use pipette's execute capability) that:
-1. Directly reads/writes the KCS I/O ports (`0xCA2`/`0xCA3`) using `iopl()`
-   and `inb()`/`outb()` system calls
-2. Implements the KCS write/read protocol in userspace
-3. Sends an "Add SEL Entry" IPMI command
-4. Sends a "Get SEL Entry" IPMI command to read it back
-5. Prints the result to stdout for validation
+This approach is preferred over shell scripting via `/dev/port` because:
+- **Performance**: Direct port I/O is instant; shell `dd`/`od` in a polling
+  loop forks ~3 processes per iteration, risking timeouts
+- **Reliability**: No dependency on `/dev/port` (`CONFIG_DEVPORT`) being
+  compiled into the test kernel
+- **Correctness**: Proper byte-level control without shell quoting issues
+- **Debuggability**: Rust binary can provide structured error output
 
-This works because:
-- Linux Direct boot runs as root (pipette is PID 1)
-- `iopl(3)` grants I/O port access from userspace
-- No kernel modules needed
-- Busybox's `devmem` doesn't help (that's MMIO), but we can embed a small
-  static binary
+The binary lives as a crate in `vmm_tests/` and is cross-compiled to
+`x86_64-unknown-linux-musl`. Pipette uploads and executes it in the guest.
 
-**Option B — Pre-built test binary in initrd**
+**Alternative approaches considered but rejected:**
 
-Build a static `ipmi_kcs_test` binary (Rust, musl target) that exercises the
-KCS protocol. Include it in the test initrd alongside pipette.
-
-This is the approach used by tests like `virtio_rng_device` which check
-`/dev/hwrng` — except for IPMI on Linux Direct there's no kernel driver path,
-so we use raw I/O ports.
-
-**Option C — Build a custom kernel with IPMI modules**
-
-Rebuild the Linux Direct test kernel with `CONFIG_IPMI_HANDLER=y`,
-`CONFIG_IPMI_SI=y`, `CONFIG_IPMI_DEVICE_INTERFACE=y`. Then the guest can
-use standard `/dev/ipmi0` and `ipmitool`.
-
-This is a heavier approach and requires changes to the kernel build
-infrastructure, but gives the most realistic test.
+- **Option A — Shell script via `/dev/port`**: Too fragile — each I/O port
+  read/write forks multiple processes, making the KCS polling loop extremely
+  slow. `/dev/port` availability is also not guaranteed.
+- **Option C — Custom kernel with IPMI modules**: Too heavy — requires
+  changes to kernel build infrastructure. Better suited for Phase 2 Alpine
+  tests.
 
 ### 3.2 Recommended Test Strategy
 
-Use **Option A** for Phase 1. The test helper can be built as a standalone
-Rust crate in `vmm_tests/` that cross-compiles to `x86_64-unknown-linux-musl`
-and gets embedded or shipped alongside test artifacts.
+Use the **static Rust binary** approach for Phase 1. The binary is built as a
+standalone crate (`ipmi_kcs_test_bin`) that cross-compiles to
+`x86_64-unknown-linux-musl` and is uploaded to the guest via pipette's
+`write_file()` method.
 
-Alternatively, since pipette can already execute arbitrary programs in the
-guest, we can use shell commands with busybox if the kernel exposes
-`/dev/port` (which allows raw I/O port access without `iopl()`):
-
-```sh
-# Check if /dev/port exists (it does on most Linux kernels with devtmpfs)
-test -e /dev/port
-
-# Write to I/O port: echo byte at offset into /dev/port
-# Read KCS status register (port 0xCA3):
-dd if=/dev/port bs=1 count=1 skip=$((0xCA3)) 2>/dev/null | od -A n -t x1
-```
-
-If `/dev/port` is available in the test initrd, **no custom binary is needed**
-— we can script the entire KCS protocol using `dd` on `/dev/port`. This is the
-simplest approach and should be tried first.
+The binary implements:
+1. `iopl(3)` syscall to enable port I/O
+2. KCS write/read protocol via `inb`/`outb`
+3. "Get Device ID" command — validates basic KCS functionality
+4. "Add SEL Entry" with a known 16-byte record
+5. "Get SEL Entry" to read it back and compare
+6. "Get SEL Info" to verify entry count
+7. Prints `SEL_TEST_PASS` on success, or a detailed error on failure
 
 ### 3.3 Test Implementation
 
@@ -510,7 +556,9 @@ Add the test to `vmm_tests/vmm_tests/tests/tests/x86_64.rs`:
 
 ```rust
 /// Test that the IPMI KCS device correctly handles SEL operations.
-/// Adds a SEL entry via the KCS interface and reads it back.
+/// Uploads a static test binary that exercises the KCS interface via
+/// direct I/O port access (iopl + inb/outb), adds a SEL entry, reads
+/// it back, and validates the data.
 #[openvmm_test(linux_direct_x64)]
 async fn ipmi_kcs_sel(
     config: PetriVmBuilder<OpenVmmPetriBackend>,
@@ -522,30 +570,24 @@ async fn ipmi_kcs_sel(
 
     let sh = agent.unix_shell();
 
-    // Verify /dev/port exists for raw I/O access
-    cmd!(sh, "test -e /dev/port")
-        .run()
-        .await
-        .context("/dev/port not available — cannot test KCS I/O")?;
+    // Upload the pre-built static test binary to the guest.
+    // The binary is built as x86_64-unknown-linux-musl and included
+    // as a test artifact.
+    let test_bin = std::io::Cursor::new(
+        petri_artifacts_vmm_test::IPMI_KCS_TEST_BIN.read().await?
+    );
+    agent.write_file("/tmp/ipmi_kcs_test", test_bin).await?;
+    cmd!(sh, "chmod +x /tmp/ipmi_kcs_test").run().await?;
 
-    // Helper shell functions for KCS I/O
-    // (These would be uploaded as a script or inlined)
-    //
-    // The test script:
-    // 1. Reads KCS status register to confirm IDLE state
-    // 2. Performs KCS WRITE_START → write IPMI "Add SEL Entry" command
-    // 3. Reads response (completion code 0x00 + record ID)
-    // 4. Performs KCS WRITE_START → write IPMI "Get SEL Entry" command
-    // 5. Reads response and validates the 16-byte SEL record matches
-    // 6. Asserts the record data is correct
-
-    // Upload and run the KCS test script
-    let script = include_str!("ipmi_kcs_test.sh");
-    agent.write_file("/tmp/ipmi_kcs_test.sh", script.as_bytes()).await?;
-    let output = cmd!(sh, "sh /tmp/ipmi_kcs_test.sh")
+    // Run the test binary — it exercises:
+    // 1. Get Device ID (verifies KCS state machine)
+    // 2. Add SEL Entry (writes a known 16-byte record)
+    // 3. Get SEL Entry (reads it back and compares)
+    // 4. Get SEL Info (verifies entry count = 1)
+    let output = cmd!(sh, "/tmp/ipmi_kcs_test")
         .read()
         .await
-        .context("IPMI KCS SEL test failed")?;
+        .context("IPMI KCS test binary failed")?;
 
     assert!(
         output.contains("SEL_TEST_PASS"),
@@ -558,148 +600,219 @@ async fn ipmi_kcs_sel(
 }
 ```
 
-#### Test Shell Script (`ipmi_kcs_test.sh`)
+> **Note on `write_file`**: The pipette `write_file()` method takes
+> `impl AsyncRead`, not `&[u8]`. Wrap byte slices in `std::io::Cursor`
+> before passing to `write_file()`.
 
-The shell script implements the KCS protocol via `/dev/port`:
+#### Test Binary Crate (`vmm_tests/ipmi_kcs_test_bin/`)
 
-```bash
-#!/bin/sh
-# IPMI KCS SEL Test via /dev/port
-#
-# KCS ports: Data=0xCA2, Status/Cmd=0xCA3
-# Uses dd to read/write individual I/O port bytes.
+The test binary is a small standalone Rust program:
 
-set -e
-
-DATA_PORT=51874    # 0xCA2
-CMD_PORT=51875     # 0xCA3
-
-# Read one byte from an I/O port
-read_port() {
-    dd if=/dev/port bs=1 count=1 skip="$1" 2>/dev/null | od -A n -t u1 | tr -d ' '
-}
-
-# Write one byte to an I/O port
-write_port() {
-    printf "\\$(printf '%03o' "$2")" | dd of=/dev/port bs=1 count=1 seek="$1" 2>/dev/null
-}
-
-# Wait for IBF=0 (bit 1 of status)
-wait_ibf_clear() {
-    for i in $(seq 1 1000); do
-        status=$(read_port $CMD_PORT)
-        if [ $((status & 2)) -eq 0 ]; then
-            return 0
-        fi
-    done
-    echo "FAIL: IBF timeout"
-    exit 1
-}
-
-# Wait for OBF=1 (bit 0 of status)
-wait_obf_set() {
-    for i in $(seq 1 1000); do
-        status=$(read_port $CMD_PORT)
-        if [ $((status & 1)) -ne 0 ]; then
-            return 0
-        fi
-    done
-    echo "FAIL: OBF timeout"
-    exit 1
-}
-
-# Read KCS status
-status=$(read_port $CMD_PORT)
-echo "Initial KCS status: $status"
-
-# Verify IDLE state (S1:S0 = 00, bits 7:6)
-state=$((status & 192))
-if [ "$state" -ne 0 ]; then
-    echo "FAIL: KCS not in IDLE state (state=$state)"
-    exit 1
-fi
-echo "KCS is in IDLE state"
-
-# === Send "Get Device ID" command (NetFn=App(0x06), Cmd=0x01) ===
-# IPMI message: [NetFn/LUN=0x18] [Cmd=0x01]
-# NetFn=0x06 << 2 | LUN=0x00 = 0x18
-
-# Write WRITE_START command
-wait_ibf_clear
-write_port $CMD_PORT 0x61
-
-# Wait for IBF clear and OBF set, read dummy
-wait_ibf_clear
-wait_obf_set
-read_port $DATA_PORT > /dev/null
-
-# Write NetFn/LUN byte
-write_port $DATA_PORT 0x18
-
-# Wait, read dummy
-wait_ibf_clear
-wait_obf_set
-read_port $DATA_PORT > /dev/null
-
-# Write WRITE_END command
-wait_ibf_clear
-write_port $CMD_PORT 0x62
-
-# Wait, read dummy
-wait_ibf_clear
-wait_obf_set
-read_port $DATA_PORT > /dev/null
-
-# Write command byte (last data byte after WRITE_END)
-write_port $DATA_PORT 0x01
-
-# Now read response
-wait_ibf_clear
-wait_obf_set
-
-# Check state is READ (0x40, bits 7:6 = 01)
-status=$(read_port $CMD_PORT)
-state=$((status & 192))
-echo "Response state: $state (expect 64 for READ)"
-
-# Read response bytes until IDLE
-response=""
-while true; do
-    wait_obf_set
-    byte=$(read_port $DATA_PORT)
-
-    status=$(read_port $CMD_PORT)
-    state=$((status & 192))
-
-    if [ "$state" -eq 0 ]; then
-        # IDLE — this was the final status byte
-        echo "Get Device ID response: $response"
-        break
-    fi
-
-    response="$response $byte"
-    # Acknowledge read
-    write_port $DATA_PORT 0x68
-    wait_ibf_clear
-done
-
-echo "Device ID retrieved successfully"
-
-# === Now test SEL: Add SEL Entry ===
-# NetFn=Storage(0x0A), Cmd=0x44
-# NetFn/LUN = 0x0A << 2 | 0x00 = 0x28
-# Data = 16 bytes of SEL record
-
-echo "Adding SEL entry..."
-# (Abbreviated — full KCS write sequence with 16 data bytes)
-# Record: Type=0x02, Sensor Type=0x01, Sensor#=0x42, Event=0x6F, Data=0x01,0x02,0x03
-
-echo "SEL_TEST_PASS"
+```
+vmm_tests/ipmi_kcs_test_bin/
+├── Cargo.toml
+└── src/
+    └── main.rs
 ```
 
-> **Note**: The actual test script would be more complete. The above shows the
-> pattern — the full implementation handles the complete KCS write/read
-> sequence for Add SEL Entry and Get SEL Entry commands.
+**`Cargo.toml`:**
+```toml
+[package]
+name = "ipmi_kcs_test_bin"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Minimal deps for a static musl binary
+libc.workspace = true
+
+[lints]
+workspace = true
+```
+
+**`src/main.rs`** (sketch):
+```rust
+//! IPMI KCS test binary for Linux Direct VMM tests.
+//! Exercises the KCS interface via direct I/O port access.
+
+use std::process::ExitCode;
+
+const KCS_DATA_REG: u16 = 0xCA2;
+const KCS_STATUS_CMD_REG: u16 = 0xCA3;
+
+// KCS commands
+const WRITE_START: u8 = 0x61;
+const WRITE_END: u8 = 0x62;
+const READ_ACK: u8 = 0x68;
+
+// Status register bits
+const IBF: u8 = 0x02;
+const OBF: u8 = 0x01;
+const STATE_MASK: u8 = 0xC0;
+const STATE_READ: u8 = 0x40;
+
+unsafe fn outb(port: u16, val: u8) {
+    std::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack));
+}
+
+unsafe fn inb(port: u16) -> u8 {
+    let val: u8;
+    std::arch::asm!("in al, dx", out("al") val, in("dx") port, options(nomem, nostack));
+    val
+}
+
+fn wait_ibf_clear() -> Result<(), &'static str> {
+    for _ in 0..100_000 {
+        if unsafe { inb(KCS_STATUS_CMD_REG) } & IBF == 0 {
+            return Ok(());
+        }
+    }
+    Err("IBF timeout")
+}
+
+fn wait_obf_set() -> Result<(), &'static str> {
+    for _ in 0..100_000 {
+        if unsafe { inb(KCS_STATUS_CMD_REG) } & OBF != 0 {
+            return Ok(());
+        }
+    }
+    Err("OBF timeout")
+}
+
+/// Send an IPMI command via KCS and return the response bytes.
+fn kcs_transfer(request: &[u8]) -> Result<Vec<u8>, &'static str> {
+    if request.is_empty() {
+        return Err("empty request");
+    }
+
+    // WRITE_START
+    wait_ibf_clear()?;
+    unsafe { outb(KCS_STATUS_CMD_REG, WRITE_START) };
+
+    // Write all bytes except the last
+    for &byte in &request[..request.len() - 1] {
+        wait_ibf_clear()?;
+        wait_obf_set()?;
+        unsafe { inb(KCS_DATA_REG) }; // dummy read to clear OBF
+        unsafe { outb(KCS_DATA_REG, byte) };
+    }
+
+    // WRITE_END + last byte
+    wait_ibf_clear()?;
+    unsafe { outb(KCS_STATUS_CMD_REG, WRITE_END) };
+    wait_ibf_clear()?;
+    wait_obf_set()?;
+    unsafe { inb(KCS_DATA_REG) }; // dummy read
+    unsafe { outb(KCS_DATA_REG, *request.last().unwrap()) };
+
+    // READ phase
+    let mut response = Vec::new();
+    loop {
+        wait_ibf_clear()?;
+        wait_obf_set()?;
+
+        let status = unsafe { inb(KCS_STATUS_CMD_REG) };
+        let byte = unsafe { inb(KCS_DATA_REG) };
+
+        if status & STATE_MASK != STATE_READ {
+            // IDLE — done (last byte is status, discard)
+            break;
+        }
+
+        response.push(byte);
+        unsafe { outb(KCS_DATA_REG, READ_ACK) };
+    }
+
+    Ok(response)
+}
+
+fn main() -> ExitCode {
+    // Enable I/O port access
+    if unsafe { libc::iopl(3) } != 0 {
+        eprintln!("FAIL: iopl(3) failed — not running as root?");
+        return ExitCode::FAILURE;
+    }
+
+    // 1. Get Device ID (NetFn=App 0x06, Cmd=0x01)
+    //    NetFn/LUN = 0x06 << 2 = 0x18
+    let resp = match kcs_transfer(&[0x18, 0x01]) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("FAIL: Get Device ID: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Response: [NetFn/LUN, Cmd, CompletionCode, ...]
+    if resp.len() < 3 || resp[2] != 0x00 {
+        eprintln!("FAIL: Get Device ID bad response: {resp:?}");
+        return ExitCode::FAILURE;
+    }
+    println!("Get Device ID: OK");
+
+    // 2. Add SEL Entry (NetFn=Storage 0x0A, Cmd=0x44)
+    //    NetFn/LUN = 0x0A << 2 = 0x28
+    //    Data = 16-byte SEL record
+    let sel_record: [u8; 16] = [
+        0x00, 0x00, // Record ID (ignored by BMC, assigned on add)
+        0x02,       // Record Type = System Event
+        0x00, 0x00, 0x00, 0x00, // Timestamp (BMC fills in)
+        0x20, 0x00, // Generator ID
+        0x04,       // EvM Rev
+        0x01,       // Sensor Type = Temperature
+        0x42,       // Sensor Number
+        0x6F,       // Event Dir / Event Type
+        0x01, 0x02, 0x03, // Event Data 1-3
+    ];
+    let mut add_req = vec![0x28, 0x44];
+    add_req.extend_from_slice(&sel_record);
+    let resp = match kcs_transfer(&add_req) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("FAIL: Add SEL Entry: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Response: [NetFn/LUN, Cmd, CC, RecordID_lo, RecordID_hi]
+    if resp.len() < 5 || resp[2] != 0x00 {
+        eprintln!("FAIL: Add SEL Entry bad response: {resp:?}");
+        return ExitCode::FAILURE;
+    }
+    let record_id = u16::from_le_bytes([resp[3], resp[4]]);
+    println!("Add SEL Entry: OK (Record ID = {record_id:#06x})");
+
+    // 3. Get SEL Entry (NetFn=Storage 0x0A, Cmd=0x43)
+    //    Data = [ResvID_lo, ResvID_hi, RecordID_lo, RecordID_hi, Offset, BytesToRead]
+    let get_req = vec![
+        0x28, 0x43,
+        0x00, 0x00,         // Reservation ID (0 = no reservation)
+        resp[3], resp[4],   // Record ID from Add response
+        0x00,               // Offset into record
+        0xFF,               // Read entire record
+    ];
+    let resp = match kcs_transfer(&get_req) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("FAIL: Get SEL Entry: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Response: [NetFn/LUN, Cmd, CC, NextRecID_lo, NextRecID_hi, Record...]
+    if resp.len() < 5 + 16 || resp[2] != 0x00 {
+        eprintln!("FAIL: Get SEL Entry bad response: {resp:?}");
+        return ExitCode::FAILURE;
+    }
+    let record_data = &resp[5..5 + 16];
+    // Verify key fields match what we wrote
+    if record_data[2] != 0x02 || record_data[10] != 0x42 || record_data[12] != 0x6F {
+        eprintln!("FAIL: SEL record mismatch: {record_data:?}");
+        return ExitCode::FAILURE;
+    }
+    println!("Get SEL Entry: OK (data verified)");
+
+    println!("SEL_TEST_PASS");
+    ExitCode::SUCCESS
+}
+```
 
 ### 3.4 Running the Test
 
@@ -930,7 +1043,8 @@ async fn ipmi_kcs_sel_alpine(
 | `vm/devices/ipmi_kcs/src/resolver.rs` | Resource resolver |
 | `vm/devices/ipmi_kcs/src/protocol.rs` | KCS state machine |
 | `vm/devices/ipmi_kcs/src/sel.rs` | SEL storage + IPMI command handlers |
-| `vmm_tests/vmm_tests/tests/tests/ipmi_kcs_test.sh` | Guest-side test script |
+| `vmm_tests/ipmi_kcs_test_bin/Cargo.toml` | Guest-side test binary crate manifest |
+| `vmm_tests/ipmi_kcs_test_bin/src/main.rs` | Static musl binary for KCS I/O port testing |
 
 ### Modified Files (Phase 1)
 
@@ -939,8 +1053,8 @@ async fn ipmi_kcs_sel_alpine(
 | `Cargo.toml` (root) | Add workspace members + dependencies |
 | `openvmm/openvmm_resources/src/lib.rs` | Register `IpmiKcsResolver` |
 | `petri/src/vm/openvmm/modify.rs` | Add `with_ipmi_kcs()` helper |
+| `petri/Cargo.toml` | Add `ipmi_kcs_resources` dependency |
 | `vmm_tests/vmm_tests/tests/tests/x86_64.rs` | Add `ipmi_kcs_sel` test |
-| `vmm_tests/vmm_tests/Cargo.toml` | Add `ipmi_kcs_resources` dependency |
 
 ### Modified Files (Phase 2)
 
