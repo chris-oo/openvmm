@@ -482,83 +482,47 @@ pub fn with_ipmi_kcs(mut self) -> Self {
 
 ## 3. Phase 1a: VMM Test for SEL Events
 
-### 3.1 Test Environment Decision: Linux Direct vs Alpine
+### 3.1 Test Environment Decision: Shell Script via `/dev/port`
 
-#### Linux Direct Test Kernel
+#### Background
 
-The Linux Direct test kernel (`bzImage` + `initrd` from
-`.packages/underhill-deps-private/`) is **minimal** and has busybox as its
-userspace. It almost certainly does **not** include the `ipmi_si` or
-`ipmi_devintf` kernel modules, which are needed for the guest to talk to the
-KCS interface.
+The original plan proposed a static Rust test binary cross-compiled to
+`x86_64-unknown-linux-musl`. Manual testing against a real Alpine Linux
+guest revealed a simpler approach is viable:
 
-#### Alpine 3.23 (UEFI boot)
+- The Alpine `linux-virt` kernel has `CONFIG_DEVPORT=y`, so `/dev/port`
+  is always available — no kernel modules needed.
+- Shell-based I/O via `dd`/`od` on `/dev/port` was manually verified to
+  work correctly: Get Device ID, Add SEL Entry, Get SEL Info all produce
+  correct responses.
+- The KCS protocol completes synchronously within the device (no async
+  delays), so the shell fork overhead doesn't cause timeouts.
 
-Alpine 3.23 cloud images **do** package IPMI tools and kernel modules:
-- `ipmitool` — available via `apk add ipmitool`
-- `ipmi_si`, `ipmi_devintf`, `ipmi_msghandler` — available as kernel modules
+This eliminates the need for a new crate, musl cross-compilation, and
+CI artifact pipeline changes.
 
-**However**, Alpine tests require UEFI boot (the Alpine VHD images are
-UEFI-only). For UEFI boot, the IPMI device needs proper ACPI/SMBIOS tables
-to be discoverable — which is deferred to Phase 2.
+**Approaches considered:**
 
-#### Recommended Approach: Static Rust Test Binary (Option B)
-
-For Phase 1 (Linux Direct, no ACPI), the most practical approach is:
-
-Build a **static Rust test binary** (`x86_64-unknown-linux-musl`) that exercises
-the KCS protocol via direct I/O port access. This binary:
-1. Calls `iopl(3)` to enable I/O port access from userspace
-2. Uses inline assembly or libc `inb()`/`outb()` for port I/O
-3. Implements the KCS write/read protocol
-4. Sends "Get Device ID", "Add SEL Entry", "Get SEL Entry" commands
-5. Validates responses and prints JSON results to stdout
-
-This approach is preferred over shell scripting via `/dev/port` because:
-- **Performance**: Direct port I/O is instant; shell `dd`/`od` in a polling
-  loop forks ~3 processes per iteration, risking timeouts
-- **Reliability**: No dependency on `/dev/port` (`CONFIG_DEVPORT`) being
-  compiled into the test kernel
-- **Correctness**: Proper byte-level control without shell quoting issues
-- **Debuggability**: Rust binary can provide structured error output
-
-The binary lives as a crate in `vmm_tests/` and is cross-compiled to
-`x86_64-unknown-linux-musl`. Pipette uploads and executes it in the guest.
-
-**Alternative approaches considered but rejected:**
-
-- **Option A — Shell script via `/dev/port`**: Too fragile — each I/O port
-  read/write forks multiple processes, making the KCS polling loop extremely
-  slow. `/dev/port` availability is also not guaranteed.
+- **Option A — Shell script via `/dev/port`** (chosen): Simple, no new
+  crates or build infrastructure. Proven via manual testing. Each I/O port
+  operation forks a few processes, but the virtual device responds instantly
+  so there is no risk of timeouts.
+- **Option B — Static Rust test binary**: More robust for real hardware,
+  but overkill for a virtual device. Requires a new crate, musl
+  cross-compilation target, and CI artifact wiring.
 - **Option C — Custom kernel with IPMI modules**: Too heavy — requires
-  changes to kernel build infrastructure. Better suited for Phase 2 Alpine
-  tests.
+  changes to kernel build infrastructure. Better suited for Phase 2.
 
-### 3.2 Recommended Test Strategy
+### 3.2 Test Implementation
 
-Use the **static Rust binary** approach for Phase 1. The binary is built as a
-standalone crate (`ipmi_kcs_test_bin`) that cross-compiles to
-`x86_64-unknown-linux-musl` and is uploaded to the guest via pipette's
-`write_file()` method.
-
-The binary implements:
-1. `iopl(3)` syscall to enable port I/O
-2. KCS write/read protocol via `inb`/`outb`
-3. "Get Device ID" command — validates basic KCS functionality
-4. "Add SEL Entry" with a known 16-byte record
-5. "Get SEL Entry" to read it back and compare
-6. "Get SEL Info" to verify entry count
-7. Prints `SEL_TEST_PASS` on success, or a detailed error on failure
-
-### 3.3 Test Implementation
-
-Add the test to `vmm_tests/vmm_tests/tests/tests/x86_64.rs`:
+Add the test to `vmm_tests/vmm_tests/tests/tests/x86_64.rs`. The test
+uses inline shell commands via `/dev/port` to exercise the KCS protocol:
 
 ```rust
 /// Test that the IPMI KCS device correctly handles SEL operations.
-/// Uploads a static test binary that exercises the KCS interface via
-/// direct I/O port access (iopl + inb/outb), adds a SEL entry, reads
-/// it back, and validates the data.
+/// Uses /dev/port to directly access KCS I/O ports (0xCA2-0xCA3),
+/// sends IPMI commands via the KCS write/read protocol, and validates
+/// responses.
 #[openvmm_test(linux_direct_x64)]
 async fn ipmi_kcs_sel(
     config: PetriVmBuilder<OpenVmmPetriBackend>,
@@ -570,27 +534,131 @@ async fn ipmi_kcs_sel(
 
     let sh = agent.unix_shell();
 
-    // Upload the pre-built static test binary to the guest.
-    // The binary is built as x86_64-unknown-linux-musl and included
-    // as a test artifact.
-    let test_bin = std::io::Cursor::new(
-        petri_artifacts_vmm_test::IPMI_KCS_TEST_BIN.read().await?
-    );
-    agent.write_file("/tmp/ipmi_kcs_test", test_bin).await?;
-    cmd!(sh, "chmod +x /tmp/ipmi_kcs_test").run().await?;
+    // Upload a test script that exercises the KCS interface via /dev/port.
+    // The script implements the KCS write/read protocol using dd and od,
+    // sends Get Device ID, Add SEL Entry, Get SEL Entry, and Get SEL Info,
+    // and prints IPMI_TEST_PASS on success.
+    let test_script = r#"#!/bin/sh
+set -e
+KCS_DATA=0xCA2
+KCS_CMD=0xCA3
 
-    // Run the test binary — it exercises:
-    // 1. Get Device ID (verifies KCS state machine)
-    // 2. Add SEL Entry (writes a known 16-byte record)
-    // 3. Get SEL Entry (reads it back and compares)
-    // 4. Get SEL Info (verifies entry count = 1)
-    let output = cmd!(sh, "/tmp/ipmi_kcs_test")
+inb() {
+    dd if=/dev/port bs=1 skip=$(($1)) count=1 2>/dev/null | od -An -tx1 | tr -d ' \n'
+}
+
+outb() {
+    printf "\\$(printf '%03o' $2)" | dd of=/dev/port bs=1 seek=$(($1)) count=1 2>/dev/null
+}
+
+wait_ibf() {
+    for i in $(seq 1 1000); do
+        s=$(inb $KCS_CMD)
+        if [ $((0x$s & 2)) -eq 0 ]; then return 0; fi
+    done
+    echo "FAIL: IBF timeout"; exit 1
+}
+
+# Send a KCS command and collect the response as hex bytes.
+# Usage: kcs_transfer <byte1> <byte2> ...
+# Prints response bytes (space-separated hex) to stdout.
+kcs_transfer() {
+    local bytes="$@"
+    local last=""
+    local count=0
+
+    # WRITE_START
+    wait_ibf
+    outb $KCS_CMD 0x61
+
+    # Write all bytes except last
+    for b in $bytes; do
+        count=$((count + 1))
+        if [ -n "$last" ]; then
+            wait_ibf
+            inb $KCS_DATA >/dev/null
+            outb $KCS_DATA $last
+        fi
+        last=$b
+    done
+
+    # WRITE_END + last byte
+    wait_ibf
+    outb $KCS_CMD 0x62
+    wait_ibf
+    inb $KCS_DATA >/dev/null
+    outb $KCS_DATA $last
+
+    # READ phase
+    local resp=""
+    while true; do
+        wait_ibf
+        local status=$(inb $KCS_CMD)
+        local byte=$(inb $KCS_DATA)
+        local state=$((0x$status & 0xC0))
+        if [ $state -ne 64 ]; then break; fi
+        resp="$resp $byte"
+        outb $KCS_DATA 0x68
+    done
+    echo $resp
+}
+
+# 1. Get Device ID (NetFn=App 0x06, Cmd=0x01)
+resp=$(kcs_transfer 0x18 0x01)
+cc=$(echo $resp | awk '{print $3}')
+if [ "$cc" != "00" ]; then
+    echo "FAIL: Get Device ID cc=$cc resp=$resp"; exit 1
+fi
+echo "Get Device ID: OK"
+
+# 2. Add SEL Entry (NetFn=Storage 0x0A, Cmd=0x44, 16-byte record)
+resp=$(kcs_transfer 0x28 0x44 0x00 0x00 0x02 0x00 0x00 0x00 0x00 0x20 0x00 0x04 0x01 0x42 0x6f 0x01 0x02 0x03)
+cc=$(echo $resp | awk '{print $3}')
+if [ "$cc" != "00" ]; then
+    echo "FAIL: Add SEL Entry cc=$cc resp=$resp"; exit 1
+fi
+rec_lo=$(echo $resp | awk '{print $4}')
+rec_hi=$(echo $resp | awk '{print $5}')
+echo "Add SEL Entry: OK (id=${rec_hi}${rec_lo})"
+
+# 3. Get SEL Entry (read back what we just wrote)
+resp=$(kcs_transfer 0x28 0x43 0x00 0x00 $rec_lo $rec_hi 0x00 0xff)
+cc=$(echo $resp | awk '{print $3}')
+if [ "$cc" != "00" ]; then
+    echo "FAIL: Get SEL Entry cc=$cc resp=$resp"; exit 1
+fi
+# Record data starts at field 6 (after NetFn, Cmd, CC, NextID_lo, NextID_hi)
+rec_type=$(echo $resp | awk '{print $8}')
+sensor_num=$(echo $resp | awk '{print $17}')
+if [ "$rec_type" != "02" ] || [ "$sensor_num" != "42" ]; then
+    echo "FAIL: SEL record mismatch type=$rec_type sensor=$sensor_num resp=$resp"; exit 1
+fi
+echo "Get SEL Entry: OK (verified)"
+
+# 4. Get SEL Info (verify count = 1)
+resp=$(kcs_transfer 0x28 0x40)
+cc=$(echo $resp | awk '{print $3}')
+count_lo=$(echo $resp | awk '{print $5}')
+count_hi=$(echo $resp | awk '{print $6}')
+if [ "$cc" != "00" ] || [ "$count_lo" != "01" ] || [ "$count_hi" != "00" ]; then
+    echo "FAIL: SEL Info cc=$cc count=${count_hi}${count_lo} resp=$resp"; exit 1
+fi
+echo "Get SEL Info: OK (count=1)"
+
+echo "IPMI_TEST_PASS"
+"#;
+
+    cmd!(sh, "cat > /tmp/ipmi_test.sh << 'SCRIPT_EOF'\n{test_script}\nSCRIPT_EOF")
+        .run().await?;
+    cmd!(sh, "chmod +x /tmp/ipmi_test.sh").run().await?;
+
+    let output = cmd!(sh, "/tmp/ipmi_test.sh")
         .read()
         .await
-        .context("IPMI KCS test binary failed")?;
+        .context("IPMI KCS test script failed")?;
 
     assert!(
-        output.contains("SEL_TEST_PASS"),
+        output.contains("IPMI_TEST_PASS"),
         "IPMI KCS SEL test did not pass: {output}"
     );
 
@@ -600,273 +668,28 @@ async fn ipmi_kcs_sel(
 }
 ```
 
-> **Note on `write_file`**: The pipette `write_file()` method takes
-> `impl AsyncRead`, not `&[u8]`. Wrap byte slices in `std::io::Cursor`
-> before passing to `write_file()`.
-
-#### Test Binary Crate (`vmm_tests/ipmi_kcs_test_bin/`)
-
-The test binary is a small standalone Rust program:
-
-```
-vmm_tests/ipmi_kcs_test_bin/
-├── Cargo.toml
-└── src/
-    └── main.rs
-```
-
-**`Cargo.toml`:**
-```toml
-[package]
-name = "ipmi_kcs_test_bin"
-edition.workspace = true
-rust-version.workspace = true
-
-[dependencies]
-# Minimal deps for a static musl binary
-libc.workspace = true
-
-[lints]
-workspace = true
-```
-
-**`src/main.rs`** (sketch):
-```rust
-//! IPMI KCS test binary for Linux Direct VMM tests.
-//! Exercises the KCS interface via direct I/O port access.
-
-use std::process::ExitCode;
-
-const KCS_DATA_REG: u16 = 0xCA2;
-const KCS_STATUS_CMD_REG: u16 = 0xCA3;
-
-// KCS commands
-const WRITE_START: u8 = 0x61;
-const WRITE_END: u8 = 0x62;
-const READ_ACK: u8 = 0x68;
-
-// Status register bits
-const IBF: u8 = 0x02;
-const OBF: u8 = 0x01;
-const STATE_MASK: u8 = 0xC0;
-const STATE_READ: u8 = 0x40;
-
-unsafe fn outb(port: u16, val: u8) {
-    std::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack));
-}
-
-unsafe fn inb(port: u16) -> u8 {
-    let val: u8;
-    std::arch::asm!("in al, dx", out("al") val, in("dx") port, options(nomem, nostack));
-    val
-}
-
-fn wait_ibf_clear() -> Result<(), &'static str> {
-    for _ in 0..100_000 {
-        if unsafe { inb(KCS_STATUS_CMD_REG) } & IBF == 0 {
-            return Ok(());
-        }
-    }
-    Err("IBF timeout")
-}
-
-fn wait_obf_set() -> Result<(), &'static str> {
-    for _ in 0..100_000 {
-        if unsafe { inb(KCS_STATUS_CMD_REG) } & OBF != 0 {
-            return Ok(());
-        }
-    }
-    Err("OBF timeout")
-}
-
-/// Send an IPMI command via KCS and return the response bytes.
-fn kcs_transfer(request: &[u8]) -> Result<Vec<u8>, &'static str> {
-    if request.is_empty() {
-        return Err("empty request");
-    }
-
-    // WRITE_START
-    wait_ibf_clear()?;
-    unsafe { outb(KCS_STATUS_CMD_REG, WRITE_START) };
-
-    // Write all bytes except the last
-    for &byte in &request[..request.len() - 1] {
-        wait_ibf_clear()?;
-        wait_obf_set()?;
-        unsafe { inb(KCS_DATA_REG) }; // dummy read to clear OBF
-        unsafe { outb(KCS_DATA_REG, byte) };
-    }
-
-    // WRITE_END + last byte
-    wait_ibf_clear()?;
-    unsafe { outb(KCS_STATUS_CMD_REG, WRITE_END) };
-    wait_ibf_clear()?;
-    wait_obf_set()?;
-    unsafe { inb(KCS_DATA_REG) }; // dummy read
-    unsafe { outb(KCS_DATA_REG, *request.last().unwrap()) };
-
-    // READ phase
-    let mut response = Vec::new();
-    loop {
-        wait_ibf_clear()?;
-        wait_obf_set()?;
-
-        let status = unsafe { inb(KCS_STATUS_CMD_REG) };
-        let byte = unsafe { inb(KCS_DATA_REG) };
-
-        if status & STATE_MASK != STATE_READ {
-            // IDLE — done (last byte is status, discard)
-            break;
-        }
-
-        response.push(byte);
-        unsafe { outb(KCS_DATA_REG, READ_ACK) };
-    }
-
-    Ok(response)
-}
-
-fn main() -> ExitCode {
-    // Enable I/O port access
-    if unsafe { libc::iopl(3) } != 0 {
-        eprintln!("FAIL: iopl(3) failed — not running as root?");
-        return ExitCode::FAILURE;
-    }
-
-    // 1. Get Device ID (NetFn=App 0x06, Cmd=0x01)
-    //    NetFn/LUN = 0x06 << 2 = 0x18
-    let resp = match kcs_transfer(&[0x18, 0x01]) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("FAIL: Get Device ID: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    // Response: [NetFn/LUN, Cmd, CompletionCode, ...]
-    if resp.len() < 3 || resp[2] != 0x00 {
-        eprintln!("FAIL: Get Device ID bad response: {resp:?}");
-        return ExitCode::FAILURE;
-    }
-    println!("Get Device ID: OK");
-
-    // 2. Add SEL Entry (NetFn=Storage 0x0A, Cmd=0x44)
-    //    NetFn/LUN = 0x0A << 2 = 0x28
-    //    Data = 16-byte SEL record
-    let sel_record: [u8; 16] = [
-        0x00, 0x00, // Record ID (ignored by BMC, assigned on add)
-        0x02,       // Record Type = System Event
-        0x00, 0x00, 0x00, 0x00, // Timestamp (BMC fills in)
-        0x20, 0x00, // Generator ID
-        0x04,       // EvM Rev
-        0x01,       // Sensor Type = Temperature
-        0x42,       // Sensor Number
-        0x6F,       // Event Dir / Event Type
-        0x01, 0x02, 0x03, // Event Data 1-3
-    ];
-    let mut add_req = vec![0x28, 0x44];
-    add_req.extend_from_slice(&sel_record);
-    let resp = match kcs_transfer(&add_req) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("FAIL: Add SEL Entry: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    // Response: [NetFn/LUN, Cmd, CC, RecordID_lo, RecordID_hi]
-    if resp.len() < 5 || resp[2] != 0x00 {
-        eprintln!("FAIL: Add SEL Entry bad response: {resp:?}");
-        return ExitCode::FAILURE;
-    }
-    let record_id = u16::from_le_bytes([resp[3], resp[4]]);
-    println!("Add SEL Entry: OK (Record ID = {record_id:#06x})");
-
-    // 3. Get SEL Entry (NetFn=Storage 0x0A, Cmd=0x43)
-    //    Data = [ResvID_lo, ResvID_hi, RecordID_lo, RecordID_hi, Offset, BytesToRead]
-    let get_req = vec![
-        0x28, 0x43,
-        0x00, 0x00,         // Reservation ID (0 = no reservation)
-        resp[3], resp[4],   // Record ID from Add response
-        0x00,               // Offset into record
-        0xFF,               // Read entire record
-    ];
-    let resp = match kcs_transfer(&get_req) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("FAIL: Get SEL Entry: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    // Response: [NetFn/LUN, Cmd, CC, NextRecID_lo, NextRecID_hi, Record...]
-    if resp.len() < 5 + 16 || resp[2] != 0x00 {
-        eprintln!("FAIL: Get SEL Entry bad response: {resp:?}");
-        return ExitCode::FAILURE;
-    }
-    let record_data = &resp[5..5 + 16];
-    // Verify key fields match what we wrote
-    if record_data[2] != 0x02 || record_data[10] != 0x42 || record_data[12] != 0x6F {
-        eprintln!("FAIL: SEL record mismatch: {record_data:?}");
-        return ExitCode::FAILURE;
-    }
-    println!("Get SEL Entry: OK (data verified)");
-
-    println!("SEL_TEST_PASS");
-    ExitCode::SUCCESS
-}
-```
-
-### 3.4 Running the Test
+### 3.3 Running the Test
 
 ```bash
-# Build and run the specific test using the flowey pipeline
 cargo xflowey vmm-tests-run \
     --filter "test(ipmi_kcs_sel)" \
     --target windows-x64 \
     --dir /mnt/d/vmm_tests_out/
 ```
 
-The `--target windows-x64` flag runs the test using the WHP (Windows Hypervisor
-Platform) backend on WSL, which is compatible with the Linux Direct boot
-firmware configuration.
+### 3.4 Unit Tests (already implemented in Phase 1)
 
-### 3.5 Unit Tests
+The `ipmi_kcs` crate already contains 21 unit tests covering:
 
-In addition to the VMM integration test, add unit tests within the
-`ipmi_kcs` crate:
-
-```rust
-#[cfg(test)]
-mod tests {
-    use test_with_tracing::test;
-
-    #[test]
-    fn kcs_write_read_roundtrip() {
-        // Create device, simulate KCS write sequence for "Get Device ID",
-        // verify response bytes match expected format
-    }
-
-    #[test]
-    fn sel_add_and_get_entry() {
-        // Add a SEL entry via IPMI command, read it back,
-        // verify record ID assignment and data integrity
-    }
-
-    #[test]
-    fn sel_clear() {
-        // Add entries, clear SEL, verify count=0
-    }
-
-    #[test]
-    fn kcs_error_recovery() {
-        // Send invalid sequence, verify device enters ERROR state,
-        // send GET_STATUS/ABORT, verify recovery to IDLE
-    }
-
-    #[test]
-    fn unknown_command_completion_code() {
-        // Send unsupported NetFn/Cmd, verify 0xC1 completion code
-    }
-}
-```
+- KCS write/read roundtrip (Get Device ID)
+- SEL add and get entry roundtrip
+- SEL clear
+- KCS error recovery (GET_STATUS/ABORT)
+- Unknown command completion codes
+- Invalid access sizes and registers
+- SEL info after operations
+- SEL time get/set
+- Multiple entries and next-record-ID chaining
 
 ---
 
