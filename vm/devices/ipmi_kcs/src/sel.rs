@@ -5,7 +5,7 @@
 
 use crate::protocol::CompletionCode;
 use crate::protocol::IpmiCommand;
-use inspect::InspectMut;
+use inspect::Inspect;
 
 /// Maximum number of SEL entries.
 const MAX_SEL_ENTRIES: usize = 128;
@@ -22,14 +22,49 @@ struct SelEntry {
     data: [u8; SEL_RECORD_SIZE],
 }
 
+impl Inspect for SelEntry {
+    fn inspect(&self, req: inspect::Request<'_>) {
+        let d = &self.data;
+        let timestamp = u32::from_le_bytes([d[3], d[4], d[5], d[6]]);
+        let generator_id = u16::from_le_bytes([d[7], d[8]]);
+        req.respond()
+            .hex("record_id", self.record_id)
+            .hex("record_type", d[2])
+            .field("timestamp", timestamp)
+            .hex("generator_id", generator_id)
+            .hex("evm_rev", d[9])
+            .hex("sensor_type", d[10])
+            .hex("sensor_number", d[11])
+            .hex("event_dir_type", d[12])
+            .hex("event_data1", d[13])
+            .hex("event_data2", d[14])
+            .hex("event_data3", d[15]);
+    }
+}
+
 /// SEL storage.
-#[derive(InspectMut)]
 pub struct SelStore {
-    #[inspect(skip)]
     entries: Vec<SelEntry>,
     next_record_id: u16,
     time_offset: i64,
     reservation_id: u16,
+}
+
+impl Inspect for SelStore {
+    fn inspect(&self, req: inspect::Request<'_>) {
+        req.respond()
+            .field("entry_count", self.entries.len())
+            .field("next_record_id", self.next_record_id)
+            .field("time_offset", self.time_offset)
+            .child("entries", |req| {
+                let mut resp = req.respond();
+                for entry in &self.entries {
+                    resp.child(&format!("{}", entry.record_id), |req| {
+                        entry.inspect(req);
+                    });
+                }
+            });
+    }
 }
 
 impl SelStore {
