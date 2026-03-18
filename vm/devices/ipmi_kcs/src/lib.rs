@@ -229,20 +229,19 @@ impl IpmiKcsDevice {
     }
 
     /// Get Device ID (NetFn=App, Cmd=0x01).
+    /// Response format per IPMI v2.0 Section 20.1.
     fn cmd_get_device_id(&self) -> Vec<u8> {
         vec![
             CompletionCode::SUCCESS.0, // Completion code
             0x20,                      // Device ID
             0x01,                      // Device revision
-            0x02,                      // Firmware revision 1
-            0x00,                      // Firmware revision 2
-            0x20,                      // IPMI version (2.0)
-            0x00,                      // Additional device support (none)
-            0x00,
-            0x00,
-            0x00, // Manufacturer ID (0)
-            0x00,
-            0x00, // Product ID (0)
+            0x01,                      // Firmware revision 1 (major, bit 7=0 = device available)
+            0x00,                      // Firmware revision 2 (minor, BCD)
+            0x02,                      // IPMI version 2.0 (BCD: low nibble=major, high=minor)
+            0x2D, // Additional device support: SEL + SDR Repo + Sensor + FRU + IPMB Event Receiver
+            0x37, 0x01, 0x00, // Manufacturer ID (IANA 311 = Microsoft, LS byte first)
+            0x01,
+            0x00, // Product ID (LS byte first) — 0x0001 = OpenVMM virtual BMC
         ]
     }
 
