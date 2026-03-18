@@ -48,7 +48,6 @@ pub struct IpmiKcsDevice {
     write_end_pending: bool,
 
     // IPMI layer
-    #[inspect(mut)]
     sel: SelStore,
 
     // Static I/O region
