@@ -697,6 +697,10 @@ flags:
     #[clap(long)]
     pub battery: bool,
 
+    /// expose an IPMI KCS device (BMC at I/O ports 0xCA2-0xCA3)
+    #[clap(long)]
+    pub ipmi_kcs: bool,
+
     /// set the uefi console mode
     #[clap(long)]
     pub uefi_console_mode: Option<UefiConsoleModeCli>,

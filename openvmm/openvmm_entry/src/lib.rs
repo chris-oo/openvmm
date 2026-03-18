@@ -1109,6 +1109,13 @@ async fn vm_config_from_command_line(
         ]);
     }
 
+    if opt.ipmi_kcs {
+        chipset_devices.push(ChipsetDeviceHandle {
+            name: "ipmi_kcs".to_string(),
+            resource: ipmi_kcs_resources::IpmiKcsHandle.into_resource(),
+        });
+    }
+
     if opt.tpm && !opt.vtl2 {
         let register_layout = if cfg!(guest_arch = "x86_64") {
             TpmRegisterLayout::IoPort
