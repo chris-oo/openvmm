@@ -70,6 +70,15 @@ impl PetriVmConfigOpenVmm {
         self
     }
 
+    /// Enable the IPMI KCS device for the VM.
+    pub fn with_ipmi_kcs(mut self) -> Self {
+        self.config.chipset_devices.push(ChipsetDeviceHandle {
+            name: "ipmi_kcs".to_string(),
+            resource: ipmi_kcs_resources::IpmiKcsHandle.into_resource(),
+        });
+        self
+    }
+
     /// Set test config for the GED's IGVM attest request handler
     pub fn with_igvm_attest_test_config(mut self, config: IgvmAttestTestConfig) -> Self {
         if !self.resources.properties.is_openhcl {
