@@ -5373,6 +5373,7 @@ dependencies = [
  "input_core",
  "inspect",
  "inspect_proto",
+ "ipmi_kcs_resources",
  "mcr_resources",
  "memory_range",
  "mesh",
