@@ -18,7 +18,9 @@ events can be written and read from inside the guest.
 1. [Background: IPMI KCS Interface & SEL](#1-background-ipmi-kcs-interface--sel)
 2. [Phase 1: IPMI KCS Device Implementation (Linux Direct)](#2-phase-1-ipmi-kcs-device-implementation-linux-direct)
 3. [Phase 1a: VMM Test for SEL Events](#3-phase-1a-vmm-test-for-sel-events)
-4. [Phase 2 (Future): UEFI Support via SMBIOS & ACPI](#4-phase-2-future-uefi-support-via-smbios--acpi)
+4. [Phase 2: UEFI Support via SMBIOS](#4-phase-2-uefi-support-via-smbios)
+5. [Phase 3: Windows VMM Test](#5-phase-3-windows-vmm-test)
+6. [Phase 4 (Optional): ACPI Support](#6-phase-4-optional-acpi-support)
 
 ---
 
@@ -693,68 +695,631 @@ The `ipmi_kcs` crate already contains 21 unit tests covering:
 
 ---
 
-## 4. Phase 2 (Future): UEFI Support via SMBIOS & ACPI
+## 4. Phase 2: UEFI Support via SMBIOS
 
-Phase 2 extends the IPMI device for UEFI-booted guests (including Alpine).
-UEFI firmware and modern OS kernels discover the IPMI interface through
-SMBIOS and ACPI tables, not by probing hard-coded I/O ports.
+Phase 2 extends the IPMI device for UEFI-booted guests. Linux discovers
+the IPMI KCS interface via SMBIOS Type 38, which is sufficient for
+`ipmi_si` auto-detection — no ACPI tables are required at this stage.
 
-### 4.1 SMBIOS Type 38 — IPMI Device Information
+**Design principle**: The I/O port base address (`0xCA2`) is a static,
+well-known constant shared between OpenVMM and mu_msvm. OpenVMM only
+needs to pass a single boolean flag (`ipmi_configured`) to the UEFI
+firmware via the config blob. The firmware generates the SMBIOS Type 38
+entry locally using the hardcoded address.
 
-Per SMBIOS Specification v3.x, Type 38 structure:
+### 4.1 OpenVMM Changes
 
-| Offset | Size | Field | Value |
-|--------|------|-------|-------|
-| 0x00 | 1 | Type | 38 (0x26) |
-| 0x01 | 1 | Length | 16 (minimum) |
-| 0x02 | 2 | Handle | Auto-assigned |
-| 0x04 | 1 | Interface Type | 0x01 = KCS |
-| 0x05 | 1 | IPMI Spec Rev | 0x20 = IPMI 2.0 |
-| 0x06 | 1 | I2C Target Addr | 0x20 (BMC default) |
-| 0x07 | 1 | NV Storage Device | 0xFF = not present |
-| 0x08 | 8 | Base Address | 0x0000000000000CA2 (I/O space, bit 0 = 0) |
-| 0x10 | 1 | Base Addr Modifier | Register spacing, LSB address bit |
-| 0x11 | 1 | Interrupt Number | 0x00 = none (polled) |
+#### 4.1.1 Add `ipmi_configured` to UEFI Config Flags Bitfield
 
-#### Where to Add
+**File**: `vm/loader/src/uefi/config.rs` (Flags struct, ~line 292)
 
-OpenVMM's SMBIOS generation lives in the firmware/UEFI path. The SMBIOS
-Type 38 entry needs to be added when the IPMI device is configured. Look at
-how existing SMBIOS entries (Type 0, 1, 2, 3) are generated and add a
-Type 38 builder in the same pattern.
+Add a new boolean field at bit 30 (first bit of current `_reserved`):
 
-Relevant code area: `vm/devices/firmware/` — specifically the SMBIOS builder
-used for UEFI boot configuration.
+```rust
+    pub hv_sint_enabled: bool,          // bit 29 (existing)
+    pub ipmi_configured: bool,          // bit 30 (new)
 
-### 4.2 ACPI SPMI Table (Service Processor Management Interface)
+    #[bits(33)]
+    _reserved: u64,                     // was 34 bits, now 33
+```
 
-The ACPI SPMI table tells the OS about the IPMI interface:
+This field tells the UEFI firmware to generate SMBIOS Type 38 and ACPI
+SPMI table entries for the IPMI KCS device.
 
-| Field | Value |
-|-------|-------|
-| Signature | "SPMI" |
-| Interface Type | 0x01 = KCS |
-| Spec Revision | 0x0200 |
-| Interrupt Type | 0x00 = none (polled) |
-| GPE | 0x00 |
-| PCI Device Flag | 0x00 = not PCI |
-| Base Address | GAS (Generic Address Structure): I/O Space, 0xCA2, byte access |
-| Register Spacing | 1 byte |
+#### 4.1.2 Add `enable_ipmi` to `LoadMode::Uefi`
 
-#### Where to Add
+**File**: `openvmm/openvmm_defs/src/config.rs` (LoadMode enum, ~line 111)
 
-OpenVMM's ACPI table generation needs the SPMI table added. Look at how
-existing ACPI tables (DSDT, FADT, MADT, etc.) are built and served to the
-guest firmware. The SPMI table is a static ACPI table — it doesn't need
-AML bytecode.
+Add a new field to the `Uefi` variant:
 
-Relevant areas:
-- `vm/devices/firmware/uefi_specs/` — ACPI table definitions
-- The UEFI firmware configuration path that assembles ACPI tables
+```rust
+    Uefi {
+        firmware: File,
+        // ... existing fields ...
+        enable_vpci_boot: bool,
+        enable_ipmi: bool,              // new
+        uefi_console_mode: Option<UefiConsoleMode>,
+        // ...
+    },
+```
 
-### 4.3 ACPI DSDT Device Node (Optional but Recommended)
+#### 4.1.3 Add `ipmi` to `UefiLoadSettings` and Set the Flag
 
-For best OS compatibility, add an IPMI device node in the DSDT:
+**File**: `openvmm/openvmm_core/src/worker/vm_loaders/uefi.rs`
+
+Add to `UefiLoadSettings` (~line 30):
+
+```rust
+pub struct UefiLoadSettings {
+    // ... existing fields ...
+    pub ipmi: bool,
+}
+```
+
+In `load_uefi()`, set the flag in the config blob builder (~line 90):
+
+```rust
+let flags = config::Flags::new()
+    // ... existing flags ...
+    .with_ipmi_configured(load_settings.ipmi);
+```
+
+#### 4.1.4 Wire Through `dispatch.rs`
+
+**File**: `openvmm/openvmm_core/src/worker/dispatch.rs` (~line 2441)
+
+In the `LoadMode::Uefi` arm of `load_firmware()`, pass the new field
+to `UefiLoadSettings`:
+
+```rust
+let load_settings = super::vm_loaders::uefi::UefiLoadSettings {
+    // ... existing fields ...
+    ipmi: enable_ipmi,
+};
+```
+
+The `enable_ipmi` field is destructured from `LoadMode::Uefi` at ~line 2430.
+
+#### 4.1.5 Update petri `with_ipmi_kcs()` to Set the UEFI Flag
+
+**File**: `petri/src/vm/openvmm/modify.rs` (~line 63)
+
+Update `with_ipmi_kcs()` to also set the UEFI enable flag (following the
+battery pattern):
+
+```rust
+pub fn with_ipmi_kcs(mut self) -> Self {
+    self.config.chipset_devices.push(ChipsetDeviceHandle {
+        name: "ipmi_kcs".to_string(),
+        resource: ipmi_kcs_resources::IpmiKcsHandle.into_resource(),
+    });
+    if let LoadMode::Uefi { enable_ipmi, .. } = &mut self.config.load_mode {
+        *enable_ipmi = true;
+    }
+    self
+}
+```
+
+#### 4.1.6 Set Defaults
+
+**File**: `petri/src/vm/openvmm/construct.rs` (~lines 698, 898)
+
+Add `enable_ipmi: false` to each `LoadMode::Uefi` construction site (two
+locations).
+
+**File**: `openvmm/openvmm_entry/src/lib.rs` (~line 1088)
+
+Add `enable_ipmi: opt.ipmi_kcs` to the `LoadMode::Uefi` construction.
+
+### 4.2 UEFI Firmware Changes (mu_msvm)
+
+All values (I/O port addresses, interface type, register spacing) are
+hardcoded constants in the UEFI firmware — OpenVMM does not pass them.
+
+> **Building**: See `building_from_wsl.md` in the root of the mu_msvm
+> repo for instructions on building and validating UEFI firmware changes.
+
+#### 4.2.1 Add `IpmiConfigured` Flag Bit
+
+**File**: `MsvmPkg/Include/BiosInterface.h` (~line 790)
+
+Add the flag after `MtrrsInitializedAtLoad` — note that `HvSintEnabled`
+(bit 29 on the Rust side) is not consumed by UEFI, so we skip it:
+
+```c
+        UINT64 MtrrsInitializedAtLoad : 1;   // bit 28 (existing)
+        UINT64 HvSintEnabled : 1;            // bit 29 (new, unused by UEFI, for alignment)
+        UINT64 IpmiConfigured : 1;           // bit 30 (new)
+        UINT64 Reserved:33;                  // was 35, now 33
+```
+
+#### 4.2.2 Add PCD for IPMI Configured
+
+**File**: `MsvmPkg/MsvmPkg.dec` (~line 301)
+
+Add a new PCD declaration (next available token ID):
+
+```
+  gMsvmPkgTokenSpaceGuid.PcdIpmiConfigured|FALSE|BOOLEAN|0x6072
+```
+
+**File**: `MsvmPkg/MsvmPkgX64.dsc` and `MsvmPkg/MsvmPkgAARCH64.dsc`
+
+Add to the `[PcdsDynamicExDefault]` section:
+
+```
+  gMsvmPkgTokenSpaceGuid.PcdIpmiConfigured|FALSE
+```
+
+#### 4.2.3 Wire Flag in PlatformPei Config Parser
+
+**File**: `MsvmPkg/PlatformPei/Config.c` (~line 950, in
+`ConfigSetUefiConfigFlags`)
+
+Add after the existing PCD-set calls:
+
+```c
+    PEI_FAIL_FAST_IF_FAILED(PcdSetBoolS(PcdIpmiConfigured,
+        (UINT8) ConfigFlags->Flags.IpmiConfigured));
+```
+
+Add `PcdIpmiConfigured` to the PEI module's `.inf` file under `[Pcd]`.
+
+#### 4.2.4 Add SMBIOS Type 38 — IPMI Device Information
+
+**File**: `MsvmPkg/SmbiosPlatformDxe/SmbiosPlatform.c`
+
+Add a new function `AddIpmiDeviceInformation()`:
+
+```c
+VOID
+AddIpmiDeviceInformation(
+    IN EFI_SMBIOS_PROTOCOL *Smbios
+    )
+{
+    if (!PcdGetBool(PcdIpmiConfigured))
+    {
+        return;
+    }
+
+    // SMBIOS Type 38 structure per SMBIOS Specification v3.x
+    #pragma pack(1)
+    typedef struct {
+        SMBIOS_STRUCTURE  Header;
+        UINT8             InterfaceType;    // 0x01 = KCS
+        UINT8             IpmiSpecRev;      // 0x20 = IPMI 2.0
+        UINT8             I2CTargetAddr;    // 0x20 (BMC default)
+        UINT8             NvStorageDevice;  // 0xFF = not present
+        UINT64            BaseAddress;      // 0xCA2 (I/O space)
+        UINT8             BaseAddrModifier; // register spacing
+        UINT8             InterruptNumber;  // 0x00 = polled
+    } SMBIOS_TYPE38_IPMI;
+    #pragma pack()
+
+    SMBIOS_TYPE38_IPMI record = {
+        .Header = {
+            .Type   = 38,
+            .Length = sizeof(SMBIOS_TYPE38_IPMI),
+            .Handle = 0,
+        },
+        .InterfaceType   = 0x01,  // KCS
+        .IpmiSpecRev     = 0x20,  // IPMI 2.0
+        .I2CTargetAddr   = 0x20,
+        .NvStorageDevice = 0xFF,
+        .BaseAddress     = 0x0000000000000CA3, // bit 0 = 1 → I/O port space; actual addr = 0xCA3 & ~1 = 0xCA2
+        .BaseAddrModifier = 0x01, // 1-byte spacing, I/O space
+        .InterruptNumber = 0x00,  // polled, no interrupt
+    };
+
+    AddStructure(Smbios, (SMBIOS_STRUCTURE *)&record, NULL, NULL);
+}
+```
+
+Call from `AddAllStructures()` (~line 1949):
+
+```c
+    AddMemoryStructures(Smbios);
+    AddSystemBootInformation(Smbios);
+    AddIpmiDeviceInformation(Smbios);   // new
+```
+
+Add `PcdIpmiConfigured` to the SmbiosPlatformDxe `.inf` under `[Pcd]`.
+
+### 4.3 Alpine UEFI VMM Test
+
+The VMM test validates SMBIOS-based IPMI discovery using the Alpine UEFI
+VHD. The test does **not** require network access — it uses only kernel
+modules and the raw `/dev/port` approach from Phase 1a.
+
+> **Warning**: The Alpine `linux-virt` kernel in the test VHD image may
+> not have `ipmi_si` and `ipmi_devintf` modules built. If `modprobe`
+> fails, the test falls back to raw `/dev/port` I/O for functional
+> validation (same approach as Phase 1a). If the kernel does have IPMI
+> modules, the test validates full SMBIOS-based discovery. The test
+> approach may need to be adjusted based on what the image supports.
+
+```rust
+/// Test that the IPMI KCS device is discoverable via SMBIOS Type 38 on
+/// a UEFI-booted Alpine guest. Falls back to /dev/port validation if
+/// ipmi_si kernel module is not available.
+#[openvmm_test(
+    uefi_x64(vhd(alpine_3_23_x64)),
+)]
+async fn ipmi_kcs_uefi_smbios(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+) -> anyhow::Result<()> {
+    let (vm, agent) = config
+        .modify_backend(|b| b.with_ipmi_kcs())
+        .run()
+        .await?;
+
+    let sh = agent.unix_shell();
+
+    // First, verify SMBIOS Type 38 is visible to the guest
+    let dmidecode_check = cmd!(sh, "test -e /sys/firmware/dmi/entries/38-0")
+        .run()
+        .await;
+
+    if dmidecode_check.is_ok() {
+        tracing::info!("SMBIOS Type 38 entry found");
+    }
+
+    // Attempt kernel-based IPMI discovery (preferred path)
+    let ipmi_si_result = cmd!(sh, "modprobe ipmi_si 2>&1").read().await;
+    let has_ipmi_si = ipmi_si_result.is_ok()
+        && !ipmi_si_result.as_deref().unwrap_or("").contains("not found");
+
+    if has_ipmi_si {
+        // Full SMBIOS discovery path: ipmi_si auto-detects from Type 38
+        cmd!(sh, "modprobe ipmi_devintf").run().await?;
+        cmd!(sh, "test -e /dev/ipmi0")
+            .run()
+            .await
+            .context("/dev/ipmi0 not found — SMBIOS discovery may have failed")?;
+    }
+
+    // Functional validation via /dev/port (always works, no modules needed).
+    // This reuses the Phase 1a approach: send Get Device ID and verify response.
+    let output = cmd!(sh, r#"sh -c '
+        inb() { dd if=/dev/port bs=1 skip=$(($1)) count=1 2>/dev/null | od -An -tx1 | tr -d " \n"; }
+        outb() { printf "\\$(printf "%03o" $2)" | dd of=/dev/port bs=1 seek=$(($1)) count=1 2>/dev/null; }
+        wait_ibf() { for i in $(seq 1 1000); do s=$(inb 0xCA3); if [ $((0x$s & 2)) -eq 0 ]; then return 0; fi; done; return 1; }
+        wait_ibf && outb 0xCA3 0x61
+        wait_ibf && inb 0xCA2 >/dev/null && outb 0xCA2 0x18
+        wait_ibf && outb 0xCA3 0x62
+        wait_ibf && inb 0xCA2 >/dev/null && outb 0xCA2 0x01
+        wait_ibf
+        status=$(inb 0xCA3)
+        data=$(inb 0xCA2)
+        state=$((0x$status & 0xC0))
+        if [ $state -eq 64 ]; then echo "KCS_READ_OK"; else echo "KCS_FAIL state=$state"; fi
+    '"#)
+    .read()
+    .await
+    .context("KCS Get Device ID failed")?;
+
+    assert!(
+        output.contains("KCS_READ_OK"),
+        "IPMI KCS device not responding on UEFI boot: {output}"
+    );
+
+    agent.power_off().await?;
+    vm.wait_for_clean_teardown().await?;
+    Ok(())
+}
+```
+
+### 4.4 Manual Validation via OpenVMM + setup-alpine.sh
+
+Before relying on the VMM test, manually validate SMBIOS discovery using
+a live Alpine VM with network access and full IPMI tooling.
+
+#### Steps
+
+1. **Set up an Alpine VM with networking**:
+   ```bash
+   # Use openvmm with UEFI boot and the IPMI device enabled
+   cargo run -p openvmm -- \
+       --uefi <path-to-uefi-firmware> \
+       --ipmi-kcs \
+       --disk <alpine-vhd> \
+       --serial
+   ```
+
+2. **Inside the Alpine guest, install packages**:
+   ```sh
+   # If using a fresh setup-alpine.sh install:
+   apk add ipmitool dmidecode
+   ```
+
+3. **Verify SMBIOS Type 38 is present**:
+   ```sh
+   dmidecode -t 38
+   ```
+   Expected output should show "IPMI Device Information" with
+   Interface Type = KCS, Base Address = 0xCA2.
+
+4. **Load IPMI kernel modules** (auto-detect from SMBIOS):
+   ```sh
+   modprobe ipmi_devintf
+   modprobe ipmi_si    # No type= or ports= — must auto-detect
+   ```
+   If `modprobe ipmi_si` succeeds without explicit parameters, SMBIOS
+   discovery is working.
+
+5. **Verify `/dev/ipmi0` exists**:
+   ```sh
+   ls -la /dev/ipmi0
+   ```
+
+6. **Test with ipmitool**:
+   ```sh
+   # Get Device ID
+   ipmitool mc info
+
+   # Add a SEL entry
+   ipmitool raw 0x0a 0x44 0x00 0x00 0x02 0x00 0x00 0x00 \
+       0x00 0x20 0x00 0x04 0x01 0x42 0x6f 0x01 0x02 0x03
+
+   # Check SEL
+   ipmitool sel info
+   ipmitool sel list
+
+   # Clear SEL
+   ipmitool sel clear
+   ```
+
+7. **Check kernel log for discovery method**:
+   ```sh
+   dmesg | grep -i ipmi
+   ```
+   Look for `ipmi_si: Trying SMBIOS-specified kcs state machine`
+   to confirm the kernel found the device via SMBIOS Type 38.
+
+> **Purpose**: This manual step confirms the end-to-end SMBIOS discovery
+> chain before committing to a CI test approach. If the Alpine kernel
+> lacks `ipmi_si`, this step will reveal it early.
+
+### 4.5 Phase 2 Implementation Order
+
+1. **OpenVMM config plumbing** — `config.rs` Flags bitfield, `LoadMode::Uefi`
+   field, `UefiLoadSettings`, `dispatch.rs` wiring, petri `with_ipmi_kcs()`
+   update, construct.rs defaults, CLI entry point.
+2. **UEFI firmware flag** — `BiosInterface.h` flag bit, PCD declaration and
+   wiring in `MsvmPkg.dec`, `.dsc` files, `PlatformPei/Config.c`.
+3. **SMBIOS Type 38** — `SmbiosPlatformDxe/SmbiosPlatform.c`, gated on
+   `PcdIpmiConfigured`.
+4. **Manual validation** — Use `openvmm --ipmi-kcs` with Alpine +
+   `setup-alpine.sh` to verify `dmidecode -t 38` and `modprobe ipmi_si`
+   auto-detection (Section 4.4).
+5. **Alpine UEFI VMM test** — Automated test (Section 4.3), adjusted
+   based on manual validation findings.
+
+### 4.6 Phase 2 File Checklist
+
+#### Modified Files (OpenVMM)
+
+| File | Change |
+|------|--------|
+| `vm/loader/src/uefi/config.rs` | Add `ipmi_configured` to `Flags` bitfield (bit 30) |
+| `openvmm/openvmm_defs/src/config.rs` | Add `enable_ipmi: bool` to `LoadMode::Uefi` |
+| `openvmm/openvmm_core/src/worker/vm_loaders/uefi.rs` | Add `ipmi: bool` to `UefiLoadSettings`, set flag in blob |
+| `openvmm/openvmm_core/src/worker/dispatch.rs` | Wire `enable_ipmi` through to `UefiLoadSettings` |
+| `petri/src/vm/openvmm/modify.rs` | Update `with_ipmi_kcs()` to set UEFI `enable_ipmi` flag |
+| `petri/src/vm/openvmm/construct.rs` | Add `enable_ipmi: false` defaults (2 locations) |
+| `openvmm/openvmm_entry/src/lib.rs` | Add `enable_ipmi: opt.ipmi_kcs` to `LoadMode::Uefi` |
+
+#### Modified Files (mu_msvm)
+
+| File | Change |
+|------|--------|
+| `MsvmPkg/Include/BiosInterface.h` | Add `HvSintEnabled` + `IpmiConfigured` bits, adjust Reserved |
+| `MsvmPkg/MsvmPkg.dec` | Add `PcdIpmiConfigured` PCD declaration (token `0x6072`) |
+| `MsvmPkg/MsvmPkgX64.dsc` | Add `PcdIpmiConfigured` default |
+| `MsvmPkg/MsvmPkgAARCH64.dsc` | Add `PcdIpmiConfigured` default |
+| `MsvmPkg/PlatformPei/Config.c` | Add `PcdSetBoolS(PcdIpmiConfigured, ...)` |
+| `MsvmPkg/PlatformPei/PlatformPei.inf` | Add `PcdIpmiConfigured` to `[Pcd]` |
+| `MsvmPkg/SmbiosPlatformDxe/SmbiosPlatform.c` | Add `AddIpmiDeviceInformation()`, call from `AddAllStructures()` |
+| `MsvmPkg/SmbiosPlatformDxe/SmbiosPlatformDxe.inf` | Add `PcdIpmiConfigured` to `[Pcd]` |
+
+#### Test Files
+
+| File | Change |
+|------|--------|
+| `vmm_tests/vmm_tests/tests/tests/x86_64.rs` | Add `ipmi_kcs_uefi_smbios` test |
+
+---
+
+## 5. Phase 3: Windows VMM Test
+
+Phase 3 adds a Windows UEFI VMM test to determine whether Windows can
+discover and use the IPMI KCS device with only SMBIOS Type 38 support
+(no ACPI). This is an exploratory phase — if Windows requires ACPI
+device enumeration, Phase 4 adds the necessary ACPI support.
+
+### 5.1 Background: Windows IPMI Discovery
+
+Windows Server editions include a built-in IPMI driver stack:
+
+- **ipmidrv.sys** — The Microsoft IPMI driver, which registers as a WMI
+  provider. On Server editions, this driver is available by default.
+- **WMI interface** — IPMI commands can be sent via the
+  `root\WMI` namespace using `Microsoft_IPMI` class methods.
+
+Windows typically discovers IPMI via ACPI PnP enumeration
+(`ACPI\IPI0001` device node in the DSDT). It's unclear whether Windows
+also synthesizes devices from SMBIOS Type 38 alone. This phase tests
+that question empirically.
+
+**Expected outcomes:**
+- **Best case**: Windows discovers the device from SMBIOS Type 38,
+  loads `ipmidrv.sys`, and the full test passes. Phase 4 is not needed.
+- **Likely case**: Windows does not enumerate the device without an
+  ACPI DSDT node. The test fails at device enumeration, confirming
+  Phase 4 is required.
+
+### 5.2 Test Strategy
+
+The test checks for device presence and, if found, validates
+functionality:
+
+1. **Device enumeration** — Check if the IPMI device appears in the
+   Windows device tree after boot.
+2. **Driver loading** — If enumerated, verify `ipmidrv` service is running.
+3. **Functional SEL operations** — If the driver loaded, send IPMI
+   commands via WMI and validate responses.
+
+### 5.3 Test Implementation
+
+Add the test to `vmm_tests/vmm_tests/tests/tests/x86_64.rs`:
+
+```rust
+/// Test that the IPMI KCS device is discovered and functional on Windows.
+/// Requires Phase 2 SMBIOS/ACPI support to be in place.
+#[openvmm_test(
+    uefi_x64(vhd(windows_datacenter_core_2025_x64_prepped)),
+)]
+async fn ipmi_kcs_windows(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+) -> anyhow::Result<()> {
+    let (vm, agent) = config
+        .modify_backend(|b| b.with_ipmi_kcs())
+        .run()
+        .await?;
+
+    let sh = agent.windows_shell();
+
+    // 1. Verify IPMI device is enumerated via PnP
+    let pnp_output = cmd!(
+        sh,
+        "powershell.exe -Command Get-PnpDevice -InstanceId 'ACPI\\IPI0001*' | Select-Object -ExpandProperty Status"
+    )
+    .read()
+    .await
+    .context("Failed to query IPMI PnP device")?;
+
+    assert!(
+        pnp_output.contains("OK"),
+        "IPMI device not found or not OK: {pnp_output}"
+    );
+
+    // 2. Verify IPMI driver service is running
+    let svc_output = cmd!(
+        sh,
+        "powershell.exe -Command (Get-Service ipmidrv -ErrorAction SilentlyContinue).Status"
+    )
+    .read()
+    .await
+    .context("Failed to query ipmidrv service")?;
+
+    assert!(
+        svc_output.trim() == "Running",
+        "ipmidrv service not running: {svc_output}"
+    );
+
+    // 3. Send IPMI Get Device ID via WMI and verify response
+    //    The Microsoft_IPMI WMI class provides RequestResponse method.
+    //    Command: NetFn=App(0x06), Lun=0, Cmd=0x01 (Get Device ID)
+    let wmi_output = cmd!(
+        sh,
+        r#"powershell.exe -Command "$ipmi = Get-WmiObject -Namespace root\WMI -Class Microsoft_IPMI; $req = $ipmi.GetMethodParameters('RequestResponse'); $req.NetworkFunction = 6; $req.Lun = 0; $req.ResponderAddress = 0x20; $req.Command = 1; $req.RequestData = @(); $resp = $ipmi.InvokeMethod('RequestResponse', $req); $resp.CompletionCode""#
+    )
+    .read()
+    .await
+    .context("Failed to send IPMI Get Device ID via WMI")?;
+
+    assert!(
+        wmi_output.trim() == "0",
+        "Get Device ID failed, completion code: {wmi_output}"
+    );
+
+    agent.power_off().await?;
+    vm.wait_for_clean_teardown().await?;
+    Ok(())
+}
+```
+
+### 5.4 Test Alternatives
+
+If WMI interaction proves too complex or unreliable, a simpler
+enumeration-only test is viable:
+
+```rust
+/// Simplified test: just verify the IPMI device is enumerated.
+#[openvmm_test(
+    uefi_x64(vhd(windows_datacenter_core_2025_x64_prepped)),
+)]
+async fn ipmi_kcs_windows_enumeration(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+) -> anyhow::Result<()> {
+    let (vm, agent) = config
+        .modify_backend(|b| b.with_ipmi_kcs())
+        .run()
+        .await?;
+
+    let sh = agent.windows_shell();
+
+    // Check for IPMI device in device tree
+    let output = cmd!(
+        sh,
+        "pnputil.exe /enum-devices /connected"
+    )
+    .read()
+    .await?;
+
+    assert!(
+        output.contains("IPI0001"),
+        "IPMI device (IPI0001) not found in connected devices:\n{output}"
+    );
+
+    agent.power_off().await?;
+    vm.wait_for_clean_teardown().await?;
+    Ok(())
+}
+```
+
+### 5.5 Running the Windows Test
+
+```bash
+cargo xflowey vmm-tests-run \
+    --filter "test(ipmi_kcs_windows)" \
+    --target windows-x64 \
+    --dir /mnt/d/vmm_tests_out/
+```
+
+### 5.6 Phase 3 Implementation Order
+
+1. **Ensure Phase 2 is complete** — SMBIOS Type 38 and config flag
+   plumbing must be in place.
+2. **Add Windows test** — Implement `ipmi_kcs_windows` in
+   `vmm_tests/vmm_tests/tests/tests/x86_64.rs`.
+3. **Run the test** — Boot a Windows Server 2025 VHD and observe:
+   - Does the IPMI device appear in Device Manager?
+   - Does `ipmidrv.sys` load?
+   - If yes, does WMI-based IPMI communication work?
+4. **Assess results** — If Windows requires ACPI for enumeration,
+   proceed to Phase 4. If SMBIOS alone works, Phase 4 can be skipped.
+
+### 5.7 Phase 3 File Checklist
+
+| File | Change |
+|------|--------|
+| `vmm_tests/vmm_tests/tests/tests/x86_64.rs` | Add `ipmi_kcs_windows` test |
+
+---
+
+## 6. Phase 4 (Optional): ACPI Support
+
+Phase 4 adds ACPI-based IPMI device discovery. This is needed if Phase 3
+reveals that Windows does not discover the device from SMBIOS Type 38
+alone. Linux does not require this phase.
+
+### 6.1 ACPI DSDT Device Node
+
+Add an IPMI device node in the DSDT so Windows enumerates it via
+`ACPI\IPI0001`.
+
+**File**: `MsvmPkg/AcpiTables/Dsdt.asl`
 
 ```asl
 Device (IPMI) {
@@ -772,84 +1337,81 @@ Device (IPMI) {
 }
 ```
 
-This requires modifying the DSDT generation in OpenVMM's firmware path.
+> **Note on conditionality**: Making `_STA` conditional on
+> `PcdIpmiConfigured` requires injecting the PCD value into the DSDT via
+> an OpRegion or external reference. A simpler approach is to always
+> include the device node — the I/O port intercept only exists when the
+> IPMI chipset device is configured, so the device will be non-functional
+> (no response) if the flag is not set. Windows and Linux both tolerate a
+> non-responsive ACPI device gracefully.
 
-### 4.4 Alpine Test with UEFI Boot
+### 6.2 ACPI SPMI Table (Optional)
 
-Once SMBIOS + ACPI are in place, the Alpine test becomes straightforward:
+The SPMI (Service Processor Management Interface) table provides
+redundant discovery metadata when SMBIOS Type 38 is already present.
+Neither Linux nor Windows strictly requires it. Add only if a specific
+OS or tool (e.g., `ipmitool`) benefits from it.
 
-```rust
-#[openvmm_test(
-    openvmm_uefi_x64(vhd(alpine_3_23_x64)),
-)]
-async fn ipmi_kcs_sel_alpine(
-    config: PetriVmBuilder<OpenVmmPetriBackend>,
-) -> anyhow::Result<()> {
-    let (vm, agent) = config
-        .with_memory(MemoryConfig {
-            startup_bytes: SIZE_1_GB,
-            ..Default::default()
-        })
-        .modify_backend(|b| b.with_ipmi_kcs())
-        .run()
-        .await?;
+Per ACPI Specification v6.x, Section 5.2.16:
 
-    let sh = agent.unix_shell();
+| Field | Value |
+|-------|-------|
+| Signature | "SPMI" |
+| Interface Type | 0x01 = KCS |
+| Spec Revision | 0x0200 |
+| Interrupt Type | 0x00 = none (polled) |
+| GPE | 0x00 |
+| PCI Device Flag | 0x00 = not PCI |
+| Base Address | GAS: I/O Space, 8-bit, offset 0, 0xCA2 |
+| Register Spacing | 1 byte |
 
-    // Install ipmitool
-    cmd!(sh, "apk add --no-cache ipmitool").run().await?;
+Implement as a new `MsvmPkg/AcpiTables/Spmi.aslc` or inline in
+`AcpiPlatformDxe`, gated on `PcdIpmiConfigured`.
 
-    // Load IPMI kernel modules
-    cmd!(sh, "modprobe ipmi_devintf").run().await?;
-    cmd!(sh, "modprobe ipmi_si type=kcs ports=0xca2")
-        .run()
-        .await
-        .context("Failed to load ipmi_si module")?;
+### 6.3 OpenVMM Linux Direct Boot — ACPI Table Updates (Optional)
 
-    // Verify IPMI device exists
-    cmd!(sh, "test -e /dev/ipmi0")
-        .run()
-        .await
-        .context("/dev/ipmi0 not found after loading ipmi_si")?;
+For Linux direct boot, OpenVMM builds ACPI tables itself (no UEFI
+firmware involved). Phase 1 already works without ACPI because the
+`ipmi_si` driver probes the default KCS address. For completeness:
 
-    // Add a SEL entry
-    cmd!(sh, "ipmitool sel add 0x01 0x02 0x03")
-        .run()
-        .await?;
+**File**: `vm/acpi/src/dsdt.rs` — Add `add_ipmi_kcs()` method.
 
-    // Read SEL entries
-    let sel_output = cmd!(sh, "ipmitool sel list")
-        .read()
-        .await?;
-    assert!(!sel_output.trim().is_empty(), "SEL should have entries");
+**File**: `openvmm/openvmm_core/src/worker/dispatch.rs` — Add
+`ipmi_enabled: bool` parameter to `add_devices_to_dsdt()`.
 
-    // Clear SEL
-    cmd!(sh, "ipmitool sel clear").run().await?;
+**File**: `vmm_core/src/acpi_builder.rs` — Add `build_spmi()` method.
 
-    // Verify SEL is empty
-    let sel_info = cmd!(sh, "ipmitool sel info")
-        .read()
-        .await?;
-    assert!(sel_info.contains("Entries          : 0"), "SEL should be empty after clear");
+### 6.4 Phase 4 Implementation Order
 
-    agent.power_off().await?;
-    vm.wait_for_clean_teardown().await?;
-    Ok(())
-}
-```
+1. **DSDT device node** — `Dsdt.asl` with `IPI0001` device (required
+   for Windows).
+2. **(Optional) SPMI table** — If any OS benefits from it.
+3. **(Optional) Linux direct ACPI** — `dsdt.rs`, `acpi_builder.rs`,
+   `dispatch.rs` plumbing.
+4. **Re-run Phase 3 Windows test** — Verify device enumeration and full
+   WMI communication.
 
-> **Note**: Alpine UEFI tests require the UEFI firmware artifact and the
-> Alpine VHD image. These are already available as test artifacts
-> (`alpine_3_23_x64`). The test should work once the SMBIOS Type 38 and ACPI
-> SPMI table are properly generated.
+### 6.5 Phase 4 File Checklist
 
-### 4.5 Phase 2 Implementation Order
+#### Modified Files (mu_msvm)
 
-1. SMBIOS Type 38 generation when IPMI device is configured
-2. ACPI SPMI table generation
-3. (Optional) DSDT device node for `IPI0001`
-4. Alpine UEFI VMM test
-5. Verify with `ipmitool` that full SEL lifecycle works end-to-end
+| File | Change |
+|------|--------|
+| `MsvmPkg/AcpiTables/Dsdt.asl` | Add `IPI0001` device node |
+
+#### New Files (mu_msvm) — Optional
+
+| File | Purpose |
+|------|----------|
+| `MsvmPkg/AcpiTables/Spmi.aslc` (or inline in AcpiPlatformDxe) | ACPI SPMI table for IPMI KCS |
+
+#### Optional Modified Files (OpenVMM — Linux Direct ACPI)
+
+| File | Change |
+|------|--------|
+| `vm/acpi/src/dsdt.rs` | Add `add_ipmi_kcs()` method |
+| `vmm_core/src/acpi_builder.rs` | Add `build_spmi()` method |
+| `openvmm/openvmm_core/src/worker/dispatch.rs` | Pass `ipmi_enabled` to `add_devices_to_dsdt()` |
 
 ---
 
@@ -879,14 +1441,33 @@ async fn ipmi_kcs_sel_alpine(
 | `petri/Cargo.toml` | Add `ipmi_kcs_resources` dependency |
 | `vmm_tests/vmm_tests/tests/tests/x86_64.rs` | Add `ipmi_kcs_sel` test |
 
-### Modified Files (Phase 2)
+### Modified Files (Phase 2) — see Section 4.6 for full details
 
 | File | Change |
 |------|--------|
-| SMBIOS builder (in `vm/devices/firmware/`) | Add Type 38 entry |
-| ACPI table builder | Add SPMI table |
-| DSDT generation | Add `IPI0001` device node |
-| `vmm_tests/vmm_tests/tests/tests/multiarch.rs` | Add Alpine IPMI test |
+| `vm/loader/src/uefi/config.rs` | Add `ipmi_configured` flag to Flags bitfield |
+| `openvmm/openvmm_defs/src/config.rs` | Add `enable_ipmi` to `LoadMode::Uefi` |
+| `openvmm/openvmm_core/src/worker/vm_loaders/uefi.rs` | Set flag in config blob |
+| `openvmm/openvmm_core/src/worker/dispatch.rs` | Wire `enable_ipmi` through |
+| `petri/src/vm/openvmm/modify.rs` | Set UEFI flag in `with_ipmi_kcs()` |
+| `petri/src/vm/openvmm/construct.rs` | Add `enable_ipmi: false` defaults |
+| `openvmm/openvmm_entry/src/lib.rs` | Wire CLI `--ipmi-kcs` to UEFI flag |
+| `MsvmPkg/Include/BiosInterface.h` | Add `IpmiConfigured` flag bit |
+| `MsvmPkg/MsvmPkg.dec` | Add `PcdIpmiConfigured` |
+| `MsvmPkg/PlatformPei/Config.c` | Wire flag to PCD |
+| `MsvmPkg/SmbiosPlatformDxe/SmbiosPlatform.c` | Add SMBIOS Type 38 |
+
+### Modified Files (Phase 3)
+
+| File | Change |
+|------|--------|
+| `vmm_tests/vmm_tests/tests/tests/x86_64.rs` | Add `ipmi_kcs_windows` test |
+
+### Modified Files (Phase 4) — see Section 6.5 for full details
+
+| File | Change |
+|------|--------|
+| `MsvmPkg/AcpiTables/Dsdt.asl` | Add `IPI0001` ACPI device node |
 
 ## Appendix B: IPMI Commands to Implement
 
