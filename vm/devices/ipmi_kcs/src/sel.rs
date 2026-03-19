@@ -185,8 +185,9 @@ impl SelStore {
         }
 
         if self.entries.len() >= MAX_SEL_ENTRIES {
-            // SEL is full — return "out of space" completion code.
-            return vec![0xD4];
+            // SEL is full — return "out of space" completion code (0x80
+            // per IPMI v2.0 Table 5-2, command-specific range).
+            return vec![0x80];
         }
 
         let record_id = self.next_record_id;
