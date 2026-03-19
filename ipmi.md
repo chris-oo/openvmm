@@ -19,6 +19,8 @@ events can be written and read from inside the guest.
 2. [Phase 1: IPMI KCS Device Implementation (Linux Direct)](#2-phase-1-ipmi-kcs-device-implementation-linux-direct)
 3. [Phase 1a: VMM Test for SEL Events](#3-phase-1a-vmm-test-for-sel-events)
 4. [Phase 2: UEFI Support via SMBIOS](#4-phase-2-uefi-support-via-smbios)
+   - [4.4 Manual Validation: Alpine](#44-manual-validation-via-openvmm--setup-alpinesh)
+   - [4.5 Manual Validation: Windows Guest SEL Logging](#45-manual-validation-windows-guest-sel-logging)
 5. [Phase 3: Windows VMM Test](#5-phase-3-windows-vmm-test)
 6. [Phase 4 (Optional): ACPI Support](#6-phase-4-optional-acpi-support)
 
@@ -1080,7 +1082,93 @@ a live Alpine VM with network access and full IPMI tooling.
 > chain before committing to a CI test approach. If the Alpine kernel
 > lacks `ipmi_si`, this step will reveal it early.
 
-### 4.5 Phase 2 Implementation Order
+### 4.5 Manual Validation: Windows Guest SEL Logging
+
+Windows bootmgr and winload automatically log SEL entries during boot
+checkpoints via the KCS interface. The boot environment discovers the KCS port
+via SMBIOS Type 38 as a fallback from ACPI SPMI (see scratch notes in
+`ipmi-sel-boot-logging.md`). This means a successful Windows boot against our
+IPMI device will populate the SEL without any guest-side tooling — we can
+observe it entirely from the host using the OpenVMM inspect interface.
+
+#### Steps
+
+1. **Boot a Windows guest with IPMI enabled**:
+   ```bash
+   cargo run -p openvmm -- \
+       --uefi <path-to-uefi-firmware> \
+       --ipmi-kcs \
+       --disk <windows-server-vhd> \
+       --serial
+   ```
+   Use a Windows Server 2025 (or 2022) Datacenter VHD. Desktop editions
+   may not include the IPMI boot logging paths.
+
+2. **Wait for boot to complete** — Let Windows reach the login screen or
+   the petri agent prompt. The SEL entries are written early in boot
+   (during bootmgr → winload → kernel transition), so they should be
+   present well before the desktop loads.
+
+3. **Inspect the IPMI device state from the OpenVMM console**:
+   ```
+   inspect chipset/ipmi_kcs
+   ```
+   This shows the full device state including the KCS state machine and
+   SEL store. Look for:
+   - `sel/entries` — Should contain one or more entries. A successful
+     Windows boot typically logs checkpoint records and possibly diagnostic
+     codes.
+   - `sel/next_record_id` — Should be > 1, confirming entries were added.
+   - `state` — Should be `IDLE` (the boot logging completes before
+     Windows finishes booting).
+
+4. **Drill into individual SEL entries**:
+   ```
+   inspect chipset/ipmi_kcs/sel/entries
+   ```
+   Each entry is a 16-byte IPMI SEL record. The record type field
+   (byte 2) should be `0x02` (System Event). The generator ID and
+   sensor fields encode the Windows boot checkpoint information per
+   `ipmidef.h`.
+
+5. **Verify the discovery path** — If the UEFI serial console is
+   enabled, look for SMBIOS Type 38 parsing output during early boot.
+   Windows discovers the KCS interface through this priority order:
+   1. ACPI SPMI table (not present in Phase 2)
+   2. SMBIOS Type 38 (our discovery path)
+
+   Since we only provide SMBIOS Type 38 in Phase 2, a successful SEL
+   population confirms the SMBIOS fallback path is working.
+
+6. **Cross-check with guest-side tools** (optional, if boot completes):
+   ```powershell
+   # Check if IPMI driver loaded (Server editions only)
+   Get-Service ipmidrv
+   # Check device enumeration
+   Get-PnpDevice | Where-Object { $_.InstanceId -match 'IPI0001' }
+   ```
+   Note: The IPMI driver (`ipmidrv.sys`) may require ACPI `IPI0001`
+   for runtime enumeration. The boot-time SEL logging uses the KCS
+   port directly (discovered via SMBIOS) and does not depend on
+   `ipmidrv.sys` being loaded.
+
+> **Key insight**: Unlike the Linux manual test which requires running
+> ipmitool inside the guest, the Windows validation is **passive** — the
+> boot process logs SEL entries automatically. We only need to inspect
+> the device from the host side. If `inspect chipset/ipmi_kcs/sel/entries`
+> shows records after a Windows boot, the SMBIOS discovery chain is
+> working end-to-end.
+
+> **What if SEL is empty after boot?** This likely means Windows could
+> not find the KCS interface via SMBIOS Type 38. Check:
+> - The `ipmi_configured` flag is set in the UEFI config (verify with
+>   `inspect chipset/ipmi_kcs/state` — device should exist)
+> - The SMBIOS Type 38 entry is present (boot an Alpine guest and run
+>   `dmidecode -t 38` to verify the firmware side)
+> - The BCD option `BCDE_LIBRARY_TYPE_SEL_LOG_OFF` is not set (this
+>   disables SEL logging in bootmgr/winload)
+
+### 4.6 Phase 2 Implementation Order
 
 1. **OpenVMM config plumbing** — `config.rs` Flags bitfield, `LoadMode::Uefi`
    field, `UefiLoadSettings`, `dispatch.rs` wiring, petri `with_ipmi_kcs()`
@@ -1089,13 +1177,16 @@ a live Alpine VM with network access and full IPMI tooling.
    wiring in `MsvmPkg.dec`, `.dsc` files, `PlatformPei/Config.c`.
 3. **SMBIOS Type 38** — `SmbiosPlatformDxe/SmbiosPlatform.c`, gated on
    `PcdIpmiConfigured`.
-4. **Manual validation** — Use `openvmm --ipmi-kcs` with Alpine +
+4. **Manual validation (Linux)** — Use `openvmm --ipmi-kcs` with Alpine +
    `setup-alpine.sh` to verify `dmidecode -t 38` and `modprobe ipmi_si`
    auto-detection (Section 4.4).
-5. **Alpine UEFI VMM test** — Automated test (Section 4.3), adjusted
+5. **Manual validation (Windows)** — Boot a Windows Server guest with
+   `--ipmi-kcs`, then `inspect chipset/ipmi_kcs/sel` to verify boot
+   checkpoint SEL entries were logged (Section 4.5).
+6. **Alpine UEFI VMM test** — Automated test (Section 4.3), adjusted
    based on manual validation findings.
 
-### 4.6 Phase 2 File Checklist
+### 4.7 Phase 2 File Checklist
 
 #### Modified Files (OpenVMM)
 
@@ -1157,6 +1248,18 @@ that question empirically.
 - **Likely case**: Windows does not enumerate the device without an
   ACPI DSDT node. The test fails at device enumeration, confirming
   Phase 4 is required.
+
+> **TODO**: Consider reworking the Phase 3 test to use a host-side
+> inspect approach instead of (or in addition to) guest-side PnP/WMI
+> checks. Windows boot logging writes SEL checkpoints automatically
+> during bootmgr/winload (see Section 4.5), so we could validate the
+> SMBIOS discovery chain purely by inspecting the device's SEL entries
+> from the host after boot — no `ipmidrv.sys` or WMI needed. This would
+> also be more resilient to the ACPI vs. SMBIOS enumeration question.
+> Additionally, adding `tracing::info!` (or a counter via
+> `inspect_counters`) to `sel.rs` when an `Add SEL Entry` command
+> completes would make it easy to observe boot-time SEL writes in test
+> output without needing to poll the inspect tree.
 
 ### 5.2 Test Strategy
 
