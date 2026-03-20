@@ -72,6 +72,10 @@ pub struct VmmTestsRunCli {
     /// Optional: custom kernel image
     #[clap(long)]
     custom_kernel: Option<PathBuf>,
+    /// Optional: custom UEFI firmware (MSVM.fd) to use instead of the
+    /// downloaded release. Path to a locally-built MSVM.fd file.
+    #[clap(long)]
+    custom_uefi_firmware: Option<PathBuf>,
 }
 
 impl VmmTestsRunCli {
@@ -89,9 +93,10 @@ impl VmmTestsRunCli {
             release,
             build_only,
             copy_extras,
+            skip_vhd_prompt,
             custom_kernel_modules,
             custom_kernel,
-            skip_vhd_prompt,
+            custom_uefi_firmware,
         } = self;
 
         // Create output directory if it doesn't exist
@@ -183,6 +188,9 @@ impl VmmTestsRunCli {
         }
         if let Some(kernel) = custom_kernel {
             test_cmd.arg("--custom-kernel").arg(kernel);
+        }
+        if let Some(ref fw) = custom_uefi_firmware {
+            test_cmd.arg("--custom-uefi-firmware").arg(fw);
         }
         if skip_vhd_prompt {
             test_cmd.arg("--skip-vhd-prompt");
