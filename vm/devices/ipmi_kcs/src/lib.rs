@@ -239,7 +239,9 @@ impl IpmiKcsDevice {
             0x00,                      // Firmware revision 2 (minor, BCD)
             0x02,                      // IPMI version 2.0 (BCD: low nibble=major, high=minor)
             0x2D, // Additional device support: SEL + SDR Repo + Sensor + FRU + IPMB Event Receiver
-            0x37, 0x01, 0x00, // Manufacturer ID (IANA 311 = Microsoft, LS byte first)
+            0x37,
+            0x01,
+            0x00, // Manufacturer ID (IANA 311 = Microsoft, LS byte first)
             0x01,
             0x00, // Product ID (LS byte first) — 0x0001 = OpenVMM virtual BMC
         ]

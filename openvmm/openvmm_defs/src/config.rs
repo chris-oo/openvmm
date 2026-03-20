@@ -158,6 +158,7 @@ pub enum LoadMode {
         enable_battery: bool,
         enable_serial: bool,
         enable_vpci_boot: bool,
+        enable_ipmi: bool,
         uefi_console_mode: Option<UefiConsoleMode>,
         default_boot_always_attempt: bool,
         bios_guid: Guid,
