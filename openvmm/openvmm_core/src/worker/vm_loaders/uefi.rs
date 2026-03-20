@@ -35,6 +35,7 @@ pub struct UefiLoadSettings {
     pub tpm: bool,
     pub guest_watchdog: bool,
     pub vpci_boot: bool,
+    pub ipmi: bool,
     pub serial: bool,
     pub uefi_console_mode: Option<UefiConsoleMode>,
     pub default_boot_always_attempt: bool,
@@ -117,7 +118,8 @@ pub fn load_uefi(
                 UefiConsoleMode::None => config::ConsolePort::None,
             },
         )
-        .with_default_boot_always_attempt(load_settings.default_boot_always_attempt);
+        .with_default_boot_always_attempt(load_settings.default_boot_always_attempt)
+        .with_ipmi_configured(load_settings.ipmi);
 
     let mut cfg = config::Blob::new();
     cfg.add(&config::BiosInformation {

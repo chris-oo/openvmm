@@ -25,20 +25,38 @@ struct SelEntry {
 impl Inspect for SelEntry {
     fn inspect(&self, req: inspect::Request<'_>) {
         let d = &self.data;
+        let record_type = d[2];
         let timestamp = u32::from_le_bytes([d[3], d[4], d[5], d[6]]);
-        let generator_id = u16::from_le_bytes([d[7], d[8]]);
-        req.respond()
-            .hex("record_id", self.record_id)
-            .hex("record_type", d[2])
-            .field("timestamp", timestamp)
-            .hex("generator_id", generator_id)
-            .hex("evm_rev", d[9])
-            .hex("sensor_type", d[10])
-            .hex("sensor_number", d[11])
-            .hex("event_dir_type", d[12])
-            .hex("event_data1", d[13])
-            .hex("event_data2", d[14])
-            .hex("event_data3", d[15]);
+        let mut resp = req.respond();
+        resp.hex("record_id", self.record_id)
+            .hex("record_type", record_type)
+            .field("timestamp", timestamp);
+
+        if record_type == 0x02 {
+            // Standard System Event Record (IPMI v2.0, Section 32.1)
+            let generator_id = u16::from_le_bytes([d[7], d[8]]);
+            resp.hex("generator_id", generator_id)
+                .hex("evm_rev", d[9])
+                .hex("sensor_type", d[10])
+                .hex("sensor_number", d[11])
+                .hex("event_dir_type", d[12])
+                .hex("event_data1", d[13])
+                .hex("event_data2", d[14])
+                .hex("event_data3", d[15]);
+        } else if (0xC0..=0xDF).contains(&record_type) {
+            // OEM Timestamped Record (IPMI v2.0, Section 32.2)
+            let manufacturer_id =
+                u32::from_le_bytes([d[7], d[8], d[9], 0]);
+            resp.field("manufacturer_id", manufacturer_id)
+                .hex("oem_data", u64::from_le_bytes([d[10], d[11], d[12], d[13], d[14], d[15], 0, 0]));
+        } else if record_type >= 0xE0 {
+            // OEM Non-timestamped Record (IPMI v2.0, Section 32.3)
+            // Bytes 3-15 are all OEM-defined (no timestamp)
+            resp.hex("oem_data", &d[3..]);
+        } else {
+            // Unknown record type — dump raw bytes
+            resp.hex("raw_data", &d[2..]);
+        }
     }
 }
 

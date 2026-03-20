@@ -1104,6 +1104,7 @@ async fn vm_config_from_command_line(
             enable_battery: opt.battery,
             enable_serial: any_serial_configured,
             enable_vpci_boot: false,
+            enable_ipmi: opt.ipmi_kcs,
             uefi_console_mode: opt.uefi_console_mode.map(|m| match m {
                 UefiConsoleModeCli::Default => UefiConsoleMode::Default,
                 UefiConsoleModeCli::Com1 => UefiConsoleMode::Com1,

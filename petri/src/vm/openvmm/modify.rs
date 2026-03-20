@@ -76,6 +76,9 @@ impl PetriVmConfigOpenVmm {
             name: "ipmi_kcs".to_string(),
             resource: ipmi_kcs_resources::IpmiKcsHandle.into_resource(),
         });
+        if let LoadMode::Uefi { enable_ipmi, .. } = &mut self.config.load_mode {
+            *enable_ipmi = true;
+        }
         self
     }
 
