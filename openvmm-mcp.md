@@ -17,7 +17,7 @@ After analyzing the codebase, we recommend building **two** MCP servers that tar
 #### Tier 1: `openvmm-mcp` — Embedded single-VM MCP server
 
 - **What:** A new CLI mode in the OpenVMM binary (`openvmm --mcp`) that replaces the interactive `openvmm>` console with an MCP server communicating over stdio (or SSE/streamable-HTTP).
-- **Where it fits:** Parallel to the existing `--ttrpc` / `--grpc` modes which launch a `TtrpcWorker` that manages a single VM via gRPC. The MCP server occupies the same architectural slot: it sits beside the VM worker and drives it via `VmRpc` messages and the `mesh` infrastructure.
+- **Where it fits:** The MCP server replaces `run_control()` — the interactive CLI loop that drives a single VM. It uses the same VM setup flow (`vm_config_from_command_line()` → launch VM worker → drive via `VmRpc` messages and `mesh` channels), but substitutes MCP JSON-RPC for the readline-based console. This is *not* analogous to the `--ttrpc`/`--grpc` mode, which constructs VMs internally from gRPC requests without using CLI args.
 - **Use case:** A developer (or AI agent) attaches to a single running VM to inspect state, debug guest issues, interact with serial, read/write memory, manage disks, etc.
 - **Scope:** One VM, deep introspection.
 
@@ -35,7 +35,7 @@ After analyzing the codebase, we recommend building **two** MCP servers that tar
 | Single-VM debugging depth | ✅ | ❌ (petri abstracts away internals) | ✅ |
 | VM lifecycle management | ❌ (VM already running) | ✅ | ✅ |
 | Incremental build path | ✅ (small surface area) | ❌ (large dependency surface) | ✅ |
-| Matches existing patterns | ✅ (like `--ttrpc`) | ✅ (like `vmm_tests`) | ✅ |
+| Matches existing patterns | ✅ (like `run_control()`) | ✅ (like `vmm_tests`) | ✅ |
 
 #### Build order: Tier 1 first, then Tier 2
 
@@ -49,13 +49,14 @@ Tier 1 (`openvmm-mcp`) can be built with minimal new dependencies and directly m
 
 | Tool | Description | Tier 1 | Tier 2 |
 |---|---|---|---|
-| `vm/pause` | Pause VM execution | ✅ | ✅ |
-| `vm/resume` | Resume paused VM | ✅ | ✅ |
+| `vm/pause` | Pause VM execution (returns `bool` — `false` if already paused) | ✅ | ✅ |
+| `vm/resume` | Resume paused VM (returns `bool` — `false` if already running) | ✅ | ✅ |
 | `vm/reset` | Reset VM (power cycle) | ✅ | ✅ |
 | `vm/shutdown` | Request guest shutdown (via shutdown IC) | ✅ | ✅ |
 | `vm/nmi` | Inject NMI to a VP | ✅ | ✅ |
 | `vm/clear_halt` | Clear halt condition | ✅ | ✅ |
 | `vm/status` | Get current VM state (running/paused/halted + halt reason) | ✅ | ✅ |
+| `vm/wait_for_halt` | Block until the VM halts; returns the halt reason. Useful for agents that need to wait for shutdown, triple fault, etc. without polling `vm/status`. Maps to the `notify_recv` channel. | ✅ | ✅ |
 
 ### 3.2 VM Configuration & Creation (Tier 2 only)
 
@@ -101,7 +102,11 @@ The inspect tree is OpenVMM's primary diagnostic interface. Key paths include:
 | `serial/read` | Read available data from the serial console output buffer |
 | `serial/execute` | Write a command and read output until a prompt/timeout (convenience wrapper) |
 
-**Implementation note:** The existing interactive CLI has a `console_in` (`AsyncWrite`) that writes to the serial port, and a background thread copying serial output to the terminal. For MCP, we'll instead buffer serial output in a ring buffer accessible via `serial/read`.
+**Implementation note:** The existing interactive CLI pipes serial output directly to the terminal via a background thread (`setup_serial()` in `openvmm_entry`). In `--mcp` mode, this would corrupt the JSON-RPC stream on stdout. The serial I/O strategy is:
+
+- **Phase 1 (minimal):** Default COM1 to stderr in MCP mode (`--com1 stderr`), so serial output is visible in logs but doesn't corrupt MCP. Add a basic `serial/read` that returns recent stderr-redirected output.
+- **Phase 2 (full):** Introduce a `SerialRingBuffer` (fixed-size, e.g., 64KB) that intercepts serial output in-process. The `serial/read` tool reads from this buffer with cursor-based pagination (`since` parameter) to avoid re-reading old data. The `serial/write` tool writes to `console_in`.
+- **Phase 2 (convenience):** `serial/execute` writes a command, waits for output until a configurable prompt pattern (default: common shell prompts like `$ `, `# `, `> `) or timeout.
 
 ### 3.6 Framebuffer / Screenshot Tools
 
@@ -109,6 +114,10 @@ The inspect tree is OpenVMM's primary diagnostic interface. Key paths include:
 |---|---|---|
 | `display/screenshot` | Capture the current framebuffer as a PNG image | `FramebufferAccess` / `View::read_line()` |
 | `display/resolution` | Get current display resolution | `View::resolution()` |
+
+**⚠️ VNC conflict:** `FramebufferAccess` is **consumed** by the VNC worker when `--vnc` is enabled — only one consumer can hold it. Resolution strategy:
+- **Phase 1:** In `--mcp` mode, skip VNC by default (the MCP client gets screenshots directly via `display/screenshot`). If `--vnc` is explicitly passed alongside `--mcp`, the display tools return an error explaining the conflict.
+- **Future:** Share the framebuffer by cloning the underlying `Mappable` file descriptor, allowing both VNC and MCP screenshot access simultaneously.
 
 ### 3.7 Disk Management Tools
 
@@ -152,7 +161,7 @@ The inspect tree is OpenVMM's primary diagnostic interface. Key paths include:
 | `debug/clear_breakpoint` | Clear a hardware breakpoint | `DebugRequest::SetDebugState` |
 | `debug/single_step` | Single-step a VP | `DebugRequest::SetDebugState` + `Resume` |
 | `debug/list_vps` | List virtual processors and their state | Enumerate VP count, read each VP's state |
-| `debug/backtrace` | Walk the stack for a VP (heuristic) | Read registers, then walk stack frames via memory reads |
+| `debug/backtrace` | Walk the stack for a VP (heuristic, **best-effort** — requires frame pointers, unreliable on optimized code) | Read registers, then walk stack frames via memory reads |
 
 ---
 
@@ -184,7 +193,7 @@ For Tier 2 (petri-mcp):
 
 ### Phase 1: Core MCP Infrastructure (Tier 1 foundation)
 
-**Goal:** Establish the MCP server crate, transport layer, and first few tools working with a running OpenVMM instance.
+**Goal:** Establish the MCP server crate, transport layer, and first few tools working with a running OpenVMM instance. Include basic serial access so the server is immediately useful for linux-direct boot.
 
 **Steps:**
 
@@ -201,18 +210,24 @@ For Tier 2 (petri-mcp):
 4. **Implement `VmHandle` abstraction** — Encapsulates all VM interaction channels.
    - New file: `openvmm/openvmm_mcp/src/vm_handle.rs`.
 
-5. **Implement lifecycle tools** — `vm/pause`, `vm/resume`, `vm/status`, `vm/reset`, `vm/nmi`, `vm/clear_halt`, `vm/shutdown`.
+5. **Implement lifecycle tools** — `vm/pause`, `vm/resume`, `vm/status`, `vm/reset`, `vm/nmi`, `vm/clear_halt`, `vm/shutdown`, `vm/wait_for_halt`.
    - New file: `openvmm/openvmm_mcp/src/tools/lifecycle.rs`.
 
-6. **Wire into `openvmm_entry`** — Add `--mcp` CLI flag, create the `VmHandle`, launch MCP server.
+6. **Wire into `openvmm_entry`** — Add `--mcp` CLI flag (with `conflicts_with("gdb")` and `conflicts_with("ttrpc")`), create the `VmHandle`, redirect serial to stderr in MCP mode, launch MCP server.
    - Touches: `openvmm/openvmm_entry/src/cli_args.rs` (add `--mcp` flag), `openvmm/openvmm_entry/src/lib.rs` (add MCP mode in `do_main()`), `openvmm/openvmm_entry/Cargo.toml` (add `openvmm_mcp` dependency).
 
-7. **Implement `inspect/tree` and `inspect/get` tools**.
+7. **Implement the MCP event loop** — Multiplex MCP protocol messages (stdin), halt notifications (`notify_recv`), and worker events (`vm_worker` stopped/failed/restarted) using a `merge()`-based select loop, mirroring `run_control()`'s event loop structure. See §6.7 for details.
+   - New file: `openvmm/openvmm_mcp/src/event_loop.rs`.
+
+8. **Implement `inspect/tree` and `inspect/get` tools**.
    - New file: `openvmm/openvmm_mcp/src/tools/inspect.rs`.
 
-8. **End-to-end validation** — Launch `openvmm --mcp -k <kernel> -r <initrd>` and verify tool calls via a simple MCP client script.
+9. **Implement basic serial tools** — Redirect COM1 to stderr by default in MCP mode. Implement `serial/write` (write to `console_in`). Implement `serial/read` returning a note that full serial buffering comes in Phase 2.
+   - New file: `openvmm/openvmm_mcp/src/tools/serial.rs`.
 
-**Estimated scope:** ~1500 LOC new, ~100 LOC modifications to existing files.
+10. **End-to-end validation** — Launch `openvmm --mcp -k <kernel> -r <initrd>` and verify tool calls via a simple MCP client script.
+
+**Estimated scope:** ~2000 LOC new, ~150 LOC modifications to existing files.
 
 ### Phase 2: Interaction & Diagnostics Tools
 
@@ -369,15 +384,15 @@ This is ~300 lines of Rust using `serde_json`. Benefits:
 
 ### 6.3 Transport
 
-**Primary: stdio** — Standard for MCP. The `openvmm --mcp` mode reads JSON-RPC from stdin, writes responses to stdout. VM logs go to stderr.
+**Primary: stdio** — Standard for MCP. The `openvmm --mcp` mode reads JSON-RPC from stdin, writes responses to stdout. VM logs and serial output go to stderr.
 
 ```
 [MCP Client] --stdin--> [openvmm --mcp] --stdout--> [MCP Client]
                               |
-                         [VM Worker]  (stderr for logs)
+                         [VM Worker]  (stderr for logs + serial)
 ```
 
-This matches the existing `--ttrpc` pattern which closes stdout to signal readiness.
+This mirrors the `run_control()` interactive CLI flow, but with structured JSON-RPC replacing the readline loop.
 
 **Future: SSE / Streamable HTTP** — For remote access. Can be added behind a feature flag using the existing `pal_async` socket infrastructure.
 
@@ -388,7 +403,9 @@ OpenVMM uses `pal_async` which provides `DefaultPool` / `DefaultDriver` — a pl
 1. Run inside a `DefaultPool::run_with` block (same as `do_main()`).
 2. Spawn a task to read lines from stdin (MCP messages are newline-delimited JSON).
 3. Dispatch tool calls to async handlers that communicate with the VM via `mesh::Sender<VmRpc>` and other channels.
-4. This mirrors the existing `run_control()` function's event loop, but driven by MCP protocol messages instead of interactive CLI commands.
+4. Multiplex MCP stdin, halt notifications, and worker events in a `merge()`-based event loop (see §6.7).
+
+**Note:** The first parameter of `vm_config_from_command_line()` is `impl Spawn`, not `&DefaultDriver` specifically. `DefaultDriver` implements `Spawn`, so this works, but the abstraction boundary matters.
 
 ### 6.5 VmHandle Abstraction
 
@@ -431,13 +448,17 @@ In `openvmm_entry/src/lib.rs`, `do_main()` currently has three modes:
 
 ```
 1. Worker host mode  → meshworker::run_vmm_mesh_host()
-2. ttrpc/grpc mode   → --ttrpc / --grpc flags
-3. Interactive mode   → run_control() with readline loop
+2. ttrpc/grpc mode   → --ttrpc / --grpc flags (VM constructed internally from gRPC requests)
+3. Interactive mode   → run_control() with readline loop (VM from CLI args)
 ```
 
-We add a fourth:
+We add a fourth, parallel to mode 3 (not mode 2):
 
 ```rust
+// In cli_args.rs:
+#[clap(long, conflicts_with_all(["gdb", "ttrpc", "grpc"]))]
+pub mcp: bool,
+
 // In do_main(), after ttrpc/grpc check:
 if opt.mcp {
     return DefaultPool::run_with(async |driver| {
@@ -477,8 +498,9 @@ if opt.mcp {
         };
 
         // Resume VM unless --paused
+        // Note: VmRpc::Resume returns bool (false = already running)
         if !opt.paused {
-            vm_handle.vm_rpc.call(VmRpc::Resume, ()).await?;
+            let _changed = vm_handle.vm_rpc.call(VmRpc::Resume, ()).await?;
         }
 
         // Run MCP server on stdio
@@ -488,6 +510,106 @@ if opt.mcp {
 ```
 
 This reuses the existing `vm_config_from_command_line()` to parse all the same CLI flags (memory, disks, firmware, etc.), then hands off to the MCP server instead of the interactive console.
+
+### 6.7 Event Loop Design
+
+The MCP server must multiplex multiple event sources, mirroring `run_control()`'s `merge()`-based select loop. Without this, tool calls hang when the VM worker dies, and halt events go unnoticed.
+
+```rust
+enum McpEvent {
+    /// Incoming MCP JSON-RPC message from stdin
+    McpMessage(Result<JsonRpcMessage, io::Error>),
+    /// VM halt notification (power off, triple fault, etc.)
+    VmHalted(HaltReason),
+    /// VM worker event (stopped, failed, restarted)
+    WorkerEvent(WorkerEvent),
+    /// Pending tool call completed (for concurrent tool dispatch)
+    ToolResult { id: JsonRpcId, result: Result<serde_json::Value, McpError> },
+    /// Stdin closed (MCP client disconnected)
+    ClientDisconnected,
+}
+
+async fn run_mcp_event_loop(driver: &DefaultDriver, vm_handle: VmHandle) -> anyhow::Result<()> {
+    let mut events = merge!(
+        mcp_stdin_reader.map(McpEvent::McpMessage),
+        vm_handle.halt_recv.map(McpEvent::VmHalted),
+        vm_handle.worker.events().map(McpEvent::WorkerEvent),
+        tool_completions.map(|(id, result)| McpEvent::ToolResult { id, result }),
+    );
+
+    let mut vm_alive = true;
+
+    while let Some(event) = events.next().await {
+        match event {
+            McpEvent::McpMessage(Ok(msg)) => {
+                // Dispatch tool calls; read-only tools run concurrently,
+                // state-changing tools are serialized
+                dispatch_mcp_message(msg, &vm_handle, vm_alive).await?;
+            }
+            McpEvent::VmHalted(reason) => {
+                vm_alive = false;
+                // Send MCP notification (if supported) or log to stderr
+                eprintln!("VM halted: {:?}", reason);
+            }
+            McpEvent::WorkerEvent(WorkerEvent::Failed(err)) => {
+                vm_alive = false;
+                // All subsequent VmRpc calls will fail — return errors
+                eprintln!("VM worker failed: {:?}", err);
+            }
+            McpEvent::ToolResult { id, result } => {
+                send_mcp_response(id, result).await?;
+            }
+            McpEvent::ClientDisconnected | McpEvent::McpMessage(Err(_)) => {
+                break; // Clean shutdown
+            }
+            _ => {}
+        }
+    }
+
+    // Cleanup (see §6.8)
+    shutdown_vm(&vm_handle).await;
+    Ok(())
+}
+```
+
+Key design points:
+- **Read-only tools** (`inspect/tree`, `debug/get_registers`, `serial/read`, `display/screenshot`) can execute concurrently.
+- **State-changing tools** (`vm/pause`, `vm/resume`, `vm/reset`, `debug/break`, `debug/set_breakpoint`) are serialized to avoid races.
+- **VM death detection:** When `WorkerEvent::Failed` arrives, the server sets `vm_alive = false` and returns clear errors for subsequent tool calls instead of hanging on `RpcError`.
+- **`vm/wait_for_halt`:** Implemented as a pending future that resolves when `McpEvent::VmHalted` fires.
+
+### 6.8 Shutdown & Cleanup
+
+When the MCP client disconnects (stdin closes or EOF), the server must clean up gracefully:
+
+1. **Detach debugger** — If debug tools were attached, send `DebugRequest::Detach` to release the debug channel.
+2. **Stop the VM worker** — Signal the worker to shut down, wait for `WorkerEvent::Stopped`.
+3. **Clean up mesh** — Drop all mesh channels and the `VmmMesh` instance.
+4. **Exit** — Return from `do_main()`.
+
+This mirrors the `InteractiveCommand::Quit` handling in `run_control()`. The server should also handle `SIGTERM`/`SIGINT` gracefully (the `DefaultPool` already handles this via `pal_async`'s signal integration).
+
+### 6.9 Testing Strategy
+
+**Unit tests:**
+- MCP protocol layer: Test JSON-RPC parsing, framing, error responses. Mock stdin/stdout with in-memory buffers.
+- Tool dispatch: Test tool registry, argument validation, unknown tool handling.
+- Serial ring buffer: Test read/write, cursor-based pagination, overflow behavior.
+
+**Integration tests (using petri):**
+- Spawn `openvmm --mcp` as a child process from a petri test.
+- Send MCP tool calls over stdin, validate JSON-RPC responses on stdout.
+- Test lifecycle: pause → check status → resume → check status.
+- Test inspect: query inspect tree, verify expected paths exist.
+- Test serial: write to serial, read back output.
+- Test error handling: call tools after VM halt, verify graceful errors.
+
+**CI integration:**
+- Add a new test target in `vmm_tests/` for MCP server tests.
+- These tests should run as part of the existing petri-based CI pipeline.
+
+**Manual validation script:**
+- Provide a simple Python/Bash script that acts as an MCP client for manual testing during development. This is not a permanent test — just a development aid.
 
 ---
 
@@ -672,7 +794,7 @@ async fn single_step(handle: &VmHandle, vp: u32) -> Result<StepResult> {
 
 ### 8.1 Open Questions
 
-1. **MCP SDK maturity:** Is there a production-quality Rust MCP SDK on crates.io? Candidates: `rmcp`, `mcp-server`, etc. Need to evaluate API ergonomics, spec compliance, and maintenance status. If none are suitable, the hand-rolled approach is low-risk given the protocol's simplicity.
+1. **MCP SDK maturity:** Is there a production-quality Rust MCP SDK on crates.io? Candidates: `rmcp`, `mcp-server`, etc. Need to evaluate API ergonomics, spec compliance, and maintenance status. If none are suitable, the hand-rolled approach is low-risk given the protocol's simplicity. The `rmcp` crate (0.1.x) is worth evaluating before committing — if lightweight, it saves ~300 lines of boilerplate and ensures spec compliance.
 
 2. **Serial buffering strategy:** The current architecture pipes serial output directly to the terminal/file with no in-process buffering. For MCP, we need a ring buffer intercepting serial output. Options:
    - Fixed-size ring buffer (e.g., 64KB) with old data dropped on overflow — **recommended**
@@ -700,6 +822,12 @@ async fn single_step(handle: &VmHandle, vp: u32) -> Result<StepResult> {
    - `nics` (array of NIC specs)
    - Everything else gets sensible defaults.
 
+7. **`--mcp` flag interactions with other CLI flags:**
+   - `--mcp` + `--vnc` — VNC is skipped by default in MCP mode (framebuffer goes to MCP). If `--vnc` is explicitly passed, display tools return errors.
+   - `--mcp` + `--paused` — Works fine, VM starts paused and agent must call `vm/resume`.
+   - `--mcp` + `--com1 <value>` — User-specified serial config is respected. If not specified, defaults to stderr in MCP mode (instead of the normal console default).
+   - `--mcp` + `--gdb` / `--ttrpc` / `--grpc` — Mutually exclusive, enforced by clap `conflicts_with_all`.
+
 ### 8.2 Risks
 
 1. **Protocol drift:** MCP is still evolving (2024-11-05 spec, 2025-03-26 Streamable HTTP update). We should pin to a specific spec version (recommend: 2025-03-26) and document which features we support.
@@ -709,7 +837,7 @@ async fn single_step(handle: &VmHandle, vp: u32) -> Result<StepResult> {
    - Support a `timeout_ms` parameter on inspect tools
    - Return partial results with clear indication of timeouts
 
-3. **Debug channel exclusivity:** Using `--mcp` with debug tools means `--gdb` cannot be used simultaneously. This is acceptable but should be documented. The MCP `--mcp` flag should error if `--gdb` is also specified.
+3. **Debug channel exclusivity:** Using `--mcp` with debug tools means `--gdb` cannot be used simultaneously. This is enforced at the CLI level via `conflicts_with_all(["gdb", "ttrpc", "grpc"])` on the `--mcp` flag. The `--mcp` flag is also mutually exclusive with `--ttrpc`/`--grpc` since they represent different VM management paradigms.
 
 4. **Framebuffer encoding cost:** Converting BGRA framebuffer → RGBA → PNG on every `display/screenshot` call has CPU cost (typical: 5-50ms for 1920×1080). Mitigations:
    - Cache the last screenshot if framebuffer hasn't changed
@@ -740,7 +868,7 @@ async fn single_step(handle: &VmHandle, vp: u32) -> Result<StepResult> {
 | `petri/src/vm/openvmm/construct.rs` | VM construction from `PetriVmConfig` | Tier 2 implementation |
 | `petri/src/worker.rs` | `Worker` — wraps `WorkerHandle` + `VmRpc` | Pattern for VM interaction |
 | `petri/pipette_client/src/lib.rs` | Guest agent client | Tier 2 guest tools |
-| `openvmm/openvmm_entry/src/ttrpc/mod.rs` | Existing gRPC/ttrpc VMService | Pattern to follow for MCP |
+| `openvmm/openvmm_entry/src/ttrpc/mod.rs` | Existing gRPC/ttrpc VMService (different paradigm — constructs VMs from gRPC, not CLI) | Contrast reference |
 | `openvmm/openvmm_entry/src/serial_io.rs` | Serial port backend configuration | Serial tool implementation |
 | `openvmm/openvmm_entry/src/meshworker.rs` | Mesh process management | Worker infrastructure |
 
