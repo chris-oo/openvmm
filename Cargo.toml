@@ -7,6 +7,7 @@ default-members = ["openvmm/openvmm"]
 members = [
   # openvmm
   "openvmm/openvmm",
+  "openvmm/openvmm_mcp",
   # repo tooling
   "flowey/flowey_hvlite",
   "xtask",
@@ -80,6 +81,7 @@ openvmm_core = { path = "openvmm/openvmm_core" }
 openvmm_defs = { path = "openvmm/openvmm_defs" }
 openvmm_entry = { path = "openvmm/openvmm_entry" }
 openvmm_helpers = { path = "openvmm/openvmm_helpers" }
+openvmm_mcp = { path = "openvmm/openvmm_mcp" }
 openvmm_pcat_locator = { path = "openvmm/openvmm_pcat_locator" }
 openvmm_resources = { path = "openvmm/openvmm_resources" }
 openvmm_ttrpc_vmservice = { path = "openvmm/openvmm_ttrpc_vmservice" }
