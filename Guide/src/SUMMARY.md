@@ -72,6 +72,7 @@
     - [CLI](./reference/openvmm/management/cli.md)
     - [Interactive Console](./reference/openvmm/management/interactive_console.md)
     - [gRPC / ttrpc](./reference/openvmm/management/grpc.md)
+    - [MCP Server](./reference/openvmm/management/mcp.md)
   - [Graphical Console](./reference/openvmm/graphical_console.md)
   - [Logging](./reference/openvmm/logging.md)
 - [OpenHCL Features](./reference/openhcl.md)
