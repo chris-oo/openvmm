@@ -23,6 +23,9 @@ as well as the generated CLI help (via `cargo run -- --help`).
   Requires `--private-memory`.
 * `--nic`: Exposes a NIC using the Consomme user-mode NAT.
 * `--gfx`: Enable a graphical console over VNC (see below)
+* `--mcp`: Run as an [MCP server](./mcp.md) instead of the interactive
+  console. Reads JSON-RPC from stdin, writes responses to stdout.
+  Conflicts with `--gdb`, `--ttrpc`, `--grpc`.
 * `--virtio-9p`: Expose a virtio 9p file system. Uses the format `tag,root_path`, e.g. `myfs,C:\\`.
   The file system can be mounted in a Linux guest using `mount -t 9p  -o trans=virtio tag /mnt/point`.
   You can specify this argument multiple times to create multiple file systems.
