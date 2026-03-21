@@ -5480,6 +5480,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "openvmm_mcp"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "futures",
+ "futures-concurrency",
+ "inspect",
+ "mesh",
+ "mesh_worker",
+ "openvmm_defs",
+ "serde",
+ "serde_json",
+ "tracing",
+ "vmm_core_defs",
+]
+
+[[package]]
 name = "openvmm_pcat_locator"
 version = "0.0.0"
 dependencies = [
