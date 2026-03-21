@@ -160,7 +160,8 @@ def test_mcp_server():
             tools = resp["result"].get("tools", [])
             tool_names = [t["name"] for t in tools]
             check(f"has tools ({len(tools)} total)", len(tools) > 0, str(tool_names))
-            for expected in ["vm/pause", "vm/resume", "vm/status", "inspect/tree", "serial/read", "serial/write"]:
+            for expected in ["vm/pause", "vm/resume", "vm/status", "vm/wait_for_halt",
+                            "inspect/tree", "serial/read", "serial/write", "serial/execute"]:
                 check(f"tool '{expected}' present", expected in tool_names, str(tool_names))
 
         # --- Test 4: VM Status ---
@@ -269,7 +270,49 @@ def test_mcp_server():
                     check("serial shows response after write", len(text) > 0,
                           f"cursor={last_cursor}->{new_cursor}, text='{text[:200]}'")
 
-        # --- Test 9: VM Pause/Resume ---
+        # --- Test 9: Serial Execute ---
+        print("\n=== Serial Execute ===")
+        if login_seen:
+            # We should be at a Password: or shell prompt after typing root.
+            # Try executing a simple command. If we're at a shell, 'echo hello'
+            # will work. If at a Password prompt, it'll fail but we'll still
+            # get output (the prompt detection will fire on the next prompt).
+            resp = send_and_recv(proc, "tools/call", {
+                "name": "serial/execute",
+                "arguments": {"command": "echo hello_mcp_test", "timeout_ms": 15000}
+            }, timeout=20)
+            check("serial/execute response received", resp is not None)
+            if resp and "result" in resp:
+                content = resp["result"].get("content", [])
+                if content:
+                    data = json.loads(content[0].get("text", "{}"))
+                    output = data.get("output", "")
+                    timed_out = data.get("timed_out", True)
+                    check("serial/execute got output", len(output) > 0,
+                          f"output='{output[:200]}'")
+                    # If we see our echo string, the command executed successfully
+                    if "hello_mcp_test" in output:
+                        check("serial/execute ran command", True)
+                    else:
+                        check("serial/execute got some output (may be at password prompt)",
+                              len(output) > 0, output[:200])
+
+        # --- Test 10: Serial Execute with custom prompt ---
+        if login_seen:
+            resp = send_and_recv(proc, "tools/call", {
+                "name": "serial/execute",
+                "arguments": {"command": "pwd", "timeout_ms": 10000, "prompt_pattern": "# "}
+            }, timeout=15)
+            check("serial/execute custom prompt response received", resp is not None)
+            if resp and "result" in resp:
+                content = resp["result"].get("content", [])
+                if content:
+                    data = json.loads(content[0].get("text", "{}"))
+                    check("serial/execute custom prompt got output",
+                          len(data.get("output", "")) > 0,
+                          data.get("output", "")[:200])
+
+        # --- Test 11: VM Pause/Resume ---
         print("\n=== VM Pause/Resume ===")
         send(proc, make_request("tools/call", {
             "name": "vm/pause",
@@ -295,7 +338,7 @@ def test_mcp_server():
                 data = json.loads(content[0].get("text", "{}"))
                 check("vm/resume reports resumed", data.get("resumed") == True, str(data))
 
-        # --- Test 10: NMI ---
+        # --- Test 12: NMI ---
         print("\n=== NMI ===")
         send(proc, make_request("tools/call", {
             "name": "vm/nmi",
@@ -309,7 +352,22 @@ def test_mcp_server():
                 data = json.loads(content[0].get("text", "{}"))
                 check("vm/nmi reports sent", data.get("nmi_sent") == True, str(data))
 
-        # --- Test 11: Unknown tool ---
+        # --- Test 13: vm/wait_for_halt (timeout) ---
+        print("\n=== Wait for Halt (timeout test) ===")
+        resp = send_and_recv(proc, "tools/call", {
+            "name": "vm/wait_for_halt",
+            "arguments": {"timeout_ms": 2000}
+        }, timeout=5)
+        check("vm/wait_for_halt response received", resp is not None)
+        if resp and "result" in resp:
+            content = resp["result"].get("content", [])
+            if content:
+                data = json.loads(content[0].get("text", "{}"))
+                check("vm/wait_for_halt timed out (VM still running)",
+                      data.get("timed_out") == True or data.get("halted") == False,
+                      str(data))
+
+        # --- Test 15: Unknown tool ---
         print("\n=== Error Handling ===")
         send(proc, make_request("tools/call", {
             "name": "nonexistent/tool",
@@ -323,7 +381,7 @@ def test_mcp_server():
                 is_error = resp["result"].get("isError", False)
                 check("unknown tool returns error", is_error, str(resp["result"]))
 
-        # --- Test 12: Unknown method ---
+        # --- Test 16: Unknown method ---
         send(proc, make_request("bogus/method"))
         resp = recv(proc, timeout=5)
         check("unknown method response received", resp is not None)

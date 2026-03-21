@@ -25,11 +25,13 @@ pub struct VmHandle {
     /// any thread/context.
     pub console_in: parking_lot::Mutex<Option<Box<dyn std::io::Write + Send>>>,
     /// Whether the VM is currently halted.
-    halted: Arc<AtomicBool>,
+    halted: AtomicBool,
     /// Whether the VM is currently paused.
-    paused: Arc<AtomicBool>,
+    paused: AtomicBool,
     /// Human-readable halt reason, if any.
     halt_reason: parking_lot::Mutex<Option<String>>,
+    /// Senders waiting for a halt notification. Drained on halt.
+    halt_waiters: parking_lot::Mutex<Vec<mesh::Sender<String>>>,
 }
 
 impl VmHandle {
@@ -45,18 +47,26 @@ impl VmHandle {
             worker,
             serial_buffer,
             console_in: parking_lot::Mutex::new(console_in),
-            halted: Arc::new(AtomicBool::new(false)),
-            paused: Arc::new(AtomicBool::new(false)),
+            halted: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
             halt_reason: parking_lot::Mutex::new(None),
+            halt_waiters: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
     /// Record that the VM has halted with the given reason string.
+    ///
+    /// Also notifies any pending `vm/wait_for_halt` callers.
     pub fn set_halted(&self, reason: String) {
-        *self.halt_reason.lock() = Some(reason);
+        *self.halt_reason.lock() = Some(reason.clone());
         self.halted.store(true, Ordering::Release);
         // A halted VM is not paused.
         self.paused.store(false, Ordering::Release);
+        // Notify all pending halt waiters.
+        let waiters: Vec<_> = self.halt_waiters.lock().drain(..).collect();
+        for waiter in waiters {
+            waiter.send(reason.clone());
+        }
     }
 
     /// Clear the halted state (e.g., after a `ClearHalt` RPC).
@@ -78,6 +88,17 @@ impl VmHandle {
     /// Returns `true` if the VM is currently paused.
     pub fn is_paused(&self) -> bool {
         self.paused.load(Ordering::Acquire)
+    }
+
+    /// Register to be notified when the VM halts.
+    ///
+    /// Returns a receiver that will receive the halt reason string when the VM
+    /// halts. If the VM is already halted, the caller should check
+    /// [`is_halted`](Self::is_halted) first.
+    pub fn register_halt_waiter(&self) -> mesh::Receiver<String> {
+        let (tx, rx) = mesh::channel();
+        self.halt_waiters.lock().push(tx);
+        rx
     }
 
     /// Returns the current halt reason, if any.
@@ -127,5 +148,53 @@ impl VmHandle {
     pub async fn write_memory(&self, gpa: u64, data: Vec<u8>) -> anyhow::Result<()> {
         let result = self.vm_rpc.call(VmRpc::WriteMemory, (gpa, data)).await?;
         result.map_err(|e| anyhow::anyhow!("{e}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Test the halt waiter notification mechanism in isolation using the same
+    /// primitives (`parking_lot::Mutex<Vec<mesh::Sender<String>>>`) that
+    /// `VmHandle` uses.
+    #[test]
+    fn halt_waiters_are_notified() {
+        let waiters: parking_lot::Mutex<Vec<mesh::Sender<String>>> =
+            parking_lot::Mutex::new(Vec::new());
+
+        // Register two waiters.
+        let (tx1, mut rx1) = mesh::channel();
+        let (tx2, mut rx2) = mesh::channel();
+        waiters.lock().push(tx1);
+        waiters.lock().push(tx2);
+
+        // Drain and notify — mirrors VmHandle::set_halted().
+        let reason = "triple fault".to_string();
+        let drained: Vec<_> = waiters.lock().drain(..).collect();
+        for w in drained {
+            w.send(reason.clone());
+        }
+
+        // Both receivers should get the reason.
+        use futures::StreamExt;
+        let msg1 = futures::executor::block_on(rx1.next());
+        let msg2 = futures::executor::block_on(rx2.next());
+        assert_eq!(msg1.as_deref(), Some("triple fault"));
+        assert_eq!(msg2.as_deref(), Some("triple fault"));
+    }
+
+    #[test]
+    fn halt_waiters_empty_after_drain() {
+        let waiters: parking_lot::Mutex<Vec<mesh::Sender<String>>> =
+            parking_lot::Mutex::new(Vec::new());
+
+        let (tx, _rx) = mesh::channel::<String>();
+        waiters.lock().push(tx);
+
+        // Drain.
+        let drained: Vec<_> = waiters.lock().drain(..).collect();
+        assert_eq!(drained.len(), 1);
+
+        // List is now empty.
+        assert!(waiters.lock().is_empty());
     }
 }

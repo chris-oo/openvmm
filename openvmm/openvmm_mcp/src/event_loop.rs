@@ -5,6 +5,10 @@
 //!
 //! Reads JSON-RPC messages from stdin, dispatches tool calls, and writes
 //! responses to stdout. Also monitors VM halt notifications.
+//!
+//! Tool calls run concurrently with the event loop via `FuturesUnordered`,
+//! allowing long-running tools (like `vm/wait_for_halt` and `serial/execute`)
+//! to proceed while halt events and new requests are still processed.
 
 use crate::protocol::InitializeParams;
 use crate::protocol::InitializeResult;
@@ -25,6 +29,10 @@ use crate::transport::StdoutWriter;
 use crate::vm_handle::VmHandle;
 use futures::StreamExt;
 use futures_concurrency::stream::Merge;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use unicycle::FuturesUnordered;
 
 /// Events processed by the main event loop.
 enum Event {
@@ -44,6 +52,7 @@ pub async fn run_mcp_server(
     vm_handle: VmHandle,
     halt_recv: mesh::Receiver<vmm_core_defs::HaltReason>,
 ) -> anyhow::Result<()> {
+    let vm = Arc::new(vm_handle);
     let stdin_rx = transport::spawn_stdin_reader();
     let mut stdout = StdoutWriter::new();
     let registry = ToolRegistry::new();
@@ -54,14 +63,41 @@ pub async fn run_mcp_server(
         .chain(futures::stream::repeat_with(|| Event::StdinClosed));
     let mut halt_stream = halt_recv.map(Event::Halt);
 
+    // Pending tool futures that run concurrently with the event loop.
+    let mut pending_tools: FuturesUnordered<
+        Pin<Box<dyn Future<Output = (serde_json::Value, ToolResult)> + Send>>,
+    > = FuturesUnordered::new();
+
     let mut initialized = false;
 
     loop {
-        let event = (&mut stdin_stream, &mut halt_stream)
-            .merge()
-            .next()
+        // Multiplex: event streams + pending tool completions.
+        // When no tools are pending, just poll the event streams.
+        // When tools are pending, use select to poll both.
+        let event = if pending_tools.is_empty() {
+            (&mut stdin_stream, &mut halt_stream).merge().next().await
+        } else {
+            match futures::future::select(
+                Box::pin((&mut stdin_stream, &mut halt_stream).merge().next()),
+                Box::pin(pending_tools.next()),
+            )
             .await
-            .unwrap();
+            {
+                futures::future::Either::Left((event, _)) => event,
+                futures::future::Either::Right((Some((id, result)), _)) => {
+                    let resp = JsonRpcResponse::success(id, serde_json::to_value(&result).unwrap());
+                    let _ = stdout.send(&resp);
+                    continue;
+                }
+                futures::future::Either::Right((None, _)) => {
+                    // FuturesUnordered returned None — shouldn't happen
+                    // since we checked is_empty(), but just continue.
+                    continue;
+                }
+            }
+        };
+
+        let Some(event) = event else { break };
 
         match event {
             Event::StdinClosed => {
@@ -71,7 +107,7 @@ pub async fn run_mcp_server(
             Event::Halt(reason) => {
                 let reason_str = format!("{reason:?}");
                 tracing::info!(?reason, "VM halted");
-                vm_handle.set_halted(reason_str);
+                vm.set_halted(reason_str);
             }
             Event::StdinMessage(line) => {
                 let msg = match transport::parse_message(&line) {
@@ -88,7 +124,15 @@ pub async fn run_mcp_server(
                     }
                 };
 
-                handle_message(msg, &vm_handle, &registry, &mut stdout, &mut initialized).await;
+                handle_message(
+                    msg,
+                    &vm,
+                    &registry,
+                    &mut stdout,
+                    &mut initialized,
+                    &mut pending_tools,
+                )
+                .await;
             }
         }
     }
@@ -98,10 +142,13 @@ pub async fn run_mcp_server(
 
 async fn handle_message(
     msg: JsonRpcMessage,
-    vm: &VmHandle,
+    vm: &Arc<VmHandle>,
     registry: &ToolRegistry,
     stdout: &mut StdoutWriter,
     initialized: &mut bool,
+    pending_tools: &mut FuturesUnordered<
+        Pin<Box<dyn Future<Output = (serde_json::Value, ToolResult)> + Send>>,
+    >,
 ) {
     // Notifications have no id — we don't send a response.
     let is_notification = msg.id.is_none();
@@ -193,13 +240,18 @@ async fn handle_message(
                 }
             };
 
-            let result = match registry.call(&params.name, vm, params.arguments).await {
-                Some(r) => r,
-                None => ToolResult::error(format!("unknown tool: {}", params.name)),
-            };
-
-            let resp = JsonRpcResponse::success(id, serde_json::to_value(&result).unwrap());
-            let _ = stdout.send(&resp);
+            match registry.call(&params.name, vm.clone(), params.arguments) {
+                Some(future) => {
+                    // Spawn the tool call as a concurrent future so the event
+                    // loop continues processing halt events and other requests.
+                    pending_tools.push(Box::pin(async move { (id, future.await) }));
+                }
+                None => {
+                    let result = ToolResult::error(format!("unknown tool: {}", params.name));
+                    let resp = JsonRpcResponse::success(id, serde_json::to_value(&result).unwrap());
+                    let _ = stdout.send(&resp);
+                }
+            }
         }
         _ => {
             if !is_notification {
