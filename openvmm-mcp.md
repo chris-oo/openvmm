@@ -43,21 +43,33 @@ Phase 1 (Core MCP Infrastructure) has been fully implemented and tested.
 - Protocol state machine enforced: tools/list and tools/call rejected before initialize handshake
 - MCP server replaces `run_control()` in the control flow — uses same `vm_config_from_command_line()` and VM worker launch path
 
-### ⏳ Phase 2 — NOT STARTED (Interaction & Diagnostics)
+### ✅ Phase 2 — COMPLETE (Serial Execute & Halt Wait)
 - `serial/execute` convenience tool (write command, wait for prompt)
-- `memory/read` and `memory/write` tools
-- `display/screenshot` tool (framebuffer → PNG)
-- `disk/add` and `disk/remove` tools
-- `snapshot/save` tool
-- `inspect/update` improvements
-- MCP resources (`vm://config`, `vm://status`, `vm://serial/log`)
+- `vm/wait_for_halt` tool (block until VM halts, returns halt reason)
+
+**Commits:**
+3. **openvmm_mcp: Phase 2 — serial/execute & vm/wait_for_halt**
+   - Two new tools: `serial/execute` (write command, poll for prompt, return output) and `vm/wait_for_halt` (block until VM halts with timeout)
+   - Event loop restructured for concurrent tool dispatch using `unicycle::FuturesUnordered` + `futures::future::select` — halt events are processed while long-running tools are pending
+   - Tool handler signatures changed from `&'a VmHandle` to `Arc<VmHandle>` for `'static` futures
+   - `VmHandle` gained halt waiter notification mechanism (list of `mesh::Sender<String>` drained on halt)
+   - `serial/execute` spawns a polling thread that checks the ring buffer every 100ms for prompt patterns
+   - Default prompt patterns: `# `, `$ `, `> `, `login: `, `Password: ` (configurable via `prompt_pattern` parameter)
+   - 11 new unit tests (prompt detection, ANSI stripping, halt waiter mechanism); total: 14 unit tests
+   - Concurrency fix: cursor snapshot + write are atomic under `console_in` lock
+   - Tool count: 13 (11 from Phase 1 + 2 new)
 
 ### ⏳ Phase 3 — NOT STARTED (Petri-MCP Orchestrator)
 - Standalone `petri_mcp` binary for multi-VM lifecycle management
 - `vm/create`, `vm/start`, `vm/destroy`, `vm/list`
 - Guest agent tools via pipette (`guest/execute`, `guest/read_file`, `guest/write_file`)
 
-### ⏳ Phase 4 — NOT STARTED (Advanced Features)
+### ⏳ Phase 4 — NOT STARTED (Extended Tools & Features)
+- `memory/read` and `memory/write` tools
+- `display/screenshot` tool (framebuffer → PNG)
+- `disk/add` and `disk/remove` tools
+- `snapshot/save` tool
+- MCP resources (`vm://config`, `vm://status`, `vm://serial/log`)
 - SSE/Streamable HTTP transport
 - MCP resource subscriptions
 - VTL2 settings management
@@ -302,34 +314,17 @@ For Tier 2 (petri-mcp):
 
 **Actual scope:** ~1,400 LOC new (openvmm_mcp), ~100 LOC modifications to openvmm_entry, ~350 LOC test script.
 
-### Phase 2: Interaction & Diagnostics Tools
+### Phase 2: Serial Execute & Halt Wait
 
-**Goal:** Complete the Tier 1 single-VM tool surface.
+**Goal:** Add the two highest-value tools for agent workflows before moving to the petri orchestrator.
 
 **Steps:**
 
-1. **Implement serial console tools** — Add `SerialRingBuffer` type that captures serial output; implement `serial/write`, `serial/read`, `serial/execute`.
-   - New file: `openvmm/openvmm_mcp/src/tools/serial.rs`, `openvmm/openvmm_mcp/src/serial_buffer.rs`.
-   - Touches: `openvmm/openvmm_entry/src/lib.rs` (wire serial output to ring buffer instead of/in addition to terminal).
+1. **Implement `serial/execute`** — Write a command to serial, poll the ring buffer until a prompt pattern (e.g. `# `, `$ `, `> `) appears or timeout expires, return the complete output in one response. This eliminates the fragile write→sleep→read pattern agents must use today.
+   - Touches: `openvmm/openvmm_mcp/src/tools/serial.rs`.
 
-2. **Implement `memory/read` and `memory/write`** — Wrap `VmRpc::ReadMemory` / `VmRpc::WriteMemory`, return hex dump or base64.
-   - New file: `openvmm/openvmm_mcp/src/tools/memory.rs`.
-
-3. **Implement `display/screenshot`** — Encode `FramebufferAccess` output as PNG, return as base64 MCP image content.
-   - New file: `openvmm/openvmm_mcp/src/tools/display.rs`.
-   - New dependency: `image` crate (for PNG encoding) or `png` crate.
-
-4. **Implement `disk/add`, `disk/remove`** — Wrap SCSI controller RPC.
-   - New file: `openvmm/openvmm_mcp/src/tools/disk.rs`.
-
-5. **Implement `snapshot/save` and `snapshot/pulse_save_restore`**.
-   - New file: `openvmm/openvmm_mcp/src/tools/snapshot.rs`.
-
-6. **Implement `inspect/update`**.
-   - Touches: `openvmm/openvmm_mcp/src/tools/inspect.rs`.
-
-7. **Implement MCP resources** — `vm://config`, `vm://status`, `vm://serial/log`.
-   - New file: `openvmm/openvmm_mcp/src/resources.rs`.
+2. **Implement `vm/wait_for_halt`** — Block until the VM halts (shutdown, triple fault, etc.), return the halt reason. Uses the existing `halt_recv` channel. Prevents agents from polling `vm/status` in a loop.
+   - Touches: `openvmm/openvmm_mcp/src/tools/lifecycle.rs`, `openvmm/openvmm_mcp/src/event_loop.rs`.
 
 ### Phase 3: Petri-MCP Orchestrator (Tier 2)
 
@@ -354,18 +349,33 @@ For Tier 2 (petri-mcp):
 
 6. **Delegate per-VM tools** — Reuse `openvmm_mcp` tool implementations for inspect, memory, debug, etc., by extracting the underlying `VmRpc` channels from `PetriVmOpenVmm`'s `Worker`.
 
-### Phase 4: Advanced Features
+### Phase 4: Extended Tools & Features
 
-**Goal:** Polish and extend.
+**Goal:** Round out the tool surface and add protocol features.
 
 **Steps:**
 
-1. Add SSE and/or Streamable HTTP transport (for remote MCP clients).
-2. Add MCP resource subscriptions (notify on VM state changes, serial output).
-3. Add `vm://inspect/{path}` dynamic resources with change notifications.
-4. Add VTL2 settings management tools (`vtl2/show`, `vtl2/add_scsi_disk`, `vtl2/remove_scsi_disk`).
-5. Add OpenHCL diagnostics integration (via `DiagClient` — inspect paravisor, restart user-mode, etc.).
-6. Add KVP interaction tools.
+1. **Implement `memory/read` and `memory/write`** — Wrap `VmRpc::ReadMemory` / `VmRpc::WriteMemory`, return hex dump or base64.
+   - New file: `openvmm/openvmm_mcp/src/tools/memory.rs`.
+
+2. **Implement `display/screenshot`** — Encode `FramebufferAccess` output as PNG, return as base64 MCP image content.
+   - New file: `openvmm/openvmm_mcp/src/tools/display.rs`.
+
+3. **Implement `disk/add`, `disk/remove`** — Wrap SCSI controller RPC.
+   - New file: `openvmm/openvmm_mcp/src/tools/disk.rs`.
+
+4. **Implement `snapshot/save` and `snapshot/pulse_save_restore`**.
+   - New file: `openvmm/openvmm_mcp/src/tools/snapshot.rs`.
+
+5. **Implement MCP resources** — `vm://config`, `vm://status`, `vm://serial/log`.
+   - New file: `openvmm/openvmm_mcp/src/resources.rs`.
+
+6. Add SSE and/or Streamable HTTP transport (for remote MCP clients).
+7. Add MCP resource subscriptions (notify on VM state changes, serial output).
+8. Add `vm://inspect/{path}` dynamic resources with change notifications.
+9. Add VTL2 settings management tools (`vtl2/show`, `vtl2/add_scsi_disk`, `vtl2/remove_scsi_disk`).
+10. Add OpenHCL diagnostics integration (via `DiagClient` — inspect paravisor, restart user-mode, etc.).
+11. Add KVP interaction tools.
 
 ### Phase 5: GDB Debug Integration (Nice-to-Have)
 
