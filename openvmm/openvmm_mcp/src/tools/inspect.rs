@@ -103,9 +103,12 @@ fn handle_tree<'a>(
             .unwrap_or(2)
             .min(10) as usize;
 
+        let obj = inspect::adhoc(|req| {
+            req.respond().field("vm", &vm.worker);
+        });
         let mut inspection = InspectionBuilder::new(&path)
             .depth(Some(depth))
-            .inspect(&vm.worker);
+            .inspect(obj);
 
         let _ = CancelContext::new()
             .with_timeout(Duration::from_secs(1))
@@ -127,9 +130,10 @@ fn handle_get<'a>(
             None => return ToolResult::error("missing required parameter: path"),
         };
 
-        let mut inspection = InspectionBuilder::new(&path)
-            .depth(Some(0))
-            .inspect(&vm.worker);
+        let obj = inspect::adhoc(|req| {
+            req.respond().field("vm", &vm.worker);
+        });
+        let mut inspection = InspectionBuilder::new(&path).depth(Some(0)).inspect(obj);
 
         let _ = CancelContext::new()
             .with_timeout(Duration::from_secs(1))
@@ -155,9 +159,10 @@ fn handle_update<'a>(
             None => return ToolResult::error("missing required parameter: value"),
         };
 
-        let result = InspectionBuilder::new(&path)
-            .update(&value, &vm.worker)
-            .await;
+        let obj = inspect::adhoc_mut(|req| {
+            req.respond().field("vm", &vm.worker);
+        });
+        let result = InspectionBuilder::new(&path).update(&value, obj).await;
 
         match result {
             Ok(v) => ToolResult::text(format!("{v:#}")),
