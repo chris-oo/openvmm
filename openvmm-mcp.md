@@ -59,6 +59,12 @@ Phase 1 (Core MCP Infrastructure) has been fully implemented and tested.
    - Concurrency fix: cursor snapshot + write are atomic under `console_in` lock
    - Tool count: 13 (11 from Phase 1 + 2 new)
 
+4. **Guide: Add MCP server documentation**
+   - New Guide page: `Guide/src/reference/openvmm/management/mcp.md`
+   - Added to `SUMMARY.md` under Configuration and Management
+   - `--mcp` flag added to CLI reference (`cli.md`)
+   - Covers: protocol overview, all 13 tools, example session, architecture
+
 ### ⏳ Phase 3 — NOT STARTED (Petri-MCP Orchestrator)
 - Standalone `petri_mcp` binary for multi-VM lifecycle management
 - `vm/create`, `vm/start`, `vm/destroy`, `vm/list`
