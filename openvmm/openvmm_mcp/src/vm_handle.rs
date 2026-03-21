@@ -21,10 +21,13 @@ pub struct VmHandle {
     pub worker: mesh_worker::WorkerHandle,
     /// Serial output ring buffer shared with the serial output sink.
     pub serial_buffer: Arc<SerialRingBuffer>,
+    /// Serial console input writer (COM1) — synchronous writer for use from
+    /// any thread/context.
+    pub console_in: parking_lot::Mutex<Option<Box<dyn std::io::Write + Send>>>,
     /// Whether the VM is currently halted.
     halted: Arc<AtomicBool>,
     /// Human-readable halt reason, if any.
-    halt_reason: Arc<std::sync::Mutex<Option<String>>>,
+    halt_reason: parking_lot::Mutex<Option<String>>,
 }
 
 impl VmHandle {
@@ -33,25 +36,27 @@ impl VmHandle {
         vm_rpc: mesh::Sender<VmRpc>,
         worker: mesh_worker::WorkerHandle,
         serial_buffer: Arc<SerialRingBuffer>,
+        console_in: Option<Box<dyn std::io::Write + Send>>,
     ) -> Self {
         Self {
             vm_rpc,
             worker,
             serial_buffer,
+            console_in: parking_lot::Mutex::new(console_in),
             halted: Arc::new(AtomicBool::new(false)),
-            halt_reason: Arc::new(std::sync::Mutex::new(None)),
+            halt_reason: parking_lot::Mutex::new(None),
         }
     }
 
     /// Record that the VM has halted with the given reason string.
     pub fn set_halted(&self, reason: String) {
-        *self.halt_reason.lock().unwrap() = Some(reason);
+        *self.halt_reason.lock() = Some(reason);
         self.halted.store(true, Ordering::Release);
     }
 
     /// Clear the halted state (e.g., after a `ClearHalt` RPC).
     pub fn clear_halted(&self) {
-        *self.halt_reason.lock().unwrap() = None;
+        *self.halt_reason.lock() = None;
         self.halted.store(false, Ordering::Release);
     }
 
@@ -62,7 +67,7 @@ impl VmHandle {
 
     /// Returns the current halt reason, if any.
     pub fn halt_reason_string(&self) -> Option<String> {
-        self.halt_reason.lock().unwrap().clone()
+        self.halt_reason.lock().clone()
     }
 
     /// Pause the VM. Returns `true` if the state actually changed.
