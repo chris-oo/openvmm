@@ -26,6 +26,8 @@ pub struct VmHandle {
     pub console_in: parking_lot::Mutex<Option<Box<dyn std::io::Write + Send>>>,
     /// Whether the VM is currently halted.
     halted: Arc<AtomicBool>,
+    /// Whether the VM is currently paused.
+    paused: Arc<AtomicBool>,
     /// Human-readable halt reason, if any.
     halt_reason: parking_lot::Mutex<Option<String>>,
 }
@@ -44,6 +46,7 @@ impl VmHandle {
             serial_buffer,
             console_in: parking_lot::Mutex::new(console_in),
             halted: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
             halt_reason: parking_lot::Mutex::new(None),
         }
     }
@@ -52,6 +55,8 @@ impl VmHandle {
     pub fn set_halted(&self, reason: String) {
         *self.halt_reason.lock() = Some(reason);
         self.halted.store(true, Ordering::Release);
+        // A halted VM is not paused.
+        self.paused.store(false, Ordering::Release);
     }
 
     /// Clear the halted state (e.g., after a `ClearHalt` RPC).
@@ -63,6 +68,16 @@ impl VmHandle {
     /// Returns `true` if the VM is currently halted.
     pub fn is_halted(&self) -> bool {
         self.halted.load(Ordering::Acquire)
+    }
+
+    /// Record whether the VM is paused.
+    pub fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Release);
+    }
+
+    /// Returns `true` if the VM is currently paused.
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
     }
 
     /// Returns the current halt reason, if any.
