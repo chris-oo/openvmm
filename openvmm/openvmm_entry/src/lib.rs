@@ -203,6 +203,8 @@ struct VmResources {
     nvme_vtl2_rpc: Option<mesh::Sender<NvmeControllerRequest>>,
     ged_rpc: Option<mesh::Sender<get_resources::ged::GuestEmulationRequest>>,
     vtl2_settings: Option<vtl2_settings_proto::Vtl2Settings>,
+    mcp_serial_buffer: Option<Arc<openvmm_mcp::serial_buffer::SerialRingBuffer>>,
+    mcp_console_in: Option<Box<dyn Write + Send>>,
     #[cfg(windows)]
     switch_ports: Vec<vmswitch::kernel::SwitchPort>,
 }
@@ -401,6 +403,17 @@ async fn vm_config_from_command_line(
         DeviceVtl::Vtl0
     };
 
+    // In MCP mode, serial output goes to an in-process ring buffer (and
+    // stderr) rather than stdout, which is reserved for JSON-RPC.
+    let mcp_serial_buffer: Option<Arc<openvmm_mcp::serial_buffer::SerialRingBuffer>> = if opt.mcp {
+        Some(Arc::new(openvmm_mcp::serial_buffer::SerialRingBuffer::new()))
+    } else {
+        None
+    };
+    // In MCP mode, we provide a raw (synchronous) writer for serial input
+    // since the PolledSocket is registered on the serial driver thread.
+    let mcp_console_in: RefCell<Option<Box<dyn Write + Send>>> = RefCell::new(None);
+
     let console_state: RefCell<Option<ConsoleState<'_>>> = RefCell::new(None);
     let setup_serial = |name: &str, cli_cfg, device| -> anyhow::Result<_> {
         Ok(match cli_cfg {
@@ -409,20 +422,62 @@ async fn vm_config_from_command_line(
                     bail!("console already set by {}", console_state.device);
                 }
                 let (config, serial) = serial_io::anonymous_serial_pair(&serial_driver)?;
-                let (serial_read, serial_write) = AsyncReadExt::split(serial);
-                *console_state.borrow_mut() = Some(ConsoleState {
-                    device,
-                    input: Box::new(serial_write),
-                });
-                thread::Builder::new()
-                    .name(name.to_owned())
-                    .spawn(move || {
-                        let _ = block_on(futures::io::copy(
-                            serial_read,
-                            &mut AllowStdIo::new(term::raw_stdout()),
-                        ));
-                    })
-                    .unwrap();
+                if let Some(ring_buf) = mcp_serial_buffer.clone() {
+                    // MCP mode: dup the underlying fd for synchronous writes,
+                    // then use the async side for reading serial output.
+                    use std::os::fd::AsFd;
+                    let dup_fd = serial
+                        .get()
+                        .as_fd()
+                        .try_clone_to_owned()
+                        .context("dup serial fd for MCP console input")?;
+                    *mcp_console_in.borrow_mut() =
+                        Some(Box::new(unix_socket::UnixStream::from(dup_fd))
+                            as Box<dyn Write + Send>);
+
+                    // Still need a ConsoleState for the rest of the code.
+                    *console_state.borrow_mut() = Some(ConsoleState {
+                        device,
+                        input: Box::new(futures::io::sink()),
+                    });
+
+                    // Tee serial output to stderr + ring buffer.
+                    let (serial_read, _serial_write) = AsyncReadExt::split(serial);
+                    thread::Builder::new()
+                        .name(name.to_owned())
+                        .spawn(move || {
+                            block_on(async move {
+                                let mut serial_read = futures::io::BufReader::new(serial_read);
+                                let mut buf = [0u8; 1024];
+                                loop {
+                                    use futures::io::AsyncReadExt;
+                                    let n = match serial_read.read(&mut buf).await {
+                                        Ok(0) | Err(_) => break,
+                                        Ok(n) => n,
+                                    };
+                                    ring_buf.write(&buf[..n]);
+                                    let _ = Write::write_all(&mut term::raw_stderr(), &buf[..n]);
+                                }
+                            });
+                        })
+                        .unwrap();
+                } else {
+                    // Normal interactive mode.
+                    let (serial_read, serial_write) = AsyncReadExt::split(serial);
+                    *console_state.borrow_mut() = Some(ConsoleState {
+                        device,
+                        input: Box::new(serial_write),
+                    });
+                    thread::Builder::new()
+                        .name(name.to_owned())
+                        .spawn(move || {
+                            let _ = block_on(futures::io::copy(
+                                serial_read,
+                                &mut AllowStdIo::new(term::raw_stdout()),
+                            ));
+                        })
+                        .unwrap();
+                }
                 Some(config)
             }
             SerialConfigCli::Stderr => {
@@ -575,6 +630,8 @@ async fn vm_config_from_command_line(
         resources.console_in = Some(input);
         console_str = device;
     }
+    resources.mcp_serial_buffer = mcp_serial_buffer;
+    resources.mcp_console_in = mcp_console_in.into_inner();
 
     if opt.shared_memory {
         tracing::warn!("--shared-memory/-M flag has no effect and will be removed");
@@ -2640,6 +2697,18 @@ async fn run_control(driver: &DefaultDriver, mesh: &VmmMesh, opt: Options) -> an
 
     if !opt.paused {
         vm_rpc.call(VmRpc::Resume, ()).await?;
+    }
+
+    // MCP mode: run the MCP server instead of the interactive console.
+    if opt.mcp {
+        let serial_buffer = resources
+            .mcp_serial_buffer
+            .clone()
+            .unwrap_or_else(|| Arc::new(openvmm_mcp::serial_buffer::SerialRingBuffer::new()));
+        let console_in = resources.mcp_console_in.take();
+        let vm_handle =
+            openvmm_mcp::VmHandle::new(vm_rpc.clone(), vm_worker, serial_buffer, console_in);
+        return openvmm_mcp::run_mcp_server(vm_handle, notify_recv).await;
     }
 
     let paravisor_diag = Arc::new(diag_client::DiagClient::from_dialer(

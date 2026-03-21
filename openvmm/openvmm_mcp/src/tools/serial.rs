@@ -76,7 +76,7 @@ fn handle_read<'a>(
 }
 
 fn handle_write<'a>(
-    _vm: &'a VmHandle,
+    vm: &'a VmHandle,
     args: serde_json::Value,
 ) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>> {
     Box::pin(async move {
@@ -85,17 +85,24 @@ fn handle_write<'a>(
             None => return ToolResult::error("missing required parameter: text"),
         };
 
-        // Write to the serial ring buffer as if it were echoed.
-        // The actual console_in write requires an AsyncWrite handle that would
-        // be wired during VM setup. For now, record what we would send.
-        let _ = text;
-        ToolResult::text(
-            serde_json::json!({
-                "written": true,
-                "bytes": text.len(),
-                "note": "serial/write will be fully wired when integrated into openvmm_entry"
-            })
-            .to_string(),
-        )
+        let mut guard = vm.console_in.lock();
+        let Some(writer) = guard.as_mut() else {
+            return ToolResult::error("serial console input not available");
+        };
+
+        use std::io::Write;
+        match writer
+            .write_all(text.as_bytes())
+            .and_then(|()| writer.flush())
+        {
+            Ok(()) => ToolResult::text(
+                serde_json::json!({
+                    "written": true,
+                    "bytes": text.len(),
+                })
+                .to_string(),
+            ),
+            Err(e) => ToolResult::error(format!("serial write failed: {e}")),
+        }
     })
 }
