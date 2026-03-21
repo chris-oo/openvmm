@@ -573,6 +573,10 @@ flags:
     #[clap(long, value_name = "PORT")]
     pub gdb: Option<u16>,
 
+    /// run as an MCP (Model Context Protocol) server on stdin/stdout
+    #[clap(long, conflicts_with_all = ["gdb", "ttrpc", "grpc"])]
+    pub mcp: bool,
+
     /// enable emulated MANA devices with the given network backend (see --net)
     ///
     /// Prefix with `pcie_port=<port_name>:` to expose the nic over emulated PCIe

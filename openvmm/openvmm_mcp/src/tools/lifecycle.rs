@@ -146,7 +146,11 @@ fn handle_nmi<'a>(
     args: serde_json::Value,
 ) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>> {
     Box::pin(async move {
-        let vp = args.get("vp").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let vp_u64 = args.get("vp").and_then(|v| v.as_u64()).unwrap_or(0);
+        if vp_u64 > u32::MAX as u64 {
+            return ToolResult::error("vp index out of range");
+        }
+        let vp = vp_u64 as u32;
         match vm.nmi(vp).await {
             Ok(()) => ToolResult::text(format!(r#"{{"nmi_sent": true, "vp": {vp}}}"#)),
             Err(e) => ToolResult::error(format!("nmi failed: {e:#}")),

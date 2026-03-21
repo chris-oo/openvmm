@@ -97,7 +97,11 @@ fn handle_tree<'a>(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(2) as usize;
+        let depth = args
+            .get("depth")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(2)
+            .min(10) as usize;
 
         let mut inspection = InspectionBuilder::new(&path)
             .depth(Some(depth))

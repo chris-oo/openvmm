@@ -12,7 +12,7 @@ const DEFAULT_CAPACITY: usize = 64 * 1024;
 
 /// A thread-safe ring buffer for serial output.
 pub struct SerialRingBuffer {
-    inner: std::sync::Mutex<RingBufferInner>,
+    inner: parking_lot::Mutex<RingBufferInner>,
 }
 
 struct RingBufferInner {
@@ -33,7 +33,7 @@ impl SerialRingBuffer {
     pub fn with_capacity(capacity: usize) -> Self {
         assert!(capacity > 0, "ring buffer capacity must be > 0");
         Self {
-            inner: std::sync::Mutex::new(RingBufferInner {
+            inner: parking_lot::Mutex::new(RingBufferInner {
                 buffer: vec![0u8; capacity],
                 write_pos: 0,
                 total_written: 0,
@@ -44,14 +44,14 @@ impl SerialRingBuffer {
     /// Write data into the ring buffer. May overwrite oldest data if the
     /// buffer is full.
     pub fn write(&self, data: &[u8]) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         let cap = inner.buffer.len();
         for &byte in data {
             let pos = inner.write_pos;
             inner.buffer[pos] = byte;
             inner.write_pos = (pos + 1) % cap;
         }
-        inner.total_written += data.len() as u64;
+        inner.total_written = inner.total_written.wrapping_add(data.len() as u64);
     }
 
     /// Read all data written since the given cursor position.
@@ -64,7 +64,7 @@ impl SerialRingBuffer {
     /// Pass `cursor = 0` on the first call to read everything currently in the
     /// buffer.
     pub fn read_since(&self, cursor: u64) -> (Vec<u8>, u64) {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         let cap = inner.buffer.len() as u64;
         let total = inner.total_written;
 
@@ -95,7 +95,7 @@ impl SerialRingBuffer {
 
     /// Return the current cursor (total bytes written so far).
     pub fn cursor(&self) -> u64 {
-        self.inner.lock().unwrap().total_written
+        self.inner.lock().total_written
     }
 }
 

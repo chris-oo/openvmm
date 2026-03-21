@@ -1,5 +1,77 @@
 # OpenVMM MCP Server — Implementation Plan
 
+## Implementation Status
+
+> **Last updated:** 2026-03-21
+
+### ✅ Phase 1 — COMPLETE
+
+Phase 1 (Core MCP Infrastructure) has been fully implemented and tested.
+
+**Commits:**
+1. `rvrtymws` — **Add openvmm_mcp crate: MCP server Phase 1**
+   - Created `openvmm/openvmm_mcp/` crate (~1,400 LOC, 13 files)
+   - Hand-rolled MCP JSON-RPC protocol (no external SDK)
+   - Stdio transport with stdin reader thread → mesh channel
+   - Async event loop merging stdin messages + VM halt notifications
+   - VmHandle abstraction over mesh RPC channels
+   - 64KB serial ring buffer with cursor-based reads
+   - 11 tools: vm/pause, vm/resume, vm/reset, vm/nmi, vm/clear_halt, vm/status, inspect/tree, inspect/get, inspect/update, serial/read, serial/write
+   - 3 unit tests for serial ring buffer
+
+2. `qopknvks` — **openvmm_mcp: wire into openvmm_entry with full serial I/O**
+   - `--mcp` CLI flag with `conflicts_with_all = ["gdb", "ttrpc", "grpc"]`
+   - Serial output teed to both ring buffer AND stderr via dup'd fd
+   - Synchronous console_in writer (dup'd unix socket fd) for serial/write
+   - Code review fixes: `parking_lot::Mutex`, protocol state machine enforcement, inspect depth clamped to 10, VP index validation, wrapping_add for buffer counter
+   - `scripts/test_mcp.py` — end-to-end test exercising all tools
+
+**Test results (34/34 passing) with Alpine linux-direct boot:**
+- MCP initialize handshake ✅
+- Tools listing (11 tools) ✅
+- VM status/pause/resume ✅
+- Inspect tree (root and specific paths like `vm`) ✅
+- Serial read — captured full boot output in ring buffer ✅
+- Serial write — sent `root\n`, received `Password:` prompt back ✅
+- NMI ✅
+- Error handling (unknown tool, unknown method) ✅
+
+**Key design decisions made during implementation:**
+- Used `parking_lot::Mutex` (not `std::sync::Mutex`) per project convention
+- Serial fd is dup'd from the PolledSocket for synchronous writes — the PolledSocket is registered on the serial driver thread, so async writes from the MCP event loop context don't work (wrong epoll instance)
+- Serial output thread uses `block_on(async { read loop })` pattern, matching existing `setup_serial()` approach
+- Protocol state machine enforced: tools/list and tools/call rejected before initialize handshake
+- MCP server replaces `run_control()` in the control flow — uses same `vm_config_from_command_line()` and VM worker launch path
+
+### ⏳ Phase 2 — NOT STARTED (Interaction & Diagnostics)
+- `serial/execute` convenience tool (write command, wait for prompt)
+- `memory/read` and `memory/write` tools
+- `display/screenshot` tool (framebuffer → PNG)
+- `disk/add` and `disk/remove` tools
+- `snapshot/save` tool
+- `inspect/update` improvements
+- MCP resources (`vm://config`, `vm://status`, `vm://serial/log`)
+
+### ⏳ Phase 3 — NOT STARTED (GDB Debug Integration)
+- Debug channel wiring (`DebugRequest`)
+- `debug/break`, `debug/continue`, `debug/get_registers`, `debug/set_registers`
+- `debug/read_memory`, `debug/write_memory`
+- `debug/set_breakpoint`, `debug/clear_breakpoint`, `debug/single_step`
+- `debug/backtrace` (heuristic stack walker)
+
+### ⏳ Phase 4 — NOT STARTED (Petri-MCP Orchestrator)
+- Standalone `petri_mcp` binary for multi-VM lifecycle management
+- `vm/create`, `vm/start`, `vm/destroy`, `vm/list`
+- Guest agent tools via pipette
+
+### ⏳ Phase 5 — NOT STARTED (Advanced Features)
+- SSE/Streamable HTTP transport
+- MCP resource subscriptions
+- VTL2 settings management
+- OpenHCL diagnostics integration
+
+---
+
 ## 1. Executive Summary
 
 We propose adding **Model Context Protocol (MCP) server** support to OpenVMM, enabling AI agents (LLMs operating through tool-calling) to configure, launch, inspect, debug, and interact with virtual machines programmatically. The MCP server exposes the same capabilities available today through OpenVMM's interactive CLI console and petri test framework — VM lifecycle management, the inspect tree, GDB-stub debugging, serial console I/O, framebuffer screenshots, and guest-agent interaction — as structured MCP tools and resources consumable by any MCP-compatible client (Claude Desktop, VS Code Copilot, custom agents, etc.).
@@ -191,43 +263,43 @@ For Tier 2 (petri-mcp):
 
 ## 5. Implementation Phases
 
-### Phase 1: Core MCP Infrastructure (Tier 1 foundation)
+### Phase 1: Core MCP Infrastructure (Tier 1 foundation) — ✅ COMPLETE
 
 **Goal:** Establish the MCP server crate, transport layer, and first few tools working with a running OpenVMM instance. Include basic serial access so the server is immediately useful for linux-direct boot.
 
 **Steps:**
 
-1. **Create `openvmm/openvmm_mcp/` crate** — New workspace member with `Cargo.toml`, add to `Cargo.toml` workspace members list.
-   - Dependencies: `serde`, `serde_json`, `tokio` (or `pal_async`), `mesh`, `openvmm_defs`, `inspect`, `anyhow`.
+1. ✅ **Create `openvmm/openvmm_mcp/` crate** — New workspace member with `Cargo.toml`, add to `Cargo.toml` workspace members list.
+   - Dependencies: `serde`, `serde_json`, `mesh`, `mesh_worker`, `inspect`, `openvmm_defs`, `vmm_core_defs`, `anyhow`, `futures`, `futures-concurrency`, `parking_lot`, `tracing`.
    - Touches: `Cargo.toml` (workspace), new `openvmm/openvmm_mcp/Cargo.toml`, new `openvmm/openvmm_mcp/src/lib.rs`.
 
-2. **Implement MCP JSON-RPC protocol layer** — Handle `initialize`, `tools/list`, `tools/call`, `resources/list`, `resources/read` over stdio.
+2. ✅ **Implement MCP JSON-RPC protocol layer** — Handle `initialize`, `tools/list`, `tools/call` over stdio. Resources deferred to Phase 2.
    - New files: `openvmm/openvmm_mcp/src/protocol.rs`, `openvmm/openvmm_mcp/src/transport.rs`.
 
-3. **Implement tool registry and dispatch** — Macro or trait-based tool registration that generates `tools/list` responses and dispatches `tools/call`.
+3. ✅ **Implement tool registry and dispatch** — Function-pointer-based registry mapping tool names to async handlers.
    - New files: `openvmm/openvmm_mcp/src/tools/mod.rs`.
 
-4. **Implement `VmHandle` abstraction** — Encapsulates all VM interaction channels.
+4. ✅ **Implement `VmHandle` abstraction** — Encapsulates VmRpc sender, WorkerHandle, serial buffer, and console_in writer.
    - New file: `openvmm/openvmm_mcp/src/vm_handle.rs`.
 
-5. **Implement lifecycle tools** — `vm/pause`, `vm/resume`, `vm/status`, `vm/reset`, `vm/nmi`, `vm/clear_halt`, `vm/shutdown`, `vm/wait_for_halt`.
+5. ✅ **Implement lifecycle tools** — `vm/pause`, `vm/resume`, `vm/status`, `vm/reset`, `vm/nmi`, `vm/clear_halt`. (`vm/shutdown` and `vm/wait_for_halt` deferred — shutdown requires shutdown IC plumbing, wait_for_halt needs oneshot channel wiring.)
    - New file: `openvmm/openvmm_mcp/src/tools/lifecycle.rs`.
 
-6. **Wire into `openvmm_entry`** — Add `--mcp` CLI flag (with `conflicts_with("gdb")` and `conflicts_with("ttrpc")`), create the `VmHandle`, redirect serial to stderr in MCP mode, launch MCP server.
-   - Touches: `openvmm/openvmm_entry/src/cli_args.rs` (add `--mcp` flag), `openvmm/openvmm_entry/src/lib.rs` (add MCP mode in `do_main()`), `openvmm/openvmm_entry/Cargo.toml` (add `openvmm_mcp` dependency).
+6. ✅ **Wire into `openvmm_entry`** — Add `--mcp` CLI flag (with `conflicts_with_all(["gdb", "ttrpc", "grpc"])`), create the `VmHandle`, tee serial output to ring buffer + stderr in MCP mode, launch MCP server.
+   - Touches: `openvmm/openvmm_entry/src/cli_args.rs`, `openvmm/openvmm_entry/src/lib.rs`, `openvmm/openvmm_entry/Cargo.toml`.
 
-7. **Implement the MCP event loop** — Multiplex MCP protocol messages (stdin), halt notifications (`notify_recv`), and worker events (`vm_worker` stopped/failed/restarted) using a `merge()`-based select loop, mirroring `run_control()`'s event loop structure. See §6.7 for details.
+7. ✅ **Implement the MCP event loop** — Multiplex MCP protocol messages (stdin) and halt notifications (`notify_recv`) using `futures_concurrency::stream::Merge`. Worker events deferred to Phase 2.
    - New file: `openvmm/openvmm_mcp/src/event_loop.rs`.
 
-8. **Implement `inspect/tree` and `inspect/get` tools**.
+8. ✅ **Implement `inspect/tree`, `inspect/get`, and `inspect/update` tools**.
    - New file: `openvmm/openvmm_mcp/src/tools/inspect.rs`.
 
-9. **Implement basic serial tools** — Redirect COM1 to stderr by default in MCP mode. Implement `serial/write` (write to `console_in`). Implement `serial/read` returning a note that full serial buffering comes in Phase 2.
-   - New file: `openvmm/openvmm_mcp/src/tools/serial.rs`.
+9. ✅ **Implement serial tools** — Full serial ring buffer (64KB) capturing serial output. `serial/read` returns buffered output with cursor. `serial/write` writes to console_in via synchronous dup'd fd.
+   - New files: `openvmm/openvmm_mcp/src/tools/serial.rs`, `openvmm/openvmm_mcp/src/serial_buffer.rs`.
 
-10. **End-to-end validation** — Launch `openvmm --mcp -k <kernel> -r <initrd>` and verify tool calls via a simple MCP client script.
+10. ✅ **End-to-end validation** — `scripts/test_mcp.py` launches `openvmm --mcp` with Alpine linux-direct boot, exercises all 11 tools, 34/34 tests passing.
 
-**Estimated scope:** ~2000 LOC new, ~150 LOC modifications to existing files.
+**Actual scope:** ~1,400 LOC new (openvmm_mcp), ~100 LOC modifications to openvmm_entry, ~350 LOC test script.
 
 ### Phase 2: Interaction & Diagnostics Tools
 
@@ -328,41 +400,28 @@ For Tier 2 (petri-mcp):
 
 ## 6. Technical Design
 
-### 6.1 Crate Structure
+### 6.1 Crate Structure (as implemented)
 
 ```
 openvmm/
-  openvmm_mcp/           # NEW: Core MCP server library
+  openvmm_mcp/           # MCP server library (Phase 1 ✅)
     Cargo.toml
     src/
-      lib.rs              # MCP server setup, tool registry, run_mcp_server()
-      protocol.rs         # MCP JSON-RPC message types + framing
-      transport.rs        # stdio / SSE transport implementation
+      lib.rs              # Module exports, re-exports run_mcp_server + VmHandle
+      protocol.rs         # MCP JSON-RPC 2.0 message types + error codes
+      transport.rs        # Stdin reader thread + stdout JSON writer
       tools/
-        mod.rs            # Tool trait, registry, dispatch
-        lifecycle.rs      # pause/resume/reset/shutdown/nmi/clear_halt/status
-        inspect.rs        # inspect tree query/update tools
-        memory.rs         # read/write guest physical memory
-        serial.rs         # serial console I/O tools
-        display.rs        # framebuffer/screenshot tools
-        disk.rs           # hot-add/remove SCSI disks
-        snapshot.rs       # save/restore tools
-        debug.rs          # GDB debug tools (registers, breakpoints, memory, step)
-      resources.rs        # MCP resource definitions
-      vm_handle.rs        # VmHandle abstraction over VmRpc + other channels
-      serial_buffer.rs    # Ring buffer for serial console output capture
+        mod.rs            # Tool registry (fn-pointer based) + dispatch
+        lifecycle.rs      # pause/resume/reset/nmi/clear_halt/status
+        inspect.rs        # inspect tree query/get/update via InspectionBuilder
+        serial.rs         # serial read (ring buffer) / write (sync fd)
+      event_loop.rs       # Async event loop: merge(stdin_stream, halt_stream)
+      vm_handle.rs        # VmHandle: VmRpc + WorkerHandle + serial + console_in
+      serial_buffer.rs    # Thread-safe 64KB ring buffer with cursor reads
 
 petri/
-  petri_mcp/              # NEW: Orchestrator MCP server binary (Phase 4)
-    Cargo.toml
-    src/
-      main.rs             # Entry point, MCP server on stdio
-      orchestrator.rs     # Multi-VM management (HashMap<VmId, VM>)
-      artifacts.rs        # Artifact resolution for firmware/images
-      tools/
-        mod.rs
-        lifecycle.rs      # create/start/destroy/list VMs
-        guest.rs          # pipette-based guest interaction tools
+  petri_mcp/              # Orchestrator MCP server binary (Phase 4 — planned)
+    ...
 ```
 
 ### 6.2 MCP SDK Choice

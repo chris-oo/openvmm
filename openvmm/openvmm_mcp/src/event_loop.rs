@@ -152,6 +152,17 @@ async fn handle_message(
             // Acknowledgement from client; no response needed.
             tracing::info!("MCP client initialized");
         }
+        _ if !*initialized => {
+            // Reject any method other than initialize/notifications before handshake.
+            if !is_notification {
+                let resp = JsonRpcErrorResponse::new(
+                    id,
+                    crate::protocol::INVALID_REQUEST,
+                    "server not initialized — send 'initialize' first",
+                );
+                let _ = stdout.send(&resp);
+            }
+        }
         "tools/list" => {
             let result = ToolsListResult {
                 tools: registry.definitions(),
@@ -160,28 +171,27 @@ async fn handle_message(
             let _ = stdout.send(&resp);
         }
         "tools/call" => {
-            let params: ToolCallParams =
-                match msg.params.map(|p| serde_json::from_value(p)).transpose() {
-                    Ok(Some(p)) => p,
-                    Ok(None) => {
-                        let resp = JsonRpcErrorResponse::new(
-                            id,
-                            crate::protocol::INVALID_PARAMS,
-                            "missing params for tools/call",
-                        );
-                        let _ = stdout.send(&resp);
-                        return;
-                    }
-                    Err(e) => {
-                        let resp = JsonRpcErrorResponse::new(
-                            id,
-                            crate::protocol::INVALID_PARAMS,
-                            format!("invalid tools/call params: {e}"),
-                        );
-                        let _ = stdout.send(&resp);
-                        return;
-                    }
-                };
+            let params: ToolCallParams = match msg.params.map(serde_json::from_value).transpose() {
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    let resp = JsonRpcErrorResponse::new(
+                        id,
+                        crate::protocol::INVALID_PARAMS,
+                        "missing params for tools/call",
+                    );
+                    let _ = stdout.send(&resp);
+                    return;
+                }
+                Err(e) => {
+                    let resp = JsonRpcErrorResponse::new(
+                        id,
+                        crate::protocol::INVALID_PARAMS,
+                        format!("invalid tools/call params: {e}"),
+                    );
+                    let _ = stdout.send(&resp);
+                    return;
+                }
+            };
 
             let result = match registry.call(&params.name, vm, params.arguments).await {
                 Some(r) => r,

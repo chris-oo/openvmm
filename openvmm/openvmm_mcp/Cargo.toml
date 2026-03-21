@@ -16,6 +16,7 @@ inspect = { workspace = true, features = ["initiate", "std"] }
 anyhow.workspace = true
 futures.workspace = true
 futures-concurrency.workspace = true
+parking_lot.workspace = true
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true, features = ["std"] }
 tracing.workspace = true
