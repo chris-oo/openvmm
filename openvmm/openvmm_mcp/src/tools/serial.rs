@@ -8,11 +8,16 @@ use crate::protocol::ToolResult;
 use crate::vm_handle::VmHandle;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
-type Handler = for<'a> fn(
-    &'a VmHandle,
+type Handler = fn(
+    Arc<VmHandle>,
     serde_json::Value,
-) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>>;
+) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'static>>;
+
+/// Default prompt suffixes used by `serial/execute` to detect command
+/// completion.
+const DEFAULT_PROMPT_SUFFIXES: &[&str] = &["# ", "$ ", "> ", "login: ", "Password: "];
 
 /// Return all serial tool definitions and handlers.
 pub fn tools() -> Vec<(ToolDefinition, Handler)> {
@@ -56,6 +61,32 @@ pub fn tools() -> Vec<(ToolDefinition, Handler)> {
                 }),
             },
             handle_write,
+        ),
+        (
+            ToolDefinition {
+                name: "serial/execute".into(),
+                description: "Write a command to the serial console and wait for the output until a shell prompt appears or a timeout expires. Returns the complete command output in one response. Much more convenient than separate serial/write + serial/read calls.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "The command to execute (a newline is appended automatically)"
+                        },
+                        "timeout_ms": {
+                            "type": "integer",
+                            "description": "Maximum time to wait for prompt in milliseconds (default: 30000)",
+                            "default": 30000
+                        },
+                        "prompt_pattern": {
+                            "type": "string",
+                            "description": "Custom prompt suffix to wait for. Default: detect common prompts (# $ > login: Password:)"
+                        }
+                    },
+                    "required": ["command"]
+                }),
+            },
+            handle_execute,
         ),
     ]
 }
@@ -104,10 +135,10 @@ fn strip_ansi_escapes(input: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn handle_read<'a>(
-    vm: &'a VmHandle,
+fn handle_read(
+    vm: Arc<VmHandle>,
     args: serde_json::Value,
-) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>> {
+) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'static>> {
     Box::pin(async move {
         let cursor = args.get("cursor").and_then(|v| v.as_u64()).unwrap_or(0);
         let raw = args.get("raw").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -130,10 +161,10 @@ fn handle_read<'a>(
     })
 }
 
-fn handle_write<'a>(
-    vm: &'a VmHandle,
+fn handle_write(
+    vm: Arc<VmHandle>,
     args: serde_json::Value,
-) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>> {
+) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'static>> {
     Box::pin(async move {
         let text = match args.get("text").and_then(|v| v.as_str()) {
             Some(t) => t,
@@ -160,4 +191,166 @@ fn handle_write<'a>(
             Err(e) => ToolResult::error(format!("serial write failed: {e}")),
         }
     })
+}
+
+/// Check whether the accumulated serial output ends with a prompt.
+fn ends_with_prompt(output: &str, custom_pattern: &Option<String>) -> bool {
+    // Strip trailing \r which serial consoles may produce.
+    let trimmed = output.trim_end_matches('\r');
+    if let Some(pattern) = custom_pattern {
+        trimmed.ends_with(pattern)
+    } else {
+        DEFAULT_PROMPT_SUFFIXES
+            .iter()
+            .any(|suffix| trimmed.ends_with(suffix))
+    }
+}
+
+fn handle_execute(
+    vm: Arc<VmHandle>,
+    args: serde_json::Value,
+) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'static>> {
+    Box::pin(async move {
+        let command = match args.get("command").and_then(|v| v.as_str()) {
+            Some(c) => c.to_string(),
+            None => return ToolResult::error("missing required parameter: command"),
+        };
+        let timeout_ms = args
+            .get("timeout_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(30_000);
+        let prompt_pattern = args
+            .get("prompt_pattern")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        // Snapshot cursor and write command atomically (under console_in lock)
+        // to prevent interleaving with concurrent serial/execute calls.
+        let start_cursor;
+        {
+            let mut guard = vm.console_in.lock();
+            let Some(writer) = guard.as_mut() else {
+                return ToolResult::error("serial console input not available");
+            };
+            start_cursor = vm.serial_buffer.cursor();
+            use std::io::Write;
+            let payload = format!("{command}\n");
+            if let Err(e) = writer
+                .write_all(payload.as_bytes())
+                .and_then(|()| writer.flush())
+            {
+                return ToolResult::error(format!("serial write failed: {e}"));
+            }
+        }
+
+        // Spawn a polling thread that watches the ring buffer for a prompt.
+        let buffer = vm.serial_buffer.clone();
+        let (result_tx, mut result_rx) = mesh::channel::<ToolResult>();
+
+        std::thread::Builder::new()
+            .name("mcp-serial-execute".into())
+            .spawn(move || {
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+                let mut cursor = start_cursor;
+                let mut full_output = String::new();
+
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+
+                    let (data, new_cursor) = buffer.read_since(cursor);
+                    if !data.is_empty() {
+                        let text = String::from_utf8_lossy(&data);
+                        full_output.push_str(&strip_ansi_escapes(&text));
+                        cursor = new_cursor;
+
+                        if ends_with_prompt(&full_output, &prompt_pattern) {
+                            result_tx.send(ToolResult::text(
+                                serde_json::json!({
+                                    "output": full_output,
+                                    "cursor": cursor,
+                                    "timed_out": false,
+                                })
+                                .to_string(),
+                            ));
+                            return;
+                        }
+                    }
+
+                    if std::time::Instant::now() >= deadline {
+                        result_tx.send(ToolResult::text(
+                            serde_json::json!({
+                                "output": full_output,
+                                "cursor": cursor,
+                                "timed_out": true,
+                            })
+                            .to_string(),
+                        ));
+                        return;
+                    }
+                }
+            })
+            .expect("spawn serial-execute thread");
+
+        // Await the result from the polling thread.
+        use futures::StreamExt;
+        match result_rx.next().await {
+            Some(result) => result,
+            None => ToolResult::error("serial execute polling thread terminated unexpectedly"),
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_detection_default_root() {
+        assert!(ends_with_prompt("localhost:~# ", &None));
+    }
+
+    #[test]
+    fn prompt_detection_default_user() {
+        assert!(ends_with_prompt("user@host:~$ ", &None));
+    }
+
+    #[test]
+    fn prompt_detection_default_login() {
+        assert!(ends_with_prompt("localhost login: ", &None));
+    }
+
+    #[test]
+    fn prompt_detection_default_password() {
+        assert!(ends_with_prompt("Password: ", &None));
+    }
+
+    #[test]
+    fn prompt_detection_trailing_cr() {
+        assert!(ends_with_prompt("localhost:~# \r", &None));
+    }
+
+    #[test]
+    fn prompt_detection_no_match() {
+        assert!(!ends_with_prompt("still booting...\n", &None));
+    }
+
+    #[test]
+    fn prompt_detection_custom_pattern() {
+        let custom = Some(">>> ".to_string());
+        assert!(ends_with_prompt("Python >>> ", &custom));
+        assert!(!ends_with_prompt("localhost:~# ", &custom));
+    }
+
+    #[test]
+    fn ansi_stripping() {
+        let input = "\x1b[32mgreen\x1b[0m plain";
+        assert_eq!(strip_ansi_escapes(input), "green plain");
+    }
+
+    #[test]
+    fn ansi_stripping_csi_params() {
+        let input = "\x1b[1;31mbold red\x1b[0m";
+        assert_eq!(strip_ansi_escapes(input), "bold red");
+    }
 }

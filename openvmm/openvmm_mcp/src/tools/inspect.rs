@@ -10,12 +10,13 @@ use inspect::InspectionBuilder;
 use mesh::CancelContext;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
-type Handler = for<'a> fn(
-    &'a VmHandle,
+type Handler = fn(
+    Arc<VmHandle>,
     serde_json::Value,
-) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>>;
+) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'static>>;
 
 /// Return all inspect tool definitions and handlers.
 pub fn tools() -> Vec<(ToolDefinition, Handler)> {
@@ -87,10 +88,10 @@ pub fn tools() -> Vec<(ToolDefinition, Handler)> {
     ]
 }
 
-fn handle_tree<'a>(
-    vm: &'a VmHandle,
+fn handle_tree(
+    vm: Arc<VmHandle>,
     args: serde_json::Value,
-) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>> {
+) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'static>> {
     Box::pin(async move {
         let path = args
             .get("path")
@@ -120,10 +121,10 @@ fn handle_tree<'a>(
     })
 }
 
-fn handle_get<'a>(
-    vm: &'a VmHandle,
+fn handle_get(
+    vm: Arc<VmHandle>,
     args: serde_json::Value,
-) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>> {
+) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'static>> {
     Box::pin(async move {
         let path = match args.get("path").and_then(|v| v.as_str()) {
             Some(p) => p.to_string(),
@@ -145,10 +146,10 @@ fn handle_get<'a>(
     })
 }
 
-fn handle_update<'a>(
-    vm: &'a VmHandle,
+fn handle_update(
+    vm: Arc<VmHandle>,
     args: serde_json::Value,
-) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>> {
+) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'static>> {
     Box::pin(async move {
         let path = match args.get("path").and_then(|v| v.as_str()) {
             Some(p) => p.to_string(),

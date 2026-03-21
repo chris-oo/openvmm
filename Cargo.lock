@@ -5495,6 +5495,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
+ "unicycle",
  "vmm_core_defs",
 ]
 

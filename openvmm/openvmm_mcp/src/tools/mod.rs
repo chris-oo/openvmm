@@ -15,15 +15,17 @@ use crate::protocol::ToolResult;
 use crate::vm_handle::VmHandle;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 /// Type alias for an async tool handler function.
 ///
-/// Each handler receives a shared reference to the VM handle and the
-/// caller-supplied arguments, returning a `ToolResult`.
-type ToolHandler = for<'a> fn(
-    &'a VmHandle,
+/// Each handler receives a cloned `Arc<VmHandle>` and the caller-supplied
+/// arguments, returning a `'static` future so it can run concurrently in the
+/// event loop's `FuturesUnordered`.
+type ToolHandler = fn(
+    Arc<VmHandle>,
     serde_json::Value,
-) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>>;
+) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'static>>;
 
 /// Registry of available MCP tools.
 pub struct ToolRegistry {
@@ -31,7 +33,7 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
-    /// Build a registry containing all Phase 1 tools.
+    /// Build a registry containing all tools.
     pub fn new() -> Self {
         let mut tools = Vec::new();
 
@@ -59,15 +61,18 @@ impl ToolRegistry {
     }
 
     /// Dispatch a tool call by name.
-    pub async fn call(
+    ///
+    /// Returns a `'static` future that can be placed into `FuturesUnordered`
+    /// for concurrent execution.
+    pub fn call(
         &self,
         name: &str,
-        vm: &VmHandle,
+        vm: Arc<VmHandle>,
         args: serde_json::Value,
-    ) -> Option<ToolResult> {
+    ) -> Option<Pin<Box<dyn Future<Output = ToolResult> + Send + 'static>>> {
         for (def, handler) in &self.tools {
             if def.name == name {
-                return Some(handler(vm, args).await);
+                return Some(handler(vm, args));
             }
         }
         None
