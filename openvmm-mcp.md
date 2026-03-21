@@ -52,22 +52,23 @@ Phase 1 (Core MCP Infrastructure) has been fully implemented and tested.
 - `inspect/update` improvements
 - MCP resources (`vm://config`, `vm://status`, `vm://serial/log`)
 
-### ⏳ Phase 3 — NOT STARTED (GDB Debug Integration)
+### ⏳ Phase 3 — NOT STARTED (Petri-MCP Orchestrator)
+- Standalone `petri_mcp` binary for multi-VM lifecycle management
+- `vm/create`, `vm/start`, `vm/destroy`, `vm/list`
+- Guest agent tools via pipette (`guest/execute`, `guest/read_file`, `guest/write_file`)
+
+### ⏳ Phase 4 — NOT STARTED (Advanced Features)
+- SSE/Streamable HTTP transport
+- MCP resource subscriptions
+- VTL2 settings management
+- OpenHCL diagnostics integration
+
+### ⏳ Phase 5 — NOT STARTED (GDB Debug Integration)
 - Debug channel wiring (`DebugRequest`)
 - `debug/break`, `debug/continue`, `debug/get_registers`, `debug/set_registers`
 - `debug/read_memory`, `debug/write_memory`
 - `debug/set_breakpoint`, `debug/clear_breakpoint`, `debug/single_step`
 - `debug/backtrace` (heuristic stack walker)
-
-### ⏳ Phase 4 — NOT STARTED (Petri-MCP Orchestrator)
-- Standalone `petri_mcp` binary for multi-VM lifecycle management
-- `vm/create`, `vm/start`, `vm/destroy`, `vm/list`
-- Guest agent tools via pipette
-
-### ⏳ Phase 5 — NOT STARTED (Advanced Features)
-- SSE/Streamable HTTP transport
-- MCP resource subscriptions
-- VTL2 settings management
 - OpenHCL diagnostics integration
 
 ---
@@ -330,7 +331,43 @@ For Tier 2 (petri-mcp):
 7. **Implement MCP resources** — `vm://config`, `vm://status`, `vm://serial/log`.
    - New file: `openvmm/openvmm_mcp/src/resources.rs`.
 
-### Phase 3: GDB Debug Integration
+### Phase 3: Petri-MCP Orchestrator (Tier 2)
+
+**Goal:** Multi-VM lifecycle management via MCP, with reliable guest interaction through pipette.
+
+**Steps:**
+
+1. **Create `petri/petri_mcp/` crate** — New workspace member with binary target.
+   - Touches: `Cargo.toml` (workspace members), new `petri/petri_mcp/Cargo.toml`, `petri/petri_mcp/src/main.rs`.
+
+2. **Implement VM creation** — Map MCP tool parameters to `PetriVmConfig` construction, handle firmware selection, disk configuration.
+   - New file: `petri/petri_mcp/src/orchestrator.rs`.
+
+3. **Implement `vm/create`, `vm/start`, `vm/destroy`, `vm/list`** — Manage a `HashMap<VmId, PetriVmOpenVmm>` of running VMs.
+   - New file: `petri/petri_mcp/src/tools/lifecycle.rs`.
+
+4. **Implement guest agent tools** — `guest/execute`, `guest/read_file`, `guest/write_file`, `guest/shell` using `PipetteClient`.
+   - New file: `petri/petri_mcp/src/tools/guest.rs`.
+
+5. **Implement artifact resolution** — Accept artifact paths via environment variables or configuration, using patterns from `petri_artifact_resolver_openvmm_known_paths`.
+   - New file: `petri/petri_mcp/src/artifacts.rs`.
+
+6. **Delegate per-VM tools** — Reuse `openvmm_mcp` tool implementations for inspect, memory, debug, etc., by extracting the underlying `VmRpc` channels from `PetriVmOpenVmm`'s `Worker`.
+
+### Phase 4: Advanced Features
+
+**Goal:** Polish and extend.
+
+**Steps:**
+
+1. Add SSE and/or Streamable HTTP transport (for remote MCP clients).
+2. Add MCP resource subscriptions (notify on VM state changes, serial output).
+3. Add `vm://inspect/{path}` dynamic resources with change notifications.
+4. Add VTL2 settings management tools (`vtl2/show`, `vtl2/add_scsi_disk`, `vtl2/remove_scsi_disk`).
+5. Add OpenHCL diagnostics integration (via `DiagClient` — inspect paravisor, restart user-mode, etc.).
+6. Add KVP interaction tools.
+
+### Phase 5: GDB Debug Integration (Nice-to-Have)
 
 **Goal:** Expose AI-driven guest debugging through MCP.
 
@@ -359,42 +396,6 @@ For Tier 2 (petri-mcp):
 
 8. **Implement `debug/list_vps`** — Enumerate VPs, report state of each.
    - Touches: `openvmm/openvmm_mcp/src/tools/debug.rs`.
-
-### Phase 4: Petri-MCP Orchestrator (Tier 2)
-
-**Goal:** Multi-VM lifecycle management via MCP.
-
-**Steps:**
-
-1. **Create `petri/petri_mcp/` crate** — New workspace member with binary target.
-   - Touches: `Cargo.toml` (workspace members), new `petri/petri_mcp/Cargo.toml`, `petri/petri_mcp/src/main.rs`.
-
-2. **Implement VM creation** — Map MCP tool parameters to `PetriVmConfig` construction, handle firmware selection, disk configuration.
-   - New file: `petri/petri_mcp/src/orchestrator.rs`.
-
-3. **Implement `vm/create`, `vm/start`, `vm/destroy`, `vm/list`** — Manage a `HashMap<VmId, PetriVmOpenVmm>` of running VMs.
-   - New file: `petri/petri_mcp/src/tools/lifecycle.rs`.
-
-4. **Implement guest agent tools** — `guest/execute`, `guest/read_file`, `guest/write_file`, `guest/shell` using `PipetteClient`.
-   - New file: `petri/petri_mcp/src/tools/guest.rs`.
-
-5. **Implement artifact resolution** — Accept artifact paths via environment variables or configuration, using patterns from `petri_artifact_resolver_openvmm_known_paths`.
-   - New file: `petri/petri_mcp/src/artifacts.rs`.
-
-6. **Delegate per-VM tools** — Reuse `openvmm_mcp` tool implementations for inspect, memory, debug, etc., by extracting the underlying `VmRpc` channels from `PetriVmOpenVmm`'s `Worker`.
-
-### Phase 5: Advanced Features
-
-**Goal:** Polish and extend.
-
-**Steps:**
-
-1. Add SSE and/or Streamable HTTP transport (for remote MCP clients).
-2. Add MCP resource subscriptions (notify on VM state changes, serial output).
-3. Add `vm://inspect/{path}` dynamic resources with change notifications.
-4. Add VTL2 settings management tools (`vtl2/show`, `vtl2/add_scsi_disk`, `vtl2/remove_scsi_disk`).
-5. Add OpenHCL diagnostics integration (via `DiagClient` — inspect paravisor, restart user-mode, etc.).
-6. Add KVP interaction tools.
 
 ---
 
