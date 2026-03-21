@@ -28,6 +28,11 @@ pub fn tools() -> Vec<(ToolDefinition, Handler)> {
                             "type": "integer",
                             "description": "Cursor from a previous read (0 to read all buffered output)",
                             "default": 0
+                        },
+                        "raw": {
+                            "type": "boolean",
+                            "description": "If true, return raw text including ANSI escape sequences. Default: false (escapes stripped).",
+                            "default": false
                         }
                     },
                     "required": []
@@ -55,15 +60,65 @@ pub fn tools() -> Vec<(ToolDefinition, Handler)> {
     ]
 }
 
+/// Strip ANSI escape sequences from text.
+///
+/// Handles:
+/// - CSI sequences: `ESC [ <params> <final byte>`
+/// - Other ESC sequences: `ESC <intermediates> <final byte>`
+fn strip_ansi_escapes(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b {
+            i += 1;
+            if i >= bytes.len() {
+                break;
+            }
+            if bytes[i] == b'[' {
+                // CSI sequence: ESC [ <0x30-0x3F>* <0x20-0x2F>* <0x40-0x7E>
+                i += 1;
+                while i < bytes.len() && (0x30..=0x3F).contains(&bytes[i]) {
+                    i += 1;
+                }
+                while i < bytes.len() && (0x20..=0x2F).contains(&bytes[i]) {
+                    i += 1;
+                }
+                if i < bytes.len() && (0x40..=0x7E).contains(&bytes[i]) {
+                    i += 1;
+                }
+            } else {
+                // Other ESC sequence: ESC <0x20-0x2F>* <0x30-0x7E>
+                while i < bytes.len() && (0x20..=0x2F).contains(&bytes[i]) {
+                    i += 1;
+                }
+                if i < bytes.len() && (0x30..=0x7E).contains(&bytes[i]) {
+                    i += 1;
+                }
+            }
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn handle_read<'a>(
     vm: &'a VmHandle,
     args: serde_json::Value,
 ) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>> {
     Box::pin(async move {
         let cursor = args.get("cursor").and_then(|v| v.as_u64()).unwrap_or(0);
+        let raw = args.get("raw").and_then(|v| v.as_bool()).unwrap_or(false);
 
         let (data, new_cursor) = vm.serial_buffer.read_since(cursor);
         let text = String::from_utf8_lossy(&data);
+        let text = if raw {
+            text.into_owned()
+        } else {
+            strip_ansi_escapes(&text)
+        };
         ToolResult::text(
             serde_json::json!({
                 "text": text,

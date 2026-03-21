@@ -85,7 +85,7 @@ pub fn tools() -> Vec<(ToolDefinition, Handler)> {
             ToolDefinition {
                 name: "vm/status".into(),
                 description:
-                    "Get the current VM status: running, halted (with reason), or unknown.".into(),
+                    "Get the current VM status: running, paused, or halted (with reason).".into(),
                 input_schema: empty_schema(),
             },
             handle_status,
@@ -99,13 +99,16 @@ fn handle_pause<'a>(
 ) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>> {
     Box::pin(async move {
         match vm.pause().await {
-            Ok(changed) => ToolResult::text(
-                serde_json::json!({
-                    "paused": true,
-                    "state_changed": changed,
-                })
-                .to_string(),
-            ),
+            Ok(changed) => {
+                vm.set_paused(true);
+                ToolResult::text(
+                    serde_json::json!({
+                        "paused": true,
+                        "state_changed": changed,
+                    })
+                    .to_string(),
+                )
+            }
             Err(e) => ToolResult::error(format!("pause failed: {e:#}")),
         }
     })
@@ -117,13 +120,16 @@ fn handle_resume<'a>(
 ) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>> {
     Box::pin(async move {
         match vm.resume().await {
-            Ok(changed) => ToolResult::text(
-                serde_json::json!({
-                    "resumed": true,
-                    "state_changed": changed,
-                })
-                .to_string(),
-            ),
+            Ok(changed) => {
+                vm.set_paused(false);
+                ToolResult::text(
+                    serde_json::json!({
+                        "resumed": true,
+                        "state_changed": changed,
+                    })
+                    .to_string(),
+                )
+            }
             Err(e) => ToolResult::error(format!("resume failed: {e:#}")),
         }
     })
@@ -135,7 +141,10 @@ fn handle_reset<'a>(
 ) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>> {
     Box::pin(async move {
         match vm.reset().await {
-            Ok(()) => ToolResult::text(r#"{"reset": true}"#.to_string()),
+            Ok(()) => {
+                vm.set_paused(false);
+                ToolResult::text(r#"{"reset": true}"#.to_string())
+            }
             Err(e) => ToolResult::error(format!("reset failed: {e:#}")),
         }
     })
@@ -182,8 +191,15 @@ fn handle_status<'a>(
 ) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>> {
     Box::pin(async move {
         let halted = vm.is_halted();
+        let paused = vm.is_paused();
         let reason = vm.halt_reason_string();
-        let status = if halted { "halted" } else { "running" };
+        let status = if halted {
+            "halted"
+        } else if paused {
+            "paused"
+        } else {
+            "running"
+        };
         ToolResult::text(
             serde_json::json!({
                 "status": status,
