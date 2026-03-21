@@ -10,6 +10,10 @@
 
 set -euo pipefail
 
+# Ensure sbin dirs are in PATH — tools like mkfs.vfat live there and may not
+# be on PATH for non-root users (common on Debian/Ubuntu).
+export PATH="/usr/sbin:/sbin:$PATH"
+
 ALPINE_VERSION="3.21"
 ALPINE_RELEASE="3.21.6"
 IMAGE_NAME="nocloud_alpine-${ALPINE_RELEASE}-x86_64-uefi-tiny-r0"
