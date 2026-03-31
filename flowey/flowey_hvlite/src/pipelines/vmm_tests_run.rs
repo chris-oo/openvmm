@@ -12,6 +12,52 @@
 use crate::pipelines::vmm_tests::VmmTestTargetCli;
 use std::path::PathBuf;
 
+/// Curated list of fast-running tests for `--quick` mode.
+///
+/// These tests are selected for rapid local validation during development.
+/// They should:
+/// - Use lightweight guests (e.g., `linux_direct`) that don't require full OS boot
+/// - Complete in under 30 seconds
+/// - Test core functionality that benefits from frequent validation
+///
+/// # Adding new tests
+///
+/// Each entry is a regex pattern that matches against the test name portion of the
+/// full nextest test path. Test paths look like `module::backend_config_testname`,
+/// e.g., `multiarch::openvmm_uefi_x64_frontpage` or `tpm::hyperv_openhcl_uefi_x64_alpine_3_23_x64_boot_with_tpm`.
+///
+/// The filter is built by prefixing each pattern with `_` and suffixing with `$`,
+/// then combining them with `|`. For example, `["foo", "bar.*baz"]` becomes
+/// `test(/_foo$|_bar.*baz$/)`.
+///
+/// Pattern examples:
+/// - `"frontpage"` - matches tests ending in `_frontpage`
+/// - `"alpine.*boot.*"` - matches `_alpine_3_23_x64_boot`, `_alpine_3_23_x64_boot_with_tpm`, etc.
+/// - `"servicing_keepalive_no_device"` - matches the exact test name suffix
+///
+/// To test your pattern, run: `cargo nextest list -E 'test(/_yourpattern$/)'`
+const QUICK_TESTS: &[&str] = &[
+    "frontpage",
+    "apicid_offset",
+    "alpine.*boot.*",
+    "mana_nic",
+    "vpci_filter",
+    "validate_mnf_usage_in_guest",
+    "servicing_keepalive_no_device",
+];
+
+/// Build a nextest filter expression that matches all quick tests.
+///
+/// Test names in nextest look like `module::backend_config_testname`, e.g.,
+/// `multiarch::openvmm_uefi_x64_frontpage`. This builds a regex that matches
+/// any test ending with `_testname` (or exactly matching for tests without
+/// a backend prefix).
+fn build_quick_filter() -> String {
+    // Match tests ending with _<name> (the underscore separates backend config from test name)
+    let pattern = QUICK_TESTS.join("$|_");
+    format!("test(/_{}/)", pattern)
+}
+
 /// Build and run VMM tests with automatic artifact discovery
 ///
 /// This is a convenience command that combines `vmm-tests-discover` and `vmm-tests`
@@ -20,6 +66,7 @@ use std::path::PathBuf;
 ///
 /// Example usage:
 ///   cargo xflowey vmm-tests-run --filter "test(ubuntu)" --target windows-x64 --dir /mnt/q/vmm_tests_out/
+///   cargo xflowey vmm-tests-run --quick --dir /mnt/q/vmm_tests_out/
 #[derive(clap::Args)]
 pub struct VmmTestsRunCli {
     /// Specify what target to build the VMM tests for
@@ -38,8 +85,16 @@ pub struct VmmTestsRunCli {
     ///   - `test(alpine)` - run tests with "alpine" in the name
     ///   - `test(/^boot_/)` - run tests starting with "boot_"
     ///   - `all()` - run all tests
-    #[clap(long, default_value = "all()")]
+    #[clap(long, default_value = "all()", conflicts_with = "quick")]
     filter: String,
+
+    /// Run only quick smoke tests (a preset selection of fast tests)
+    ///
+    /// This is a convenience flag for rapid local validation during development.
+    /// Runs a curated selection of fast tests that use lightweight guests (like
+    /// linux_direct) and complete quickly.
+    #[clap(long, conflicts_with = "filter")]
+    quick: bool,
 
     /// pass `--verbose` to cargo
     #[clap(long)]
@@ -62,7 +117,7 @@ pub struct VmmTestsRunCli {
     #[clap(long)]
     copy_extras: bool,
 
-    /// Skip the interactive VHD download prompt
+    /// Skip the interactive VHD download prompt.
     #[clap(long)]
     skip_vhd_prompt: bool,
 
@@ -87,6 +142,7 @@ impl VmmTestsRunCli {
             target,
             dir,
             filter,
+            quick,
             verbose,
             install_missing_deps,
             unstable_whp,
@@ -98,6 +154,9 @@ impl VmmTestsRunCli {
             custom_kernel,
             custom_uefi_firmware,
         } = self;
+
+        // Determine the effective filter
+        let effective_filter = if quick { build_quick_filter() } else { filter };
 
         // Create output directory if it doesn't exist
         std::fs::create_dir_all(&dir).context("failed to create output directory")?;
@@ -119,7 +178,7 @@ impl VmmTestsRunCli {
             .arg("xflowey")
             .arg("vmm-tests-discover")
             .arg("--filter")
-            .arg(&filter)
+            .arg(&effective_filter)
             .arg("--output")
             .arg(&artifacts_file);
 
@@ -156,7 +215,7 @@ impl VmmTestsRunCli {
             .arg("xflowey")
             .arg("vmm-tests")
             .arg("--filter")
-            .arg(&filter)
+            .arg(&effective_filter)
             .arg("--artifacts-file")
             .arg(&artifacts_file)
             .arg("--dir")
@@ -192,7 +251,7 @@ impl VmmTestsRunCli {
         if let Some(ref fw) = custom_uefi_firmware {
             test_cmd.arg("--custom-uefi-firmware").arg(fw);
         }
-        if skip_vhd_prompt {
+        if skip_vhd_prompt || quick {
             test_cmd.arg("--skip-vhd-prompt");
         }
 

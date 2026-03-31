@@ -128,6 +128,20 @@ Hyper-V Administrators group.
 
 To see all available options: `cargo xflowey vmm-tests-run --help`.
 
+### Quick Tests
+
+For rapid local validation during development, you can run a curated subset of
+fast-running tests using the `--quick` flag:
+
+```bash
+cargo xflowey vmm-tests-run --quick --dir /mnt/e/vmm_tests
+```
+
+This runs a preset selection of fast tests (typically using `linux_direct` guests
+that don't require a full OS boot) that are ideal for rapid developer iteration.
+
+The `--quick` flag conflicts with `--filter` — use one or the other, not both.
+
 ### Advanced: `vmm-tests` (lower-level)
 
 The `cargo xflowey vmm-tests` command is a lower-level alternative that gives
@@ -172,7 +186,7 @@ which provide detailed instructions on how to build / acquire the missing
 artifact. Some dependencies can only be built on Linux (OpenHCL and Linux
 pipette, for example). If you are building on Linux and want to run Windows
 guest tests, pipette will need to be
-[cross compiled for Windows](#linux-cross-compiling-pipetteexe). 
+[cross compiled for Windows](#linux-cross-compiling-pipetteexe).
 
 ```admonish warning
 `cargo nextest run` won't rebuild any of your changes. Make sure you `cargo build`
