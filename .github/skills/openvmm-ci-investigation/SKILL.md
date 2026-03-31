@@ -39,6 +39,21 @@ Read the script's output to identify:
 
 Then use the information to diagnose the issue and suggest fixes.
 
+## Quick Local Reproduction
+
+After identifying a failing test, you can quickly validate a fix locally using:
+
+```bash
+cargo xflowey vmm-tests-run --quick --dir <output-dir>
+```
+
+This runs a curated subset of fast tests ideal for rapid iteration. For a
+specific test, use `--filter` instead:
+
+```bash
+cargo xflowey vmm-tests-run --filter "test(failing_test_name)" --dir <output-dir>
+```
+
 ## Reference: Manual Commands
 
 > **Only use these if the script fails or you need to dig deeper into a

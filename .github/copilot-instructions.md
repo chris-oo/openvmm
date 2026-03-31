@@ -89,6 +89,8 @@ For VMM test validation during development, use `cargo xflowey vmm-tests-run`:
 ```bash
 # Run a specific test
 cargo xflowey vmm-tests-run --filter "test(my_test_name)" --dir <output-dir>
+# Run curated quick smoke tests
+cargo xflowey vmm-tests-run --quick --dir <output-dir>
 ```
 This automatically discovers artifacts, builds dependencies, and runs tests.
 See `Guide/src/dev_guide/tests/vmm.md` for details.
