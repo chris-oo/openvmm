@@ -1,10 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use anyhow::Context as _;
 use flowey::node::prelude::ReadVar;
 use flowey::pipeline::prelude::*;
+use flowey_lib_hvlite::_jobs::local_build_and_run_nextest_vmm_tests::BuildSelections;
 use flowey_lib_hvlite::_jobs::local_build_and_run_nextest_vmm_tests::VmmTestSelectionFlags;
 use flowey_lib_hvlite::_jobs::local_build_and_run_nextest_vmm_tests::VmmTestSelections;
+use flowey_lib_hvlite::artifact_to_build_mapping::ResolvedArtifactSelections;
 use flowey_lib_hvlite::install_vmm_tests_deps::VmmTestsDepSelections;
 use flowey_lib_hvlite::run_cargo_build::common::CommonArch;
 use flowey_lib_hvlite::run_cargo_build::common::CommonTriple;
@@ -40,6 +43,10 @@ pub struct VmmTestsCli {
     /// Custom list of artifacts to download
     #[clap(long, conflicts_with("flags"), requires("filter"))]
     artifacts: Vec<KnownTestArtifacts>,
+    /// Path to a JSON file containing discovered artifacts (from vmm-tests-discover).
+    /// This enables building only the dependencies needed for the specified tests.
+    #[clap(long, conflicts_with_all(["flags", "artifacts"]), requires("filter"))]
+    artifacts_file: Option<PathBuf>,
     /// Flags used to generate the VMM test filter
     ///
     /// Syntax: `--flags=<+|-><flag>,..`
@@ -72,12 +79,20 @@ pub struct VmmTestsCli {
     #[clap(long)]
     copy_extras: bool,
 
+    /// Skip the interactive VHD download prompt
+    #[clap(long)]
+    skip_vhd_prompt: bool,
+
     /// Optional: custom kernel modules
     #[clap(long)]
     custom_kernel_modules: Option<PathBuf>,
     /// Optional: custom kernel image
     #[clap(long)]
     custom_kernel: Option<PathBuf>,
+    /// Optional: custom UEFI firmware (MSVM.fd) to use instead of the
+    /// downloaded release. Path to a locally-built MSVM.fd file.
+    #[clap(long)]
+    custom_uefi_firmware: Option<PathBuf>,
 }
 
 impl IntoPipeline for VmmTestsCli {
@@ -91,6 +106,7 @@ impl IntoPipeline for VmmTestsCli {
             dir,
             filter,
             artifacts,
+            artifacts_file,
             flags,
             verbose,
             install_missing_deps,
@@ -100,6 +116,8 @@ impl IntoPipeline for VmmTestsCli {
             copy_extras,
             custom_kernel_modules,
             custom_kernel,
+            custom_uefi_firmware,
+            skip_vhd_prompt,
         } = self;
 
         let openvmm_repo = flowey_lib_common::git_checkout::RepoSource::ExistingClone(
@@ -136,6 +154,56 @@ impl IntoPipeline for VmmTestsCli {
             _ => anyhow::bail!("Unsupported architecture: {:?}", target_architecture),
         };
 
+        // Handle artifacts-file mode: read discovered artifacts from JSON file
+        let (resolved_filter, resolved_artifacts, resolved_build, needs_release_igvm) =
+            if let Some(artifacts_path) = artifacts_file {
+                let filter = filter.expect("--filter is required with --artifacts-file");
+                log::info!(
+                    "Reading discovered artifacts from: {}",
+                    artifacts_path.display()
+                );
+
+                let json_output = std::fs::read_to_string(&artifacts_path).with_context(|| {
+                    format!(
+                        "failed to read artifacts file: {}",
+                        artifacts_path.display()
+                    )
+                })?;
+
+                // Parse the JSON and resolve to build selections
+                let resolved = ResolvedArtifactSelections::from_artifact_list_json(
+                    &json_output,
+                    target_architecture,
+                    target_os,
+                )
+                .context("failed to parse artifact list")?;
+
+                if !resolved.unknown.is_empty() {
+                    anyhow::bail!(
+                        "Unknown artifacts found (mapping needs to be updated):\n  {}",
+                        resolved.unknown.join("\n  ")
+                    );
+                }
+
+                log::info!("Resolved build selections: {:?}", resolved.build);
+                log::info!(
+                    "Resolved downloads: {:?}",
+                    resolved.downloads.iter().collect::<Vec<_>>()
+                );
+
+                (
+                    filter,
+                    resolved.downloads.into_iter().collect(),
+                    resolved.build,
+                    resolved.needs_release_igvm,
+                )
+            } else if let Some(filter) = filter {
+                // Custom mode with explicit artifacts
+                (filter, artifacts, BuildSelections::default(), true)
+            } else {
+                // Flags mode - not using artifacts-file, return early to use existing logic
+                (String::new(), Vec::new(), BuildSelections::default(), true)
+            };
         // When running Windows binaries under WSL, the output directory must be
         // a Windows path (e.g., /mnt/c/..., /mnt/d/...) because Windows
         // requires the VHDs to live in a Windows directory.
@@ -150,6 +218,51 @@ impl IntoPipeline for VmmTestsCli {
                 dir.display()
             );
         }
+
+        // Determine test selections based on mode
+        // Note: We track whether artifacts_file was used via resolved_build having non-default values
+        let using_artifacts_file = resolved_build != BuildSelections::default();
+        let selections = if using_artifacts_file {
+            VmmTestSelections::Custom {
+                filter: resolved_filter,
+                artifacts: resolved_artifacts,
+                build: resolved_build.clone(),
+                deps: match target_os {
+                    target_lexicon::OperatingSystem::Windows => VmmTestsDepSelections::Windows {
+                        hyperv: true,
+                        whp: resolved_build.openvmm,
+                        hardware_isolation: resolved_build.prep_steps,
+                    },
+                    target_lexicon::OperatingSystem::Linux => VmmTestsDepSelections::Linux,
+                    _ => unreachable!(),
+                },
+                needs_release_igvm,
+            }
+        } else if !resolved_filter.is_empty() {
+            // Custom mode with explicit artifacts (filter was specified without artifacts-file)
+            VmmTestSelections::Custom {
+                filter: resolved_filter,
+                artifacts: resolved_artifacts,
+                build: BuildSelections::default(),
+                deps: match target_os {
+                    target_lexicon::OperatingSystem::Windows => VmmTestsDepSelections::Windows {
+                        hyperv: true,
+                        whp: true,
+                        hardware_isolation: match target_architecture {
+                            target_lexicon::Architecture::Aarch64(_) => false,
+                            target_lexicon::Architecture::X86_64 => true,
+                            _ => panic!("Unhandled architecture: {:?}", target_architecture),
+                        },
+                    },
+                    target_lexicon::OperatingSystem::Linux => VmmTestsDepSelections::Linux,
+                    _ => unreachable!(),
+                },
+                needs_release_igvm,
+            }
+        } else {
+            // Flags mode
+            VmmTestSelections::Flags(flags.unwrap_or_default())
+        };
 
         let mut job = pipeline.new_job(
             FlowPlatform::host(backend_hint),
@@ -173,6 +286,16 @@ impl IntoPipeline for VmmTestsCli {
                 );
         }
 
+        // Override UEFI firmware with a local MSVM.fd path
+        if let Some(fw_path) = custom_uefi_firmware {
+            job = job.dep_on(move |_| {
+                flowey_lib_hvlite::_jobs::cfg_versions::Request::LocalUefi(
+                    recipe_arch,
+                    ReadVar::from_static(fw_path),
+                )
+            });
+        }
+
         job = job
             .dep_on(
                 |_| flowey_lib_hvlite::_jobs::cfg_hvlite_reposource::Params {
@@ -193,45 +316,14 @@ impl IntoPipeline for VmmTestsCli {
                 flowey_lib_hvlite::_jobs::local_build_and_run_nextest_vmm_tests::Params {
                     target,
                     test_content_dir: dir,
-                    selections: if let Some(filter) = filter {
-                        VmmTestSelections::Custom {
-                            filter,
-                            artifacts,
-                            // TODO: add a way to manually specify these
-                            // For now, just build and install everything.
-                            build: Default::default(),
-                            deps: match target_os {
-                                target_lexicon::OperatingSystem::Windows => {
-                                    VmmTestsDepSelections::Windows {
-                                        hyperv: true,
-                                        whp: true,
-                                        // No hardware isolation support on Aarch64, so don't default to needing it when the
-                                        // user specifies a custom filter.
-                                        hardware_isolation: match target_architecture {
-                                            target_lexicon::Architecture::Aarch64(_) => false,
-                                            target_lexicon::Architecture::X86_64 => true,
-                                            _ => panic!(
-                                                "Unhandled architecture: {:?}",
-                                                target_architecture
-                                            ),
-                                        },
-                                    }
-                                }
-                                target_lexicon::OperatingSystem::Linux => {
-                                    VmmTestsDepSelections::Linux
-                                }
-                                _ => unreachable!(),
-                            },
-                        }
-                    } else {
-                        VmmTestSelections::Flags(flags.unwrap_or_default())
-                    },
+                    selections,
                     unstable_whp,
                     release,
                     build_only,
                     copy_extras,
                     custom_kernel_modules,
                     custom_kernel,
+                    skip_vhd_prompt,
                     done: ctx.new_done_handle(),
                 }
             });
