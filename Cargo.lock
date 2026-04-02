@@ -2066,6 +2066,7 @@ dependencies = [
  "flowey_lib_hvlite",
  "log",
  "serde",
+ "serde_json",
  "target-lexicon",
  "vmm_test_images",
 ]
