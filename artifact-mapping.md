@@ -165,140 +165,213 @@ Any compile-time solution must either:
 
 ## Proposed Approaches
 
-### Approach A: Trait bound on `require()` + build-category enum
+## Approach A: Trait bound on `require()` + build-category enum (CHOSEN)
 
-**Core idea**: Add a `HasBuildMapping` trait with an associated const to
-`petri_artifacts_core`. Require it as a bound on `ArtifactResolver::require()`.
-Store the build category in `ErasedArtifactHandle`. Flowey matches on the
-category enum (exhaustive) instead of strings.
+**Core idea**: Add a `HasBuildMapping` trait to `petri_artifacts_core` (minimal,
+just a marker). Put `ArtifactBuildCategory`, `BuildTarget`, and all
+`HasBuildMapping` impls in `vmm_test_images` — the existing bridge crate that
+already sits between petri artifact crates and flowey. Add `HasBuildMapping` as
+a bound on `ArtifactResolver::require()`. Flowey matches on the category enum
+(exhaustive) instead of strings.
 
-**Changes**:
+### Dependency chain (unchanged — no new crates, no cycles)
+
+```
+petri_artifacts_core          (HasBuildMapping trait definition)
+    ↑
+petri_artifacts_common        (declares PIPETTE_*, TEST_LOG_DIRECTORY)
+    ↑
+petri_artifacts_vmm_test      (declares all VMM artifacts)
+    ↑
+vmm_test_images               (ArtifactBuildCategory, BuildTarget,
+                               KnownTestArtifacts, HasBuildMapping impls)
+    ↑
+flowey_lib_hvlite             (consumes build categories to set BuildSelections)
+```
+
+`vmm_test_images` already depends on `petri_artifacts_vmm_test` and is already
+depended on by `flowey_lib_hvlite`. It's the natural place for the mapping logic.
+
+### Changes
+
+**1. `petri_artifacts_core/src/lib.rs` — minimal trait definition**
 
 ```rust
-// petri_artifacts_core/src/lib.rs — NEW
+/// Every artifact used in a test must declare how the build system should
+/// provide it. See `ArtifactBuildCategory` in `vmm_test_images` for the
+/// concrete categories.
+///
+/// This trait is intentionally minimal here to avoid coupling
+/// `petri_artifacts_core` to build-system concepts. The associated type
+/// is defined as an opaque associated const; `vmm_test_images` provides
+/// the concrete `ArtifactBuildCategory` type and all implementations.
+pub trait HasBuildMapping: ArtifactId {}
+```
 
-/// What flowey needs to do with this artifact.
+Add bound to `require()` and `try_require()`:
+
+```rust
+pub fn require<A: ArtifactId + HasBuildMapping>(
+    &self, handle: ArtifactHandle<A>,
+) -> ResolvedArtifact<A> { ... }
+
+pub fn try_require<A: ArtifactId + HasBuildMapping>(
+    &self, handle: ArtifactHandle<A>,
+) -> ResolvedOptionalArtifact<A> { ... }
+```
+
+**2. `vmm_test_images/src/lib.rs` — enums + impls**
+
+Add dependency on `petri_artifacts_core` (already transitive via
+`petri_artifacts_vmm_test`).
+
+```rust
+/// What the build system needs to do to provide this artifact.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ArtifactBuildCategory {
-    /// Must be cargo-built. The &'static str is a stable build-target key
-    /// (e.g., "openvmm", "openhcl", "pipette_linux").
-    Build(&'static str),
-    /// Downloaded from an external source (VHDs, ISOs, VMGS, release IGVMs).
-    Download,
-    /// Always available from deps/environment (firmware, log directory).
+    /// Must be cargo-built.
+    Build(BuildTarget),
+    /// Downloaded from an external source (VHDs, ISOs, VMGS files).
+    Download {
+        artifact: KnownTestArtifacts,
+        also_build: &'static [BuildTarget],
+    },
+    /// Downloaded release IGVM from GitHub.
+    ReleaseDownload,
+    /// Always available from deps/environment (firmware, log dir).
     AlwaysAvailable,
 }
 
-/// Every artifact that can be used in a test must declare its build category.
-pub trait HasBuildMapping: ArtifactId {
+/// Build targets that correspond to fields on `BuildSelections`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum BuildTarget {
+    Openvmm,
+    OpenvmmVhost,
+    Openhcl,
+    GuestTestUefi,
+    Tmks,
+    TmkVmmWindows,
+    TmkVmmLinux,
+    Vmgstool,
+    PipetteWindows,
+    PipetteLinux,
+    TpmGuestTestsWindows,
+    TpmGuestTestsLinux,
+    TestIgvmAgentRpcServer,
+    PrepSteps,
+}
+```
+
+Then implement `HasBuildMapping` for every artifact. Each impl provides the
+build category via a method or associated const on a local extension trait
+(since the core trait is a marker):
+
+```rust
+use petri_artifacts_vmm_test::artifacts::*;
+
+/// Extension of HasBuildMapping with the concrete category.
+pub trait ArtifactBuildInfo: petri_artifacts_core::HasBuildMapping {
     const BUILD_CATEGORY: ArtifactBuildCategory;
 }
-```
 
-Extend `ErasedArtifactHandle`:
-
-```rust
-pub struct ErasedArtifactHandle {
-    artifact_id_str: &'static str,
-    build_category: ArtifactBuildCategory,  // NEW
+// Build artifacts
+impl HasBuildMapping for OPENVMM_WIN_X64 {}
+impl ArtifactBuildInfo for OPENVMM_WIN_X64 {
+    const BUILD_CATEGORY: ArtifactBuildCategory =
+        ArtifactBuildCategory::Build(BuildTarget::Openvmm);
 }
 
-impl<A: ArtifactId + HasBuildMapping> AsArtifactHandle for ArtifactHandle<A> {
-    fn erase(&self) -> ErasedArtifactHandle {
-        ErasedArtifactHandle {
-            artifact_id_str: A::GLOBAL_UNIQUE_ID,
-            build_category: A::BUILD_CATEGORY,
-        }
-    }
+impl HasBuildMapping for OPENVMM_LINUX_X64 {}
+impl ArtifactBuildInfo for OPENVMM_LINUX_X64 {
+    const BUILD_CATEGORY: ArtifactBuildCategory =
+        ArtifactBuildCategory::Build(BuildTarget::Openvmm);
 }
-```
 
-Add bound to `require()`:
-
-```rust
-impl<'a> ArtifactResolver<'a> {
-    pub fn require<A: ArtifactId + HasBuildMapping>(&self, handle: ArtifactHandle<A>)
-        -> ResolvedArtifact<A> { ... }
+// Download artifacts with side effects
+impl HasBuildMapping for test_vhd::ALPINE_3_23_X64 {}
+impl ArtifactBuildInfo for test_vhd::ALPINE_3_23_X64 {
+    const BUILD_CATEGORY: ArtifactBuildCategory =
+        ArtifactBuildCategory::Download {
+            artifact: KnownTestArtifacts::Alpine323X64Vhd,
+            also_build: &[BuildTarget::PipetteLinux],
+        };
 }
-```
 
-At declaration sites, implement the trait:
-
-```rust
-// petri_artifacts_vmm_test/src/lib.rs
-declare_artifacts! { OPENVMM_WIN_X64, OPENVMM_LINUX_X64 }
-
-impl HasBuildMapping for OPENVMM_WIN_X64 {
-    const BUILD_CATEGORY: ArtifactBuildCategory = ArtifactBuildCategory::Build("openvmm");
+impl HasBuildMapping for test_vhd::GEN2_WINDOWS_DATA_CENTER_CORE2025_X64 {}
+impl ArtifactBuildInfo for test_vhd::GEN2_WINDOWS_DATA_CENTER_CORE2025_X64 {
+    const BUILD_CATEGORY: ArtifactBuildCategory =
+        ArtifactBuildCategory::Download {
+            artifact: KnownTestArtifacts::Gen2WindowsDataCenterCore2025X64Vhd,
+            also_build: &[BuildTarget::PipetteWindows, BuildTarget::PrepSteps],
+        };
 }
-impl HasBuildMapping for OPENVMM_LINUX_X64 {
-    const BUILD_CATEGORY: ArtifactBuildCategory = ArtifactBuildCategory::Build("openvmm");
+
+// Always-available artifacts
+impl HasBuildMapping for loadable::UEFI_FIRMWARE_X64 {}
+impl ArtifactBuildInfo for loadable::UEFI_FIRMWARE_X64 {
+    const BUILD_CATEGORY: ArtifactBuildCategory =
+        ArtifactBuildCategory::AlwaysAvailable;
 }
 ```
 
-Or extend `declare_artifacts!` to accept the category inline:
+**3. `ErasedArtifactHandle` — no changes needed**
+
+`ErasedArtifactHandle` stays as-is with just `artifact_id_str`. The compile-time
+enforcement comes from the `HasBuildMapping` bound on `require()`, not from data
+in the erased handle. Flowey resolves artifact ID strings to categories via
+`vmm_test_images::lookup_build_category()` (see step 4 in the implementation
+plan below).
+
+**4. Flowey side: replace string match with category match**
 
 ```rust
-declare_artifacts! {
-    OPENVMM_WIN_X64 => Build("openvmm"),
-    OPENVMM_LINUX_X64 => Build("openvmm"),
-    // ...
-}
-```
-
-In flowey, replace the string-match with a category-match:
-
-```rust
+// flowey_lib_hvlite/src/artifact_to_build_mapping.rs
 fn resolve_from_category(
     &mut self,
     category: ArtifactBuildCategory,
-    artifact_id: &str,  // still available for download-specific logic
 ) {
     match category {
         ArtifactBuildCategory::Build(target) => {
             match target {
-                "openvmm" => self.build.openvmm = true,
-                "openhcl" => self.build.openhcl = true,
-                "pipette_linux" => self.build.pipette_linux = true,
-                // ... exhaustive if you use an enum instead of &str
-                _ => panic!("unknown build target: {target}"),
+                BuildTarget::Openvmm => self.build.openvmm = true,
+                BuildTarget::OpenvmmVhost => self.build.openvmm_vhost = true,
+                BuildTarget::Openhcl => self.build.openhcl = true,
+                BuildTarget::GuestTestUefi => self.build.guest_test_uefi = true,
+                BuildTarget::Tmks => self.build.tmks = true,
+                BuildTarget::TmkVmmWindows => self.build.tmk_vmm_windows = true,
+                BuildTarget::TmkVmmLinux => self.build.tmk_vmm_linux = true,
+                BuildTarget::Vmgstool => self.build.vmgstool = true,
+                BuildTarget::PipetteWindows => self.build.pipette_windows = true,
+                BuildTarget::PipetteLinux => self.build.pipette_linux = true,
+                BuildTarget::TpmGuestTestsWindows => self.build.tpm_guest_tests_windows = true,
+                BuildTarget::TpmGuestTestsLinux => self.build.tpm_guest_tests_linux = true,
+                BuildTarget::TestIgvmAgentRpcServer => self.build.test_igvm_agent_rpc_server = true,
+                BuildTarget::PrepSteps => self.build.prep_steps = true,
             }
         }
-        ArtifactBuildCategory::Download => { /* handled by KnownTestArtifacts */ }
-        ArtifactBuildCategory::AlwaysAvailable => { /* nothing to do */ }
+        ArtifactBuildCategory::Download { artifact, also_build } => {
+            self.downloads.insert(artifact);
+            for &target in also_build {
+                self.resolve_build_target(target);
+            }
+        }
+        ArtifactBuildCategory::ReleaseDownload => {
+            self.needs_release_igvm = true;
+        }
+        ArtifactBuildCategory::AlwaysAvailable => {}
     }
 }
 ```
 
-**Compile-time enforcement**: If a developer adds a new artifact via
-`declare_artifacts!` and uses it in a test (`resolver.require(NEW_ARTIFACT)`)
-without implementing `HasBuildMapping`, they get a compiler error:
+This match on `BuildTarget` is **exhaustive** — adding a new `BuildTarget`
+variant forces updating this match. The `Download` variant's `also_build` array
+encodes side effects (e.g., "this VHD needs pipette_linux") at the declaration
+site, not in flowey.
 
-```
-error[E0277]: the trait bound `NEW_ARTIFACT: HasBuildMapping` is not satisfied
-```
-
-**Pros**:
-- True compile-time enforcement via trait bounds
-- Category enum is small and stable — adding a new artifact to an existing
-  category (e.g., a new OpenHCL IGVM variant) requires zero flowey changes
-- Eliminates the 4 CI gate jobs
-- Build category info co-located with artifact declaration
-
-**Cons**:
-- Introduces build-system concepts (`ArtifactBuildCategory`) into
-  `petri_artifacts_core`, which is otherwise build-system-agnostic
-- Requires implementing `HasBuildMapping` for every existing artifact (~60 impls)
-- `Build(&'static str)` keys are still stringly-typed unless replaced with an
-  enum (which would further couple petri to flowey)
-- Platform-specific logic (e.g., "this VHD also needs pipette_windows on
-  Windows") can't be expressed purely in the category — some flowey-side logic
-  remains
-
-**Mitigation for the coupling concern**: The `ArtifactBuildCategory` enum can be
-kept generic — `Build`, `Download`, `AlwaysAvailable` are universal concepts,
-not flowey-specific. The build target keys (`"openvmm"`, `"openhcl"`) are
-stable identifiers that any build system could use.
+Platform-specific filtering (e.g., "don't build pipette_linux on a Windows-only
+host") is already handled by the existing code in
+`local_build_and_run_nextest_vmm_tests` at line 467:
+`if !linux_host { build.pipette_linux = false; }`. This stays unchanged.
 
 ---
 
@@ -480,69 +553,142 @@ construction is fully compile-time, and a `const_assert!(ARTIFACT_MAPPINGS.len()
 
 ---
 
-## Recommendation
+## Implementation Plan (Approach A)
 
-**Approach A (trait bound + build-category enum)** or **Approach D (unified
-macro)** provide the strongest compile-time guarantees. Of these, **Approach A
-is more incremental** — it can be adopted without rewriting the
-`declare_artifacts!` macro, by adding `HasBuildMapping` impls alongside existing
-declarations. Once all impls are in place, the 4 CI gate jobs can be removed.
+### Step 1: Add `HasBuildMapping` marker trait to `petri_artifacts_core`
 
-### Suggested implementation order
+**File**: `petri/petri_artifacts_core/src/lib.rs`
 
-1. Add `ArtifactBuildCategory` enum and `HasBuildMapping` trait to
-   `petri_artifacts_core`
-2. Add `build_category` field to `ErasedArtifactHandle`
-3. Add `HasBuildMapping` bound to `ArtifactResolver::require()` and
-   `ArtifactResolver::try_require()`
-4. Implement `HasBuildMapping` for all existing artifacts in
-   `petri_artifacts_vmm_test` and `petri_artifacts_common`
-5. Update flowey's `artifact_to_build_mapping.rs` to match on
-   `build_category` instead of strings
-6. Remove `test_artifact_mapping_completeness` job and its 4 CI gates
-7. Optionally evolve toward Approach D (unified macro) later
+Add the trait and the bound on `require()` / `try_require()`. This is the
+minimal change that enables compile-time enforcement. The trait is a marker —
+no associated consts, no dependency on build-system types.
 
-### Handling platform-specific mapping logic
+### Step 2: Add `BuildTarget`, `ArtifactBuildCategory` to `vmm_test_images`
 
-Some artifacts need platform-dependent build logic (e.g., Windows VHDs also
-require `pipette_windows` to be built). This can be handled by:
+**File**: `vmm_tests/vmm_test_images/src/lib.rs`
 
-- Keeping a small amount of category-to-selections logic in flowey that
-  considers the target platform
-- Using additional trait associated consts (e.g.,
-  `const ALSO_NEEDS_PIPETTE: bool`) for artifacts that have side-dependencies
-- Or accepting that the `Download` category's secondary effects (like needing
-  pipette) are inherently platform-logic and stay in flowey — the category just
-  needs to be recognized, not contain every detail
+Add `BuildTarget` enum (14 variants matching `BuildSelections` fields) and
+`ArtifactBuildCategory` enum with `Build`, `Download`, `ReleaseDownload`,
+`AlwaysAvailable` variants. `Download` carries `KnownTestArtifacts` and
+`also_build: &'static [BuildTarget]`.
 
-### Open questions
+Add the `ArtifactBuildInfo` extension trait that provides the concrete
+`BUILD_CATEGORY` associated const.
 
-1. **Should `ArtifactBuildCategory` live in `petri_artifacts_core` or a new
-   intermediate crate?** Putting it in `petri_artifacts_core` is simplest but
-   introduces build-system concepts. A separate `petri_artifact_build_info`
-   crate keeps concerns separated but adds a crate.
+### Step 3: Implement `HasBuildMapping` + `ArtifactBuildInfo` for all artifacts
 
-2. **Should `Build` carry a `&'static str` key or a dedicated enum?** A string
-   key is simpler and more extensible; an enum provides exhaustive matching.
-   Could start with strings and upgrade to an enum if desired.
+**Files**: `vmm_tests/vmm_test_images/src/lib.rs`
 
-3. **Should `declare_artifacts!` be extended to accept the category, or should
-   `HasBuildMapping` impls be written separately?** Extending the macro is
-   cleaner long-term (Approach D) but is a larger change. Separate impls allow
-   incremental adoption.
+~52 impls total (47 in `petri_artifacts_vmm_test`, 5 in `petri_artifacts_common`).
+Each impl provides the build category — same information that's currently in the
+string match arms of `artifact_to_build_mapping.rs`, but type-safe and
+co-located.
 
----
+### Step 4: Provide a lookup function in `vmm_test_images`
 
-## Files involved in the current approach
+**File**: `vmm_tests/vmm_test_images/src/lib.rs`
 
-| File | Role |
-|------|------|
-| `petri/petri_artifacts_core/src/lib.rs` | `ArtifactId`, `ArtifactHandle`, `ErasedArtifactHandle`, `declare_artifacts!` |
-| `vmm_tests/petri_artifacts_vmm_test/src/lib.rs` | All VMM test artifact declarations |
-| `petri/petri_artifacts_common/src/lib.rs` | Common artifacts (pipette, log dir) |
-| `petri/src/test.rs` | `--list-required-artifacts`, `ArtifactResolver`, test collection |
-| `flowey/flowey_lib_hvlite/src/artifact_to_build_mapping.rs` | String-based mapping (the thing to replace) |
-| `flowey/flowey_lib_hvlite/src/_jobs/test_artifact_mapping_completeness.rs` | Runtime completeness check (the thing to remove) |
-| `flowey/flowey_lib_hvlite/src/_jobs/local_discover_vmm_tests_artifacts.rs` | Artifact discovery via nextest + test binary |
-| `flowey/flowey_lib_hvlite/src/_jobs/local_build_and_run_nextest_vmm_tests.rs` | `BuildSelections` struct |
-| `flowey/flowey_hvlite/src/pipelines/checkin_gates.rs` | CI gate wiring (lines 1365–1417) |
+`ErasedArtifactHandle` stays unchanged — it keeps just `artifact_id_str`. The
+compile-time enforcement comes from the `HasBuildMapping` trait bound on
+`require()` (step 1), not from data carried in the erased handle.
+
+For flowey to resolve an artifact ID string to its `ArtifactBuildCategory`,
+`vmm_test_images` provides a lookup function:
+
+```rust
+/// Look up the build category for an artifact by its ID string.
+///
+/// This is the bridge between the string-based discovery output and the
+/// type-safe build category system. The lookup table is derived from the
+/// `ArtifactBuildInfo` impls — it cannot get out of sync because adding
+/// a new artifact without an impl is a compile error (via the
+/// `HasBuildMapping` bound on `require()`).
+pub fn lookup_build_category(artifact_id: &str) -> Option<ArtifactBuildCategory> {
+    // Generated from the ArtifactBuildInfo impls. Can be a match, a
+    // phf map, or a linear scan of a const array.
+    ARTIFACT_BUILD_TABLE.iter()
+        .find(|(id, _)| *id == artifact_id)
+        .map(|(_, cat)| *cat)
+}
+
+const ARTIFACT_BUILD_TABLE: &[(&str, ArtifactBuildCategory)] = &[
+    (
+        <OPENVMM_WIN_X64 as ArtifactId>::GLOBAL_UNIQUE_ID,
+        <OPENVMM_WIN_X64 as ArtifactBuildInfo>::BUILD_CATEGORY,
+    ),
+    (
+        <OPENVMM_LINUX_X64 as ArtifactId>::GLOBAL_UNIQUE_ID,
+        <OPENVMM_LINUX_X64 as ArtifactBuildInfo>::BUILD_CATEGORY,
+    ),
+    // ... one entry per artifact, referencing the trait consts directly
+];
+```
+
+This table is built from trait associated consts, so it's always consistent with
+the `ArtifactBuildInfo` impls. A typo or missing entry is impossible — the
+compiler resolves `<TYPE as ArtifactId>::GLOBAL_UNIQUE_ID` and
+`<TYPE as ArtifactBuildInfo>::BUILD_CATEGORY` at compile time.
+
+### Step 5: Update flowey to use the lookup function
+
+**File**: `flowey/flowey_lib_hvlite/src/artifact_to_build_mapping.rs`
+
+Replace the ~250-line string match with:
+
+```rust
+fn resolve_artifact(&mut self, artifact_id: &str) -> bool {
+    let Some(category) = vmm_test_images::lookup_build_category(artifact_id) else {
+        log::warn!("unknown artifact ID: {artifact_id}");
+        return false;
+    };
+    self.apply_category(category);
+    true
+}
+
+fn apply_category(&mut self, category: ArtifactBuildCategory) {
+    match category {
+        ArtifactBuildCategory::Build(target) => self.apply_build_target(target),
+        ArtifactBuildCategory::Download { artifact, also_build } => {
+            self.downloads.insert(artifact);
+            for &target in also_build {
+                self.apply_build_target(target);
+            }
+        }
+        ArtifactBuildCategory::ReleaseDownload => {
+            self.needs_release_igvm = true;
+        }
+        ArtifactBuildCategory::AlwaysAvailable => {}
+    }
+}
+
+fn apply_build_target(&mut self, target: BuildTarget) {
+    match target {
+        BuildTarget::Openvmm => self.build.openvmm = true,
+        BuildTarget::OpenvmmVhost => self.build.openvmm_vhost = true,
+        BuildTarget::Openhcl => self.build.openhcl = true,
+        // ... exhaustive — adding a new variant is a compile error
+    }
+}
+```
+
+### Step 6: Remove CI validation infrastructure
+
+**Files**:
+- Delete `flowey/flowey_lib_hvlite/src/_jobs/test_artifact_mapping_completeness.rs`
+- Remove the 4 CI gate jobs from `flowey/flowey_hvlite/src/pipelines/checkin_gates.rs`
+  (lines 1365–1417)
+- Remove the module declaration from `flowey/flowey_lib_hvlite/src/_jobs/mod.rs`
+- Run `cargo xflowey regen` to regenerate CI pipeline YAMLs
+
+## Files involved
+
+| File | Change |
+|------|--------|
+| `petri/petri_artifacts_core/src/lib.rs` | Add `HasBuildMapping` trait; add bound to `require()`/`try_require()` |
+| `vmm_tests/vmm_test_images/src/lib.rs` | Add `BuildTarget`, `ArtifactBuildCategory`, `ArtifactBuildInfo`; ~52 trait impls; `lookup_build_category()` function |
+| `vmm_tests/petri_artifacts_vmm_test/src/lib.rs` | No changes (artifacts stay as-is) |
+| `petri/petri_artifacts_common/src/lib.rs` | No changes (artifacts stay as-is) |
+| `flowey/flowey_lib_hvlite/src/artifact_to_build_mapping.rs` | Replace string match with `lookup_build_category()` + category match |
+| `flowey/flowey_lib_hvlite/src/_jobs/test_artifact_mapping_completeness.rs` | Delete |
+| `flowey/flowey_hvlite/src/pipelines/checkin_gates.rs` | Remove 4 CI gate jobs |
+| `flowey/flowey_lib_hvlite/src/_jobs/mod.rs` | Remove module declaration |
