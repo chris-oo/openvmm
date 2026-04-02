@@ -36,6 +36,18 @@ pub trait ArtifactId: 'static {
     fn i_know_what_im_doing_with_this_manual_impl_instead_of_using_the_declare_artifacts_macro();
 }
 
+/// Every artifact used in a test must declare how the build system should
+/// provide it.
+///
+/// This is a marker trait enforced as a bound on
+/// [`ArtifactResolver::require()`] and [`ArtifactResolver::try_require()`].
+/// If a developer adds a new artifact and uses it in a test without
+/// implementing this trait, they get a compile error.
+///
+/// The concrete build category metadata is provided by `ArtifactBuildInfo`
+/// in `vmm_test_images`.
+pub trait HasBuildMapping: ArtifactId {}
+
 /// A type-safe handle to a particular Artifact, as declared using the
 /// [`declare_artifacts!`](crate::declare_artifacts) macro.
 #[derive(Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -145,7 +157,10 @@ impl<'a> ArtifactResolver<'a> {
     }
 
     /// Resolve a required artifact.
-    pub fn require<A: ArtifactId>(&self, handle: ArtifactHandle<A>) -> ResolvedArtifact<A> {
+    pub fn require<A: ArtifactId + HasBuildMapping>(
+        &self,
+        handle: ArtifactHandle<A>,
+    ) -> ResolvedArtifact<A> {
         match &self.0 {
             ArtifactResolverInner::Collecting(requirements) => {
                 requirements.borrow_mut().require(handle.erase());
@@ -158,7 +173,7 @@ impl<'a> ArtifactResolver<'a> {
     }
 
     /// Resolve an optional artifact.
-    pub fn try_require<A: ArtifactId>(
+    pub fn try_require<A: ArtifactId + HasBuildMapping>(
         &self,
         handle: ArtifactHandle<A>,
     ) -> ResolvedOptionalArtifact<A> {
@@ -275,6 +290,8 @@ macro_rules! declare_artifacts {
                         const GLOBAL_UNIQUE_ID: &'static str = module_path!();
                         fn i_know_what_im_doing_with_this_manual_impl_instead_of_using_the_declare_artifacts_macro() {}
                     }
+
+                    impl $crate::HasBuildMapping for super::$name {}
                 }
             }
         )*
