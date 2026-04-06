@@ -239,6 +239,8 @@ pub struct PcieNvmeDrive {
     pub nsid: u32,
     /// The drive to attach.
     pub drive: Drive,
+    /// PCIe virtio-blk drives, keyed by PCIe root port name. Each entry is (port_name, drive).
+    pub pcie_virtio_blk_drives: Vec<(String, Drive)>,
 }
 
 /// Static properties about the VM for convenience during contruction and
@@ -412,6 +414,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
                 tpm: None,
                 vmbus_storage_controllers: HashMap::new(),
                 pcie_nvme_drives: Vec::new(),
+                pcie_virtio_blk_drives: Vec::new(),
             },
             modify_vmm_config: None,
             resources: PetriVmResources {
@@ -485,6 +488,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
                 tpm: None,
                 vmbus_storage_controllers: HashMap::new(),
                 pcie_nvme_drives: Vec::new(),
+                pcie_virtio_blk_drives: Vec::new(),
             },
             modify_vmm_config: None,
             resources: PetriVmResources {
@@ -841,6 +845,12 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
                         nsid: 1,
                         drive: boot_drive,
                     });
+                    self
+                }
+                BootDeviceType::PcieVirtioBlk => {
+                    self.config
+                        .pcie_virtio_blk_drives
+                        .push(("rp0".into(), boot_drive));
                     self
                 }
             }
@@ -2372,6 +2382,8 @@ pub enum BootDeviceType {
     NvmeViaNvme,
     /// Boot from NVMe attached to a PCIe root port.
     PcieNvme,
+    /// Boot from a virtio-blk device attached to a PCIe root port.
+    PcieVirtioBlk,
 }
 
 impl BootDeviceType {
@@ -2381,7 +2393,8 @@ impl BootDeviceType {
             | BootDeviceType::Ide
             | BootDeviceType::Scsi
             | BootDeviceType::Nvme
-            | BootDeviceType::PcieNvme => false,
+            | BootDeviceType::PcieNvme
+            | BootDeviceType::PcieVirtioBlk => false,
             BootDeviceType::IdeViaScsi
             | BootDeviceType::IdeViaNvme
             | BootDeviceType::ScsiViaScsi

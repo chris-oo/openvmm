@@ -193,6 +193,30 @@ impl PetriVmConfigOpenVmm {
         self
     }
 
+    /// Add a PCIe virtio-blk device to the VM using a RAM-backed disk.
+    ///
+    /// This exposes a virtio-blk device on a PCIe root port, suitable for
+    /// guests running virtio drivers (e.g. Linux, or UEFI with VirtioBlkDxe).
+    pub fn with_pcie_virtio_blk(mut self, port_name: &str) -> Self {
+        self.config.pcie_devices.push(PcieDeviceConfig {
+            port_name: port_name.to_string(),
+            resource: virtio_resources::VirtioPciDeviceHandle(
+                virtio_resources::blk::VirtioBlkHandle {
+                    disk: LayeredDiskHandle::single_layer(RamDiskLayerHandle {
+                        len: Some(1024 * 1024),
+                        sector_size: None,
+                    })
+                    .into_resource(),
+                    read_only: false,
+                }
+                .into_resource(),
+            )
+            .into_resource(),
+        });
+
+        self
+    }
+
     /// Load with the specified VTL2 relocation mode.
     pub fn with_vtl2_relocation_mode(mut self, mode: Vtl2BaseAddressType) -> Self {
         let LoadMode::Igvm {

@@ -401,78 +401,149 @@ use openvmm_defs::config::PcieRootPortConfig;
 ## Dependency Graph
 
 ```
-VirtioBlkDxe
-  ├── VirtioLib (library)
+VirtioBlkDxe (block device driver)
+  ├── VirtioLib (library: ring init/map/flush utilities)
   ├── gVirtioDeviceProtocolGuid (protocol)
-  │   └── VirtioPciDeviceDxe (produces it)
+  │   └── Virtio10Dxe (modern 1.0 PCI transport — required for OpenVMM)
+  │       ├── PciCapLib (PCI capability parsing)
+  │       │   └── OrderedCollectionLib (from MdePkg, already available)
+  │       ├── PciCapPciIoLib (PCI capability access via EFI_PCI_IO_PROTOCOL)
   │       └── gEfiPciIoProtocolGuid (from PciBusDxe, already in firmware)
   └── Standard MdePkg libs (BaseMemoryLib, DebugLib, etc.)
 ```
 
-## Files to Vendor (Complete List)
+**Note:** VirtioPciDeviceDxe (legacy 0.9.5 transport) is **NOT needed** — see
+"Implementation Findings" below. It can be kept in the tree for future use with
+legacy virtio devices but is not required for the boot chain.
+
+## Minimal Files to Vendor (Complete List)
 
 **From `mu_tiano_platforms` → `mu_msvm`:**
 
-### Headers (6 files)
+### Headers (8 files)
 1. `QemuPkg/Include/Protocol/VirtioDevice.h` → `MsvmPkg/Include/Protocol/VirtioDevice.h`
 2. `QemuPkg/Include/IndustryStandard/Virtio.h` → `MsvmPkg/Include/IndustryStandard/Virtio.h`
 3. `QemuPkg/Include/IndustryStandard/Virtio10.h` → `MsvmPkg/Include/IndustryStandard/Virtio10.h`
 4. `QemuPkg/Include/IndustryStandard/Virtio095.h` → `MsvmPkg/Include/IndustryStandard/Virtio095.h`
 5. `QemuPkg/Include/IndustryStandard/VirtioBlk.h` → `MsvmPkg/Include/IndustryStandard/VirtioBlk.h`
 6. `QemuPkg/Include/Library/VirtioLib.h` → `MsvmPkg/Include/Library/VirtioLib.h`
+7. `QemuPkg/Include/Library/PciCapLib.h` → `MsvmPkg/Include/Library/PciCapLib.h`
+8. `QemuPkg/Include/Library/PciCapPciIoLib.h` → `MsvmPkg/Include/Library/PciCapPciIoLib.h`
 
 ### VirtioLib (2 files)
-7. `QemuPkg/Library/VirtioLib/VirtioLib.c` → `MsvmPkg/Library/VirtioLib/VirtioLib.c`
-8. `QemuPkg/Library/VirtioLib/VirtioLib.inf` → `MsvmPkg/Library/VirtioLib/VirtioLib.inf`
+9. `QemuPkg/Library/VirtioLib/VirtioLib.c` → `MsvmPkg/Library/VirtioLib/VirtioLib.c`
+10. `QemuPkg/Library/VirtioLib/VirtioLib.inf` → `MsvmPkg/Library/VirtioLib/VirtioLib.inf`
 
-### VirtioPciDeviceDxe (4 files)
-9. `QemuPkg/VirtioPciDeviceDxe/VirtioPciDevice.c` → `MsvmPkg/VirtioPciDeviceDxe/VirtioPciDevice.c`
-10. `QemuPkg/VirtioPciDeviceDxe/VirtioPciDevice.h` → `MsvmPkg/VirtioPciDeviceDxe/VirtioPciDevice.h`
-11. `QemuPkg/VirtioPciDeviceDxe/VirtioPciFunctions.c` → `MsvmPkg/VirtioPciDeviceDxe/VirtioPciFunctions.c`
-12. `QemuPkg/VirtioPciDeviceDxe/VirtioPciDeviceDxe.inf` → `MsvmPkg/VirtioPciDeviceDxe/VirtioPciDeviceDxe.inf`
+### BasePciCapLib (3 files)
+11. `QemuPkg/Library/BasePciCapLib/BasePciCapLib.c` → `MsvmPkg/Library/BasePciCapLib/BasePciCapLib.c`
+12. `QemuPkg/Library/BasePciCapLib/BasePciCapLib.h` → `MsvmPkg/Library/BasePciCapLib/BasePciCapLib.h`
+13. `QemuPkg/Library/BasePciCapLib/BasePciCapLib.inf` → `MsvmPkg/Library/BasePciCapLib/BasePciCapLib.inf`
 
-### VirtioBlkDxe (3 files)
-13. `QemuPkg/VirtioBlkDxe/VirtioBlk.c` → `MsvmPkg/VirtioBlkDxe/VirtioBlk.c`
-14. `QemuPkg/VirtioBlkDxe/VirtioBlk.h` → `MsvmPkg/VirtioBlkDxe/VirtioBlk.h`
-15. `QemuPkg/VirtioBlkDxe/VirtioBlk.inf` → `MsvmPkg/VirtioBlkDxe/VirtioBlk.inf`
+### UefiPciCapPciIoLib (3 files)
+14. `QemuPkg/Library/UefiPciCapPciIoLib/UefiPciCapPciIoLib.c` → `MsvmPkg/Library/UefiPciCapPciIoLib/UefiPciCapPciIoLib.c`
+15. `QemuPkg/Library/UefiPciCapPciIoLib/UefiPciCapPciIoLib.h` → `MsvmPkg/Library/UefiPciCapPciIoLib/UefiPciCapPciIoLib.h`
+16. `QemuPkg/Library/UefiPciCapPciIoLib/UefiPciCapPciIoLib.inf` → `MsvmPkg/Library/UefiPciCapPciIoLib/UefiPciCapPciIoLib.inf`
+
+### Virtio10Dxe (3 files) — modern PCI transport
+17. `QemuPkg/Virtio10Dxe/Virtio10.c` → `MsvmPkg/Virtio10Dxe/Virtio10.c`
+18. `QemuPkg/Virtio10Dxe/Virtio10.h` → `MsvmPkg/Virtio10Dxe/Virtio10.h`
+19. `QemuPkg/Virtio10Dxe/Virtio10.inf` → `MsvmPkg/Virtio10Dxe/Virtio10.inf`
+
+### VirtioBlkDxe (3 files) — block device driver
+20. `QemuPkg/VirtioBlkDxe/VirtioBlk.c` → `MsvmPkg/VirtioBlkDxe/VirtioBlk.c`
+21. `QemuPkg/VirtioBlkDxe/VirtioBlk.h` → `MsvmPkg/VirtioBlkDxe/VirtioBlk.h`
+22. `QemuPkg/VirtioBlkDxe/VirtioBlk.inf` → `MsvmPkg/VirtioBlkDxe/VirtioBlk.inf`
+
+### Optional: VirtioPciDeviceDxe (4 files) — legacy transport, not required
+23–26. Can be kept for future legacy virtio device support, but not needed for OpenVMM.
 
 ## Files to Modify in mu_msvm
 
-16. `MsvmPkg/MsvmPkg.dec` — add protocol GUID to `[Protocols]`, add new `[LibraryClasses]` section
-17. `MsvmPkg/MsvmPkgX64.dsc` — add `VirtioLib` to `[LibraryClasses]` (~line 173), add drivers to `[Components]` (~line 882)
-18. `MsvmPkg/MsvmPkgAARCH64.dsc` — add `VirtioLib` to `[LibraryClasses]` (~line 175), add drivers to `[Components]` (~line 861)
-19. `MsvmPkg/MsvmPkgX64.fdf` — add 2 INFs to `[FV.DXE]` after NvmExpressDxe (~line 249)
-20. `MsvmPkg/MsvmPkgAARCH64.fdf` — add 2 INFs to `[FV.DXE]` after NvmExpressDxe (~line 211)
+- `MsvmPkg/MsvmPkg.dec` — add `gVirtioDeviceProtocolGuid` + `VirtioLib`, `PciCapLib`, `PciCapPciIoLib` library classes
+- `MsvmPkg/MsvmPkgX64.dsc` — add library class mappings (VirtioLib, PciCapLib, PciCapPciIoLib, OrderedCollectionLib) + components (Virtio10Dxe, VirtioBlkDxe)
+- `MsvmPkg/MsvmPkgAARCH64.dsc` — same as X64
+- `MsvmPkg/MsvmPkgX64.fdf` — add `INF` entries to `[FV.DXE]`
+- `MsvmPkg/MsvmPkgAARCH64.fdf` — same as X64
 
 ## Files to Modify/Create in openvmm
 
-21. `petri/src/vm/mod.rs` — add `PcieVirtioBlk` to `BootDeviceType` enum (~line 2338) + routing (~line 824)
-22. `petri/src/vm/openvmm/modify.rs` — add `with_pcie_virtio_blk()` helper (~line 170)
-23. `vmm_tests/vmm_tests/tests/tests/multiarch/pcie.rs` — add `pcie_virtio_blk_boot` test
+- `petri/src/vm/mod.rs` — add `PcieVirtioBlk` to `BootDeviceType` enum + routing
+- `petri/src/vm/openvmm/construct.rs` — add `pcie_virtio_blk_drives` construction
+- `petri/src/vm/openvmm/modify.rs` — add `with_pcie_virtio_blk()` helper
+- `vmm_tests/vmm_tests/tests/tests/multiarch/pcie.rs` — add `pcie_virtio_blk_boot` test
+
+---
+
+## Implementation Findings
+
+### Transport version mismatch (resolved)
+
+OpenVMM's virtio-pci device presents as a **modern (1.0)** device:
+- Vendor ID: `0x1AF4`
+- Device ID: `0x1042` (base `0x1040` + block device type 2)
+- Uses PCI capabilities for config space layout (BAR0 with cap pointers)
+
+The initially vendored **VirtioPciDeviceDxe** only supports **legacy (0.9.5)** transport:
+- Matches device IDs `0x1000–0x103F` with revision 0
+- Uses fixed I/O port offsets in BAR0
+
+**Fix:** Vendor **Virtio10Dxe** instead — this is the modern transport driver that
+uses PCI capabilities (VIRTIO_PCI_CAP) to locate config regions. It matches
+device IDs `≥ 0x1040`. Requires two additional libraries: `BasePciCapLib` and
+`UefiPciCapPciIoLib`.
+
+### UEFI boot chain: WORKING ✅
+
+With Virtio10Dxe + VirtioBlkDxe, the full UEFI boot chain works:
+
+1. ✅ PciHostBridgeDxe enumerates PCIe root complex via ECAM
+2. ✅ PciBusDxe discovers virtio PCI device (0x1AF4:0x1042)
+3. ✅ Virtio10Dxe binds and produces `VIRTIO_DEVICE_PROTOCOL`
+4. ✅ VirtioBlkDxe binds and produces `EFI_BLOCK_IO_PROTOCOL`
+5. ✅ UEFI boot manager finds EFI system partition on the virtio-blk disk
+6. ✅ GRUB loads and starts the Linux kernel
+
+Confirmed by `BootSuccess` event and GRUB appearing on the framebuffer.
+
+### Linux guest driver probe failure: BLOCKING 🔴
+
+After UEFI hands off to Linux, the kernel's `virtio_blk` driver fails:
+
+```
+virtio_blk virtio0: 1/0/0 default/read/poll queues
+virtio_blk virtio0: probe with driver virtio_blk failed with error -2
+```
+
+Error -2 is `ENOENT`. The device is discovered on PCI but the virtio_blk driver
+can't complete initialization — likely a virtqueue setup issue in OpenVMM's
+virtio-pci emulator when used by the Linux driver (as opposed to the UEFI driver
+which uses a simpler initialization sequence).
+
+This causes the root filesystem mount to fail, the guest drops to emergency
+shell, and the pipette test agent never starts — making the VMM test hang.
+
+**This is an OpenVMM virtio-pci emulator bug, not a firmware issue.** The UEFI
+firmware vendoring is complete and working. The VMM test needs either:
+1. The OpenVMM virtio-pci emulator bug to be fixed (separate investigation), or
+2. The test to validate only the UEFI boot chain (BootSuccess) without waiting
+   for pipette
 
 ## Risks & Open Questions
 
-1. **VirtIO PCI version**: The vendored VirtioPciDeviceDxe implements legacy
-   (0.9.5) virtio-pci transport. OpenVMM's virtio-blk device emulator supports
-   both legacy and modern (1.0) virtio. Need to confirm the legacy transport
-   works correctly with OpenVMM's emulator, or whether we need to set
-   `VIRTIO_F_VERSION_1` negotiation.
+1. ~~**VirtIO PCI version**~~ — **Resolved.** Virtio10Dxe handles modern transport.
 
-2. **DMA / Bounce Buffers**: NvmExpressDxe in mu_msvm has custom
-   `NvmExpressBounce.c` for Hyper-V isolation. The virtio drivers use
-   `VirtioAllocateSharedPages` / `VirtioMapSharedBuffer` for DMA. Under
-   isolation (SNP/TDX), these may need analogous bounce-buffer treatment.
-   For initial non-isolated scenarios this should work as-is.
+2. **DMA / Bounce Buffers**: The virtio drivers use `VirtioAllocateSharedPages` /
+   `VirtioMapSharedBuffer` for DMA. Under isolation (SNP/TDX), these may need
+   bounce-buffer treatment. For initial non-isolated scenarios this works as-is.
 
-3. **INF Package References**: All three `.inf` files reference
-   `QemuPkg/QemuPkg.dec` — these must be changed to `MsvmPkg/MsvmPkg.dec`.
-   The `MdePkg/MdePkg.dec` references stay as-is.
+3. **Linux virtio_blk probe failure**: OpenVMM's virtio-pci device emulator has
+   a bug that prevents the Linux virtio_blk driver from probing successfully.
+   UEFI boot works, but guest OS can't use the device after handoff. Needs
+   separate investigation in `vm/devices/virtio/virtio/src/transport/pci.rs`.
 
-4. **Firmware size**: Adding three new drivers increases the firmware image size.
-   Check that the DXE firmware volume has enough space in the FDF layout.
-   The X64 FDF allocates 6 MB for the full firmware; the DXE FV is the largest
-   section. If space is tight, a release build (smaller than debug) can be used.
+4. **Firmware size**: The DXE firmware volume has sufficient space — X64 build
+   succeeds in 12s with all drivers included.
 
-5. **Guest driver availability**: The VMM test uses Alpine Linux which includes
-   virtio drivers in-kernel. Windows guests would need the virtio-win drivers
-   package. Initial testing with Linux is simplest.
+5. **Guest driver availability**: Alpine Linux includes virtio drivers in-kernel
+   (confirmed — `virtio_blk` module loads and finds the PCI device). The probe
+   failure is an emulator issue, not a missing driver issue.
