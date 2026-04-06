@@ -4,7 +4,10 @@
 use crate::multiarch::OsFlavor;
 use crate::multiarch::cmd;
 use guid::Guid;
+use memory_range::MemoryRange;
 use net_backend_resources::mac_address::MacAddress;
+use openvmm_defs::config::PcieRootComplexConfig;
+use openvmm_defs::config::PcieRootPortConfig;
 use pal_async::DefaultDriver;
 use pal_async::timer::PolledTimer;
 use petri::PetriVmBuilder;
@@ -501,6 +504,92 @@ async fn pcie_nvme_boot(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::
         .filter(|d| d.class_code == 0x010802)
         .count();
     assert!(nvme_count >= 1, "NVMe controller not visible in guest");
+
+    agent.power_off().await?;
+    vm.wait_for_clean_teardown().await?;
+    Ok(())
+}
+
+/// Boot an OS from a virtio-blk device on an emulated PCIe root port.
+/// Validates the full PciHostBridgeDxe → PciBusDxe → VirtioPciDeviceDxe →
+/// VirtioBlkDxe → OS boot chain.
+///
+/// Requires a mu_msvm firmware build with VirtioPciDeviceDxe and VirtioBlkDxe.
+/// Pass `--custom-uefi-firmware <path>` to use a locally-built firmware.
+#[openvmm_test(uefi_x64(vhd(alpine_3_23_x64)), uefi_aarch64(vhd(alpine_3_23_aarch64)))]
+async fn pcie_virtio_blk_boot(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Result<()> {
+    const ECAM_SIZE: u64 = 256 * 1024 * 1024;
+    const LOW_MMIO_SIZE: u64 = 64 * 1024 * 1024;
+    const HIGH_MMIO_SIZE: u64 = 1024 * 1024 * 1024;
+
+    let os_flavor = config.os_flavor();
+    let (vm, agent) = config
+        .with_boot_device_type(petri::BootDeviceType::PcieVirtioBlk)
+        .modify_backend(|b| {
+            b.with_custom_config(|c| {
+                // Enable verbose firmware logging for debugging.
+                c.efi_diagnostics_log_level =
+                    openvmm_defs::config::EfiDiagnosticsLogLevelType::Full;
+                // Always attempt default boot so ConnectAll runs and
+                // PciBusDxe enumerates before the boot manager searches.
+                if let openvmm_defs::config::LoadMode::Uefi {
+                    ref mut default_boot_always_attempt,
+                    ref mut enable_vpci_boot,
+                    ..
+                } = c.load_mode
+                {
+                    *default_boot_always_attempt = true;
+                    // Disable VPCI boot to avoid VPCI PCI_IO handles
+                    // interfering with ePCI enumeration.
+                    *enable_vpci_boot = false;
+                }
+                let low_mmio_start = c.memory.mmio_gaps[0].start();
+                let high_mmio_end = c.memory.mmio_gaps[1].end();
+                let pcie_low = MemoryRange::new(low_mmio_start - LOW_MMIO_SIZE..low_mmio_start);
+                let pcie_high = MemoryRange::new(high_mmio_end..high_mmio_end + HIGH_MMIO_SIZE);
+                let ecam_range = MemoryRange::new(pcie_low.start() - ECAM_SIZE..pcie_low.start());
+                c.memory.pci_ecam_gaps.push(ecam_range);
+                c.memory.pci_mmio_gaps.push(pcie_low);
+                c.memory.pci_mmio_gaps.push(pcie_high);
+                c.pcie_root_complexes.push(PcieRootComplexConfig {
+                    index: 0,
+                    name: "rc0".into(),
+                    segment: 0,
+                    start_bus: 0,
+                    end_bus: 255,
+                    ecam_range,
+                    low_mmio: pcie_low,
+                    high_mmio: pcie_high,
+                    ports: vec![PcieRootPortConfig {
+                        name: "rp0".into(),
+                        hotplug: false,
+                    }],
+                });
+            })
+        })
+        .run()
+        .await?;
+
+    // If we get here, the firmware successfully:
+    //   1. Enumerated the PCIe root complex via ECAM
+    //   2. PciBusDxe found the virtio-blk PCI device
+    //   3. VirtioPciDeviceDxe bound and produced VIRTIO_DEVICE_PROTOCOL
+    //   4. VirtioBlkDxe bound and produced EFI_BLOCK_IO_PROTOCOL
+    //   5. UEFI boot manager booted the OS from the virtio-blk device
+    //   6. Pipette agent started in guest
+
+    let guest_devices = parse_guest_pci_devices(os_flavor, &agent).await?;
+    tracing::info!(?guest_devices, "guest devices");
+
+    // Virtio PCI vendor 0x1AF4, block device class 0x010000
+    let virtio_blk_count = guest_devices
+        .iter()
+        .filter(|d| d.vendor_id == 0x1AF4 && d.class_code >> 8 == 0x0100)
+        .count();
+    assert!(
+        virtio_blk_count >= 1,
+        "virtio-blk device not visible in guest"
+    );
 
     agent.power_off().await?;
     vm.wait_for_clean_teardown().await?;

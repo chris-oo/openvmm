@@ -120,6 +120,7 @@ impl PetriVmConfigOpenVmm {
             tpm: tpm_config,
             vmbus_storage_controllers,
             pcie_nvme_drives,
+            pcie_virtio_blk_drives,
         } = petri_vm_config;
 
         tracing::debug!(?firmware, ?arch, "Petri VM firmware configuration");
@@ -208,7 +209,7 @@ impl PetriVmConfigOpenVmm {
         let (mut vmbus_devices, vpci_devices) =
             vmbus_storage_controllers_to_openvmm(&vmbus_storage_controllers)?;
 
-        let pcie_devices = pcie_nvme_drives
+        let mut pcie_devices: Vec<PcieDeviceConfig> = pcie_nvme_drives
             .into_iter()
             .filter_map(|(port_name, nsid, Drive { disk, .. })| {
                 let disk = disk?;
@@ -231,6 +232,23 @@ impl PetriVmConfigOpenVmm {
                 }))
             })
             .collect::<Result<Vec<_>, _>>()?;
+
+        for (port_name, Drive { disk, .. }) in pcie_virtio_blk_drives {
+            if let Some(disk) = disk {
+                let disk = petri_disk_to_openvmm(&disk)?;
+                pcie_devices.push(PcieDeviceConfig {
+                    port_name,
+                    resource: VirtioPciDeviceHandle(
+                        VirtioBlkHandle {
+                            disk,
+                            read_only: false,
+                        }
+                        .into_resource(),
+                    )
+                    .into_resource(),
+                });
+            }
+        }
 
         let (firmware_event_send, firmware_event_recv) = mesh::mpsc_channel();
 
