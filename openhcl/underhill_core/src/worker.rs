@@ -50,6 +50,7 @@ use crate::options::GuestStateEncryptionPolicyCli;
 use crate::options::GuestStateLifetimeCli;
 use crate::options::KeepAliveConfig;
 use crate::options::TestScenarioConfig;
+use crate::partition::OpenhclPartition;
 use crate::reference_time::ReferenceTime;
 use crate::servicing;
 use crate::servicing::ServicingState;
@@ -139,11 +140,8 @@ use underhill_confidentiality::confidential_debug_enabled;
 use underhill_threadpool::AffinitizedThreadpool;
 use underhill_threadpool::ThreadpoolBuilder;
 use user_driver::vfio::VfioDmaClients;
-use virt::Partition;
 use virt::VpIndex;
-use virt::X86Partition;
 use virt::state::HvRegisterState;
-use virt_mshv_vtl::UhPartition;
 use virt_mshv_vtl::UhPartitionNewParams;
 use virt_mshv_vtl::UhProtoPartition;
 use vm_loader::initial_regs::initial_regs;
@@ -800,7 +798,7 @@ impl UhVmNetworkSettings {
         driver_source: &VmTaskDriverSource,
         uevent_listener: &UeventListener,
         servicing_netvsp_state: &Option<Vec<crate::emuplat::netvsp::SavedState>>,
-        partition: Arc<UhPartition>,
+        partition: Arc<dyn OpenhclPartition>,
         state_units: &StateUnits,
         tp: &AffinitizedThreadpool,
         vmbus_server: &Option<VmbusServerHandle>,
@@ -987,7 +985,7 @@ impl LoadedVmNetworkSettings for UhVmNetworkSettings {
         threadpool: &AffinitizedThreadpool,
         uevent_listener: &UeventListener,
         servicing_netvsp_state: &Option<Vec<crate::emuplat::netvsp::SavedState>>,
-        partition: Arc<UhPartition>,
+        partition: Arc<dyn OpenhclPartition>,
         state_units: &StateUnits,
         vmbus_server: &Option<VmbusServerHandle>,
         dma_client_spawner: DmaClientSpawner,
@@ -2183,7 +2181,7 @@ async fn new_underhill_vm(
         .await
         .context("failed to create partition")?;
 
-    let partition = Arc::new(partition);
+    let partition: Arc<dyn OpenhclPartition> = Arc::new(partition);
 
     // By default, scale the max QD by the number of VPs to save memory
     // on smaller VMs, up to a QD of 256.
@@ -2715,7 +2713,62 @@ async fn new_underhill_vm(
 
     let emuplat_adjust_gpa_range;
 
-    let synic = virt::Hv1::synic(partition.as_ref());
+    let synic: Arc<dyn vmcore::synic::SynicPortAccess> =
+        Arc::new(virt::synic::SynicPorts::new(partition.clone().into_synic()));
+
+    let mut chipset = vm_manifest_builder::VmManifestBuilder::new(
+        match firmware_type {
+            FirmwareType::Pcat => vm_manifest_builder::BaseChipsetType::HypervGen1,
+            FirmwareType::Uefi => vm_manifest_builder::BaseChipsetType::HypervGen2Uefi,
+            FirmwareType::None => vm_manifest_builder::BaseChipsetType::HyperVGen2LinuxDirect,
+        },
+        if cfg!(guest_arch = "x86_64") {
+            vm_manifest_builder::MachineArch::X86_64
+        } else if cfg!(guest_arch = "aarch64") {
+            vm_manifest_builder::MachineArch::Aarch64
+        } else {
+            anyhow::bail!("unsupported guest architecture")
+        },
+    );
+
+    if with_serial {
+        chipset = chipset.with_serial(serial_inputs);
+        if env_cfg.emulated_serial_wait_for_rts {
+            chipset = chipset.with_serial_wait_for_rts();
+        }
+    }
+
+    if matches!(firmware_type, FirmwareType::Pcat) {
+        // Use the stub floppy implementation for compatibility with existing
+        // releases and because we don't need a functional floppy disk.
+        chipset = chipset.with_stub_floppy();
+        // Use the host's VGA implementation, at least for now.
+        chipset = chipset.with_proxy_vga();
+    } else {
+        if dps.general.watchdog_enabled {
+            chipset = chipset.with_guest_watchdog();
+        }
+
+        if dps.general.psp_enabled {
+            chipset = chipset.with_psp();
+        }
+    }
+
+    if dps.general.battery_enabled {
+        chipset = chipset.with_battery(
+            get_client
+                .take_battery_status_recv()
+                .await
+                .context("failed to get battery status channel")?,
+        );
+    }
+
+    let vm_manifest_builder::VmChipsetResult {
+        chipset,
+        mut chipset_devices,
+    } = chipset
+        .build()
+        .context("failed to build chipset configuration")?;
 
     let deps_generic_ioapic = chipset.with_generic_ioapic.then(|| dev::GenericIoApicDeps {
         num_entries: virt::irqcon::IRQ_LINES as u8,
@@ -3061,10 +3114,7 @@ async fn new_underhill_vm(
         0..=1,
         0,
         "bsp",
-        Arc::new(vmm_core::emuplat::apic::ApicLintLineTarget::new(
-            partition.clone(),
-            Vtl::Vtl0,
-        )),
+        partition.clone().into_lint_target(Vtl::Vtl0),
     );
 
     // Add the GIC.
@@ -3590,7 +3640,7 @@ async fn new_underhill_vm(
             &vtl0_memory_map,
             capabilities,
             &mut partition_unit,
-            &partition,
+            partition.as_ref(),
             env_cfg.cmdline_append.as_deref(),
             vtl0_info,
             &runtime_params,
@@ -3869,7 +3919,7 @@ async fn load_firmware(
     vtl0_memory_map: &[(MemoryRangeWithNode, MemoryMapEntryType)],
     chipset_capabilities: vmotherboard::options::VmChipsetCapabilities,
     partition_unit: &mut PartitionUnit,
-    partition: &UhPartition,
+    partition: &dyn OpenhclPartition,
     cmdline_append: Option<&str>,
     vtl0_info: MeasuredVtl0Info,
     runtime_params: &RuntimeParameters,
@@ -3925,7 +3975,7 @@ async fn load_firmware(
 }
 
 pub struct UnderhillPmTimerAssist {
-    pub partition: std::sync::Weak<UhPartition>,
+    pub partition: std::sync::Weak<dyn OpenhclPartition>,
 }
 
 impl chipset::pm::PmTimerAssist for UnderhillPmTimerAssist {
@@ -3934,7 +3984,7 @@ impl chipset::pm::PmTimerAssist for UnderhillPmTimerAssist {
             if let Err(err) = partition.set_pm_timer_assist(port) {
                 tracing::warn!(
                     CVM_ALLOWED,
-                    error = &err as &dyn std::error::Error,
+                    error = err.as_ref() as &dyn std::error::Error,
                     ?port,
                     "failed to set PM timer assist"
                 );
@@ -4000,7 +4050,7 @@ impl ChipsetDevice for FallbackMmioDevice {
 
 #[cfg(guest_arch = "x86_64")]
 struct WatchdogTimeoutNmi {
-    partition: Arc<UhPartition>,
+    partition: Arc<dyn OpenhclPartition>,
     watchdog_send: Option<mesh::Sender<()>>,
 }
 

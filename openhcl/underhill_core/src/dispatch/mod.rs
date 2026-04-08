@@ -13,6 +13,7 @@ use crate::emuplat::netvsp::RuntimeSavedState;
 use crate::nvme_manager::manager::NvmeManager;
 use crate::options::KeepAliveConfig;
 use crate::options::TestScenarioConfig;
+use crate::partition::OpenhclPartition;
 use crate::reference_time::ReferenceTime;
 use crate::servicing;
 use crate::servicing::NvmeSavedState;
@@ -61,7 +62,6 @@ use tracing::instrument;
 use uevent::UeventListener;
 use underhill_threadpool::AffinitizedThreadpool;
 use virt::IsolationType;
-use virt_mshv_vtl::UhPartition;
 use virt_mshv_vtl::VtlCrash;
 use vm_resource::ResourceResolver;
 use vm_topology::memory::MemoryRangeWithNode;
@@ -113,7 +113,7 @@ pub trait LoadedVmNetworkSettings: Inspect {
         threadpool: &AffinitizedThreadpool,
         uevent_listener: &UeventListener,
         servicing_netvsp_state: &Option<Vec<crate::emuplat::netvsp::SavedState>>,
-        partition: Arc<UhPartition>,
+        partition: Arc<dyn OpenhclPartition>,
         state_units: &StateUnits,
         vmbus_server: &Option<VmbusServerHandle>,
         dma_client_spawner: DmaClientSpawner,
@@ -161,7 +161,7 @@ pub(crate) struct LoadedVm {
     /// Memory map with IGVM types for each range.
     pub vtl0_memory_map: Vec<(MemoryRangeWithNode, MemoryMapEntryType)>,
 
-    pub partition: Arc<UhPartition>,
+    pub partition: Arc<dyn OpenhclPartition>,
     pub state_units: StateUnits,
     pub last_state_unit_stop: Option<ReferenceTime>,
     pub vmbus_server: Option<VmbusServerHandle>,

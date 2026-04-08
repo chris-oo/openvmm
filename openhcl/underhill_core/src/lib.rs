@@ -18,6 +18,7 @@ mod livedump;
 mod loader;
 mod nvme_manager;
 mod options;
+mod partition;
 mod reference_time;
 mod servicing;
 mod threadpool_vm_task_backend;
