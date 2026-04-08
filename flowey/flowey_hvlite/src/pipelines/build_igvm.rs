@@ -31,6 +31,9 @@ pub enum OpenhclRecipeCli {
     X64,
     /// X64 OpenHCL, using the dev kernel in VTL2
     X64Devkern,
+    /// X64 OpenHCL running in VTL0, using KVM and nested virtualization to run
+    /// the guest. Uses the dev kernel.
+    X64Nested,
 }
 
 /// Build OpenHCL IGVM files for local development. DO NOT USE IN CI.
@@ -335,7 +338,8 @@ impl IntoPipeline for BuildIgvmCli {
             | OpenhclRecipeCli::X64Cvm
             | OpenhclRecipeCli::X64CvmDevkern
             | OpenhclRecipeCli::X64TestLinuxDirect
-            | OpenhclRecipeCli::X64TestLinuxDirectDevkern => CommonArch::X86_64,
+            | OpenhclRecipeCli::X64TestLinuxDirectDevkern
+            | OpenhclRecipeCli::X64Nested => CommonArch::X86_64,
             OpenhclRecipeCli::Aarch64 | OpenhclRecipeCli::Aarch64Devkern => CommonArch::Aarch64,
         };
 
@@ -431,6 +435,7 @@ impl IntoPipeline for BuildIgvmCli {
                 OpenhclRecipeCli::X64CvmDevkern => OpenhclIgvmRecipe::X64CvmDevkern,
                 OpenhclRecipeCli::Aarch64 => OpenhclIgvmRecipe::Aarch64,
                 OpenhclRecipeCli::Aarch64Devkern => OpenhclIgvmRecipe::Aarch64Devkern,
+                OpenhclRecipeCli::X64Nested => OpenhclIgvmRecipe::X64Nested,
             },
             release,
             release_cfg,

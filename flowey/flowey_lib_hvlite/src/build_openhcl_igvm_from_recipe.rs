@@ -91,6 +91,7 @@ pub enum OpenhclIgvmRecipe {
     X64CvmDevkern,
     Aarch64,
     Aarch64Devkern,
+    X64Nested,
 }
 
 impl OpenhclIgvmRecipe {
@@ -239,6 +240,25 @@ impl OpenhclIgvmRecipe {
                 vtl0_kernel_type: None,
                 with_uefi: true,
                 with_interactive: false, // #1234
+                with_sidecar: false,
+                max_trace_level,
+            },
+            Self::X64Nested => OpenhclIgvmRecipeDetails {
+                local_only: None,
+                igvm_manifest: in_repo_template(
+                    "openhcl-x64-nested.json",
+                    "openhcl-x64-nested.json",
+                ),
+                openhcl_kernel_package: OpenhclKernelPackage::Dev,
+                openvmm_hcl_features: {
+                    let mut f = base_openvmm_hcl_features();
+                    f.insert(OpenvmmHclFeature::VirtKvm);
+                    f
+                },
+                target: CommonTriple::X86_64_LINUX_MUSL,
+                vtl0_kernel_type: None,
+                with_uefi: true,
+                with_interactive: false,
                 with_sidecar: false,
                 max_trace_level,
             },

@@ -324,6 +324,7 @@ pub fn non_production_build_igvm_tool_out_name(recipe: &OpenhclIgvmRecipe) -> &'
         OpenhclIgvmRecipe::X64CvmDevkern => "x64-cvm-devkern",
         OpenhclIgvmRecipe::Aarch64 => "aarch64",
         OpenhclIgvmRecipe::Aarch64Devkern => "aarch64-devkern",
+        OpenhclIgvmRecipe::X64Nested => "x64-nested",
         OpenhclIgvmRecipe::LocalOnlyCustom(_) => unreachable!(),
     }
 }

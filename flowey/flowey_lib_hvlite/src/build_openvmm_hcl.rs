@@ -16,6 +16,7 @@ pub enum OpenvmmHclFeature {
     Gdb,
     MiSecure,
     Tpm,
+    VirtKvm,
     LocalOnlyCustom(String),
 }
 
@@ -153,6 +154,7 @@ impl FlowNode for Node {
                     OpenvmmHclFeature::Gdb => "gdb".into(),
                     OpenvmmHclFeature::MiSecure => "mi-secure".into(),
                     OpenvmmHclFeature::Tpm => "tpm".into(),
+                    OpenvmmHclFeature::VirtKvm => "virt_kvm".into(),
                     OpenvmmHclFeature::LocalOnlyCustom(s) => s,
                 })
                 .collect::<Vec<String>>();
