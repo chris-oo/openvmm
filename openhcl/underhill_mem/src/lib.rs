@@ -5,10 +5,12 @@
 
 #![cfg(target_os = "linux")]
 
+mod devmem;
 mod init;
 mod mapping;
 mod registrar;
 
+pub use devmem::DevMemMemory;
 pub use init::BootInit;
 pub use init::Init;
 pub use init::MemoryMappings;

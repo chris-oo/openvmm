@@ -8534,6 +8534,7 @@ dependencies = [
  "anyhow",
  "build_rs_guest_arch",
  "cvm_tracing",
+ "fs-err",
  "futures",
  "guestmem",
  "hcl",
