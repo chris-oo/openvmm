@@ -8523,8 +8523,10 @@ dependencies = [
  "libc",
  "log",
  "nix 0.30.1",
+ "safe_intrinsics",
  "underhill_confidentiality",
  "walkdir",
+ "x86defs",
 ]
 
 [[package]]
