@@ -21,6 +21,9 @@ dev_snp_ohcl_tio_support = ["tee_call/dev_snp_ohcl_tio_support"]
 # Enable VPCI device support
 vpci = []
 
+# Enable KVM and nested virtualization support.
+virt_kvm = []
+
 [target.'cfg(target_os = "linux")'.dependencies]
 vmotherboard = { workspace = true, features = [
     "encryption",

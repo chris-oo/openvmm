@@ -289,6 +289,10 @@ pub struct Options {
     /// The default time to wait in milliseconds for dump collection during a
     /// panic in servicing.
     pub servicing_timeout_dump_collection_in_ms: u64,
+
+    /// (OPENHCL_KVM=1) Use KVM and nested virtualization to run the guest OS
+    /// instead of the mshv_vtl driver.
+    pub kvm: bool,
 }
 
 impl Options {
@@ -467,6 +471,7 @@ impl Options {
             parse_legacy_env_number("OPENHCL_CONFIG_TIMEOUT_IN_SECONDS")?.unwrap_or(5);
         let servicing_timeout_dump_collection_in_ms =
             parse_env_number("OPENHCL_SERVICING_TIMEOUT_DUMP_COLLECTION_IN_MS")?.unwrap_or(500);
+        let kvm = parse_env_bool("OPENHCL_KVM");
 
         let mut args = std::env::args().chain(extra_args);
         // Skip our own filename.
@@ -533,6 +538,7 @@ impl Options {
             disable_lower_vtl_timer_virt,
             config_timeout_in_seconds,
             servicing_timeout_dump_collection_in_ms,
+            kvm,
         })
     }
 

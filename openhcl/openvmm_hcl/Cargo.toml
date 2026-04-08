@@ -27,6 +27,9 @@ vpci = ["underhill_entry/vpci"]
 # Enable TIO support for SEV-SNP
 dev_snp_ohcl_tio_support = ["underhill_entry/dev_snp_ohcl_tio_support"]
 
+# Enable KVM and nested virtualization support.
+virt_kvm = ["underhill_entry/virt_kvm"]
+
 [target.'cfg(target_os = "linux")'.dependencies]
 underhill_entry.workspace = true
 openvmm_hcl_resources.workspace = true

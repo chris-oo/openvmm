@@ -321,6 +321,8 @@ pub struct UnderhillEnvCfg {
     pub config_timeout_in_seconds: u64,
     /// The timeout in milliseconds for dump collection during a panic in servicing.
     pub servicing_timeout_dump_collection_in_ms: u64,
+    /// Use KVM instead of mshv_vtl for running the guest.
+    pub kvm: bool,
 }
 
 /// Bundle of config + runtime objects for hooking into the underhill remote
