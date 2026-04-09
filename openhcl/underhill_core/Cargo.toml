@@ -22,7 +22,7 @@ dev_snp_ohcl_tio_support = ["tee_call/dev_snp_ohcl_tio_support"]
 vpci = []
 
 # Enable KVM and nested virtualization support.
-virt_kvm = []
+virt_kvm = ["dep:virt_kvm"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 vmotherboard = { workspace = true, features = [
@@ -104,6 +104,7 @@ openhcl_attestation_protocol.workspace = true
 bootloader_fdt_parser.workspace = true
 vga_proxy.workspace = true
 video_core.workspace = true
+virt_kvm = { workspace = true, optional = true }
 virt_mshv_vtl.workspace = true
 vm_manifest_builder.workspace = true
 vmbus_async.workspace = true

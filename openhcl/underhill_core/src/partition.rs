@@ -138,3 +138,70 @@ impl OpenhclPartition for virt_mshv_vtl::UhPartition {
         virt::Aarch64Partition::control_gic(self, vtl)
     }
 }
+
+/// KVM nested virtualization backend.
+///
+/// This is not a shipping configuration. The KVM backend is intended for
+/// development and testing of OpenHCL on Linux without Hyper-V dependencies.
+/// Many OpenHCL-specific features (VSM, PM timer assist, host IO fast path)
+/// are stubbed out since they don't apply to the KVM environment.
+#[cfg(feature = "virt_kvm")]
+impl OpenhclPartition for virt_kvm::KvmPartition {
+    fn reference_time(&self) -> u64 {
+        virt::Hv1::reference_time_source(self).map_or(0, |s| s.now().ref_time)
+    }
+
+    fn vtl0_guest_os_id(&self) -> anyhow::Result<hvdef::hypercall::HvGuestOsId> {
+        // No guest OS ID concept in KVM.
+        Ok(hvdef::hypercall::HvGuestOsId::new())
+    }
+
+    fn register_host_io_port_fast_path(&self, _range: RangeInclusive<u16>) -> Box<dyn Send> {
+        // No fast-path optimization available in KVM.
+        Box::new(())
+    }
+
+    fn revoke_guest_vsm(&self) -> anyhow::Result<()> {
+        // No VSM in KVM mode.
+        Ok(())
+    }
+
+    fn request_msi(&self, vtl: Vtl, request: MsiRequest) {
+        virt::Partition::request_msi(self, vtl, request)
+    }
+
+    fn caps(&self) -> &PartitionCapabilities {
+        virt::Partition::caps(self)
+    }
+
+    fn set_pm_timer_assist(&self, _port: Option<u16>) -> anyhow::Result<()> {
+        // Not available in KVM.
+        Ok(())
+    }
+
+    fn assert_debug_interrupt(&self, _vtl: u8) {
+        // TODO: forward to KVM debug interrupt injection
+    }
+
+    fn into_synic(self: Arc<Self>) -> Arc<dyn Synic> {
+        self
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    fn into_lint_target(
+        self: Arc<Self>,
+        vtl: Vtl,
+    ) -> Arc<dyn vmcore::line_interrupt::LineSetTarget> {
+        Arc::new(vmm_core::emuplat::apic::ApicLintLineTarget::new(self, vtl))
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    fn ioapic_routing(&self) -> Arc<dyn virt::irqcon::IoApicRouting> {
+        virt::X86Partition::ioapic_routing(self)
+    }
+
+    #[cfg(guest_arch = "aarch64")]
+    fn control_gic(&self, vtl: Vtl) -> Arc<dyn virt::irqcon::ControlGic> {
+        virt::Aarch64Partition::control_gic(self, vtl)
+    }
+}

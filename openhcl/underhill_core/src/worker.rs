@@ -1661,7 +1661,7 @@ async fn new_underhill_vm(
 
     let hide_isolation = isolation.is_isolated() && env_cfg.hide_isolation;
 
-    let mut with_vmbus: bool = false;
+    let mut with_vmbus: bool = env_cfg.kvm;
     let mut with_vmbus_relay = false;
     if dps.general.vmbus_redirection_enabled {
         with_vmbus = true;
@@ -1855,26 +1855,36 @@ async fn new_underhill_vm(
         "vtom must be present if and only if hardware isolation is enabled"
     );
 
-    // Construct the underhill partition instance. This contains much of the configuration of the guest deposited by
-    // the host, along with additional device configuration and transports.
-    let params = UhPartitionNewParams {
-        lower_vtl_memory_layout: &mem_layout,
-        isolation,
-        topology: &processor_topology,
-        cvm_cpuid_info: runtime_params.cvm_cpuid_info(),
-        snp_secrets: runtime_params.snp_secrets(),
-        vtom,
-        handle_synic: with_vmbus,
-        no_sidecar_hotplug: env_cfg.no_sidecar_hotplug,
-        use_mmio_hypercalls,
-        intercept_debug_exceptions: env_cfg.gdbstub,
-        hide_isolation,
-        disable_proxy_redirect: env_cfg.disable_proxy_redirect,
-        disable_lower_vtl_timer_virt: env_cfg.disable_lower_vtl_timer_virt,
-    };
+    // Construct the underhill partition instance. This contains much of the
+    // configuration of the guest deposited by the host, along with additional
+    // device configuration and transports.
+    //
+    // In the KVM path, we skip the mshv_vtl-specific partition construction
+    // and instead create the partition later using virt_kvm.
+    let proto_partition = if env_cfg.kvm {
+        None
+    } else {
+        let params = UhPartitionNewParams {
+            lower_vtl_memory_layout: &mem_layout,
+            isolation,
+            topology: &processor_topology,
+            cvm_cpuid_info: runtime_params.cvm_cpuid_info(),
+            snp_secrets: runtime_params.snp_secrets(),
+            vtom,
+            handle_synic: with_vmbus,
+            no_sidecar_hotplug: env_cfg.no_sidecar_hotplug,
+            use_mmio_hypercalls,
+            intercept_debug_exceptions: env_cfg.gdbstub,
+            hide_isolation,
+            disable_proxy_redirect: env_cfg.disable_proxy_redirect,
+            disable_lower_vtl_timer_virt: env_cfg.disable_lower_vtl_timer_virt,
+        };
 
-    let proto_partition = UhProtoPartition::new(params, |cpu| tp.driver(cpu).clone())
-        .context("failed to create prototype partition")?;
+        Some(
+            UhProtoPartition::new(params, |cpu| tp.driver(cpu).clone())
+                .context("failed to create prototype partition")?,
+        )
+    };
 
     let gm = underhill_mem::init(&underhill_mem::Init {
         processor_topology: &processor_topology,
@@ -1889,7 +1899,10 @@ async fn new_underhill_vm(
             accepted_regions: measured_vtl2_info.accepted_regions(),
         }),
         shared_pool: &shared_pool,
-        maximum_vtl: if proto_partition.guest_vsm_available() {
+        maximum_vtl: if proto_partition
+            .as_ref()
+            .is_some_and(|p| p.guest_vsm_available())
+        {
             Vtl::Vtl1
         } else {
             Vtl::Vtl0
@@ -1946,7 +1959,9 @@ async fn new_underhill_vm(
     guest_memory_access_self_test(
         &mem_layout,
         is_restoring,
-        proto_partition.create_partition_available(),
+        proto_partition
+            .as_ref()
+            .is_some_and(|p| p.create_partition_available()),
         highest_vtl_gm,
         &shared_pool,
         vtom,
@@ -2161,29 +2176,92 @@ async fn new_underhill_vm(
         None
     };
 
-    let late_params = virt_mshv_vtl::UhLateParams {
-        gm: [
-            gm.vtl0().clone(),
-            gm.vtl1().cloned().unwrap_or(GuestMemory::empty()),
-        ]
-        .into(),
-        vtl0_kernel_exec_gm: gm.vtl0_kernel_execute().clone(),
-        vtl0_user_exec_gm: gm.vtl0_user_execute().clone(),
-        #[cfg(guest_arch = "x86_64")]
-        cpuid,
-        crash_notification_send,
-        vmtime: &vmtime_source,
-        cvm_params,
-        vmbus_relay: with_vmbus_relay,
+    let (partition, vps): (
+        Arc<dyn OpenhclPartition>,
+        Vec<virt_mshv_vtl::UhProcessorBox>,
+    );
+
+    if let Some(proto_partition) = proto_partition {
+        // Standard mshv_vtl path.
+        let late_params = virt_mshv_vtl::UhLateParams {
+            gm: [
+                gm.vtl0().clone(),
+                gm.vtl1().cloned().unwrap_or(GuestMemory::empty()),
+            ]
+            .into(),
+            vtl0_kernel_exec_gm: gm.vtl0_kernel_execute().clone(),
+            vtl0_user_exec_gm: gm.vtl0_user_execute().clone(),
+            #[cfg(guest_arch = "x86_64")]
+            cpuid,
+            crash_notification_send,
+            vmtime: &vmtime_source,
+            cvm_params,
+            vmbus_relay: with_vmbus_relay,
+        };
+
+        let (uh_partition, uh_vps) = proto_partition
+            .build(late_params)
+            .instrument(tracing::info_span!("new_uh_partition", CVM_ALLOWED))
+            .await
+            .context("failed to create partition")?;
+
+        partition = Arc::new(uh_partition);
+        vps = uh_vps;
+    } else {
+        // KVM nested virtualization path.
+        #[cfg(not(feature = "virt_kvm"))]
+        anyhow::bail!("KVM support is not enabled (build with --features virt_kvm)");
+
+        #[cfg(feature = "virt_kvm")]
+        {
+            let mut dev_mem =
+                underhill_mem::DevMemMemory::new(&mem_layout).context("failed to open /dev/mem")?;
+
+            let mut kvm_hv = virt_kvm::Kvm;
+            let kvm_proto = virt::Hypervisor::new_partition(
+                &mut kvm_hv,
+                virt::ProtoPartitionConfig {
+                    processor_topology: &processor_topology,
+                    hv_config: Some(virt::HvConfig {
+                        offload_enlightenments: false,
+                        allow_device_assignment: false,
+                        vtl2: None,
+                    }),
+                    vmtime: &vmtime_source,
+                    user_mode_apic: false,
+                    isolation: virt::IsolationType::None,
+                },
+            )
+            .context("failed to create KVM prototype partition")?;
+
+            #[cfg(guest_arch = "x86_64")]
+            let kvm_cpuid = {
+                let extended_ioapic_rte = true;
+                vmm_core::cpuid::hyperv_cpuid_leaves(extended_ioapic_rte, false).collect::<Vec<_>>()
+            };
+
+            let (kvm_partition, _kvm_vps) = virt::ProtoPartition::build(
+                kvm_proto,
+                virt::PartitionConfig {
+                    mem_layout: &mem_layout,
+                    guest_memory: dev_mem.vtl0(),
+                    #[cfg(guest_arch = "x86_64")]
+                    cpuid: &kvm_cpuid,
+                    vtl0_alias_map: None,
+                },
+            )
+            .context("failed to build KVM partition")?;
+
+            dev_mem
+                .map_partition(&kvm_partition)
+                .context("failed to map memory into KVM partition")?;
+
+            partition = Arc::new(kvm_partition);
+            // TODO: spawn KVM VPs using _kvm_vps (requires making vp.rs
+            // generic over the processor type).
+            vps = Vec::new();
+        }
     };
-
-    let (partition, vps) = proto_partition
-        .build(late_params)
-        .instrument(tracing::info_span!("new_uh_partition", CVM_ALLOWED))
-        .await
-        .context("failed to create partition")?;
-
-    let partition: Arc<dyn OpenhclPartition> = Arc::new(partition);
 
     // By default, scale the max QD by the number of VPs to save memory
     // on smaller VMs, up to a QD of 256.

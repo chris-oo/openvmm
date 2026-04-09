@@ -8431,6 +8431,7 @@ dependencies = [
  "vga_proxy",
  "video_core",
  "virt",
+ "virt_kvm",
  "virt_mshv_vtl",
  "vm_loader",
  "vm_manifest_builder",
