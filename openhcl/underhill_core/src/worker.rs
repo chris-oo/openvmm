@@ -2180,6 +2180,8 @@ async fn new_underhill_vm(
         Arc<dyn OpenhclPartition>,
         Vec<virt_mshv_vtl::UhProcessorBox>,
     );
+    #[cfg(feature = "virt_kvm")]
+    let mut kvm_vps: Option<Vec<virt_kvm::KvmProcessorBinder>> = None;
 
     if let Some(proto_partition) = proto_partition {
         // Standard mshv_vtl path.
@@ -2240,7 +2242,7 @@ async fn new_underhill_vm(
                 vmm_core::cpuid::hyperv_cpuid_leaves(extended_ioapic_rte, false).collect::<Vec<_>>()
             };
 
-            let (kvm_partition, _kvm_vps) = virt::ProtoPartition::build(
+            let (kvm_partition, kvm_vps_vec) = virt::ProtoPartition::build(
                 kvm_proto,
                 virt::PartitionConfig {
                     mem_layout: &mem_layout,
@@ -2257,8 +2259,7 @@ async fn new_underhill_vm(
                 .context("failed to map memory into KVM partition")?;
 
             partition = Arc::new(kvm_partition);
-            // TODO: spawn KVM VPs using _kvm_vps (requires making vp.rs
-            // generic over the processor type).
+            kvm_vps = Some(kvm_vps_vec);
             vps = Vec::new();
         }
     };
@@ -3707,6 +3708,17 @@ async fn new_underhill_vm(
         .context("failed to validate restore for dma manager")?;
 
     // Start the VP tasks on the thread pool.
+    #[cfg(feature = "virt_kvm")]
+    if let Some(kvm_vps) = kvm_vps.take() {
+        crate::vp::spawn_kvm_vps(tp, kvm_vps, vp_runners, &chipset)
+            .await
+            .context("failed to spawn KVM vps")?;
+    } else {
+        crate::vp::spawn_vps(tp, vps, vp_runners, &chipset, isolation)
+            .await
+            .context("failed to spawn vps")?;
+    }
+    #[cfg(not(feature = "virt_kvm"))]
     crate::vp::spawn_vps(tp, vps, vp_runners, &chipset, isolation)
         .await
         .context("failed to spawn vps")?;

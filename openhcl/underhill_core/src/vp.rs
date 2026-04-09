@@ -340,3 +340,112 @@ async fn online_cpu(cpu: u32) {
         panic!("failed to online processor {cpu}: {err}");
     }
 }
+
+/// Spawn VPs for a KVM partition.
+///
+/// This is simpler than the mshv_vtl path: no sidecar, no hotplug, no
+/// isolation-specific backing types. Each VP is bound to a thread and run
+/// directly via the standard [`virt::BindProcessor`]/[`virt::Processor`]
+/// interface.
+#[cfg(feature = "virt_kvm")]
+pub(crate) async fn spawn_kvm_vps(
+    tp: &AffinitizedThreadpool,
+    vps: Vec<virt_kvm::KvmProcessorBinder>,
+    runners: Vec<vmm_core::partition_unit::VpRunner>,
+    chipset: &vmm_core::vmotherboard_adapter::ChipsetPlusSynic,
+) -> anyhow::Result<()> {
+    // Wrapper that adds ProtobufSaveRestore to a Processor via its state
+    // access methods. This is the same pattern as openvmm_core's WrappedVp.
+    struct VpWrapper<T>(T);
+
+    impl<T: virt::Processor> inspect::InspectMut for VpWrapper<T> {
+        fn inspect_mut(&mut self, req: inspect::Request<'_>) {
+            self.0.inspect_mut(req)
+        }
+    }
+
+    impl<T: virt::Processor> virt::Processor for VpWrapper<T> {
+        type StateAccess<'a>
+            = T::StateAccess<'a>
+        where
+            Self: 'a;
+
+        fn set_debug_state(
+            &mut self,
+            vtl: hvdef::Vtl,
+            state: Option<&virt::x86::DebugState>,
+        ) -> Result<(), <Self::StateAccess<'_> as virt::vp::AccessVpState>::Error> {
+            self.0.set_debug_state(vtl, state)
+        }
+
+        async fn run_vp(
+            &mut self,
+            stop: virt::StopVp<'_>,
+            dev: &impl virt::io::CpuIo,
+        ) -> Result<std::convert::Infallible, virt::VpHaltReason> {
+            self.0.run_vp(stop, dev).await
+        }
+
+        fn flush_async_requests(&mut self) {
+            self.0.flush_async_requests()
+        }
+
+        fn access_state(&mut self, vtl: hvdef::Vtl) -> Self::StateAccess<'_> {
+            self.0.access_state(vtl)
+        }
+    }
+
+    impl<T: virt::Processor> vmcore::save_restore::SaveRestore for VpWrapper<T> {
+        type SavedState = virt::vp::VpSavedState;
+
+        fn save(&mut self) -> Result<Self::SavedState, vmcore::save_restore::SaveError> {
+            use virt::vp::AccessVpState;
+            self.0.flush_async_requests();
+            self.0
+                .access_state(hvdef::Vtl::Vtl0)
+                .save_all()
+                .map_err(|err| vmcore::save_restore::SaveError::Other(err.into()))
+        }
+
+        fn restore(
+            &mut self,
+            state: Self::SavedState,
+        ) -> Result<(), vmcore::save_restore::RestoreError> {
+            use virt::vp::AccessVpState;
+            self.0
+                .access_state(hvdef::Vtl::Vtl0)
+                .restore_all(&state)
+                .map_err(|err| vmcore::save_restore::RestoreError::Other(err.into()))
+        }
+    }
+
+    let _: Vec<()> = try_join_all(vps.into_iter().zip(runners).enumerate().map(
+        |(cpu, (mut binder, mut runner))| {
+            let chipset = chipset.clone();
+            let tp = tp.clone();
+            let cpu = cpu as u32;
+            async move {
+                tp.driver(cpu)
+                    .clone()
+                    .spawn("kvm-vp-init", async move {
+                        let thread = underhill_threadpool::Thread::current().unwrap();
+                        thread.set_idle_task(async move |_control| {
+                            let processor = virt::BindProcessor::bind(&mut binder)
+                                .expect("failed to bind KVM VP");
+                            let mut wrapped = VpWrapper(processor);
+                            match runner.run(&mut wrapped, &chipset).await {
+                                Ok(()) => {}
+                                Err(_cancelled) => {
+                                    tracing::info!(cpu, "KVM VP cancelled");
+                                }
+                            }
+                        });
+                        Ok::<(), anyhow::Error>(())
+                    })
+                    .await
+            }
+        },
+    ))
+    .await?;
+    Ok(())
+}
