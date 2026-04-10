@@ -1886,30 +1886,65 @@ async fn new_underhill_vm(
         )
     };
 
-    let gm = underhill_mem::init(&underhill_mem::Init {
-        processor_topology: &processor_topology,
-        isolation,
-        vtl0_alias_map_bit,
-        vtom,
-        mem_layout: &mem_layout,
-        complete_memory_layout: &complete_memory_layout,
-        boot_init: boot_init.then_some(underhill_mem::BootInit {
-            tp,
-            vtl2_memory: runtime_params.vtl2_memory_map(),
-            accepted_regions: measured_vtl2_info.accepted_regions(),
-        }),
-        shared_pool: &shared_pool,
-        maximum_vtl: if proto_partition
-            .as_ref()
-            .is_some_and(|p| p.guest_vsm_available())
+    // Initialize guest memory.
+    //
+    // In the mshv_vtl path, this uses the mshv drivers to set up hardware-backed
+    // memory mappings. In the KVM path, memory is mapped via /dev/mem in the
+    // partition creation block instead, and the MemoryMappings object is not used.
+    #[cfg(feature = "virt_kvm")]
+    let mut kvm_dev_mem: Option<underhill_mem::DevMemMemory> = None;
+
+    if env_cfg.kvm {
+        #[cfg(feature = "virt_kvm")]
         {
-            Vtl::Vtl1
-        } else {
-            Vtl::Vtl0
-        },
-    })
-    .await
-    .context("failed to initialize memory")?;
+            kvm_dev_mem = Some(
+                underhill_mem::DevMemMemory::new(&mem_layout)
+                    .context("failed to open /dev/mem for KVM memory")?,
+            );
+        }
+    }
+
+    // For KVM mode, we skip mshv-specific memory init and use DevMemMemory.
+    // The `gm` object is still needed for the rest of the worker code, but
+    // we only initialize it for the mshv_vtl path.
+    let gm = if !env_cfg.kvm {
+        underhill_mem::init(&underhill_mem::Init {
+            processor_topology: &processor_topology,
+            isolation,
+            vtl0_alias_map_bit,
+            vtom,
+            mem_layout: &mem_layout,
+            complete_memory_layout: &complete_memory_layout,
+            boot_init: boot_init.then_some(underhill_mem::BootInit {
+                tp,
+                vtl2_memory: runtime_params.vtl2_memory_map(),
+                accepted_regions: measured_vtl2_info.accepted_regions(),
+            }),
+            shared_pool: &shared_pool,
+            maximum_vtl: if proto_partition
+                .as_ref()
+                .is_some_and(|p| p.guest_vsm_available())
+            {
+                Vtl::Vtl1
+            } else {
+                Vtl::Vtl0
+            },
+        })
+        .await
+        .context("failed to initialize memory")?
+    } else {
+        // TODO: The rest of the worker code uses MemoryMappings extensively.
+        // For now, the KVM path will diverge at the partition creation block
+        // and not use most of this code. A proper refactor should split the
+        // mshv_vtl and KVM paths more cleanly.
+        //
+        // We still need to satisfy the type system, so panic if we somehow
+        // reach mshv-specific code in KVM mode.
+        anyhow::bail!(
+            "KVM mode: mshv memory init skipped. \
+             The KVM partition creation path should handle memory setup."
+        )
+    };
 
     // Devices in hardware isolated VMs default to accessing only shared memory,
     // since that is what the guest expects--it will double buffer memory to be

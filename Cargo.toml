@@ -9,6 +9,7 @@ members = [
   "openvmm/openvmm",
   # openvmm_vhost
   "openvmm_vhost/openvmm_vhost",
+  "openvmm/openvmm_mcp",
   # repo tooling
   "flowey/flowey_hvlite",
   "xtask",
