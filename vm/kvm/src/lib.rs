@@ -1436,6 +1436,10 @@ impl<'a> VpRunner<'a> {
                     event_flags: unsafe { system_event.__bindgen_anon_1.flags },
                 }
             }
+            // KVM_EXIT_SYSTEM_EVENT on x86_64: the guest requested a
+            // system-level event such as reset or shutdown.
+            #[cfg(target_arch = "x86_64")]
+            KVM_EXIT_SYSTEM_EVENT => Exit::Shutdown,
             exit_reason => return Err(Error::UnknownExit(exit_reason)),
         };
         Ok(exit)

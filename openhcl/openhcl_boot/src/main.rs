@@ -264,12 +264,9 @@ fn build_kernel_command_line(
     // com1. This is overridden by any user customizations in the static or
     // dynamic command line, as this console argument provided by the bootloader
     // comes first.
-    let console = if partition_info.com3_serial_available && can_trust_host {
-        "ttyS2,115200"
-    } else {
-        "ttynull"
-    };
-    write!(cmdline, "console={console} ")?;
+    // Force COM3 console for debugging nested virt.
+    let console = "ttyS2,115200";
+    write!(cmdline, "console={console} earlyprintk=ttyS2,115200 ")?;
 
     if params.isolation_type != IsolationType::None {
         write!(
@@ -602,7 +599,8 @@ fn shim_main(shim_params_raw_offset: isize) -> ! {
 
     // Enable logging ASAP. This is fine even when isolated, as we don't have
     // any access to secrets in the boot shim.
-    boot_logger_runtime_init(p.isolation_type, partition_info.com3_serial_available);
+    // Force COM3 logging on for debugging nested virt boot.
+    boot_logger_runtime_init(p.isolation_type, true);
     log::info!("openhcl_boot: logging enabled");
 
     // Confidential debug will show up in boot_options only if included in the
