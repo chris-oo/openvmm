@@ -142,7 +142,8 @@ pub trait LoadedVmNetworkSettings: Inspect {
 pub(crate) struct LoadedVm {
     pub partition_unit: PartitionUnit,
     /// The various guest memory objects.
-    pub memory: underhill_mem::MemoryMappings,
+    /// `None` in KVM mode where DevMemMemory is used instead.
+    pub memory: Option<underhill_mem::MemoryMappings>,
     pub firmware_type: FirmwareType,
     pub isolation: IsolationType,
     // contain task handles which must be kept live

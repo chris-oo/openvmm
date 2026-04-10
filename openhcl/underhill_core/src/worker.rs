@@ -1905,46 +1905,117 @@ async fn new_underhill_vm(
     }
 
     // For KVM mode, we skip mshv-specific memory init and use DevMemMemory.
-    // The `gm` object is still needed for the rest of the worker code, but
-    // we only initialize it for the mshv_vtl path.
     let gm = if !env_cfg.kvm {
-        underhill_mem::init(&underhill_mem::Init {
-            processor_topology: &processor_topology,
-            isolation,
-            vtl0_alias_map_bit,
-            vtom,
-            mem_layout: &mem_layout,
-            complete_memory_layout: &complete_memory_layout,
-            boot_init: boot_init.then_some(underhill_mem::BootInit {
-                tp,
-                vtl2_memory: runtime_params.vtl2_memory_map(),
-                accepted_regions: measured_vtl2_info.accepted_regions(),
-            }),
-            shared_pool: &shared_pool,
-            maximum_vtl: if proto_partition
-                .as_ref()
-                .is_some_and(|p| p.guest_vsm_available())
-            {
-                Vtl::Vtl1
-            } else {
-                Vtl::Vtl0
-            },
-        })
-        .await
-        .context("failed to initialize memory")?
+        Some(
+            underhill_mem::init(&underhill_mem::Init {
+                processor_topology: &processor_topology,
+                isolation,
+                vtl0_alias_map_bit,
+                vtom,
+                mem_layout: &mem_layout,
+                complete_memory_layout: &complete_memory_layout,
+                boot_init: boot_init.then_some(underhill_mem::BootInit {
+                    tp,
+                    vtl2_memory: runtime_params.vtl2_memory_map(),
+                    accepted_regions: measured_vtl2_info.accepted_regions(),
+                }),
+                shared_pool: &shared_pool,
+                maximum_vtl: if proto_partition
+                    .as_ref()
+                    .is_some_and(|p| p.guest_vsm_available())
+                {
+                    Vtl::Vtl1
+                } else {
+                    Vtl::Vtl0
+                },
+            })
+            .await
+            .context("failed to initialize memory")?,
+        )
     } else {
-        // TODO: The rest of the worker code uses MemoryMappings extensively.
         // For now, the KVM path will diverge at the partition creation block
         // and not use most of this code. A proper refactor should split the
         // mshv_vtl and KVM paths more cleanly.
         //
         // We still need to satisfy the type system, so panic if we somehow
         // reach mshv-specific code in KVM mode.
-        anyhow::bail!(
-            "KVM mode: mshv memory init skipped. \
-             The KVM partition creation path should handle memory setup."
-        )
+        // === KVM early return path ===
+        #[cfg(not(feature = "virt_kvm"))]
+        anyhow::bail!("KVM support not enabled (build with --features virt_kvm)");
+
+        #[cfg(feature = "virt_kvm")]
+        {
+            let mut dev_mem = kvm_dev_mem.take().unwrap();
+            let mut kvm_hv = virt_kvm::Kvm;
+
+            let mut state_units = StateUnits::new();
+            let vmtime_keeper = VmTimeKeeper::new(tp.driver(0), VmTime::from_100ns(0));
+            let vmtime_source = vmtime_keeper.builder().build(tp.driver(0)).await.unwrap();
+            let _vmtime = state_units
+                .add("vmtime")
+                .spawn(tp, |recv| {
+                    let mut vmtime = vmtime_keeper;
+                    async move {
+                        run_vmtime(&mut vmtime, recv).await;
+                        vmtime
+                    }
+                })
+                .unwrap();
+
+            let kvm_proto = virt::Hypervisor::new_partition(
+                &mut kvm_hv,
+                virt::ProtoPartitionConfig {
+                    processor_topology: &processor_topology,
+                    hv_config: Some(virt::HvConfig {
+                        offload_enlightenments: false,
+                        allow_device_assignment: false,
+                        vtl2: None,
+                    }),
+                    vmtime: &vmtime_source,
+                    user_mode_apic: false,
+                    isolation: virt::IsolationType::None,
+                },
+            )
+            .context("failed to create KVM prototype partition")?;
+
+            #[cfg(guest_arch = "x86_64")]
+            let kvm_cpuid = {
+                let extended_ioapic_rte = true;
+                vmm_core::cpuid::hyperv_cpuid_leaves(extended_ioapic_rte, false).collect::<Vec<_>>()
+            };
+
+            let (kvm_partition, _kvm_vps) = virt::ProtoPartition::build(
+                kvm_proto,
+                virt::PartitionConfig {
+                    mem_layout: &mem_layout,
+                    guest_memory: dev_mem.vtl0(),
+                    #[cfg(guest_arch = "x86_64")]
+                    cpuid: &kvm_cpuid,
+                    vtl0_alias_map: None,
+                },
+            )
+            .context("failed to build KVM partition")?;
+
+            dev_mem
+                .map_partition(&kvm_partition)
+                .context("failed to map memory into KVM partition")?;
+
+            let _partition: Arc<dyn OpenhclPartition> = Arc::new(kvm_partition);
+
+            tracing::info!(CVM_ALLOWED, "KVM nested VM: partition created, starting...");
+
+            state_units.start().await;
+
+            // Block forever — VPs will be spawned on threadpool threads.
+            // TODO: wire up chipset, VP spawning, and firmware loading.
+            let (_send, recv) = mesh::oneshot::<()>();
+            let _ = recv.await;
+            unreachable!();
+        }
     };
+
+    // Unwrap gm since we're past the KVM early return.
+    let gm = gm.unwrap();
 
     // Devices in hardware isolated VMs default to accessing only shared memory,
     // since that is what the guest expects--it will double buffer memory to be
@@ -3782,7 +3853,7 @@ async fn new_underhill_vm(
     // Construct a LoadedVm struct directly, and call the common run loop.
     let loaded_vm = LoadedVm {
         partition_unit,
-        memory: gm,
+        memory: Some(gm),
         firmware_type,
         isolation,
         chipset_devices: devices,
