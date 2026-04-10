@@ -85,6 +85,41 @@ impl MemoryMappings {
     }
 }
 
+impl crate::AccessGuestMemory for MemoryMappings {
+    fn vtl0(&self) -> &GuestMemory {
+        self.vtl0()
+    }
+
+    fn vtl1(&self) -> Option<&GuestMemory> {
+        self.vtl1()
+    }
+
+    fn vtl0_kernel_execute(&self) -> &GuestMemory {
+        self.vtl0_kernel_execute()
+    }
+
+    fn vtl0_user_execute(&self) -> &GuestMemory {
+        self.vtl0_user_execute()
+    }
+
+    fn cvm_memory(&self) -> Option<&CvmMemory> {
+        self.cvm_memory()
+    }
+
+    fn isolated_memory_protector(&self) -> anyhow::Result<Option<Arc<dyn ProtectIsolatedMemory>>> {
+        Ok(self.cvm_memory.as_ref().map(|m| m.protector.clone()))
+    }
+
+    fn map_partition(
+        &mut self,
+        _partition: &dyn virt::PartitionMemoryMapper,
+    ) -> anyhow::Result<()> {
+        // UhPartition handles memory mapping internally via the mshv_vtl
+        // driver, so no additional mapping is needed here.
+        Ok(())
+    }
+}
+
 pub struct Init<'a> {
     pub processor_topology: &'a ProcessorTopology,
     pub isolation: IsolationType,

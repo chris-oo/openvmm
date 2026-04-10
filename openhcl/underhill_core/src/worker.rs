@@ -1891,22 +1891,10 @@ async fn new_underhill_vm(
     // In the mshv_vtl path, this uses the mshv drivers to set up hardware-backed
     // memory mappings. In the KVM path, memory is mapped via /dev/mem in the
     // partition creation block instead, and the MemoryMappings object is not used.
-    #[cfg(feature = "virt_kvm")]
-    let mut kvm_dev_mem: Option<underhill_mem::DevMemMemory> = None;
-
-    if env_cfg.kvm {
-        #[cfg(feature = "virt_kvm")]
-        {
-            kvm_dev_mem = Some(
-                underhill_mem::DevMemMemory::new(&mem_layout)
-                    .context("failed to open /dev/mem for KVM memory")?,
-            );
-        }
-    }
-
-    // For KVM mode, we skip mshv-specific memory init and use DevMemMemory.
-    let gm = if !env_cfg.kvm {
-        Some(
+    // Initialize guest memory. In the mshv_vtl path, this uses mshv drivers.
+    // In the KVM path, memory is mapped via /dev/mem.
+    let gm: Box<dyn underhill_mem::AccessGuestMemory> = if !env_cfg.kvm {
+        Box::new(
             underhill_mem::init(&underhill_mem::Init {
                 processor_topology: &processor_topology,
                 isolation,
@@ -1933,89 +1921,11 @@ async fn new_underhill_vm(
             .context("failed to initialize memory")?,
         )
     } else {
-        // For now, the KVM path will diverge at the partition creation block
-        // and not use most of this code. A proper refactor should split the
-        // mshv_vtl and KVM paths more cleanly.
-        //
-        // We still need to satisfy the type system, so panic if we somehow
-        // reach mshv-specific code in KVM mode.
-        // === KVM early return path ===
-        #[cfg(not(feature = "virt_kvm"))]
-        anyhow::bail!("KVM support not enabled (build with --features virt_kvm)");
-
-        #[cfg(feature = "virt_kvm")]
-        {
-            let mut dev_mem = kvm_dev_mem.take().unwrap();
-            let mut kvm_hv = virt_kvm::Kvm;
-
-            let mut state_units = StateUnits::new();
-            let vmtime_keeper = VmTimeKeeper::new(tp.driver(0), VmTime::from_100ns(0));
-            let vmtime_source = vmtime_keeper.builder().build(tp.driver(0)).await.unwrap();
-            let _vmtime = state_units
-                .add("vmtime")
-                .spawn(tp, |recv| {
-                    let mut vmtime = vmtime_keeper;
-                    async move {
-                        run_vmtime(&mut vmtime, recv).await;
-                        vmtime
-                    }
-                })
-                .unwrap();
-
-            let kvm_proto = virt::Hypervisor::new_partition(
-                &mut kvm_hv,
-                virt::ProtoPartitionConfig {
-                    processor_topology: &processor_topology,
-                    hv_config: Some(virt::HvConfig {
-                        offload_enlightenments: false,
-                        allow_device_assignment: false,
-                        vtl2: None,
-                    }),
-                    vmtime: &vmtime_source,
-                    user_mode_apic: false,
-                    isolation: virt::IsolationType::None,
-                },
-            )
-            .context("failed to create KVM prototype partition")?;
-
-            #[cfg(guest_arch = "x86_64")]
-            let kvm_cpuid = {
-                let extended_ioapic_rte = true;
-                vmm_core::cpuid::hyperv_cpuid_leaves(extended_ioapic_rte, false).collect::<Vec<_>>()
-            };
-
-            let (kvm_partition, _kvm_vps) = virt::ProtoPartition::build(
-                kvm_proto,
-                virt::PartitionConfig {
-                    mem_layout: &mem_layout,
-                    guest_memory: dev_mem.vtl0(),
-                    #[cfg(guest_arch = "x86_64")]
-                    cpuid: &kvm_cpuid,
-                    vtl0_alias_map: None,
-                },
-            )
-            .context("failed to build KVM partition")?;
-
-            dev_mem
-                .map_partition(&kvm_partition)
-                .context("failed to map memory into KVM partition")?;
-
-            let _partition: Arc<dyn OpenhclPartition> = Arc::new(kvm_partition);
-
-            tracing::info!(CVM_ALLOWED, "KVM nested VM: partition created, starting...");
-
-            state_units.start().await;
-
-            // Block forever — VPs will be spawned on threadpool threads.
-            // TODO: wire up chipset, VP spawning, and firmware loading.
-            let (_send, recv) = mesh::oneshot::<()>();
-            let _ = recv.await;
-            unreachable!();
-        }
+        Box::new(
+            underhill_mem::DevMemMemory::new(&mem_layout)
+                .context("failed to open /dev/mem for KVM memory")?,
+        )
     };
-
-    // Unwrap gm since we're past the KVM early return.
-    let gm = gm.unwrap();
 
     // Devices in hardware isolated VMs default to accessing only shared memory,
     // since that is what the guest expects--it will double buffer memory to be
@@ -2047,8 +1957,16 @@ async fn new_underhill_vm(
             .map(|bit| 1 << bit)
             .unwrap_or(0),
         isolation,
+        !env_cfg.kvm, // KVM mode doesn't need lower VTL DMA protection
     )
     .context("failed to create global dma manager")?;
+
+    // In KVM mode, there's no VTL separation, so all DMA uses Any policy.
+    let vtl0_dma_policy = if env_cfg.kvm {
+        LowerVtlPermissionPolicy::Any
+    } else {
+        LowerVtlPermissionPolicy::Vtl0
+    };
 
     if let Some(dma_manager_state) = servicing_state.dma_manager_state.flatten() {
         use vmcore::save_restore::SaveRestore;
@@ -2079,7 +1997,7 @@ async fn new_underhill_vm(
         dma_manager
             .new_client(DmaClientParameters {
                 device_name: "get".into(),
-                lower_vtl_policy: LowerVtlPermissionPolicy::Vtl0,
+                lower_vtl_policy: vtl0_dma_policy,
                 allocation_visibility: if isolation.is_isolated() {
                     AllocationVisibility::Shared
                 } else {
@@ -3445,7 +3363,7 @@ async fn new_underhill_vm(
                     vmbus.control().clone(),
                     dma_manager.new_client(DmaClientParameters {
                         device_name: "vpci-relay".into(),
-                        lower_vtl_policy: LowerVtlPermissionPolicy::Vtl0,
+                        lower_vtl_policy: vtl0_dma_policy,
                         allocation_visibility: if hardware_isolated {
                             AllocationVisibility::Shared
                         } else {
@@ -3722,7 +3640,7 @@ async fn new_underhill_vm(
             dma_manager
                 .new_client(DmaClientParameters {
                     device_name: "shutdown-relay".into(),
-                    lower_vtl_policy: LowerVtlPermissionPolicy::Vtl0,
+                    lower_vtl_policy: vtl0_dma_policy,
                     allocation_visibility: AllocationVisibility::Private,
                     persistent_allocations: false,
                 })
@@ -3853,7 +3771,7 @@ async fn new_underhill_vm(
     // Construct a LoadedVm struct directly, and call the common run loop.
     let loaded_vm = LoadedVm {
         partition_unit,
-        memory: Some(gm),
+        memory: gm,
         firmware_type,
         isolation,
         chipset_devices: devices,

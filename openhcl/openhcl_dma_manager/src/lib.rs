@@ -122,7 +122,7 @@ pub struct OpenhclDmaManager {
 }
 
 /// The required VTL permissions on DMA allocations.
-#[derive(Inspect)]
+#[derive(Clone, Copy, Inspect)]
 pub enum LowerVtlPermissionPolicy {
     /// No specific permission constraints are required.
     Any,
@@ -323,16 +323,18 @@ impl OpenhclDmaManager {
         private_ranges: &[MemoryRange],
         vtom: u64,
         isolation_type: virt::IsolationType,
+        lower_vtl_dma_protection: bool,
     ) -> anyhow::Result<Self> {
         tracing::info!(
             ?shared_ranges,
             ?private_ranges,
             vtom,
             ?isolation_type,
+            lower_vtl_dma_protection,
             "create dma manager"
         );
 
-        let shared_pool = if shared_ranges.is_empty() {
+        let shared_pool = if shared_ranges.is_empty() || !lower_vtl_dma_protection {
             None
         } else {
             Some(
@@ -344,7 +346,7 @@ impl OpenhclDmaManager {
             )
         };
 
-        let private_pool = if private_ranges.is_empty() {
+        let private_pool = if private_ranges.is_empty() || !lower_vtl_dma_protection {
             None
         } else {
             Some(
@@ -360,7 +362,7 @@ impl OpenhclDmaManager {
             inner: Arc::new(DmaManagerInner {
                 shared_spawner: shared_pool.as_ref().map(|pool| pool.allocator_spawner()),
                 private_spawner: private_pool.as_ref().map(|pool| pool.allocator_spawner()),
-                lower_vtl: if isolation_type.is_hardware_isolated() {
+                lower_vtl: if !lower_vtl_dma_protection || isolation_type.is_hardware_isolated() {
                     None
                 } else {
                     Some(DmaManagerLowerVtl::new().context("failed to create lower vtl")?)

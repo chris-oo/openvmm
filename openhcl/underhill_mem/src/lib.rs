@@ -12,9 +12,37 @@ mod registrar;
 
 pub use devmem::DevMemMemory;
 pub use init::BootInit;
+pub use init::CvmMemory;
 pub use init::Init;
 pub use init::MemoryMappings;
 pub use init::init;
+
+use guestmem::GuestMemory;
+use inspect::Inspect;
+
+/// Trait for accessing guest memory from different backends.
+///
+/// This abstracts over [`MemoryMappings`] (mshv_vtl driver) and
+/// [`DevMemMemory`] (`/dev/mem` for KVM nested virtualization),
+/// allowing the worker code to use either backend.
+pub trait AccessGuestMemory: Send + Sync + Inspect {
+    /// Access to guest VTL0 memory.
+    fn vtl0(&self) -> &GuestMemory;
+    /// Optional access to guest VTL1 memory.
+    fn vtl1(&self) -> Option<&GuestMemory>;
+    /// VTL0 memory with kernel execute permissions.
+    /// Falls back to `vtl0()` when not available.
+    fn vtl0_kernel_execute(&self) -> &GuestMemory;
+    /// VTL0 memory with user execute permissions.
+    /// Falls back to `vtl0()` when not available.
+    fn vtl0_user_execute(&self) -> &GuestMemory;
+    /// Access to CVM-specific memory (if confidential VM).
+    fn cvm_memory(&self) -> Option<&CvmMemory>;
+    /// The memory protector for use with the partition.
+    fn isolated_memory_protector(&self) -> anyhow::Result<Option<Arc<dyn ProtectIsolatedMemory>>>;
+    /// Map the memory into the specified partition.
+    fn map_partition(&mut self, partition: &dyn virt::PartitionMemoryMapper) -> anyhow::Result<()>;
+}
 
 use cvm_tracing::CVM_ALLOWED;
 use guestmem::GuestMemoryBackingError;

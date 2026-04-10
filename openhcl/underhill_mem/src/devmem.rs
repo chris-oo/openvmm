@@ -96,6 +96,38 @@ impl DevMemMemory {
     }
 }
 
+impl crate::AccessGuestMemory for DevMemMemory {
+    fn vtl0(&self) -> &GuestMemory {
+        &self.mem
+    }
+
+    fn vtl1(&self) -> Option<&GuestMemory> {
+        None
+    }
+
+    fn vtl0_kernel_execute(&self) -> &GuestMemory {
+        &self.mem
+    }
+
+    fn vtl0_user_execute(&self) -> &GuestMemory {
+        &self.mem
+    }
+
+    fn cvm_memory(&self) -> Option<&crate::CvmMemory> {
+        None
+    }
+
+    fn isolated_memory_protector(
+        &self,
+    ) -> anyhow::Result<Option<Arc<dyn virt_mshv_vtl::ProtectIsolatedMemory>>> {
+        Ok(None)
+    }
+
+    fn map_partition(&mut self, partition: &dyn virt::PartitionMemoryMapper) -> anyhow::Result<()> {
+        self.map_partition(partition)
+    }
+}
+
 impl Drop for DevMemMemory {
     fn drop(&mut self) {
         let Some(partition) = self.partition.take().and_then(|p| p.upgrade()) else {
