@@ -5495,6 +5495,7 @@ name = "openvmm_mcp"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "diag_client",
  "futures",
  "futures-concurrency",
  "inspect",

@@ -1,0 +1,27 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "openvmm_mcp"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+openvmm_defs.workspace = true
+vmm_core_defs.workspace = true
+diag_client.workspace = true
+mesh.workspace = true
+mesh_worker.workspace = true
+inspect = { workspace = true, features = ["initiate", "std"] }
+
+anyhow.workspace = true
+futures.workspace = true
+futures-concurrency.workspace = true
+parking_lot.workspace = true
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, features = ["std"] }
+tracing.workspace = true
+unicycle.workspace = true
+
+[lints]
+workspace = true

@@ -2177,6 +2177,7 @@ async fn run_control(driver: &DefaultDriver, mesh: VmmMesh, opt: Options) -> any
         vm_rpc.call(VmRpc::Resume, ()).await?;
     }
 
+    // Create paravisor diag client before MCP so it can use it.
     let paravisor_diag = Arc::new(diag_client::DiagClient::from_dialer(
         driver.clone(),
         DiagDialer {
@@ -2189,6 +2190,23 @@ async fn run_control(driver: &DefaultDriver, mesh: VmmMesh, opt: Options) -> any
             },
         },
     ));
+
+    // MCP mode: run the MCP server instead of the interactive console.
+    if opt.mcp {
+        let serial_buffer = resources
+            .mcp_serial_buffer
+            .clone()
+            .unwrap_or_else(|| Arc::new(openvmm_mcp::serial_buffer::SerialRingBuffer::new()));
+        let console_in = resources.mcp_console_in.take();
+        let vm_handle = openvmm_mcp::VmHandle::new(
+            vm_rpc.clone(),
+            vm_worker,
+            serial_buffer,
+            console_in,
+            Some(paravisor_diag.clone()),
+        );
+        return openvmm_mcp::run_mcp_server(vm_handle, notify_recv).await;
+    }
 
     let diag_inspector = DiagInspector::new(driver.clone(), paravisor_diag.clone());
 
