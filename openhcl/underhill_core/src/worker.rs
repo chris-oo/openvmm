@@ -1893,7 +1893,7 @@ async fn new_underhill_vm(
     // partition creation block instead, and the MemoryMappings object is not used.
     // Initialize guest memory. In the mshv_vtl path, this uses mshv drivers.
     // In the KVM path, memory is mapped via /dev/mem.
-    let gm: Box<dyn underhill_mem::AccessGuestMemory> = if !env_cfg.kvm {
+    let mut gm: Box<dyn underhill_mem::AccessGuestMemory> = if !env_cfg.kvm {
         Box::new(
             underhill_mem::init(&underhill_mem::Init {
                 processor_topology: &processor_topology,
@@ -1940,9 +1940,9 @@ async fn new_underhill_vm(
     // shared/private state, so we have no choice but to allow devices to access
     // both.
     let device_memory = if hide_isolation || !isolation.is_hardware_isolated() {
-        gm.vtl0()
+        gm.vtl0().clone()
     } else {
-        &gm.cvm_memory().unwrap().shared_gm
+        gm.cvm_memory().unwrap().shared_gm.clone()
     };
 
     let mut dma_manager = OpenhclDmaManager::new(
@@ -2240,9 +2240,6 @@ async fn new_underhill_vm(
 
         #[cfg(feature = "virt_kvm")]
         {
-            let mut dev_mem =
-                underhill_mem::DevMemMemory::new(&mem_layout).context("failed to open /dev/mem")?;
-
             let mut kvm_hv = virt_kvm::Kvm;
             let kvm_proto = virt::Hypervisor::new_partition(
                 &mut kvm_hv,
@@ -2266,11 +2263,13 @@ async fn new_underhill_vm(
                 vmm_core::cpuid::hyperv_cpuid_leaves(extended_ioapic_rte, false).collect::<Vec<_>>()
             };
 
+            let kvm_guest_memory = gm.vtl0().clone();
+
             let (kvm_partition, kvm_vps_vec) = virt::ProtoPartition::build(
                 kvm_proto,
                 virt::PartitionConfig {
                     mem_layout: &mem_layout,
-                    guest_memory: dev_mem.vtl0(),
+                    guest_memory: &kvm_guest_memory,
                     #[cfg(guest_arch = "x86_64")]
                     cpuid: &kvm_cpuid,
                     vtl0_alias_map: None,
@@ -2278,8 +2277,8 @@ async fn new_underhill_vm(
             )
             .context("failed to build KVM partition")?;
 
-            dev_mem
-                .map_partition(&kvm_partition)
+            // Map the guest memory (from gm) into the KVM partition.
+            gm.map_partition(&kvm_partition)
                 .context("failed to map memory into KVM partition")?;
 
             partition = Arc::new(kvm_partition);
@@ -3731,23 +3730,8 @@ async fn new_underhill_vm(
         .validate_restore()
         .context("failed to validate restore for dma manager")?;
 
-    // Start the VP tasks on the thread pool.
-    #[cfg(feature = "virt_kvm")]
-    if let Some(kvm_vps) = kvm_vps.take() {
-        crate::vp::spawn_kvm_vps(tp, kvm_vps, vp_runners, &chipset)
-            .await
-            .context("failed to spawn KVM vps")?;
-    } else {
-        crate::vp::spawn_vps(tp, vps, vp_runners, &chipset, isolation)
-            .await
-            .context("failed to spawn vps")?;
-    }
-    #[cfg(not(feature = "virt_kvm"))]
-    crate::vp::spawn_vps(tp, vps, vp_runners, &chipset, isolation)
-        .await
-        .context("failed to spawn vps")?;
-
-    // Load the firmware.
+    // Load the firmware BEFORE spawning KVM VPs, since KVM VPs start
+    // executing immediately on their dedicated threads.
     if let Some(vtl0_info) = measured_vtl0_info {
         load_firmware(
             gm.vtl0(),
@@ -3767,6 +3751,28 @@ async fn new_underhill_vm(
         .instrument(tracing::info_span!("load_firmware", CVM_ALLOWED))
         .await?;
     }
+
+    // Start the VP tasks on the thread pool.
+    #[cfg(feature = "virt_kvm")]
+    if let Some(kvm_vps) = kvm_vps.take() {
+        tracing::info!(
+            CVM_ALLOWED,
+            vp_count = kvm_vps.len(),
+            "spawning KVM VPs"
+        );
+        crate::vp::spawn_kvm_vps(tp, kvm_vps, vp_runners, &chipset)
+            .await
+            .context("failed to spawn KVM vps")?;
+        tracing::info!(CVM_ALLOWED, "KVM VPs spawned successfully");
+    } else {
+        crate::vp::spawn_vps(tp, vps, vp_runners, &chipset, isolation)
+            .await
+            .context("failed to spawn vps")?;
+    }
+    #[cfg(not(feature = "virt_kvm"))]
+    crate::vp::spawn_vps(tp, vps, vp_runners, &chipset, isolation)
+        .await
+        .context("failed to spawn vps")?;
 
     // Construct a LoadedVm struct directly, and call the common run loop.
     let loaded_vm = LoadedVm {

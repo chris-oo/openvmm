@@ -419,30 +419,38 @@ pub(crate) async fn spawn_kvm_vps(
         }
     }
 
+    // virt_kvm VPs block in the KVM run loop, so they need dedicated threads
+    // rather than the underhill threadpool (which is designed for mshv_vtl VPs).
+    // This matches the pattern from the original PR #281.
     let _: Vec<()> = try_join_all(vps.into_iter().zip(runners).enumerate().map(
-        |(cpu, (mut binder, mut runner))| {
+        |(vp_index, (mut binder, mut runner))| {
             let chipset = chipset.clone();
-            let tp = tp.clone();
-            let cpu = cpu as u32;
-            async move {
-                tp.driver(cpu)
-                    .clone()
-                    .spawn("kvm-vp-init", async move {
-                        let thread = underhill_threadpool::Thread::current().unwrap();
-                        thread.set_idle_task(async move |_control| {
-                            let processor = virt::BindProcessor::bind(&mut binder)
-                                .expect("failed to bind KVM VP");
-                            let mut wrapped = VpWrapper(processor);
-                            match runner.run(&mut wrapped, &chipset).await {
-                                Ok(()) => {}
-                                Err(_cancelled) => {
-                                    tracing::info!(cpu, "KVM VP cancelled");
-                                }
+            let (send, recv) = mesh::oneshot();
+            std::thread::Builder::new()
+                .name(format!("kvm-vp-{}", vp_index))
+                .spawn(move || match virt::BindProcessor::bind(&mut binder) {
+                    Ok(vp) => {
+                        send.send(Ok(()));
+                        let mut wrapped = VpWrapper(vp);
+                        // Block this thread running the VP until it halts.
+                        pal_async::local::block_with_io(|driver| {
+                            let mut runner = runner;
+                            let chipset = chipset;
+                            async move {
+                                while runner.run(&mut wrapped, &chipset).await.is_err() {}
                             }
                         });
-                        Ok::<(), anyhow::Error>(())
-                    })
-                    .await
+                    }
+                    Err(err) => {
+                        send.send(Err(err));
+                    }
+                })
+                .unwrap();
+
+            async move {
+                recv.await
+                    .unwrap()
+                    .with_context(|| format!("failed to bind KVM VP {vp_index}"))
             }
         },
     ))
