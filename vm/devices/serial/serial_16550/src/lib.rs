@@ -71,6 +71,8 @@ pub struct Serial16550 {
     #[inspect(skip)]
     tx_waker: Option<Waker>,
     stats: SerialStats,
+    /// Captures all transmitted bytes for debugging (inspect via vm/serial-comN/tx_log).
+    tx_log: String,
 }
 
 #[derive(Inspect, Default)]
@@ -167,6 +169,7 @@ impl Serial16550 {
             rx_waker: None,
             tx_waker: None,
             stats: Default::default(),
+            tx_log: String::new(),
         };
         if this.io.is_connected() {
             this.state.connect();
@@ -332,7 +335,13 @@ impl Serial16550 {
         let data = data[0];
         let dlab = self.state.lcr.dlab();
         match register {
-            Register::THR if !dlab => self.state.write_thr(&mut self.stats, data),
+            Register::THR if !dlab => {
+                self.state.write_thr(&mut self.stats, data);
+                // Capture for debug inspect.
+                if data.is_ascii() || data == b'\n' || data == b'\r' {
+                    self.tx_log.push(data as char);
+                }
+            }
             Register::DLL if dlab => self.state.dll = data,
             Register::IER if !dlab => self.state.write_ier(data),
             Register::DLM if dlab => self.state.dlm = data,
