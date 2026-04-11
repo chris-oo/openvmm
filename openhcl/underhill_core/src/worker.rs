@@ -3760,7 +3760,7 @@ async fn new_underhill_vm(
             vp_count = kvm_vps.len(),
             "spawning KVM VPs"
         );
-        crate::vp::spawn_kvm_vps(tp, kvm_vps, vp_runners, &chipset)
+        crate::vp::spawn_kvm_vps(tp, kvm_vps, vp_runners, &chipset, partition.clone())
             .await
             .context("failed to spawn KVM vps")?;
         tracing::info!(CVM_ALLOWED, "KVM VPs spawned successfully");

@@ -79,6 +79,9 @@ pub trait OpenhclPartition: Send + Sync + Inspect {
     /// Returns the interface for GIC control.
     #[cfg(guest_arch = "aarch64")]
     fn control_gic(&self, vtl: Vtl) -> Arc<dyn virt::irqcon::ControlGic>;
+
+    /// Gets an interface for yielding VPs.
+    fn into_request_yield(self: Arc<Self>) -> Arc<dyn vmm_core::partition_unit::RequestYield>;
 }
 
 impl OpenhclPartition for virt_mshv_vtl::UhPartition {
@@ -136,6 +139,10 @@ impl OpenhclPartition for virt_mshv_vtl::UhPartition {
     #[cfg(guest_arch = "aarch64")]
     fn control_gic(&self, vtl: Vtl) -> Arc<dyn virt::irqcon::ControlGic> {
         virt::Aarch64Partition::control_gic(self, vtl)
+    }
+
+    fn into_request_yield(self: Arc<Self>) -> Arc<dyn vmm_core::partition_unit::RequestYield> {
+        self
     }
 }
 
@@ -203,5 +210,9 @@ impl OpenhclPartition for virt_kvm::KvmPartition {
     #[cfg(guest_arch = "aarch64")]
     fn control_gic(&self, vtl: Vtl) -> Arc<dyn virt::irqcon::ControlGic> {
         virt::Aarch64Partition::control_gic(self, vtl)
+    }
+
+    fn into_request_yield(self: Arc<Self>) -> Arc<dyn vmm_core::partition_unit::RequestYield> {
+        self
     }
 }

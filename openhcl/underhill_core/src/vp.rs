@@ -9,8 +9,12 @@ use futures::future::try_join_all;
 use pal_async::task::Spawn;
 use pal_async::task::SpawnLocal;
 use pal_uring::IdleControl;
+#[cfg(feature = "virt_kvm")]
+use std::sync::Arc;
 use std::sync::LazyLock;
 use underhill_threadpool::AffinitizedThreadpool;
+#[cfg(feature = "virt_kvm")]
+use virt::VpIndex;
 
 pub(crate) async fn spawn_vps(
     tp: &AffinitizedThreadpool,
@@ -349,10 +353,11 @@ async fn online_cpu(cpu: u32) {
 /// interface.
 #[cfg(feature = "virt_kvm")]
 pub(crate) async fn spawn_kvm_vps(
-    tp: &AffinitizedThreadpool,
+    _tp: &AffinitizedThreadpool,
     vps: Vec<virt_kvm::KvmProcessorBinder>,
     runners: Vec<vmm_core::partition_unit::VpRunner>,
     chipset: &vmm_core::vmotherboard_adapter::ChipsetPlusSynic,
+    partition: Arc<dyn crate::partition::OpenhclPartition>,
 ) -> anyhow::Result<()> {
     // Wrapper that adds ProtobufSaveRestore to a Processor via its state
     // access methods. This is the same pattern as openvmm_core's WrappedVp.
@@ -419,12 +424,13 @@ pub(crate) async fn spawn_kvm_vps(
         }
     }
 
-    // virt_kvm VPs block in the KVM run loop, so they need dedicated threads
-    // rather than the underhill threadpool (which is designed for mshv_vtl VPs).
-    // This matches the pattern from the original PR #281.
+    // virt_kvm VPs block in the KVM run loop, so they need dedicated threads.
+    // Use block_on_vp which integrates with the partition's request_yield
+    // mechanism, allowing the VP to be interrupted for state changes.
     let _: Vec<()> = try_join_all(vps.into_iter().zip(runners).enumerate().map(
         |(vp_index, (mut binder, mut runner))| {
             let chipset = chipset.clone();
+            let partition = partition.clone().into_request_yield();
             let (send, recv) = mesh::oneshot();
             std::thread::Builder::new()
                 .name(format!("kvm-vp-{}", vp_index))
@@ -432,14 +438,13 @@ pub(crate) async fn spawn_kvm_vps(
                     Ok(vp) => {
                         send.send(Ok(()));
                         let mut wrapped = VpWrapper(vp);
-                        // Block this thread running the VP until it halts.
-                        pal_async::local::block_with_io(|driver| {
-                            let mut runner = runner;
-                            let chipset = chipset;
-                            async move {
+                        vmm_core::partition_unit::block_on_vp(
+                            partition,
+                            VpIndex::new(vp_index as u32),
+                            async {
                                 while runner.run(&mut wrapped, &chipset).await.is_err() {}
-                            }
-                        });
+                            },
+                        );
                     }
                     Err(err) => {
                         send.send(Err(err));
