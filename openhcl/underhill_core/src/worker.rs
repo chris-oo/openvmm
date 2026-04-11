@@ -1979,18 +1979,22 @@ async fn new_underhill_vm(
     let highest_vtl_gm = gm.vtl1().unwrap_or(gm.vtl0());
 
     // Perform a quick validation to make sure each range is appropriately
-    // accessible.
-    guest_memory_access_self_test(
-        &mem_layout,
-        is_restoring,
-        proto_partition
-            .as_ref()
-            .is_some_and(|p| p.create_partition_available()),
-        highest_vtl_gm,
-        &shared_pool,
-        vtom,
-    )
-    .context("guest memory access self test failed")?;
+    // accessible. Skip in KVM mode since DevMemMemory maps different ranges
+    // than what mem_layout describes (mem_layout is the VTL0 guest layout,
+    // not OpenHCL's own memory).
+    if !env_cfg.kvm {
+        guest_memory_access_self_test(
+            &mem_layout,
+            is_restoring,
+            proto_partition
+                .as_ref()
+                .is_some_and(|p| p.create_partition_available()),
+            highest_vtl_gm,
+            &shared_pool,
+            vtom,
+        )
+        .context("guest memory access self test failed")?;
+    }
 
     // Set the gpa allocator to GET that is required by the attestation message.
     get_client.set_gpa_allocator(
@@ -3730,29 +3734,11 @@ async fn new_underhill_vm(
         .validate_restore()
         .context("failed to validate restore for dma manager")?;
 
-    // Load the firmware BEFORE spawning KVM VPs, since KVM VPs start
-    // executing immediately on their dedicated threads.
-    if let Some(vtl0_info) = measured_vtl0_info {
-        load_firmware(
-            gm.vtl0(),
-            &mem_layout,
-            &processor_topology,
-            &vtl0_memory_map,
-            capabilities,
-            &mut partition_unit,
-            partition.as_ref(),
-            env_cfg.cmdline_append.as_deref(),
-            vtl0_info,
-            &runtime_params,
-            load_kind,
-            &dps,
-            isolation.is_isolated(),
-        )
-        .instrument(tracing::info_span!("load_firmware", CVM_ALLOWED))
-        .await?;
-    }
-
-    // Start the VP tasks on the thread pool.
+    // Start the VP tasks. VP runners must be started BEFORE load_firmware
+    // because load_firmware sends set_initial_regs events to the VP runners
+    // via mesh channels, and the runners must be actively polling to receive them.
+    // The VP runners wait for a Start event before actually running the VP,
+    // so they won't execute guest code until state_units.start() later.
     #[cfg(feature = "virt_kvm")]
     if let Some(kvm_vps) = kvm_vps.take() {
         tracing::info!(
@@ -3773,6 +3759,28 @@ async fn new_underhill_vm(
     crate::vp::spawn_vps(tp, vps, vp_runners, &chipset, isolation)
         .await
         .context("failed to spawn vps")?;
+
+    // Load the firmware. This sends set_initial_regs to the VP runners
+    // (which are now actively polling).
+    if let Some(vtl0_info) = measured_vtl0_info {
+        load_firmware(
+            gm.vtl0(),
+            &mem_layout,
+            &processor_topology,
+            &vtl0_memory_map,
+            capabilities,
+            &mut partition_unit,
+            partition.as_ref(),
+            env_cfg.cmdline_append.as_deref(),
+            vtl0_info,
+            &runtime_params,
+            load_kind,
+            &dps,
+            isolation.is_isolated(),
+        )
+        .instrument(tracing::info_span!("load_firmware", CVM_ALLOWED))
+        .await?;
+    }
 
     // Construct a LoadedVm struct directly, and call the common run loop.
     let loaded_vm = LoadedVm {
