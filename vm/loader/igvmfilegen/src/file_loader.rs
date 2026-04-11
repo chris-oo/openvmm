@@ -490,10 +490,18 @@ pub struct IgvmOutput {
 }
 
 impl<R: IgvmLoaderRegister + GuestArch + 'static> IgvmLoader<R> {
-    pub fn new(with_paravisor: bool, isolation_type: LoaderIsolationType) -> Self {
+    pub fn new(
+        paravisor_present: bool,
+        max_vtl_config: u8,
+        isolation_type: LoaderIsolationType,
+    ) -> Self {
         let vp_context_builder: Option<Box<dyn VpContextBuilder<Register = R>>>;
         let platform_header;
-        let max_vtl = if with_paravisor { Vtl::Vtl2 } else { Vtl::Vtl0 };
+        let max_vtl = if max_vtl_config >= 2 {
+            Vtl::Vtl2
+        } else {
+            Vtl::Vtl0
+        };
         let initialization_headers;
 
         match isolation_type {
@@ -514,7 +522,7 @@ impl<R: IgvmLoaderRegister + GuestArch + 'static> IgvmLoader<R> {
             }
             _ => {
                 let (header, init_headers, vp_builder) =
-                    R::init(with_paravisor, max_vtl, isolation_type);
+                    R::init(paravisor_present, max_vtl, isolation_type);
                 platform_header = header;
                 initialization_headers = init_headers;
                 vp_context_builder = Some(vp_builder);
@@ -534,7 +542,7 @@ impl<R: IgvmLoaderRegister + GuestArch + 'static> IgvmLoader<R> {
             max_vtl,
             parameter_areas: BTreeMap::new(),
             isolation_type,
-            paravisor_present: with_paravisor,
+            paravisor_present,
             imported_regions_config_page: None,
         }
     }
@@ -891,14 +899,20 @@ impl<R: IgvmLoaderRegister + GuestArch + 'static> IgvmLoader<R> {
 
 impl<R: IgvmLoaderRegister + GuestArch + 'static> ImageLoad<R> for IgvmVtlLoader<'_, R> {
     fn isolation_config(&self) -> IsolationConfig {
+        // For IsolationConfig, paravisor_present means "VTL2 paravisor with
+        // hardware VTL support." This controls whether memory is marked as
+        // VTL2-protectable. When running a paravisor in VTL0 (e.g., KVM nested
+        // virt with max_vtl=0), the paravisor is present in the image but
+        // there is no VTL2 hardware support.
+        let vtl2_paravisor = self.loader.paravisor_present && self.loader.max_vtl >= Vtl::Vtl2;
         match self.loader.isolation_type {
             LoaderIsolationType::None => IsolationConfig {
-                paravisor_present: self.loader.paravisor_present,
+                paravisor_present: vtl2_paravisor,
                 isolation_type: IsolationType::None,
                 shared_gpa_boundary_bits: None,
             },
             LoaderIsolationType::Vbs { .. } => IsolationConfig {
-                paravisor_present: self.loader.paravisor_present,
+                paravisor_present: vtl2_paravisor,
                 isolation_type: IsolationType::Vbs,
                 shared_gpa_boundary_bits: None,
             },
@@ -907,12 +921,12 @@ impl<R: IgvmLoaderRegister + GuestArch + 'static> ImageLoad<R> for IgvmVtlLoader
                 policy: _,
                 injection_type: _,
             } => IsolationConfig {
-                paravisor_present: self.loader.paravisor_present,
+                paravisor_present: vtl2_paravisor,
                 isolation_type: IsolationType::Snp,
                 shared_gpa_boundary_bits,
             },
             LoaderIsolationType::Tdx { .. } => IsolationConfig {
-                paravisor_present: self.loader.paravisor_present,
+                paravisor_present: vtl2_paravisor,
                 isolation_type: IsolationType::Tdx,
                 shared_gpa_boundary_bits: Some(TDX_SHARED_GPA_BOUNDARY_BITS),
             },

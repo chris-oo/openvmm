@@ -246,8 +246,8 @@ impl OpenhclIgvmRecipe {
             Self::X64Nested => OpenhclIgvmRecipeDetails {
                 local_only: None,
                 igvm_manifest: in_repo_template(
-                    "openhcl-x64-nested.json",
-                    "openhcl-x64-nested.json",
+                    "openhcl-x64-nested-direct.json",
+                    "openhcl-x64-nested-direct.json",
                 ),
                 openhcl_kernel_package: OpenhclKernelPackage::Dev,
                 openvmm_hcl_features: {
@@ -256,8 +256,8 @@ impl OpenhclIgvmRecipe {
                     f
                 },
                 target: CommonTriple::X86_64_LINUX_MUSL,
-                vtl0_kernel_type: None,
-                with_uefi: true,
+                vtl0_kernel_type: Some(Vtl0KernelType::Example),
+                with_uefi: false,
                 with_interactive: false,
                 with_sidecar: false,
                 max_trace_level,
@@ -478,6 +478,8 @@ impl SimpleFlowNode for Node {
             None
         };
 
+        let with_kvm_rootfs = openvmm_hcl_features.contains(&OpenvmmHclFeature::VirtKvm);
+
         // build openvmm_hcl bin
         let openvmm_hcl_bin = if let Some(ref path) = custom_openvmm_hcl {
             let path = path.clone();
@@ -596,7 +598,16 @@ impl SimpleFlowNode for Node {
         openvmm_hcl_bin.write_into(ctx, built_openvmm_hcl, |x| x);
 
         let initrd = {
-            let rootfs_config = [openvmm_repo_path.map(ctx, |p| p.join("openhcl/rootfs.config"))]
+            let mut rootfs_configs: Vec<ReadVar<PathBuf>> =
+                vec![openvmm_repo_path.map(ctx, |p| p.join("openhcl/rootfs.config"))];
+
+            // Include KVM kernel modules when building with virt_kvm.
+            if with_kvm_rootfs {
+                rootfs_configs
+                    .push(openvmm_repo_path.map(ctx, |p| p.join("openhcl/rootfs.kvm.config")));
+            }
+
+            let rootfs_config = rootfs_configs
                 .into_iter()
                 .chain(
                     custom_extra_rootfs

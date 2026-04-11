@@ -7,11 +7,11 @@
             "isolation_type": "none",
             "image": {
                 "openhcl": {
-                    "command_line": "OPENHCL_KVM=1 OPENHCL_FORCE_LOAD_VTL0_IMAGE=linux",
+                    "command_line": "OPENHCL_KVM=1 OPENHCL_BOOT_LOG=com3 OPENHCL_SIDECAR=off",
                     "memory_page_count": 163840,
                     "memory_page_base": 131072,
                     "linux": {
-                        "command_line": "panic=-1 debug console=ttyS0,115200",
+                        "command_line": "panic=-1 debug console=ttyS2,115200",
                         "use_initrd": true
                     }
                 }

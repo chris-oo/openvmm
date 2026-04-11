@@ -204,10 +204,14 @@ fn create_igvm_file<R: IgvmfilegenRegister + GuestArch + 'static>(
             },
         };
 
-        // Max VTL of 2 implies paravisor.
-        let with_paravisor = config.max_vtl == 2;
+        // A paravisor is present whenever an OpenHCL image is being loaded,
+        // regardless of the max VTL. This allows nested virtualization configs
+        // (max_vtl=0 with KVM) to still generate VTL0 config pages.
+        let with_paravisor = matches!(config.image, Image::Openhcl { .. });
+        let max_vtl = config.max_vtl;
 
-        let mut loader = IgvmLoader::<R>::new(with_paravisor, loader_isolation_type);
+        let mut loader =
+            IgvmLoader::<R>::new(with_paravisor, max_vtl, loader_isolation_type);
 
         load_image(&mut loader.loader(), &config.image, &resources)?;
 
