@@ -471,6 +471,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
                 vmgs: PetriVmgsResource::Ephemeral,
                 tpm: None,
                 vmbus_storage_controllers: HashMap::new(),
+                pcie_nvme_drives: Vec::new(),
             },
             modify_vmm_config: None,
             resources: PetriVmResources {
@@ -824,7 +825,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
                 BootDeviceType::PcieNvme => {
                     self.config
                         .pcie_nvme_drives
-                        .push(("rp0".into(), 1, boot_drive));
+                        .push(("s0rc0rp0".into(), 1, boot_drive));
                     self
                 }
             }
