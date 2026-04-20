@@ -86,11 +86,20 @@ The easiest way to run VMM tests locally is `cargo xflowey vmm-tests-run`. It
 automatically discovers required artifacts, builds dependencies, and runs your
 tests in a single command.
 
-To run a **specific test** (or set of tests), use `--filter` with a
-[nextest filter](https://nexte.st/docs/filtersets/) expression:
+To run a **specific test** (or set of tests), pass a test name substring as
+a positional argument:
 
 ```bash
-cargo xflowey vmm-tests-run --filter "test(my_test_name)" --dir /tmp/vmm-tests-run
+cargo xflowey vmm-tests-run my_test_name --dir /tmp/vmm-tests-run
+```
+
+#### Advanced Filtering
+
+For complex filters using [nextest filter
+expressions](https://nexte.st/docs/filtersets/), use `--filter`:
+
+```bash
+cargo xflowey vmm-tests-run --filter "test(/^boot_/) & !test(hyperv)" --dir /tmp/vmm-tests-run
 ```
 
 ### Targeting a Platform

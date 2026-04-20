@@ -15,14 +15,14 @@ building, and test execution automatically.
 ## Quick Start
 
 ```bash
-# Run a specific test
-cargo xflowey vmm-tests-run --filter "test(my_test_name)" --dir /tmp/vmm-tests-run
+# Run a specific test by name substring
+cargo xflowey vmm-tests-run my_test_name --dir /tmp/vmm-tests-run
 
-# Run all tests matching a prefix
+# Run all tests matching a prefix (advanced filter syntax)
 cargo xflowey vmm-tests-run --filter "test(/^boot_/)" --dir /tmp/vmm-tests-run
 
 # Run all tests (rarely needed locally)
-cargo xflowey vmm-tests-run --filter "all()" --dir /tmp/vmm-tests-run
+cargo xflowey vmm-tests-run --dir /tmp/vmm-tests-run
 ```
 
 The `--dir` flag is **required** and specifies where build artifacts go.
@@ -31,7 +31,19 @@ or pick a default. Storage requirements vary and the user knows their setup.
 
 ## Filter Syntax
 
-Filters use [nextest filter expressions](https://nexte.st/docs/filtersets/):
+The simplest way to filter tests is to pass a name substring as a positional
+argument:
+
+```bash
+cargo xflowey vmm-tests-run ttrpc --dir /tmp/vmm-tests-run
+```
+
+This matches any test with "ttrpc" in its name.
+
+### Advanced Filtering
+
+For complex filters, use `--filter` with
+[nextest filter expressions](https://nexte.st/docs/filtersets/):
 
 | Expression | Matches |
 |-----------|---------|

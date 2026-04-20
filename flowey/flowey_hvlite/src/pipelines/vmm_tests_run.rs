@@ -26,6 +26,16 @@ use std::process::Stdio;
 /// Build and run VMM tests with automatic artifact discovery
 #[derive(clap::Args)]
 pub struct VmmTestsRunCli {
+    /// Simple test name filter (substring match).
+    ///
+    /// Matches tests whose name contains this string. For full nextest
+    /// filter expression syntax, use --filter instead.
+    ///
+    /// Examples:
+    ///   cargo xflowey vmm-tests-run ttrpc
+    ///   cargo xflowey vmm-tests-run "boot_"
+    name_filter: Option<String>,
+
     /// Specify what target to build the VMM tests for
     ///
     /// If not specified, defaults to the current host target.
@@ -36,14 +46,16 @@ pub struct VmmTestsRunCli {
     #[clap(long)]
     dir: PathBuf,
 
-    /// Test filter (nextest filter expression)
+    /// Advanced: test filter (nextest filter expression)
+    ///
+    /// Mutually exclusive with the positional name filter.
     ///
     /// Examples:
-    ///   - `test(alpine)` - run tests with "alpine" in the name
-    ///   - `test(/^boot_/)` - run tests starting with "boot_"
-    ///   - `all()` - run all tests
-    #[clap(long, default_value = "all()")]
-    filter: String,
+    ///   --filter "test(alpine)" - run tests with "alpine" in the name
+    ///   --filter "test(/^boot_/)" - run tests starting with "boot_"
+    ///   --filter "test(a) & !test(b)" - combine filters
+    #[clap(long, conflicts_with = "name_filter")]
+    filter: Option<String>,
 
     /// pass `--verbose` to cargo
     #[clap(long)]
@@ -97,6 +109,7 @@ impl IntoPipeline for VmmTestsRunCli {
         }
 
         let Self {
+            name_filter,
             target,
             dir,
             filter,
@@ -123,14 +136,17 @@ impl IntoPipeline for VmmTestsRunCli {
         validate_output_dir(&dir, target_os)?;
         std::fs::create_dir_all(&dir).context("failed to create output directory")?;
 
-        // 3. Run artifact discovery inline at pipeline construction time
+        // 3. Resolve filter expression
+        let filter = resolve_filter(name_filter.as_deref(), filter.as_deref())?;
+
+        // 4. Run artifact discovery inline at pipeline construction time
         log::info!("Step 1: Discovering required artifacts...");
         let repo_root = crate::repo_root();
         let (artifacts_json, test_names, test_binary) =
             discover_artifacts(&repo_root, &target_str, &filter, release)
                 .context("during artifact discovery")?;
 
-        // 4. Resolve to build selections
+        // 5. Resolve to build selections
         let mut resolved = ResolvedArtifactSelections::from_artifact_list_json(
             &artifacts_json,
             target_architecture,
@@ -145,7 +161,7 @@ impl IntoPipeline for VmmTestsRunCli {
             );
         }
 
-        // 5. Determine lazy fetch mode.
+        // 6. Determine lazy fetch mode.
         //
         // By default, VHD/ISO downloads are skipped and disk images are
         // streamed on demand via HTTP (with local SQLite caching). This
@@ -196,7 +212,7 @@ impl IntoPipeline for VmmTestsRunCli {
 
         let selections = selections_from_resolved(filter, resolved, target_os);
 
-        // 6. Construct and return the pipeline
+        // 7. Construct and return the pipeline
         log::info!("Step 2: Building and running tests...");
         build_vmm_tests_pipeline(
             backend_hint,
@@ -216,6 +232,37 @@ impl IntoPipeline for VmmTestsRunCli {
                 custom_uefi_firmware,
             },
         )
+    }
+}
+
+/// Characters that are special in nextest filter expression syntax.
+const FILTER_METACHARACTERS: &[char] = &['(', ')', '|', '&', '!', '/'];
+
+/// Resolve the user's filter arguments into a nextest filter expression.
+///
+/// The positional `name_filter` is a simple substring match, mapped to
+/// `test(<value>)`. The `--filter` flag passes through a raw nextest filter
+/// expression. Clap enforces mutual exclusivity, so at most one is set.
+fn resolve_filter(name_filter: Option<&str>, filter: Option<&str>) -> anyhow::Result<String> {
+    match (filter, name_filter) {
+        (Some(f), _) => Ok(f.to_string()),
+        (None, Some(name)) => {
+            if name.is_empty() {
+                anyhow::bail!(
+                    "positional filter cannot be empty. \
+                     Omit it to run all tests, or provide a test name substring."
+                );
+            }
+            if let Some(c) = name.chars().find(|c| FILTER_METACHARACTERS.contains(c)) {
+                anyhow::bail!(
+                    "positional filter contains special character '{c}'. \
+                     Use --filter with nextest filter syntax instead.\n\
+                     Example: --filter \"test({name})\""
+                );
+            }
+            Ok(format!("test({name})"))
+        }
+        (None, None) => Ok("all()".to_string()),
     }
 }
 
@@ -604,4 +651,93 @@ fn build_vmm_tests_pipeline(
     job.finish();
 
     Ok(pipeline)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_filter_no_args_returns_all() {
+        assert_eq!(resolve_filter(None, None).unwrap(), "all()");
+    }
+
+    #[test]
+    fn resolve_filter_basic_substring() {
+        assert_eq!(resolve_filter(Some("ttrpc"), None).unwrap(), "test(ttrpc)");
+    }
+
+    #[test]
+    fn resolve_filter_trailing_underscore() {
+        assert_eq!(resolve_filter(Some("boot_"), None).unwrap(), "test(boot_)");
+    }
+
+    #[test]
+    fn resolve_filter_dots_are_safe() {
+        assert_eq!(
+            resolve_filter(Some("foo.bar"), None).unwrap(),
+            "test(foo.bar)"
+        );
+    }
+
+    #[test]
+    fn resolve_filter_hyphens_are_safe() {
+        assert_eq!(
+            resolve_filter(Some("foo-bar"), None).unwrap(),
+            "test(foo-bar)"
+        );
+    }
+
+    #[test]
+    fn resolve_filter_rejects_parens() {
+        let err = resolve_filter(Some("a(b)"), None).unwrap_err();
+        assert!(err.to_string().contains("special character '('"), "{err}");
+    }
+
+    #[test]
+    fn resolve_filter_rejects_pipe() {
+        let err = resolve_filter(Some("a|b"), None).unwrap_err();
+        assert!(err.to_string().contains("special character '|'"), "{err}");
+    }
+
+    #[test]
+    fn resolve_filter_rejects_bang() {
+        let err = resolve_filter(Some("!foo"), None).unwrap_err();
+        assert!(err.to_string().contains("special character '!'"), "{err}");
+    }
+
+    #[test]
+    fn resolve_filter_rejects_empty_string() {
+        let err = resolve_filter(Some(""), None).unwrap_err();
+        assert!(err.to_string().contains("cannot be empty"), "{err}");
+    }
+
+    #[test]
+    fn resolve_filter_explicit_filter_passthrough() {
+        assert_eq!(
+            resolve_filter(None, Some("test(/^boot_/)")).unwrap(),
+            "test(/^boot_/)"
+        );
+    }
+
+    #[test]
+    fn resolve_filter_complex_filter_passthrough() {
+        assert_eq!(
+            resolve_filter(None, Some("test(a) & !test(b)")).unwrap(),
+            "test(a) & !test(b)"
+        );
+    }
+
+    #[test]
+    fn positional_and_filter_conflict() {
+        use clap::Parser;
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[clap(flatten)]
+            inner: VmmTestsRunCli,
+        }
+        let result =
+            TestCli::try_parse_from(["test", "ttrpc", "--filter", "test(foo)", "--dir", "/tmp"]);
+        assert!(result.is_err());
+    }
 }

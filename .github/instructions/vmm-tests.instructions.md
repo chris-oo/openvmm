@@ -13,6 +13,10 @@ Use `cargo xflowey vmm-tests-run` instead. It automatically discovers
 artifacts, builds dependencies, and runs tests in a single command:
 
 ```bash
+# Run tests by name substring
+cargo xflowey vmm-tests-run my_test_name --dir /tmp/vmm-tests-run
+
+# Advanced: full nextest filter expression
 cargo xflowey vmm-tests-run --filter "test(my_test_name)" --dir /tmp/vmm-tests-run
 ```
 
