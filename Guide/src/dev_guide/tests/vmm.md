@@ -90,7 +90,7 @@ To run a **specific test** (or set of tests), pass a test name substring as
 a positional argument:
 
 ```bash
-cargo xflowey vmm-tests-run my_test_name --dir /tmp/vmm-tests-run
+cargo xflowey vmm-tests-run my_test_name
 ```
 
 #### Advanced Filtering
@@ -99,8 +99,13 @@ For complex filters using [nextest filter
 expressions](https://nexte.st/docs/filtersets/), use `--filter`:
 
 ```bash
-cargo xflowey vmm-tests-run --filter "test(/^boot_/) & !test(hyperv)" --dir /tmp/vmm-tests-run
+cargo xflowey vmm-tests-run --filter "test(/^boot_/) & !test(hyperv)"
 ```
+
+#### Output Directory
+
+By default, build artifacts go to `target/vmm-tests/` in the repo root.
+Use `--dir` to override this, which is required when cross-compiling:
 
 ### Targeting a Platform
 

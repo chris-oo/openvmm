@@ -93,10 +93,10 @@ invisible.
 For VMM test validation during development, use `cargo xflowey vmm-tests-run`:
 ```bash
 # Run a specific test
-cargo xflowey vmm-tests-run my_test_name --dir <output-dir>
+cargo xflowey vmm-tests-run my_test_name
 
 # Advanced: full nextest filter expression
-cargo xflowey vmm-tests-run --filter "test(my_test_name)" --dir <output-dir>
+cargo xflowey vmm-tests-run --filter "test(my_test_name)"
 ```
 This automatically discovers artifacts, builds dependencies, and runs tests.
 See `Guide/src/dev_guide/tests/vmm.md` for details.

@@ -14,10 +14,10 @@ artifacts, builds dependencies, and runs tests in a single command:
 
 ```bash
 # Run tests by name substring
-cargo xflowey vmm-tests-run my_test_name --dir /tmp/vmm-tests-run
+cargo xflowey vmm-tests-run my_test_name
 
 # Advanced: full nextest filter expression
-cargo xflowey vmm-tests-run --filter "test(my_test_name)" --dir /tmp/vmm-tests-run
+cargo xflowey vmm-tests-run --filter "test(my_test_name)"
 ```
 
 To learn the full workflow (filter syntax, cross-compilation, logging, common

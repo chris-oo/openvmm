@@ -16,18 +16,26 @@ building, and test execution automatically.
 
 ```bash
 # Run a specific test by name substring
-cargo xflowey vmm-tests-run my_test_name --dir /tmp/vmm-tests-run
+cargo xflowey vmm-tests-run my_test_name
 
 # Run all tests matching a prefix (advanced filter syntax)
-cargo xflowey vmm-tests-run --filter "test(/^boot_/)" --dir /tmp/vmm-tests-run
+cargo xflowey vmm-tests-run --filter "test(/^boot_/)"
 
 # Run all tests (rarely needed locally)
-cargo xflowey vmm-tests-run --dir /tmp/vmm-tests-run
+cargo xflowey vmm-tests-run
 ```
 
-The `--dir` flag is **required** and specifies where build artifacts go.
-**Always ask the user** which directory to use for `--dir` — do not guess
-or pick a default. Storage requirements vary and the user knows their setup.
+## Output Directory
+
+By default, build artifacts go to `target/vmm-tests/` in the repo root.
+Use `--dir` to override this:
+
+```bash
+cargo xflowey vmm-tests-run my_test --dir /tmp/custom-output
+```
+
+**`--dir` is required when cross-compiling** (e.g., targeting Windows from
+WSL2). For native builds, you do not need to specify it.
 
 ## Filter Syntax
 
@@ -35,7 +43,7 @@ The simplest way to filter tests is to pass a name substring as a positional
 argument:
 
 ```bash
-cargo xflowey vmm-tests-run ttrpc --dir /tmp/vmm-tests-run
+cargo xflowey vmm-tests-run ttrpc
 ```
 
 This matches any test with "ttrpc" in its name.

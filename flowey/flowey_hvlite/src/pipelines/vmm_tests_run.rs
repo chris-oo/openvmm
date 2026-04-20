@@ -42,9 +42,12 @@ pub struct VmmTestsRunCli {
     #[clap(long)]
     target: Option<VmmTestTargetCli>,
 
-    /// Directory for the output artifacts
+    /// Directory for the output artifacts.
+    ///
+    /// Required when cross-compiling (--target differs from host).
+    /// Defaults to ./target/vmm-tests for native builds.
     #[clap(long)]
-    dir: PathBuf,
+    dir: Option<PathBuf>,
 
     /// Advanced: test filter (nextest filter expression)
     ///
@@ -131,22 +134,38 @@ impl IntoPipeline for VmmTestsRunCli {
         let target_os = target.as_triple().operating_system;
         let target_architecture = target.as_triple().architecture;
         let target_str = target.as_triple().to_string();
+        let repo_root = crate::repo_root();
 
-        // 2. Validate output directory for WSL
+        // 2. Resolve output directory, defaulting to target/vmm-tests for native builds
+        let dir = match dir {
+            Some(d) => d,
+            None => {
+                if is_cross_compile(&target, backend_hint) {
+                    anyhow::bail!(
+                        "--dir is required when cross-compiling. \
+                         Use --dir to specify where to put the test output.\n\
+                         Hint: when targeting Windows from WSL, use a DrvFs path \
+                         (e.g., /mnt/c/vmm-tests)."
+                    );
+                }
+                repo_root.join("target").join("vmm-tests")
+            }
+        };
+
+        // 3. Validate output directory for WSL
         validate_output_dir(&dir, target_os)?;
         std::fs::create_dir_all(&dir).context("failed to create output directory")?;
 
-        // 3. Resolve filter expression
+        // 4. Resolve filter expression
         let filter = resolve_filter(name_filter.as_deref(), filter.as_deref())?;
 
-        // 4. Run artifact discovery inline at pipeline construction time
+        // 5. Run artifact discovery inline at pipeline construction time
         log::info!("Step 1: Discovering required artifacts...");
-        let repo_root = crate::repo_root();
         let (artifacts_json, test_names, test_binary) =
             discover_artifacts(&repo_root, &target_str, &filter, release)
                 .context("during artifact discovery")?;
 
-        // 5. Resolve to build selections
+        // 6. Resolve to build selections
         let mut resolved = ResolvedArtifactSelections::from_artifact_list_json(
             &artifacts_json,
             target_architecture,
@@ -161,7 +180,7 @@ impl IntoPipeline for VmmTestsRunCli {
             );
         }
 
-        // 6. Determine lazy fetch mode.
+        // 7. Determine lazy fetch mode.
         //
         // By default, VHD/ISO downloads are skipped and disk images are
         // streamed on demand via HTTP (with local SQLite caching). This
@@ -212,7 +231,7 @@ impl IntoPipeline for VmmTestsRunCli {
 
         let selections = selections_from_resolved(filter, resolved, target_os);
 
-        // 7. Construct and return the pipeline
+        // 8. Construct and return the pipeline
         log::info!("Step 2: Building and running tests...");
         build_vmm_tests_pipeline(
             backend_hint,
@@ -264,6 +283,24 @@ fn resolve_filter(name_filter: Option<&str>, filter: Option<&str>) -> anyhow::Re
         }
         (None, None) => Ok("all()".to_string()),
     }
+}
+
+/// Determine whether this is a cross-compilation scenario.
+///
+/// Cross-compilation means the resolved target triple differs from the host.
+/// WSL targeting Windows is always cross (Linux host → Windows target).
+fn is_cross_compile(target: &CommonTriple, backend_hint: PipelineBackendHint) -> bool {
+    let host_target = match (
+        FlowArch::host(backend_hint),
+        FlowPlatform::host(backend_hint),
+    ) {
+        (FlowArch::Aarch64, FlowPlatform::Windows) => CommonTriple::AARCH64_WINDOWS_MSVC,
+        (FlowArch::X86_64, FlowPlatform::Windows) => CommonTriple::X86_64_WINDOWS_MSVC,
+        (FlowArch::X86_64, FlowPlatform::Linux(_)) => CommonTriple::X86_64_LINUX_GNU,
+        _ => return true, // unknown host → treat as cross
+    };
+
+    target.as_triple() != host_target.as_triple()
 }
 
 /// Run artifact discovery by invoking `cargo nextest list` and the test
@@ -739,5 +776,50 @@ mod tests {
         let result =
             TestCli::try_parse_from(["test", "ttrpc", "--filter", "test(foo)", "--dir", "/tmp"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn is_cross_compile_native_linux_x64() {
+        // Linux x64 host targeting linux x64 → not cross
+        assert!(!is_cross_compile(
+            &CommonTriple::X86_64_LINUX_GNU,
+            PipelineBackendHint::Local,
+        ));
+    }
+
+    #[test]
+    fn is_cross_compile_linux_targeting_windows() {
+        // Linux x64 host targeting windows x64 → cross
+        assert!(is_cross_compile(
+            &CommonTriple::X86_64_WINDOWS_MSVC,
+            PipelineBackendHint::Local,
+        ));
+    }
+
+    #[test]
+    fn dir_defaults_for_native_build() {
+        // When dir is None and not cross-compiling, default to target/vmm-tests
+        let target = CommonTriple::X86_64_LINUX_GNU;
+        let backend_hint = PipelineBackendHint::Local;
+        let dir: Option<PathBuf> = None;
+
+        let resolved = match dir {
+            Some(d) => d,
+            None => {
+                assert!(!is_cross_compile(&target, backend_hint));
+                crate::repo_root().join("target").join("vmm-tests")
+            }
+        };
+        assert!(resolved.ends_with("target/vmm-tests"));
+    }
+
+    #[test]
+    fn dir_explicit_overrides_default() {
+        let dir: Option<PathBuf> = Some(PathBuf::from("/tmp/custom"));
+        let resolved = match dir {
+            Some(d) => d,
+            None => unreachable!(),
+        };
+        assert_eq!(resolved, PathBuf::from("/tmp/custom"));
     }
 }
