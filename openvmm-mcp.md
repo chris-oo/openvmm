@@ -2,7 +2,7 @@
 
 ## Implementation Status
 
-> **Last updated:** 2026-03-21
+> **Last updated:** 2026-04-21
 
 ### ✅ Phase 1 — COMPLETE
 
@@ -64,6 +64,33 @@ Phase 1 (Core MCP Infrastructure) has been fully implemented and tested.
    - Added to `SUMMARY.md` under Configuration and Management
    - `--mcp` flag added to CLI reference (`cli.md`)
    - Covers: protocol overview, all 13 tools, example session, architecture
+
+### ✅ VmController Refactor — COMPLETE
+
+Refactored the MCP server to use `VmController` (from PR #3259) instead of
+directly holding a `WorkerHandle` and raw `VmRpc` sender. This brings MCP
+in line with how the ttrpc and REPL frontends manage VM lifecycle.
+
+**Changes:**
+- VmController now owns the WorkerHandle, VmmMesh, and worker lifecycle
+- MCP receives `VmControllerEvent` via a bridge task for halt and
+  worker-stopped notifications
+- Inspect routes through `VmControllerRpc::Inspect` via a callback,
+  giving richer inspection (mesh + vm + vnc + gdb workers)
+- Pause/resume/reset/nmi/memory ops remain as direct VmRpc calls
+  (same pattern as ttrpc)
+- Fixed a lost-wakeup race in `wait_for_halt`: halt-state check and
+  waiter registration are now atomic under a single lock
+- Added worker-stopped state tracking: pending halt waiters are drained
+  with an error when the worker dies, and subsequent tool calls fail fast
+- Removed `mesh_worker` and `vmm_core_defs` dependencies from `openvmm_mcp`
+- 17 unit tests, 43/43 integration tests passing
+
+### ✅ vm-debugging Skill — COMPLETE
+
+Added `.github/skills/vm-debugging/SKILL.md` — teaches agents how to
+launch `openvmm --mcp`, send JSON-RPC commands, and debug VM issues
+interactively. Complements the `vmm-tests` skill.
 
 ### ⏳ Phase 3 — NOT STARTED (Petri-MCP Orchestrator)
 - Standalone `petri_mcp` binary for multi-VM lifecycle management
