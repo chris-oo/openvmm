@@ -126,10 +126,51 @@ Bumped the MCP protocol to version `2025-06-18`, adopting:
 - `debug/set_breakpoint`, `debug/clear_breakpoint`, `debug/single_step`
 - `debug/backtrace` (heuristic stack walker)
 
+### ⏳ Deferred — Guest Agent Tools (Windows Guest Support)
+
+The current `serial/execute` approach only works for Linux guests (shell
+prompt on COM1). Windows guests don't expose a shell over the serial
+console, so guest command execution requires a different approach.
+
+**Recommended path:** Wire pipette into the embedded MCP server. The
+building blocks already exist in the repo:
+
+- **pipette** (`petri/pipette/`) — lightweight guest agent, runs as a
+  Windows service or Linux daemon
+- **pipette_protocol** (`petri/pipette_protocol/`) — mesh RPC protocol
+  over vsock (port `0x1337`)
+- **pipette_client** (`petri/pipette_client/`) — host-side client library
+- **IMC hive injection** (`petri/make_imc_hive/`) — auto-configures
+  pipette as a Windows service via registry hive injected over VmBus
+
+New MCP tools to add:
+- `guest/execute` — run a command in the guest via pipette (works for
+  both Windows and Linux, unlike `serial/execute`)
+- `guest/read_file` — read a file from the guest filesystem
+- `guest/write_file` — write a file to the guest filesystem
+
+Implementation work:
+1. Add vsock listener setup to the `--mcp` CLI path (plumbing exists in
+   `petri/src/vm/openvmm/construct.rs`)
+2. Add `pipette_client` as a dependency of `openvmm_mcp`
+3. Implement `guest/*` MCP tools that proxy to pipette RPCs
+4. Document how to prepare a Windows guest image with pipette
+5. Optionally support IMC hive injection from the CLI for zero-prep boot
+
+**Alternative lower-effort options:**
+- **EMS/SAC** — Windows Server's Emergency Management Services exposes a
+  limited command prompt over COM1. Works with existing `serial/execute`
+  using `prompt_pattern: "SAC>"`, but only on Server SKUs and the shell
+  is very limited.
+- **`display/screenshot`** — once implemented, gives visual interaction
+  with Windows guests (read screen + type via serial/write). Usable for
+  simple tasks without guest-side software.
+
 ### ⏳ Deferred — Petri-MCP Orchestrator
 - Standalone `petri_mcp` binary for multi-VM lifecycle management
 - `vm/create`, `vm/start`, `vm/destroy`, `vm/list`
-- Guest agent tools via pipette (`guest/execute`, `guest/read_file`, `guest/write_file`)
+- Guest agent tools via pipette (subsumed by the above if wired into
+  the embedded server first)
 
 ---
 
