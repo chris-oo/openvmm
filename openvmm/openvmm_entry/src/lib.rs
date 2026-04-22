@@ -2377,13 +2377,12 @@ async fn run_control_inner(
         // controller, so the MCP crate doesn't depend on openvmm_entry types
         // and the Deferred only traverses one mesh channel.
         let ctrl_send_for_inspect = ctrl_send.clone();
-        let inspect_fn: Box<dyn Fn(inspect::Deferred) + Send + Sync> =
-            Box::new(move |deferred| {
-                ctrl_send_for_inspect.send(vm_controller::VmControllerRpc::Inspect(
-                    vm_controller::InspectTarget::Host,
-                    deferred,
-                ));
-            });
+        let inspect_fn: Box<dyn Fn(inspect::Deferred) + Send + Sync> = Box::new(move |deferred| {
+            ctrl_send_for_inspect.send(vm_controller::VmControllerRpc::Inspect(
+                vm_controller::InspectTarget::Host,
+                deferred,
+            ));
+        });
 
         let vm_handle =
             openvmm_mcp::VmHandle::new(vm_rpc.clone(), serial_buffer, console_in, inspect_fn);
