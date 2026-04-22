@@ -5515,14 +5515,12 @@ dependencies = [
  "futures-concurrency",
  "inspect",
  "mesh",
- "mesh_worker",
  "openvmm_defs",
  "parking_lot",
  "serde",
  "serde_json",
  "tracing",
  "unicycle",
- "vmm_core_defs",
 ]
 
 [[package]]

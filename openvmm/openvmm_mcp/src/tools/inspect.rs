@@ -104,12 +104,13 @@ fn handle_tree(
             .unwrap_or(2)
             .min(10) as usize;
 
-        let obj = inspect::adhoc(|req| {
-            req.respond().field("vm", &vm.worker);
-        });
-        let mut inspection = InspectionBuilder::new(&path)
-            .depth(Some(depth))
-            .inspect(obj);
+        let vm_ref = vm.clone();
+        let mut inspection =
+            InspectionBuilder::new(&path)
+                .depth(Some(depth))
+                .inspect(inspect::adhoc(move |req| {
+                    (vm_ref.inspect_fn)(req.defer());
+                }));
 
         let _ = CancelContext::new()
             .with_timeout(Duration::from_secs(1))
@@ -131,10 +132,12 @@ fn handle_get(
             None => return ToolResult::error("missing required parameter: path"),
         };
 
-        let obj = inspect::adhoc(|req| {
-            req.respond().field("vm", &vm.worker);
-        });
-        let mut inspection = InspectionBuilder::new(&path).depth(Some(0)).inspect(obj);
+        let vm_ref = vm.clone();
+        let mut inspection = InspectionBuilder::new(&path)
+            .depth(Some(0))
+            .inspect(inspect::adhoc(move |req| {
+                (vm_ref.inspect_fn)(req.defer());
+            }));
 
         let _ = CancelContext::new()
             .with_timeout(Duration::from_secs(1))
@@ -160,14 +163,24 @@ fn handle_update(
             None => return ToolResult::error("missing required parameter: value"),
         };
 
-        let obj = inspect::adhoc_mut(|req| {
-            req.respond().field("vm", &vm.worker);
-        });
-        let result = InspectionBuilder::new(&path).update(&value, obj).await;
+        let vm_ref = vm.clone();
+        let update = inspect::update(
+            &path,
+            &value,
+            inspect::adhoc(move |req| {
+                (vm_ref.inspect_fn)(req.defer());
+            }),
+        );
+
+        let result = CancelContext::new()
+            .with_timeout(Duration::from_secs(1))
+            .until_cancelled(update)
+            .await;
 
         match result {
-            Ok(v) => ToolResult::text(format!("{v:#}")),
-            Err(e) => ToolResult::error(format!("update failed: {e}")),
+            Ok(Ok(v)) => ToolResult::text(format!("{v:#}")),
+            Ok(Err(e)) => ToolResult::error(format!("update failed: {e}")),
+            Err(_) => ToolResult::error("update timed out"),
         }
     })
 }

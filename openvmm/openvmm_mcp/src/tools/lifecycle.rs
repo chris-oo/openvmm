@@ -210,16 +210,8 @@ fn handle_status(
     _args: serde_json::Value,
 ) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'static>> {
     Box::pin(async move {
-        let halted = vm.is_halted();
-        let paused = vm.is_paused();
+        let status = vm.status_string();
         let reason = vm.halt_reason_string();
-        let status = if halted {
-            "halted"
-        } else if paused {
-            "paused"
-        } else {
-            "running"
-        };
         ToolResult::text(
             serde_json::json!({
                 "status": status,
@@ -235,26 +227,25 @@ fn handle_wait_for_halt(
     args: serde_json::Value,
 ) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'static>> {
     Box::pin(async move {
-        // If already halted, return immediately.
-        if vm.is_halted() {
-            return ToolResult::text(
-                serde_json::json!({
-                    "halted": true,
-                    "reason": vm.halt_reason_string(),
-                })
-                .to_string(),
-            );
-        }
-
         let timeout_ms = args
             .get("timeout_ms")
             .and_then(|v| v.as_u64())
             .unwrap_or(300_000);
 
-        // Register a halt waiter — we receive the reason string when the VM
-        // halts, sent by VmHandle::set_halted() which the event loop calls
-        // when it processes the Halt event.
-        let mut halt_rx = vm.register_halt_waiter();
+        // Atomically check halt/worker state and register a waiter under a
+        // single lock, preventing lost-wakeup races.
+        let mut halt_rx = match vm.register_halt_waiter() {
+            crate::vm_handle::HaltWaiterResult::AlreadyHalted(reason) => {
+                return ToolResult::text(
+                    serde_json::json!({
+                        "halted": true,
+                        "reason": reason,
+                    })
+                    .to_string(),
+                );
+            }
+            crate::vm_handle::HaltWaiterResult::Registered(rx) => rx,
+        };
 
         // Create a timeout channel driven by a sleeping thread.
         let (timeout_tx, mut timeout_rx) = mesh::channel::<()>();

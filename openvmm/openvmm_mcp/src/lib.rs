@@ -18,3 +18,15 @@ pub mod vm_handle;
 
 pub use event_loop::run_mcp_server;
 pub use vm_handle::VmHandle;
+
+/// Events the MCP server receives from the VM controller.
+///
+/// These are bridged from `VmControllerEvent` by the entry point, so that the
+/// MCP crate does not depend on `openvmm_entry`.
+#[derive(mesh::MeshPayload)]
+pub enum VmEvent {
+    /// The guest halted with the given reason string.
+    GuestHalt(String),
+    /// The VM worker stopped (normally or with an error).
+    WorkerStopped { error: Option<String> },
+}

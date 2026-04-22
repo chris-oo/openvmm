@@ -2324,9 +2324,77 @@ async fn run_control_inner(
             .clone()
             .unwrap_or_else(|| Arc::new(openvmm_mcp::serial_buffer::SerialRingBuffer::new()));
         let console_in = resources.mcp_console_in.take();
+
+        // Create VmController channels.
+        let (ctrl_send, ctrl_recv) = mesh::channel();
+        let (ctrl_event_send, ctrl_event_recv) = mesh::channel();
+
+        // Build VmController — same pattern as the REPL/ttrpc paths.
+        let controller = vm_controller::VmController {
+            mesh: mesh_slot.take().unwrap(),
+            vm_worker,
+            vnc_worker,
+            gdb_worker,
+            diag_inspector: None,
+            vtl2_settings: None,
+            ged_rpc: None,
+            vm_rpc: vm_rpc.clone(),
+            paravisor_diag: None,
+            igvm_path: None,
+            memory_backing_file: opt.memory_backing_file.clone(),
+            memory: opt.memory,
+            processors: opt.processors,
+            log_file: opt.log_file.clone(),
+        };
+
+        // Spawn the VmController task.
+        let controller_task = driver.spawn(
+            "vm-controller",
+            controller.run(ctrl_recv, ctrl_event_send, notify_recv),
+        );
+
+        // Bridge VmControllerEvent → openvmm_mcp::VmEvent so the MCP crate
+        // does not depend on openvmm_entry types.
+        let (mcp_event_send, mcp_event_recv) = mesh::channel();
+        drop(driver.spawn("mcp-event-bridge", async move {
+            use vm_controller::VmControllerEvent;
+            let mut ctrl_event_recv = ctrl_event_recv;
+            while let Some(event) = ctrl_event_recv.next().await {
+                match event {
+                    VmControllerEvent::GuestHalt(reason) => {
+                        mcp_event_send.send(openvmm_mcp::VmEvent::GuestHalt(reason));
+                    }
+                    VmControllerEvent::WorkerStopped { error } => {
+                        mcp_event_send.send(openvmm_mcp::VmEvent::WorkerStopped { error });
+                        break;
+                    }
+                    VmControllerEvent::VncWorkerStopped { .. } => {}
+                }
+            }
+        }));
+
+        // Create an inspect callback that routes deferrals through the
+        // controller, so the MCP crate doesn't depend on openvmm_entry types
+        // and the Deferred only traverses one mesh channel.
+        let ctrl_send_for_inspect = ctrl_send.clone();
+        let inspect_fn: Box<dyn Fn(inspect::Deferred) + Send + Sync> =
+            Box::new(move |deferred| {
+                ctrl_send_for_inspect.send(vm_controller::VmControllerRpc::Inspect(
+                    vm_controller::InspectTarget::Host,
+                    deferred,
+                ));
+            });
+
         let vm_handle =
-            openvmm_mcp::VmHandle::new(vm_rpc.clone(), vm_worker, serial_buffer, console_in);
-        return openvmm_mcp::run_mcp_server(vm_handle, notify_recv).await;
+            openvmm_mcp::VmHandle::new(vm_rpc.clone(), serial_buffer, console_in, inspect_fn);
+        let result = openvmm_mcp::run_mcp_server(vm_handle, mcp_event_recv).await;
+
+        // Clean shutdown: tell the controller to quit and wait for it.
+        ctrl_send.send(vm_controller::VmControllerRpc::Quit);
+        drop(ctrl_send);
+        controller_task.await;
+
+        return result;
     }
 
     let paravisor_diag = Arc::new(diag_client::DiagClient::from_dialer(

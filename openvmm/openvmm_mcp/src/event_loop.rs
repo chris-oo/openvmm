@@ -4,12 +4,14 @@
 //! MCP server event loop.
 //!
 //! Reads JSON-RPC messages from stdin, dispatches tool calls, and writes
-//! responses to stdout. Also monitors VM halt notifications.
+//! responses to stdout. Also monitors VM controller events (guest halt,
+//! worker stopped).
 //!
 //! Tool calls run concurrently with the event loop via `FuturesUnordered`,
 //! allowing long-running tools (like `vm/wait_for_halt` and `serial/execute`)
-//! to proceed while halt events and new requests are still processed.
+//! to proceed while events and new requests are still processed.
 
+use crate::VmEvent;
 use crate::protocol::InitializeParams;
 use crate::protocol::InitializeResult;
 use crate::protocol::JsonRpcErrorResponse;
@@ -38,8 +40,8 @@ use unicycle::FuturesUnordered;
 enum Event {
     /// A raw JSON line arrived from stdin.
     StdinMessage(String),
-    /// The VM halted.
-    Halt(vmm_core_defs::HaltReason),
+    /// A VM controller event arrived.
+    Controller(VmEvent),
     /// stdin closed — time to shut down.
     StdinClosed,
 }
@@ -50,7 +52,7 @@ enum Event {
 /// and enters the event loop.
 pub async fn run_mcp_server(
     vm_handle: VmHandle,
-    halt_recv: mesh::Receiver<vmm_core_defs::HaltReason>,
+    controller_events: mesh::Receiver<VmEvent>,
 ) -> anyhow::Result<()> {
     let vm = Arc::new(vm_handle);
     let stdin_rx = transport::spawn_stdin_reader();
@@ -61,7 +63,7 @@ pub async fn run_mcp_server(
     let mut stdin_stream = stdin_rx
         .map(Event::StdinMessage)
         .chain(futures::stream::repeat_with(|| Event::StdinClosed));
-    let mut halt_stream = halt_recv.map(Event::Halt);
+    let mut controller_stream = controller_events.map(Event::Controller);
 
     // Pending tool futures that run concurrently with the event loop.
     let mut pending_tools: FuturesUnordered<
@@ -75,10 +77,13 @@ pub async fn run_mcp_server(
         // When no tools are pending, just poll the event streams.
         // When tools are pending, use select to poll both.
         let event = if pending_tools.is_empty() {
-            (&mut stdin_stream, &mut halt_stream).merge().next().await
+            (&mut stdin_stream, &mut controller_stream)
+                .merge()
+                .next()
+                .await
         } else {
             match futures::future::select(
-                Box::pin((&mut stdin_stream, &mut halt_stream).merge().next()),
+                Box::pin((&mut stdin_stream, &mut controller_stream).merge().next()),
                 Box::pin(pending_tools.next()),
             )
             .await
@@ -90,8 +95,6 @@ pub async fn run_mcp_server(
                     continue;
                 }
                 futures::future::Either::Right((None, _)) => {
-                    // FuturesUnordered returned None — shouldn't happen
-                    // since we checked is_empty(), but just continue.
                     continue;
                 }
             }
@@ -104,11 +107,21 @@ pub async fn run_mcp_server(
                 tracing::debug!("stdin closed, shutting down MCP server");
                 break;
             }
-            Event::Halt(reason) => {
-                let reason_str = format!("{reason:?}");
-                tracing::info!(?reason, "VM halted");
-                vm.set_halted(reason_str);
-            }
+            Event::Controller(vm_event) => match vm_event {
+                VmEvent::GuestHalt(reason) => {
+                    tracing::info!(%reason, "VM halted");
+                    vm.set_halted(reason);
+                }
+                VmEvent::WorkerStopped { error } => {
+                    if let Some(err) = &error {
+                        tracing::error!(error = %err, "VM worker stopped with error");
+                    } else {
+                        tracing::info!("VM worker stopped");
+                    }
+                    vm.set_worker_stopped(error);
+                    break;
+                }
+            },
             Event::StdinMessage(line) => {
                 let msg = match transport::parse_message(&line) {
                     Ok(m) => m,
