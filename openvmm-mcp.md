@@ -2,7 +2,7 @@
 
 ## Implementation Status
 
-> **Last updated:** 2026-04-21
+> **Last updated:** 2026-04-22
 
 ### ✅ Phase 1 — COMPLETE
 
@@ -92,29 +92,44 @@ Added `.github/skills/vm-debugging/SKILL.md` — teaches agents how to
 launch `openvmm --mcp`, send JSON-RPC commands, and debug VM issues
 interactively. Complements the `vmm-tests` skill.
 
-### ⏳ Phase 3 — NOT STARTED (Petri-MCP Orchestrator)
-- Standalone `petri_mcp` binary for multi-VM lifecycle management
-- `vm/create`, `vm/start`, `vm/destroy`, `vm/list`
-- Guest agent tools via pipette (`guest/execute`, `guest/read_file`, `guest/write_file`)
+### ✅ MCP Spec Bump — COMPLETE (2024-11-05 → 2025-06-18)
 
-### ⏳ Phase 4 — NOT STARTED (Extended Tools & Features)
-- `memory/read` and `memory/write` tools
+Bumped the MCP protocol to version `2025-06-18`, adopting:
+- **Ping support** — `ping` method works before and after initialize
+- **Tool titles** — human-friendly `title` field on all 13 tools
+- **Tool annotations** — `readOnlyHint`, `destructiveHint`, `idempotentHint`,
+  `openWorldHint` on every tool to help clients auto-approve safe tools
+- **Structured output** — `outputSchema` on tool definitions and
+  `structuredContent` in tool results alongside text content for
+  backwards compatibility
+- **Unknown-tool error handling** — now returns JSON-RPC protocol error
+  instead of `isError` tool result (per 2025-06-18 spec)
+- 7 new unit tests (24 total), updated integration test script and Guide docs
+
+### ⏳ Next — Display Screenshot
 - `display/screenshot` tool (framebuffer → PNG)
+
+### ⏳ Then — Memory Tools
+- `memory/read` and `memory/write` tools (raw GPA access via VmRpc)
+
+### ⏳ Then — Disk & Snapshot
 - `disk/add` and `disk/remove` tools
 - `snapshot/save` tool
-- MCP resources (`vm://config`, `vm://status`, `vm://serial/log`)
-- SSE/Streamable HTTP transport
-- MCP resource subscriptions
-- VTL2 settings management
-- OpenHCL diagnostics integration
 
-### ⏳ Phase 5 — NOT STARTED (GDB Debug Integration)
+### ⏳ Then — MCP Resources
+- `vm://config`, `vm://status`, `vm://serial/log`
+
+### ⏳ Later — GDB Debug Integration
 - Debug channel wiring (`DebugRequest`)
 - `debug/break`, `debug/continue`, `debug/get_registers`, `debug/set_registers`
 - `debug/read_memory`, `debug/write_memory`
 - `debug/set_breakpoint`, `debug/clear_breakpoint`, `debug/single_step`
 - `debug/backtrace` (heuristic stack walker)
-- OpenHCL diagnostics integration
+
+### ⏳ Deferred — Petri-MCP Orchestrator
+- Standalone `petri_mcp` binary for multi-VM lifecycle management
+- `vm/create`, `vm/start`, `vm/destroy`, `vm/list`
+- Guest agent tools via pipette (`guest/execute`, `guest/read_file`, `guest/write_file`)
 
 ---
 

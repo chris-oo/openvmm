@@ -5519,6 +5519,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "serde_json",
+ "test_with_tracing",
  "tracing",
  "unicycle",
 ]

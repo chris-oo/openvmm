@@ -212,8 +212,14 @@ async fn handle_message(
             // Acknowledgement from client; no response needed.
             tracing::info!("MCP client initialized");
         }
+        "ping" => {
+            // Ping works both before and after initialize (MCP 2025-06-18).
+            let resp = JsonRpcResponse::success(id, serde_json::json!({}));
+            let _ = stdout.send(&resp);
+        }
         _ if !*initialized => {
             // Reject any method other than initialize/notifications before handshake.
+            // Per spec, ping is allowed before initialize.
             if !is_notification {
                 let resp = JsonRpcErrorResponse::new(
                     id,
@@ -260,8 +266,12 @@ async fn handle_message(
                     pending_tools.push(Box::pin(async move { (id, future.await) }));
                 }
                 None => {
-                    let result = ToolResult::error(format!("unknown tool: {}", params.name));
-                    let resp = JsonRpcResponse::success(id, serde_json::to_value(&result).unwrap());
+                    // Per MCP 2025-06-18, unknown tools are protocol errors.
+                    let resp = JsonRpcErrorResponse::new(
+                        id,
+                        crate::protocol::INVALID_PARAMS,
+                        format!("unknown tool: {}", params.name),
+                    );
                     let _ = stdout.send(&resp);
                 }
             }

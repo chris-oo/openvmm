@@ -3,6 +3,7 @@
 
 //! Serial console tools: read output, write input, execute commands.
 
+use crate::protocol::ToolAnnotations;
 use crate::protocol::ToolDefinition;
 use crate::protocol::ToolResult;
 use crate::vm_handle::VmHandle;
@@ -25,6 +26,7 @@ pub fn tools() -> Vec<(ToolDefinition, Handler)> {
         (
             ToolDefinition {
                 name: "serial/read".into(),
+                title: Some("Read Serial Output".into()),
                 description: "Read serial console output since the given cursor. Returns new output and an updated cursor for subsequent reads.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -42,12 +44,27 @@ pub fn tools() -> Vec<(ToolDefinition, Handler)> {
                     },
                     "required": []
                 }),
+                output_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string"},
+                        "cursor": {"type": "integer"},
+                        "bytes_read": {"type": "integer"}
+                    },
+                    "required": ["text", "cursor", "bytes_read"]
+                })),
+                annotations: Some(ToolAnnotations {
+                    read_only_hint: Some(true),
+                    open_world_hint: Some(false),
+                    ..Default::default()
+                }),
             },
             handle_read as Handler,
         ),
         (
             ToolDefinition {
                 name: "serial/write".into(),
+                title: Some("Write to Serial Console".into()),
                 description: "Write text to the VM serial console input. Note: the VM must have a serial console configured.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -59,12 +76,26 @@ pub fn tools() -> Vec<(ToolDefinition, Handler)> {
                     },
                     "required": ["text"]
                 }),
+                output_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "written": {"type": "boolean"},
+                        "bytes": {"type": "integer"}
+                    },
+                    "required": ["written", "bytes"]
+                })),
+                annotations: Some(ToolAnnotations {
+                    read_only_hint: Some(false),
+                    idempotent_hint: Some(false),
+                    ..Default::default()
+                }),
             },
             handle_write,
         ),
         (
             ToolDefinition {
                 name: "serial/execute".into(),
+                title: Some("Execute Serial Command".into()),
                 description: "Write a command to the serial console and wait for the output until a shell prompt appears or a timeout expires. Returns the complete command output in one response. Much more convenient than separate serial/write + serial/read calls.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -84,6 +115,20 @@ pub fn tools() -> Vec<(ToolDefinition, Handler)> {
                         }
                     },
                     "required": ["command"]
+                }),
+                output_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "output": {"type": "string"},
+                        "cursor": {"type": "integer"},
+                        "timed_out": {"type": "boolean"}
+                    },
+                    "required": ["output", "cursor", "timed_out"]
+                })),
+                annotations: Some(ToolAnnotations {
+                    read_only_hint: Some(false),
+                    idempotent_hint: Some(false),
+                    ..Default::default()
                 }),
             },
             handle_execute,
@@ -150,14 +195,11 @@ fn handle_read(
         } else {
             strip_ansi_escapes(&text)
         };
-        ToolResult::text(
-            serde_json::json!({
-                "text": text,
-                "cursor": new_cursor,
-                "bytes_read": data.len(),
-            })
-            .to_string(),
-        )
+        ToolResult::structured(serde_json::json!({
+            "text": text,
+            "cursor": new_cursor,
+            "bytes_read": data.len(),
+        }))
     })
 }
 
@@ -181,13 +223,10 @@ fn handle_write(
             .write_all(text.as_bytes())
             .and_then(|()| writer.flush())
         {
-            Ok(()) => ToolResult::text(
-                serde_json::json!({
-                    "written": true,
-                    "bytes": text.len(),
-                })
-                .to_string(),
-            ),
+            Ok(()) => ToolResult::structured(serde_json::json!({
+                "written": true,
+                "bytes": text.len(),
+            })),
             Err(e) => ToolResult::error(format!("serial write failed: {e}")),
         }
     })
@@ -265,27 +304,21 @@ fn handle_execute(
                         cursor = new_cursor;
 
                         if ends_with_prompt(&full_output, &prompt_pattern) {
-                            result_tx.send(ToolResult::text(
-                                serde_json::json!({
-                                    "output": full_output,
-                                    "cursor": cursor,
-                                    "timed_out": false,
-                                })
-                                .to_string(),
-                            ));
+                            result_tx.send(ToolResult::structured(serde_json::json!({
+                                "output": full_output,
+                                "cursor": cursor,
+                                "timed_out": false,
+                            })));
                             return;
                         }
                     }
 
                     if std::time::Instant::now() >= deadline {
-                        result_tx.send(ToolResult::text(
-                            serde_json::json!({
-                                "output": full_output,
-                                "cursor": cursor,
-                                "timed_out": true,
-                            })
-                            .to_string(),
-                        ));
+                        result_tx.send(ToolResult::structured(serde_json::json!({
+                            "output": full_output,
+                            "cursor": cursor,
+                            "timed_out": true,
+                        })));
                         return;
                     }
                 }

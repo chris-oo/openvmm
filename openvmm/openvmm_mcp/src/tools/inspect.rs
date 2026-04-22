@@ -3,6 +3,7 @@
 
 //! Inspect tools: query and update the VM inspect tree.
 
+use crate::protocol::ToolAnnotations;
 use crate::protocol::ToolDefinition;
 use crate::protocol::ToolResult;
 use crate::vm_handle::VmHandle;
@@ -18,12 +19,22 @@ type Handler = fn(
     serde_json::Value,
 ) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'static>>;
 
+/// Annotations for read-only inspect tools.
+fn read_only() -> Option<ToolAnnotations> {
+    Some(ToolAnnotations {
+        read_only_hint: Some(true),
+        open_world_hint: Some(false),
+        ..Default::default()
+    })
+}
+
 /// Return all inspect tool definitions and handlers.
 pub fn tools() -> Vec<(ToolDefinition, Handler)> {
     vec![
         (
             ToolDefinition {
                 name: "inspect/tree".into(),
+                title: Some("Inspect Tree".into()),
                 description:
                     "Query the VM inspect tree at a given path. Returns a JSON representation of the subtree."
                         .into(),
@@ -43,12 +54,22 @@ pub fn tools() -> Vec<(ToolDefinition, Handler)> {
                     },
                     "required": []
                 }),
+                output_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "result": {}
+                    },
+                    "required": ["path", "result"]
+                })),
+                annotations: read_only(),
             },
             handle_tree as Handler,
         ),
         (
             ToolDefinition {
                 name: "inspect/get".into(),
+                title: Some("Get Inspect Value".into()),
                 description:
                     "Get a single value from the inspect tree at the specified path.".into(),
                 input_schema: serde_json::json!({
@@ -61,12 +82,22 @@ pub fn tools() -> Vec<(ToolDefinition, Handler)> {
                     },
                     "required": ["path"]
                 }),
+                output_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "value": {}
+                    },
+                    "required": ["path", "value"]
+                })),
+                annotations: read_only(),
             },
             handle_get,
         ),
         (
             ToolDefinition {
                 name: "inspect/update".into(),
+                title: Some("Update Inspect Value".into()),
                 description: "Update a mutable value in the inspect tree.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -81,6 +112,20 @@ pub fn tools() -> Vec<(ToolDefinition, Handler)> {
                         }
                     },
                     "required": ["path", "value"]
+                }),
+                output_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "old_value": {"type": "string"}
+                    },
+                    "required": ["path", "old_value"]
+                })),
+                annotations: Some(ToolAnnotations {
+                    read_only_hint: Some(false),
+                    idempotent_hint: Some(false),
+                    open_world_hint: Some(false),
+                    ..Default::default()
                 }),
             },
             handle_update,
@@ -118,7 +163,13 @@ fn handle_tree(
             .await;
 
         let node = inspection.results();
-        ToolResult::text(format!("{}", node.json()))
+        let node_json_str = format!("{}", node.json());
+        let result_value = serde_json::from_str::<serde_json::Value>(&node_json_str)
+            .unwrap_or(serde_json::Value::Null);
+        ToolResult::structured(serde_json::json!({
+            "path": path,
+            "result": result_value,
+        }))
     })
 }
 
@@ -145,7 +196,13 @@ fn handle_get(
             .await;
 
         let node = inspection.results();
-        ToolResult::text(format!("{}", node.json()))
+        let node_json_str = format!("{}", node.json());
+        let result_value = serde_json::from_str::<serde_json::Value>(&node_json_str)
+            .unwrap_or(serde_json::Value::Null);
+        ToolResult::structured(serde_json::json!({
+            "path": path,
+            "value": result_value,
+        }))
     })
 }
 
@@ -178,7 +235,10 @@ fn handle_update(
             .await;
 
         match result {
-            Ok(Ok(v)) => ToolResult::text(format!("{v:#}")),
+            Ok(Ok(v)) => ToolResult::structured(serde_json::json!({
+                "path": path,
+                "old_value": format!("{v:#}"),
+            })),
             Ok(Err(e)) => ToolResult::error(format!("update failed: {e}")),
             Err(_) => ToolResult::error("update timed out"),
         }

@@ -17,7 +17,7 @@ use serde::Serialize;
 pub const JSONRPC_VERSION: &str = "2.0";
 
 /// The MCP protocol version we advertise.
-pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 
 // ── Incoming messages ──
 
@@ -130,8 +130,37 @@ pub struct ToolsCapability {
 #[serde(rename_all = "camelCase")]
 pub struct ToolDefinition {
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub description: String,
     pub input_schema: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<ToolAnnotations>,
+}
+
+/// Annotations describing tool behavior, as defined in MCP 2025-06-18.
+///
+/// All fields are optional hints. Clients should not rely on these for
+/// security decisions from untrusted servers.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolAnnotations {
+    /// If true, the tool does not modify its environment. Default: false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_only_hint: Option<bool>,
+    /// If true, the tool may perform destructive updates. Default: true.
+    /// Only meaningful when `read_only_hint` is false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub destructive_hint: Option<bool>,
+    /// If true, calling repeatedly with same args has no additional effect.
+    /// Default: false. Only meaningful when `read_only_hint` is false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotent_hint: Option<bool>,
+    /// If true, the tool may interact with external entities. Default: true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_world_hint: Option<bool>,
 }
 
 /// Parameters for `tools/call`.
@@ -149,6 +178,10 @@ pub struct ToolResult {
     pub content: Vec<ContentItem>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub is_error: bool,
+    /// Structured output as a JSON object (MCP 2025-06-18).
+    /// For backwards compatibility, the serialized JSON is also in `content`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structured_content: Option<serde_json::Value>,
 }
 
 /// A content block inside a tool result.
@@ -196,11 +229,24 @@ impl JsonRpcErrorResponse {
 }
 
 impl ToolResult {
-    /// Create a successful text result.
+    /// Create a successful text result (unstructured).
     pub fn text(text: impl Into<String>) -> Self {
         Self {
             content: vec![ContentItem::Text { text: text.into() }],
             is_error: false,
+            structured_content: None,
+        }
+    }
+
+    /// Create a result with both structured content and a text fallback.
+    /// The value MUST be a JSON object (MCP spec requirement).
+    pub fn structured(value: serde_json::Value) -> Self {
+        assert!(value.is_object(), "structuredContent must be a JSON object");
+        let text = serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string());
+        Self {
+            content: vec![ContentItem::Text { text }],
+            is_error: false,
+            structured_content: Some(value),
         }
     }
 
@@ -209,6 +255,107 @@ impl ToolResult {
         Self {
             content: vec![ContentItem::Text { text: text.into() }],
             is_error: true,
+            structured_content: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    #[test]
+    fn tool_annotations_serializes_camel_case() {
+        let ann = ToolAnnotations {
+            read_only_hint: Some(true),
+            open_world_hint: Some(false),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&ann).unwrap();
+        assert_eq!(json["readOnlyHint"], true);
+        assert_eq!(json["openWorldHint"], false);
+        assert!(json.get("destructiveHint").is_none());
+        assert!(json.get("idempotentHint").is_none());
+    }
+
+    #[test]
+    fn tool_result_structured_has_both_fields() {
+        let value = serde_json::json!({"status": "running", "paused": false});
+        let result = ToolResult::structured(value.clone());
+        let json = serde_json::to_value(&result).unwrap();
+
+        assert_eq!(json["structuredContent"], value);
+
+        let text = json["content"][0]["text"].as_str().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed, value);
+
+        assert!(json.get("isError").is_none());
+    }
+
+    #[test]
+    fn tool_result_text_has_no_structured_content() {
+        let result = ToolResult::text("hello");
+        let json = serde_json::to_value(&result).unwrap();
+        assert!(json.get("structuredContent").is_none());
+        assert_eq!(json["content"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn tool_result_error_has_no_structured_content() {
+        let result = ToolResult::error("something broke");
+        let json = serde_json::to_value(&result).unwrap();
+        assert!(json.get("structuredContent").is_none());
+        assert_eq!(json["isError"], true);
+    }
+
+    #[test]
+    #[should_panic(expected = "structuredContent must be a JSON object")]
+    fn tool_result_structured_rejects_non_object() {
+        ToolResult::structured(serde_json::json!("just a string"));
+    }
+
+    #[test]
+    fn tool_definition_serializes_all_fields() {
+        let def = ToolDefinition {
+            name: "vm/status".into(),
+            title: Some("Get VM Status".into()),
+            description: "Get status".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            output_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {"status": {"type": "string"}}
+            })),
+            annotations: Some(ToolAnnotations {
+                read_only_hint: Some(true),
+                ..Default::default()
+            }),
+        };
+        let json = serde_json::to_value(&def).unwrap();
+
+        assert_eq!(json["name"], "vm/status");
+        assert_eq!(json["title"], "Get VM Status");
+        assert!(json["outputSchema"].is_object());
+        assert_eq!(json["annotations"]["readOnlyHint"], true);
+        assert!(json.get("input_schema").is_none());
+        assert!(json.get("inputSchema").is_some());
+    }
+
+    #[test]
+    fn tool_definition_omits_none_fields() {
+        let def = ToolDefinition {
+            name: "test".into(),
+            title: None,
+            description: "desc".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            output_schema: None,
+            annotations: None,
+        };
+        let json = serde_json::to_value(&def).unwrap();
+
+        assert!(json.get("title").is_none());
+        assert!(json.get("outputSchema").is_none());
+        assert!(json.get("annotations").is_none());
     }
 }
