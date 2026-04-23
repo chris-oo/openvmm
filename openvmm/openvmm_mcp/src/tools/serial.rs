@@ -36,6 +36,10 @@ pub fn tools() -> Vec<(ToolDefinition, Handler)> {
                             "description": "Cursor from a previous read (0 to read all buffered output)",
                             "default": 0
                         },
+                        "max_bytes": {
+                            "type": "integer",
+                            "description": "Maximum number of bytes to return. When set and more data is available, only the most recent max_bytes are returned (tail behavior). The cursor advances past skipped data. Use this to avoid large responses when polling, e.g. max_bytes=4096."
+                        },
                         "raw": {
                             "type": "boolean",
                             "description": "If true, return raw text including ANSI escape sequences. Default: false (escapes stripped).",
@@ -49,9 +53,11 @@ pub fn tools() -> Vec<(ToolDefinition, Handler)> {
                     "properties": {
                         "text": {"type": "string"},
                         "cursor": {"type": "integer"},
-                        "bytes_read": {"type": "integer"}
+                        "bytes_read": {"type": "integer"},
+                        "truncated": {"type": "boolean"},
+                        "bytes_skipped": {"type": "integer"}
                     },
-                    "required": ["text", "cursor", "bytes_read"]
+                    "required": ["text", "cursor", "bytes_read", "truncated", "bytes_skipped"]
                 })),
                 annotations: Some(ToolAnnotations {
                     read_only_hint: Some(true),
@@ -186,9 +192,25 @@ fn handle_read(
 ) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'static>> {
     Box::pin(async move {
         let cursor = args.get("cursor").and_then(|v| v.as_u64()).unwrap_or(0);
+        let max_bytes = args
+            .get("max_bytes")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
         let raw = args.get("raw").and_then(|v| v.as_bool()).unwrap_or(false);
 
         let (data, new_cursor) = vm.serial_buffer.read_since(cursor);
+
+        // Apply tail truncation: if max_bytes is set and data exceeds it,
+        // return only the most recent max_bytes bytes.
+        let (data, bytes_skipped) = match max_bytes {
+            Some(max) if data.len() > max => {
+                let skip = data.len() - max;
+                (data[skip..].to_vec(), skip)
+            }
+            _ => (data, 0),
+        };
+
+        let bytes_read = data.len();
         let text = String::from_utf8_lossy(&data);
         let text = if raw {
             text.into_owned()
@@ -198,7 +220,9 @@ fn handle_read(
         ToolResult::structured(serde_json::json!({
             "text": text,
             "cursor": new_cursor,
-            "bytes_read": data.len(),
+            "bytes_read": bytes_read,
+            "truncated": bytes_skipped > 0,
+            "bytes_skipped": bytes_skipped,
         }))
     })
 }

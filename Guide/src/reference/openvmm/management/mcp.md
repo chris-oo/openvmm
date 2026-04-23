@@ -66,6 +66,19 @@ defining their structured return value.
 | Tool | Description | Read-only |
 |---|---|---|
 | `serial/read` | Read output since a cursor position | ✅ |
+
+`serial/read` accepts an optional `max_bytes` parameter. When set, only
+the most recent `max_bytes` bytes are returned (tail behavior) and the
+cursor advances past skipped data. The response includes `truncated`
+(bool) and `bytes_skipped` (integer) fields so the caller knows data
+was dropped. Use `max_bytes` when polling during boot to avoid receiving
+the entire boot log:
+
+```json
+→ {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+     "name":"serial/read",
+     "arguments":{"cursor":0,"max_bytes":4096}}}
+```
 | `serial/write` | Write text to COM1 input | |
 | `serial/execute` | Write a command, wait for prompt, return output | |
 

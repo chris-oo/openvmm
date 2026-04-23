@@ -281,6 +281,48 @@ def test_mcp_server():
         check("serial shows boot output", has_linux,
               boot_text[-300:] if boot_text else "(empty)")
 
+        # --- Test 7b: serial/read with max_bytes ---
+        print("\n=== Serial Read with max_bytes ===")
+        # Read from cursor 0 with max_bytes to verify truncation
+        send(proc, make_request("tools/call", {
+            "name": "serial/read",
+            "arguments": {"cursor": 0, "max_bytes": 256}
+        }))
+        resp = recv(proc, timeout=5)
+        check("serial/read max_bytes response received", resp is not None)
+        if resp and "result" in resp:
+            sc = resp["result"].get("structuredContent") or json.loads(
+                resp["result"].get("content", [{}])[0].get("text", "{}"))
+            check("serial/read max_bytes truncated",
+                  sc.get("truncated") == True,
+                  f"bytes_read={sc.get('bytes_read')}, bytes_skipped={sc.get('bytes_skipped')}")
+            check("serial/read max_bytes bounded",
+                  sc.get("bytes_read", 99999) <= 256,
+                  f"bytes_read={sc.get('bytes_read')}")
+            check("serial/read max_bytes has bytes_skipped",
+                  sc.get("bytes_skipped", 0) > 0,
+                  f"bytes_skipped={sc.get('bytes_skipped')}")
+            check("serial/read max_bytes cursor advanced",
+                  sc.get("cursor", 0) == last_cursor,
+                  f"cursor={sc.get('cursor')}, expected={last_cursor}")
+
+        # Read with max_bytes larger than available (no truncation)
+        send(proc, make_request("tools/call", {
+            "name": "serial/read",
+            "arguments": {"cursor": last_cursor, "max_bytes": 65536}
+        }))
+        resp = recv(proc, timeout=5)
+        check("serial/read large max_bytes response received", resp is not None)
+        if resp and "result" in resp:
+            sc = resp["result"].get("structuredContent") or json.loads(
+                resp["result"].get("content", [{}])[0].get("text", "{}"))
+            check("serial/read large max_bytes not truncated",
+                  sc.get("truncated") == False,
+                  f"truncated={sc.get('truncated')}")
+            check("serial/read large max_bytes no bytes_skipped",
+                  sc.get("bytes_skipped", -1) == 0,
+                  f"bytes_skipped={sc.get('bytes_skipped')}")
+
         # --- Test 8: Serial write ---
         print("\n=== Serial Write ===")
         send(proc, make_request("tools/call", {

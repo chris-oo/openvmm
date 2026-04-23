@@ -105,7 +105,7 @@ Returns `{"output": "...", "cursor": N, "timed_out": false}`.
 #### Read Serial Output (Boot Log)
 
 ```json
-{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"serial/read","arguments":{"cursor":0}}}
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"serial/read","arguments":{"cursor":0,"max_bytes":4096}}}
 ```
 
 Returns `{"text": "...", "cursor": N}`. Use the returned `cursor` in
@@ -165,7 +165,7 @@ Blocks until the guest halts (shutdown, triple fault) or times out.
 
 1. Launch openvmm with `--mcp` (async bash)
 2. Send the MCP handshake
-3. Poll `serial/read` with `cursor: 0` every 5 seconds until you see `login:`
+3. Poll `serial/read` with `cursor: 0` and `max_bytes: 4096` every 5 seconds until you see `login:`
 4. Send `serial/write` with `"root\n"` then `"alpine\n"` (password)
 5. Now use `serial/execute` to run commands
 
