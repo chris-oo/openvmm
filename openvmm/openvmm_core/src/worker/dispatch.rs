@@ -693,15 +693,21 @@ fn convert_vtl2_config(
 
     let late_map_vtl0_memory = match vtl2_cfg.late_map_vtl0_memory {
         Some(policy) => {
+            use super::vm_loaders::igvm::select_igvm_context;
+            use super::vm_loaders::igvm::supports_relocations;
             use super::vm_loaders::igvm::vtl2_memory_info;
             use virt::LateMapVtl0AllowedRanges;
             let igvm_file = igvm_file.context("vtl2 configured but not loading from igvm")?;
 
             let allowed_ranges = if let LoadMode::Igvm {
-                vtl2_base_address, ..
+                vtl2_base_address,
+                igvm_context,
+                ..
             } = load_mode
             {
-                let range = vtl2_memory_info(igvm_file).context("invalid igvm file")?;
+                let context = select_igvm_context(igvm_file, *igvm_context)
+                    .context("selecting igvm context")?;
+                let range = vtl2_memory_info(igvm_file, &context).context("invalid igvm file")?;
                 match vtl2_base_address {
                     Vtl2BaseAddressType::File => {
                         // Allowed range is the file range as-is.
@@ -709,7 +715,7 @@ fn convert_vtl2_config(
                     }
                     Vtl2BaseAddressType::Absolute(base) => {
                         // This file must support relocations.
-                        if !crate::worker::vm_loaders::igvm::supports_relocations(igvm_file) {
+                        if !supports_relocations(igvm_file, &context) {
                             anyhow::bail!(
                                 "vtl2 base address is absolute but igvm file does not support relocations"
                             );
@@ -836,7 +842,9 @@ impl InitializedVm {
 
         // Determine if a special vtl2 memory allocation should be used.
         let vtl2_range = if let LoadMode::Igvm {
-            vtl2_base_address, ..
+            vtl2_base_address,
+            igvm_context,
+            ..
         } = &cfg.load_mode
         {
             match vtl2_base_address {
@@ -844,16 +852,21 @@ impl InitializedVm {
                 | Vtl2BaseAddressType::Absolute(_)
                 | Vtl2BaseAddressType::Vtl2Allocate { .. } => None,
                 Vtl2BaseAddressType::MemoryLayout { size } => {
+                    let igvm_file = igvm_file
+                        .as_ref()
+                        .expect("igvm file should be already parsed");
+                    let context =
+                        super::vm_loaders::igvm::select_igvm_context(igvm_file, *igvm_context)
+                            .context("selecting igvm context")?;
                     let vtl2_range = super::vm_loaders::igvm::vtl2_memory_range(
                         physical_address_size,
                         cfg.memory.mem_size,
                         &cfg.memory.mmio_gaps,
                         &cfg.memory.pci_ecam_gaps,
                         &cfg.memory.pci_mmio_gaps,
-                        igvm_file
-                            .as_ref()
-                            .expect("igvm file should be already parsed"),
+                        igvm_file,
                         *size,
+                        &context,
                     )
                     .context("unable to determine vtl2 memory range")?;
                     tracing::info!(?vtl2_range, "vtl2 memory range selected");
@@ -2527,6 +2540,7 @@ impl LoadedVmInner {
                 ref cmdline,
                 vtl2_base_address,
                 com_serial,
+                igvm_context,
             } => {
                 let madt = acpi_builder.build_madt();
                 let srat = acpi_builder.build_srat();
@@ -2552,6 +2566,7 @@ impl LoadedVmInner {
                     with_vmbus_redirect: self.vmbus_redirect,
                     com_serial,
                     entropy: Some(&entropy),
+                    igvm_context,
                 };
                 super::vm_loaders::igvm::load_igvm(params)?
             }

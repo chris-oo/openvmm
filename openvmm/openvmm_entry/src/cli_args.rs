@@ -23,6 +23,7 @@ use clap::Parser;
 use clap::ValueEnum;
 use openvmm_defs::config::DEFAULT_PCAT_BOOT_ORDER;
 use openvmm_defs::config::DeviceVtl;
+use openvmm_defs::config::IgvmContextSelector;
 use openvmm_defs::config::PcatBootDevice;
 use openvmm_defs::config::Vtl2BaseAddressType;
 use openvmm_defs::config::X2ApicConfig;
@@ -397,6 +398,25 @@ options:
     /// (absolute=\<addr\>, disable, auto=\<filesize,or memory size\>, vtl2=\<filesize,or memory size\>,)
     #[clap(long, requires("igvm"), default_value = "auto=filesize", value_parser = parse_vtl2_relocation)]
     pub igvm_vtl2_relocation_type: Vtl2BaseAddressType,
+
+    /// IGVM context selector for multi-context IGVM v2 files.
+    ///
+    /// Selects the platform context: `default` uses the v1 fallback, `debug`
+    /// selects a v2 debug context, `release` selects a v2 release context.
+    #[clap(
+        long,
+        requires("igvm"),
+        default_value = "default",
+        conflicts_with("igvm_compatibility_mask")
+    )]
+    pub igvm_context: IgvmContextSelectorCli,
+
+    /// IGVM compatibility mask override (diagnostic only).
+    ///
+    /// Selects a specific context by compatibility mask. Use for generated-file
+    /// debugging and targeted loader tests only.
+    #[clap(long, requires("igvm"), conflicts_with("igvm_context"), hide = true)]
+    pub igvm_compatibility_mask: Option<u32>,
 
     /// add a virtio_9p device (e.g. myfs,C:\)
     ///
@@ -1719,6 +1739,32 @@ pub enum Vtl0LateMapPolicyCli {
 #[derive(Debug, Copy, Clone, ValueEnum)]
 pub enum IsolationCli {
     Vbs,
+}
+
+/// IGVM context selection mode for multi-context IGVM v2 files.
+///
+/// Selects which platform context to use when loading a multi-context IGVM v2
+/// file. Defaults to `default`, which uses the v1 fallback header.
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+pub enum IgvmContextSelectorCli {
+    /// Use the v1 fallback header (default behavior for v1 files and v2 files
+    /// with a v1 fallback header).
+    #[default]
+    Default,
+    /// Select the v2 context requiring debug enabled.
+    Debug,
+    /// Select the v2 context requiring debug disabled.
+    Release,
+}
+
+impl From<IgvmContextSelectorCli> for IgvmContextSelector {
+    fn from(value: IgvmContextSelectorCli) -> Self {
+        match value {
+            IgvmContextSelectorCli::Default => IgvmContextSelector::Default,
+            IgvmContextSelectorCli::Debug => IgvmContextSelector::DebugEnabled,
+            IgvmContextSelectorCli::Release => IgvmContextSelector::DebugDisabled,
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]

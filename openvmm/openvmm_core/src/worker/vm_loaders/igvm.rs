@@ -26,6 +26,7 @@ use loader::importer::TableRegister;
 use loader::importer::X86Register;
 use memory_range::MemoryRange;
 use memory_range::subtract_ranges;
+use openvmm_defs::config::IgvmContextSelector;
 use openvmm_defs::config::SerialInformation;
 use openvmm_defs::config::Vtl2BaseAddressType;
 use range_map_vec::RangeMap;
@@ -96,6 +97,12 @@ pub enum Error {
     MissingRequiredMemory(MemoryRange),
     #[error("IGVM file requires at least two mmio ranges")]
     UnsupportedMmio,
+    #[error("no matching IGVM context found for selector {0:?}")]
+    NoMatchingContext(IgvmContextSelector),
+    #[error("ambiguous IGVM context: multiple v2 headers match selector {0:?}")]
+    AmbiguousContext(IgvmContextSelector),
+    #[error("no v1 fallback platform header in multi-context IGVM file")]
+    NoV1FallbackHeader,
 }
 
 fn from_memory_range(range: &MemoryRange) -> IGVM_VHS_MEMORY_RANGE {
@@ -125,44 +132,191 @@ fn from_igvm_vtl(vtl: igvm::hv_defs::Vtl) -> hvdef::Vtl {
     }
 }
 
-/// Read and parse an IgvmFile from a File. This assumes the file is a VBS IGVM
-/// file.
+/// Read and parse an IgvmFile from a File.
 pub fn read_igvm_file(mut file: &std::fs::File) -> Result<IgvmFile, Error> {
     let mut file_contents = Vec::new();
     file.rewind().map_err(Error::Igvm)?;
     file.read_to_end(&mut file_contents).map_err(Error::Igvm)?;
 
-    let igvm_file = IgvmFile::new_from_binary(&file_contents, Some(igvm::IsolationType::Vbs))
-        .map_err(Error::InvalidIgvmFile)?;
+    // Parse with no isolation filter so multi-context files retain all
+    // candidate platform headers for selector-aware loading.
+    let igvm_file =
+        IgvmFile::new_from_binary(&file_contents, None).map_err(Error::InvalidIgvmFile)?;
 
     Ok(igvm_file)
 }
 
-/// Extract the vbs supported platform header from an igvm file.
-fn vbs_platform_header(igvm_file: &IgvmFile) -> Result<&IgvmPlatformHeader, Error> {
-    igvm_file
+/// A selected IGVM platform context, determined by applying an
+/// [`IgvmContextSelector`] to the file's platform headers.
+#[derive(Debug, Clone)]
+pub struct SelectedIgvmContext {
+    pub platform_type: IgvmPlatformType,
+    pub compatibility_mask: u32,
+    pub highest_vtl: u8,
+    pub requirements: Option<igvm_defs::SupportedPlatformRequirements>,
+    /// Whether a v1 fallback header was used (no v2 requirements).
+    pub v1_fallback: bool,
+}
+
+/// Select an IGVM platform context using the given selector.
+///
+/// Filters to VSM_ISOLATION platform type. For `Default`, returns the first v1
+/// fallback header (no requirements). For `DebugEnabled`/`DebugDisabled`,
+/// matches v2 headers by requirements. For `CompatibilityMask`, selects by mask.
+pub fn select_igvm_context(
+    igvm_file: &IgvmFile,
+    selector: IgvmContextSelector,
+) -> Result<SelectedIgvmContext, Error> {
+    let vsm_headers: Vec<&IgvmPlatformHeader> = igvm_file
         .platforms()
         .iter()
-        .find(|header| header.platform_type() == IgvmPlatformType::VSM_ISOLATION)
-        .ok_or(Error::NoVbsSupport)
+        .filter(|header| header.platform_type() == IgvmPlatformType::VSM_ISOLATION)
+        .collect();
+
+    match selector {
+        IgvmContextSelector::Default => {
+            let v1 = vsm_headers
+                .iter()
+                .find(|header| header.requirements().is_none())
+                .copied();
+
+            match v1 {
+                Some(header) => Ok(SelectedIgvmContext {
+                    platform_type: header.platform_type(),
+                    compatibility_mask: header.compatibility_mask(),
+                    highest_vtl: header.highest_vtl(),
+                    requirements: None,
+                    v1_fallback: true,
+                }),
+                None => {
+                    if vsm_headers
+                        .iter()
+                        .any(|header| header.requirements().is_some())
+                    {
+                        Err(Error::NoV1FallbackHeader)
+                    } else {
+                        Err(Error::NoVbsSupport)
+                    }
+                }
+            }
+        }
+        IgvmContextSelector::DebugEnabled => {
+            let matches: Vec<&IgvmPlatformHeader> = vsm_headers
+                .iter()
+                .filter(|header| {
+                    header
+                        .requirements()
+                        .map(|requirements| requirements.reject_debug_disabled() != 0)
+                        .unwrap_or(false)
+                })
+                .copied()
+                .collect();
+
+            match matches.len() {
+                0 => Err(Error::NoMatchingContext(selector)),
+                1 => {
+                    let header = matches[0];
+                    Ok(SelectedIgvmContext {
+                        platform_type: header.platform_type(),
+                        compatibility_mask: header.compatibility_mask(),
+                        highest_vtl: header.highest_vtl(),
+                        requirements: header.requirements(),
+                        v1_fallback: false,
+                    })
+                }
+                _ => Err(Error::AmbiguousContext(selector)),
+            }
+        }
+        IgvmContextSelector::DebugDisabled => {
+            let matches: Vec<&IgvmPlatformHeader> = vsm_headers
+                .iter()
+                .filter(|header| {
+                    header
+                        .requirements()
+                        .map(|requirements| requirements.reject_debug_enabled() != 0)
+                        .unwrap_or(false)
+                })
+                .copied()
+                .collect();
+
+            match matches.len() {
+                0 => Err(Error::NoMatchingContext(selector)),
+                1 => {
+                    let header = matches[0];
+                    Ok(SelectedIgvmContext {
+                        platform_type: header.platform_type(),
+                        compatibility_mask: header.compatibility_mask(),
+                        highest_vtl: header.highest_vtl(),
+                        requirements: header.requirements(),
+                        v1_fallback: false,
+                    })
+                }
+                _ => Err(Error::AmbiguousContext(selector)),
+            }
+        }
+        IgvmContextSelector::CompatibilityMask(mask) => {
+            let v2_matches: Vec<&IgvmPlatformHeader> = vsm_headers
+                .iter()
+                .filter(|header| {
+                    header.compatibility_mask() == mask && header.requirements().is_some()
+                })
+                .copied()
+                .collect();
+            let v1_matches: Vec<&IgvmPlatformHeader> = vsm_headers
+                .iter()
+                .filter(|header| {
+                    header.compatibility_mask() == mask && header.requirements().is_none()
+                })
+                .copied()
+                .collect();
+
+            match (v1_matches.len(), v2_matches.len()) {
+                (_, 2..) => Err(Error::AmbiguousContext(selector)),
+                (_, 1) => {
+                    let header = v2_matches[0];
+                    Ok(SelectedIgvmContext {
+                        platform_type: header.platform_type(),
+                        compatibility_mask: header.compatibility_mask(),
+                        highest_vtl: header.highest_vtl(),
+                        requirements: header.requirements(),
+                        v1_fallback: false,
+                    })
+                }
+                (1, 0) => {
+                    let header = v1_matches[0];
+                    Ok(SelectedIgvmContext {
+                        platform_type: header.platform_type(),
+                        compatibility_mask: header.compatibility_mask(),
+                        highest_vtl: header.highest_vtl(),
+                        requirements: None,
+                        v1_fallback: true,
+                    })
+                }
+                (0, 0) => Err(Error::NoMatchingContext(selector)),
+                _ => Err(Error::AmbiguousContext(selector)),
+            }
+        }
+    }
 }
 
 /// Determine if the given `igvm_file` supports relocations or not.
-pub fn supports_relocations(igvm_file: &IgvmFile) -> bool {
-    let platform = vbs_platform_header(igvm_file).unwrap();
-    debug_assert_eq!(platform.platform_type(), IgvmPlatformType::VSM_ISOLATION);
-    let mask = platform.compatibility_mask();
-
-    igvm_file.relocations(mask).0.is_some()
+pub fn supports_relocations(igvm_file: &IgvmFile, context: &SelectedIgvmContext) -> bool {
+    debug_assert_eq!(context.platform_type, IgvmPlatformType::VSM_ISOLATION);
+    igvm_file
+        .relocations(context.compatibility_mask)
+        .0
+        .is_some()
 }
 
 /// Determine the VTL2 memory size encoded in the file by looking for a
 /// [`IgvmDirectiveHeader::RequiredMemory`] structure is looked for, with the
 /// flag set for vtl2_protectable.
-pub fn vtl2_memory_info(igvm_file: &IgvmFile) -> Result<MemoryRange, Error> {
-    let platform = vbs_platform_header(igvm_file)?;
-    debug_assert_eq!(platform.platform_type(), IgvmPlatformType::VSM_ISOLATION);
-    let mask = platform.compatibility_mask();
+pub fn vtl2_memory_info(
+    igvm_file: &IgvmFile,
+    context: &SelectedIgvmContext,
+) -> Result<MemoryRange, Error> {
+    debug_assert_eq!(context.platform_type, IgvmPlatformType::VSM_ISOLATION);
+    let mask = context.compatibility_mask;
 
     let mut required_memory = None;
 
@@ -200,16 +354,16 @@ pub fn vtl2_memory_range(
     pci_mmio_gaps: &[MemoryRange],
     igvm_file: &IgvmFile,
     vtl2_size: Option<u64>,
+    context: &SelectedIgvmContext,
 ) -> Result<MemoryRange, Error> {
-    let platform = vbs_platform_header(igvm_file)?;
-    debug_assert_eq!(platform.platform_type(), IgvmPlatformType::VSM_ISOLATION);
-    let mask = platform.compatibility_mask();
+    debug_assert_eq!(context.platform_type, IgvmPlatformType::VSM_ISOLATION);
+    let mask = context.compatibility_mask;
 
     let relocs = igvm_file.relocations(mask);
 
     // Use the required memory struct as the hint for how large the file needs
     // for vtl2 mem.
-    let igvm_size = vtl2_memory_info(igvm_file)?.len();
+    let igvm_size = vtl2_memory_info(igvm_file, context)?.len();
 
     // TODO: only supports single relocation region, since that's what Underhill
     //       does
@@ -537,6 +691,8 @@ pub struct LoadIgvmParams<'a, T: ArchTopology> {
     pub com_serial: Option<SerialInformation>,
     /// Entropy
     pub entropy: Option<&'a [u8]>,
+    /// The IGVM context selector.
+    pub igvm_context: IgvmContextSelector,
 }
 
 pub fn load_igvm(
@@ -579,6 +735,7 @@ fn load_igvm_x86(
         with_vmbus_redirect,
         com_serial,
         entropy,
+        igvm_context,
     } = params;
 
     let relocations_enabled = match vtl2_base_address {
@@ -598,9 +755,19 @@ fn load_igvm_x86(
 
     let command_line = CString::new(cmdline).map_err(Error::InvalidCommandLine)?;
 
-    let platform = vbs_platform_header(igvm_file)?;
-    debug_assert_eq!(platform.platform_type(), IgvmPlatformType::VSM_ISOLATION);
-    let (mask, max_vtl) = (platform.compatibility_mask(), platform.highest_vtl());
+    let context = select_igvm_context(igvm_file, igvm_context)?;
+    let (mask, max_vtl) = (context.compatibility_mask, context.highest_vtl);
+    let selected_vtl2_memory_info = vtl2_memory_info(igvm_file, &context);
+
+    tracing::info!(
+        selector = ?igvm_context,
+        platform_type = ?context.platform_type,
+        compatibility_mask = context.compatibility_mask,
+        requirements = ?context.requirements,
+        vtl2_memory_info = ?selected_vtl2_memory_info,
+        v1_fallback = context.v1_fallback,
+        "selected IGVM context",
+    );
 
     let (relocation_regions, mut page_table_fixup) = igvm_file.relocations(mask);
 
@@ -740,21 +907,32 @@ fn load_igvm_x86(
         }
     };
 
+    let directive_applies = |header: &IgvmDirectiveHeader| {
+        header
+            .compatibility_mask()
+            .map(|header_mask| header_mask & mask == mask)
+            .unwrap_or(true)
+    };
+
     // Ensure required memory is present.
-    let required_ram = igvm_file.directives().iter().filter_map(|header| {
-        if let IgvmDirectiveHeader::RequiredMemory {
-            gpa,
-            compatibility_mask: _,
-            number_of_bytes,
-            vtl2_protectable: _,
-        } = *header
-        {
-            let base = relocate_gpa(gpa);
-            Some(MemoryRange::new(base..base + number_of_bytes as u64))
-        } else {
-            None
-        }
-    });
+    let required_ram = igvm_file
+        .directives()
+        .iter()
+        .filter(|header| directive_applies(header))
+        .filter_map(|header| {
+            if let IgvmDirectiveHeader::RequiredMemory {
+                gpa,
+                compatibility_mask: _,
+                number_of_bytes,
+                vtl2_protectable: _,
+            } = *header
+            {
+                let base = relocate_gpa(gpa);
+                Some(MemoryRange::new(base..base + number_of_bytes as u64))
+            } else {
+                None
+            }
+        });
 
     let mut all_ram = mem_layout
         .ram()
@@ -780,6 +958,7 @@ fn load_igvm_x86(
         | Vtl2BaseAddressType::MemoryLayout { .. } => igvm_file
             .directives()
             .iter()
+            .filter(|header| directive_applies(header))
             .filter_map(|header| {
                 if let IgvmDirectiveHeader::RequiredMemory {
                     gpa,
@@ -811,49 +990,55 @@ fn load_igvm_x86(
     let pt_range = page_table_fixup.as_ref().map_or(MemoryRange::EMPTY, |x| {
         MemoryRange::new(x.gpa..x.gpa + x.size)
     });
-    let directives = igvm_file.directives().iter().filter(|&header| {
-        if !vtl2_only {
-            true
-        } else if let Some(reloc_region) = &relocation_region {
-            // Remove directives for pages outside relocation regions, and for
-            // registers for lower VTLs.
-            match *header {
-                IgvmDirectiveHeader::PageData { gpa, .. } => {
-                    reloc_region.contains(gpa) || pt_range.contains_addr(gpa)
+    let directives = igvm_file
+        .directives()
+        .iter()
+        .filter(|header| directive_applies(header))
+        .filter(|&header| {
+            if !vtl2_only {
+                true
+            } else if let Some(reloc_region) = &relocation_region {
+                // Remove directives for pages outside relocation regions, and for
+                // registers for lower VTLs.
+                match *header {
+                    IgvmDirectiveHeader::PageData { gpa, .. } => {
+                        reloc_region.contains(gpa) || pt_range.contains_addr(gpa)
+                    }
+                    IgvmDirectiveHeader::X64VbsVpContext { vtl, .. } => {
+                        vtl == igvm::hv_defs::Vtl::Vtl2
+                    }
+                    IgvmDirectiveHeader::AArch64VbsVpContext { vtl, .. } => {
+                        vtl == igvm::hv_defs::Vtl::Vtl2
+                    }
+                    IgvmDirectiveHeader::ParameterInsert(IGVM_VHS_PARAMETER_INSERT {
+                        gpa,
+                        compatibility_mask: _,
+                        parameter_area_index: _,
+                    }) => reloc_region.contains(gpa),
+                    IgvmDirectiveHeader::ParameterArea { .. }
+                    | IgvmDirectiveHeader::VpCount { .. }
+                    | IgvmDirectiveHeader::Srat { .. }
+                    | IgvmDirectiveHeader::Madt { .. }
+                    | IgvmDirectiveHeader::Slit { .. }
+                    | IgvmDirectiveHeader::Pptt { .. }
+                    | IgvmDirectiveHeader::MmioRanges { .. }
+                    | IgvmDirectiveHeader::MemoryMap { .. }
+                    | IgvmDirectiveHeader::CommandLine { .. }
+                    | IgvmDirectiveHeader::RequiredMemory { .. }
+                    | IgvmDirectiveHeader::SnpVpContext { .. }
+                    | IgvmDirectiveHeader::ErrorRange { .. }
+                    | IgvmDirectiveHeader::SnpIdBlock { .. }
+                    | IgvmDirectiveHeader::VbsMeasurement { .. }
+                    | IgvmDirectiveHeader::DeviceTree { .. }
+                    | IgvmDirectiveHeader::EnvironmentInfo { .. } => true,
+                    IgvmDirectiveHeader::X64NativeVpContext { .. } => {
+                        todo!("native igvm type not supported yet")
+                    }
                 }
-                IgvmDirectiveHeader::X64VbsVpContext { vtl, .. } => vtl == igvm::hv_defs::Vtl::Vtl2,
-                IgvmDirectiveHeader::AArch64VbsVpContext { vtl, .. } => {
-                    vtl == igvm::hv_defs::Vtl::Vtl2
-                }
-                IgvmDirectiveHeader::ParameterInsert(IGVM_VHS_PARAMETER_INSERT {
-                    gpa,
-                    compatibility_mask: _,
-                    parameter_area_index: _,
-                }) => reloc_region.contains(gpa),
-                IgvmDirectiveHeader::ParameterArea { .. }
-                | IgvmDirectiveHeader::VpCount { .. }
-                | IgvmDirectiveHeader::Srat { .. }
-                | IgvmDirectiveHeader::Madt { .. }
-                | IgvmDirectiveHeader::Slit { .. }
-                | IgvmDirectiveHeader::Pptt { .. }
-                | IgvmDirectiveHeader::MmioRanges { .. }
-                | IgvmDirectiveHeader::MemoryMap { .. }
-                | IgvmDirectiveHeader::CommandLine { .. }
-                | IgvmDirectiveHeader::RequiredMemory { .. }
-                | IgvmDirectiveHeader::SnpVpContext { .. }
-                | IgvmDirectiveHeader::ErrorRange { .. }
-                | IgvmDirectiveHeader::SnpIdBlock { .. }
-                | IgvmDirectiveHeader::VbsMeasurement { .. }
-                | IgvmDirectiveHeader::DeviceTree { .. }
-                | IgvmDirectiveHeader::EnvironmentInfo { .. } => true,
-                IgvmDirectiveHeader::X64NativeVpContext { .. } => {
-                    todo!("native igvm type not supported yet")
-                }
+            } else {
+                panic!("no relocation region, cannot filter to VTL2");
             }
-        } else {
-            panic!("no relocation region, cannot filter to VTL2");
-        }
-    });
+        });
 
     let mut page_data = PageDataBuffer::new();
     for header in directives {
@@ -1356,5 +1541,176 @@ impl PageDataBuffer {
         self.data.clear();
         self.len = 0;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use igvm::IgvmRevision;
+    use igvm_defs::IGVM_NATIVE_PLATFORM_VERSION;
+    use igvm_defs::IGVM_VHS_SUPPORTED_PLATFORM;
+    use igvm_defs::IGVM_VHS_SUPPORTED_PLATFORM_V2;
+    use igvm_defs::IGVM_VSM_ISOLATION_PLATFORM_VERSION;
+
+    fn new_platform(
+        compatibility_mask: u32,
+        platform_type: IgvmPlatformType,
+    ) -> IgvmPlatformHeader {
+        let platform_version = match platform_type {
+            IgvmPlatformType::NATIVE => IGVM_NATIVE_PLATFORM_VERSION,
+            IgvmPlatformType::VSM_ISOLATION => IGVM_VSM_ISOLATION_PLATFORM_VERSION,
+            _ => unimplemented!("test helper only supports native and VSM"),
+        };
+
+        IgvmPlatformHeader::SupportedPlatform(IGVM_VHS_SUPPORTED_PLATFORM {
+            compatibility_mask,
+            highest_vtl: 0,
+            platform_type,
+            platform_version,
+            shared_gpa_boundary: 0,
+        })
+    }
+
+    fn new_vsm_platform_v2(
+        compatibility_mask: u32,
+        requirements: igvm_defs::SupportedPlatformRequirements,
+    ) -> IgvmPlatformHeader {
+        IgvmPlatformHeader::SupportedPlatformV2(IGVM_VHS_SUPPORTED_PLATFORM_V2 {
+            compatibility_mask,
+            highest_vtl: 2,
+            platform_type: IgvmPlatformType::VSM_ISOLATION,
+            platform_version: IGVM_VSM_ISOLATION_PLATFORM_VERSION,
+            shared_gpa_boundary: 0,
+            requirements,
+        })
+    }
+
+    fn new_igvm_file(platforms: Vec<IgvmPlatformHeader>) -> IgvmFile {
+        IgvmFile::new(IgvmRevision::V1, platforms, vec![], vec![])
+            .expect("test IGVM file should be valid")
+    }
+
+    fn debug_enabled_requirements() -> igvm_defs::SupportedPlatformRequirements {
+        igvm_defs::SupportedPlatformRequirements::new().with_reject_debug_disabled(1)
+    }
+
+    fn debug_disabled_requirements() -> igvm_defs::SupportedPlatformRequirements {
+        igvm_defs::SupportedPlatformRequirements::new().with_reject_debug_enabled(1)
+    }
+
+    #[test]
+    fn select_context_returns_no_vbs_support_without_vsm_headers() {
+        let igvm_file = new_igvm_file(vec![new_platform(0x1, IgvmPlatformType::NATIVE)]);
+
+        assert!(matches!(
+            select_igvm_context(&igvm_file, IgvmContextSelector::Default),
+            Err(Error::NoVbsSupport)
+        ));
+    }
+
+    #[test]
+    fn default_selector_requires_v1_fallback_header() {
+        let igvm_file = new_igvm_file(vec![new_vsm_platform_v2(
+            0x1,
+            debug_disabled_requirements(),
+        )]);
+
+        assert!(matches!(
+            select_igvm_context(&igvm_file, IgvmContextSelector::Default),
+            Err(Error::NoV1FallbackHeader)
+        ));
+    }
+
+    #[test]
+    fn debug_enabled_selector_requires_matching_v2_header() {
+        let igvm_file = new_igvm_file(vec![new_platform(0x1, IgvmPlatformType::VSM_ISOLATION)]);
+
+        assert!(matches!(
+            select_igvm_context(&igvm_file, IgvmContextSelector::DebugEnabled),
+            Err(Error::NoMatchingContext(IgvmContextSelector::DebugEnabled))
+        ));
+    }
+
+    #[test]
+    fn selectors_choose_expected_contexts() {
+        let igvm_file = new_igvm_file(vec![
+            new_platform(0x1, IgvmPlatformType::VSM_ISOLATION),
+            new_vsm_platform_v2(0x1, debug_disabled_requirements()),
+            new_vsm_platform_v2(0x2, debug_enabled_requirements()),
+        ]);
+
+        let default_context = select_igvm_context(&igvm_file, IgvmContextSelector::Default)
+            .expect("default context should select v1 fallback");
+        assert_eq!(default_context.compatibility_mask, 0x1);
+        assert!(default_context.v1_fallback);
+
+        let debug_context = select_igvm_context(&igvm_file, IgvmContextSelector::DebugEnabled)
+            .expect("debug context should select debug-enabled v2 header");
+        assert_eq!(debug_context.compatibility_mask, 0x2);
+        assert!(!debug_context.v1_fallback);
+
+        let release_context = select_igvm_context(&igvm_file, IgvmContextSelector::DebugDisabled)
+            .expect("release context should select debug-disabled v2 header");
+        assert_eq!(release_context.compatibility_mask, 0x1);
+        assert!(!release_context.v1_fallback);
+    }
+
+    #[test]
+    fn compatibility_mask_selector_selects_v1_only_header() {
+        let igvm_file = new_igvm_file(vec![new_platform(0x4, IgvmPlatformType::VSM_ISOLATION)]);
+
+        let context = select_igvm_context(&igvm_file, IgvmContextSelector::CompatibilityMask(0x4))
+            .expect("mask selector should select matching v1 header");
+
+        assert_eq!(context.compatibility_mask, 0x4);
+        assert_eq!(context.requirements, None);
+        assert!(context.v1_fallback);
+    }
+
+    #[test]
+    fn compatibility_mask_selector_prefers_v2_over_v1_fallback() {
+        let requirements = debug_disabled_requirements();
+        let igvm_file = new_igvm_file(vec![
+            new_platform(0x1, IgvmPlatformType::VSM_ISOLATION),
+            new_vsm_platform_v2(0x1, requirements),
+        ]);
+
+        let context = select_igvm_context(&igvm_file, IgvmContextSelector::CompatibilityMask(0x1))
+            .expect("mask selector should select matching v2 header");
+
+        assert_eq!(context.compatibility_mask, 0x1);
+        assert_eq!(context.requirements, Some(requirements));
+        assert!(!context.v1_fallback);
+    }
+
+    #[test]
+    fn compatibility_mask_selector_returns_no_match() {
+        let igvm_file = new_igvm_file(vec![new_platform(0x1, IgvmPlatformType::VSM_ISOLATION)]);
+
+        assert!(matches!(
+            select_igvm_context(&igvm_file, IgvmContextSelector::CompatibilityMask(0x2)),
+            Err(Error::NoMatchingContext(
+                IgvmContextSelector::CompatibilityMask(0x2)
+            ))
+        ));
+    }
+
+    #[test]
+    fn duplicate_v2_compatibility_masks_are_rejected_before_selection() {
+        let result = IgvmFile::new(
+            IgvmRevision::V1,
+            vec![
+                new_vsm_platform_v2(0x1, debug_disabled_requirements()),
+                new_vsm_platform_v2(0x1, debug_enabled_requirements()),
+            ],
+            vec![],
+            vec![],
+        );
+
+        assert!(matches!(
+            result,
+            Err(igvm::Error::AmbiguousCompatibilityMask)
+        ));
     }
 }

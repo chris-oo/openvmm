@@ -31,6 +31,17 @@ as well as the generated CLI help (via `cargo run -- --help`).
 * `--uefi`: Boot using `mu_msvm` UEFI
 * `--uefi-firmware <FILE>`: Path to the UEFI firmware file (`MSVM.fd`). When `--uefi` is specified, this option is required only if you do not set the environment variable `OPENVMM_UEFI_FIRMWARE` (or the architecture-specific variants `X86_64_OPENVMM_UEFI_FIRMWARE`, or `AARCH64_OPENVMM_UEFI_FIRMWARE`). If omitted, the default is read from `OPENVMM_UEFI_FIRMWARE` first, then falls back to the architecture-specific variables.
 * `--pcat`: Boot using the Microsoft Hyper-V PCAT BIOS
+* `--igvm <FILE>`: Boot using an IGVM firmware file.
+* `--igvm-context <default|debug|release>`: Selects the IGVM platform
+  context for multi-context IGVM v2 files. The default is `default`, which
+  uses the v1 fallback platform header. `debug` selects a v2 context that
+  requires debug enabled, and `release` selects a v2 context that requires
+  debug disabled. Requires `--igvm` and conflicts with
+  `--igvm-compatibility-mask`.
+* `--igvm-compatibility-mask <MASK>`: Diagnostic override that selects an
+  IGVM context by explicit compatibility mask. This is intended for generated
+  file debugging and targeted loader tests only. Requires `--igvm` and
+  conflicts with `--igvm-context`.
 * `--disk file:<DISK>`: Exposes a single disk over VMBus. You must also
   pass `--hv`. The `DISK` argument can be:
   * A flat binary disk image

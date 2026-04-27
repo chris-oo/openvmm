@@ -74,6 +74,7 @@ use openvmm_defs::config::DEFAULT_PCAT_BOOT_ORDER;
 use openvmm_defs::config::DeviceVtl;
 use openvmm_defs::config::EfiDiagnosticsLogLevelType;
 use openvmm_defs::config::HypervisorConfig;
+use openvmm_defs::config::IgvmContextSelector;
 use openvmm_defs::config::LateMapVtl0MemoryPolicy;
 use openvmm_defs::config::LoadMode;
 use openvmm_defs::config::MemoryConfig;
@@ -972,6 +973,15 @@ async fn vm_config_from_command_line(
                 io_port: ComPort::Com3.io_port(),
                 irq: ComPort::Com3.irq().into(),
             }),
+            igvm_context: if let Some(mask) = opt.igvm_compatibility_mask {
+                IgvmContextSelector::CompatibilityMask(mask)
+            } else {
+                match opt.igvm_context {
+                    cli_args::IgvmContextSelectorCli::Default => IgvmContextSelector::Default,
+                    cli_args::IgvmContextSelectorCli::Debug => IgvmContextSelector::DebugEnabled,
+                    cli_args::IgvmContextSelectorCli::Release => IgvmContextSelector::DebugDisabled,
+                }
+            },
         };
     } else if opt.pcat {
         // Emit a nice error early instead of complaining about missing firmware.

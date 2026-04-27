@@ -139,6 +139,21 @@ pub enum LinuxDirectBootMode {
     Acpi,
 }
 
+/// Selector for which IGVM platform context to use when loading a multi-context
+/// IGVM v2 file.
+#[derive(MeshPayload, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IgvmContextSelector {
+    /// Select the v1 fallback platform header (default behavior).
+    #[default]
+    Default,
+    /// Select the v2 context requiring debug enabled (`reject_debug_disabled = 1`).
+    DebugEnabled,
+    /// Select the v2 context requiring debug disabled (`reject_debug_enabled = 1`).
+    DebugDisabled,
+    /// Select context by explicit compatibility mask (diagnostic use).
+    CompatibilityMask(u32),
+}
+
 #[derive(MeshPayload, Debug)]
 pub enum LoadMode {
     Linux {
@@ -171,6 +186,7 @@ pub enum LoadMode {
         cmdline: String,
         vtl2_base_address: Vtl2BaseAddressType,
         com_serial: Option<SerialInformation>,
+        igvm_context: IgvmContextSelector,
     },
     None,
 }
