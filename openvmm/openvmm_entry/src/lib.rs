@@ -2385,6 +2385,10 @@ async fn run_control_inner(
         let result = openvmm_mcp::run_mcp_server(vm_handle, mcp_event_recv).await;
 
         // Clean shutdown: tell the controller to quit and wait for it.
+        // Work around the detached SCSI task holding up worker stop.
+        // TODO: Fix the underlying bug
+        drop(resources.scsi_rpc.take());
+        drop(resources.nvme_vtl2_rpc.take());
         ctrl_send.send(vm_controller::VmControllerRpc::Quit);
         drop(ctrl_send);
         controller_task.await;
