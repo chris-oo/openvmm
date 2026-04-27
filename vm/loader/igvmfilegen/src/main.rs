@@ -18,13 +18,22 @@ use clap::Parser;
 use file_loader::IgvmLoaderRegister;
 use file_loader::IgvmVtlLoader;
 use igvm::IgvmFile;
+use igvm::IgvmPlatformHeader;
 use igvm_defs::IGVM_FIXED_HEADER;
+use igvm_defs::IGVM_VHS_SUPPORTED_PLATFORM;
+use igvm_defs::IgvmPlatformType;
 use igvm_defs::SnpPolicy;
+use igvm_defs::SupportedPlatformRequirements;
 use igvm_defs::TdxPolicy;
 use igvmfilegen_config::Config;
 use igvmfilegen_config::ConfigIsolationType;
+use igvmfilegen_config::ContextRequirements;
+use igvmfilegen_config::DebugRequirement;
 use igvmfilegen_config::Image;
 use igvmfilegen_config::LinuxImage;
+use igvmfilegen_config::MigrationRequirement;
+use igvmfilegen_config::PlatformFallbackKey;
+use igvmfilegen_config::PlatformHeadersVersion;
 use igvmfilegen_config::ResourceType;
 use igvmfilegen_config::Resources;
 use igvmfilegen_config::SecureAvicType;
@@ -39,6 +48,8 @@ use loader::linux::InitrdConfig;
 use loader::paravisor::CommandLineType;
 use loader::paravisor::Vtl0Config;
 use loader::paravisor::Vtl0Linux;
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::io::Seek;
 use std::io::Write;
 use std::path::PathBuf;
@@ -153,6 +164,84 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+fn supported_platform_requirements(
+    requirements: &ContextRequirements,
+) -> SupportedPlatformRequirements {
+    let mut igvm_requirements = SupportedPlatformRequirements::new();
+
+    igvm_requirements = match requirements.debug {
+        DebugRequirement::Enabled => igvm_requirements.with_reject_debug_disabled(1),
+        DebugRequirement::Disabled => igvm_requirements.with_reject_debug_enabled(1),
+        DebugRequirement::Any => igvm_requirements,
+    };
+
+    match requirements.migration {
+        MigrationRequirement::Enabled => igvm_requirements.with_reject_migration_disabled(1),
+        MigrationRequirement::Disabled => igvm_requirements.with_reject_migration_enabled(1),
+        MigrationRequirement::Any => igvm_requirements,
+    }
+}
+
+fn sorted_fallback_contexts(
+    platform_headers: &igvmfilegen_config::PlatformHeaders,
+) -> Vec<(PlatformFallbackKey, String)> {
+    let mut fallback_contexts: Vec<_> = platform_headers
+        .v1_fallback_contexts
+        .iter()
+        .map(|(&key, context_name)| (key, context_name.clone()))
+        .collect();
+    fallback_contexts.sort_by_key(|(key, _context_name)| *key);
+    fallback_contexts
+}
+
+fn platform_version_for_type(platform_type: IgvmPlatformType) -> u16 {
+    match platform_type {
+        IgvmPlatformType::VSM_ISOLATION => igvm_defs::IGVM_VSM_ISOLATION_PLATFORM_VERSION,
+        IgvmPlatformType::SEV_SNP => igvm_defs::IGVM_SEV_SNP_PLATFORM_VERSION,
+        IgvmPlatformType::TDX => igvm_defs::IGVM_TDX_PLATFORM_VERSION,
+        _ => 0,
+    }
+}
+
+fn v1_platform_header(platform: &IgvmPlatformHeader) -> IgvmPlatformHeader {
+    IgvmPlatformHeader::SupportedPlatform(IGVM_VHS_SUPPORTED_PLATFORM {
+        compatibility_mask: platform.compatibility_mask(),
+        highest_vtl: platform.highest_vtl(),
+        platform_type: platform.platform_type(),
+        platform_version: platform_version_for_type(platform.platform_type()),
+        shared_gpa_boundary: platform.shared_gpa_boundary(),
+    })
+}
+
+fn single_context_v1_file<R: IgvmLoaderRegister>(file: &IgvmFile) -> anyhow::Result<IgvmFile> {
+    let [platform] = file.platforms() else {
+        bail!(
+            "expected single-context igvm file, found {} platform headers",
+            file.platforms().len()
+        );
+    };
+
+    IgvmFile::new(
+        R::igvm_revision(),
+        vec![v1_platform_header(platform)],
+        file.initializations().to_vec(),
+        file.directives().to_vec(),
+    )
+    .context("creating single-context v1 igvm file")
+}
+
+fn sanitize_filename_component(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    if sanitized.is_empty() {
+        "context".to_string()
+    } else {
+        sanitized
+    }
+}
+
 /// Create an IGVM file from the specified config
 fn create_igvm_file<R: IgvmfilegenRegister + GuestArch + 'static>(
     igvm_config: Config,
@@ -161,11 +250,29 @@ fn create_igvm_file<R: IgvmfilegenRegister + GuestArch + 'static>(
     output: PathBuf,
 ) -> anyhow::Result<()> {
     tracing::debug!(?igvm_config, "Creating IGVM file",);
+    igvm_config.validate().context("validating igvm config")?;
 
+    let is_v2 = matches!(
+        igvm_config.platform_headers.version,
+        PlatformHeadersVersion::V2
+    );
+    let platform_headers = igvm_config.platform_headers;
+    let guest_configs = igvm_config.guest_configs;
+    let fallback_context_names: HashSet<_> = if is_v2 {
+        platform_headers
+            .v1_fallback_contexts
+            .values()
+            .cloned()
+            .collect()
+    } else {
+        HashSet::new()
+    };
     let mut igvm_file: Option<IgvmFile> = None;
     let mut map_files = Vec::new();
+    let mut context_info = Vec::new();
+    let mut fallback_files = HashMap::new();
     let base_path = output.file_stem().unwrap();
-    for config in igvm_config.guest_configs {
+    for config in guest_configs {
         // Max VTL must be 2 or 0.
         if config.max_vtl != 2 && config.max_vtl != 0 {
             bail!("max_vtl must be 2 or 0");
@@ -176,6 +283,18 @@ fn create_igvm_file<R: IgvmfilegenRegister + GuestArch + 'static>(
             ConfigIsolationType::Vbs { .. } => "vbs",
             ConfigIsolationType::Snp { .. } => "snp",
             ConfigIsolationType::Tdx { .. } => "tdx",
+        };
+        let config_context_name = config.context_name.clone();
+        let context_name = config_context_name
+            .clone()
+            .unwrap_or_else(|| isolation_string.to_string());
+        let requirements = if is_v2 {
+            config
+                .requirements
+                .as_ref()
+                .map(supported_platform_requirements)
+        } else {
+            None
         };
         let loader_isolation_type = match config.isolation_type {
             ConfigIsolationType::None => LoaderIsolationType::None,
@@ -213,13 +332,21 @@ fn create_igvm_file<R: IgvmfilegenRegister + GuestArch + 'static>(
         // Max VTL of 2 implies paravisor.
         let with_paravisor = config.max_vtl == 2;
 
-        let mut loader = IgvmLoader::<R>::new(with_paravisor, loader_isolation_type);
+        let mut loader = IgvmLoader::<R>::new(with_paravisor, loader_isolation_type, requirements);
 
         load_image(&mut loader.loader(), &config.image, &resources)?;
 
         let igvm_output = loader
             .finalize(config.guest_svn)
             .context("finalizing loader")?;
+
+        if is_v2 && fallback_context_names.contains(&context_name) {
+            fallback_files.insert(
+                context_name.clone(),
+                single_context_v1_file::<R>(&igvm_output.guest)
+                    .context("creating v1 fallback igvm file")?,
+            );
+        }
 
         // Merge the loaded guest into the overall IGVM file.
         match &mut igvm_file {
@@ -228,6 +355,7 @@ fn create_igvm_file<R: IgvmfilegenRegister + GuestArch + 'static>(
                 .context("merging guest into overall igvm file")?,
             None => igvm_file = Some(igvm_output.guest),
         }
+        context_info.push((context_name.clone(), isolation_string.to_string()));
 
         map_files.push(igvm_output.map);
 
@@ -237,6 +365,10 @@ fn create_igvm_file<R: IgvmfilegenRegister + GuestArch + 'static>(
             let doc_path = {
                 let mut name = base_path.to_os_string();
                 name.push("-");
+                if is_v2 && config_context_name.is_some() {
+                    name.push(&context_name);
+                    name.push("-");
+                }
                 name.push(isolation_string);
                 name.push(".json");
                 output.with_file_name(name)
@@ -258,6 +390,80 @@ fn create_igvm_file<R: IgvmfilegenRegister + GuestArch + 'static>(
             )
             .context("writing doc file")?;
         }
+    }
+
+    if is_v2 {
+        let merged_igvm_file = igvm_file.take().expect("should have an igvm file");
+        let platforms = merged_igvm_file.platforms();
+        if platforms.len() != context_info.len() {
+            bail!(
+                "merged platform count {} does not match context count {}",
+                platforms.len(),
+                context_info.len()
+            );
+        }
+
+        let context_mask: HashMap<_, _> = context_info
+            .iter()
+            .zip(platforms.iter())
+            .map(|((name, _isolation), platform)| (name.clone(), platform.compatibility_mask()))
+            .collect();
+
+        let fallback_contexts = sorted_fallback_contexts(&platform_headers);
+        let mut new_platforms = Vec::new();
+        for (_key, fallback_context_name) in &fallback_contexts {
+            let mask = *context_mask
+                .get(fallback_context_name)
+                .with_context(|| format!("missing fallback context {fallback_context_name:?}"))?;
+            let platform = platforms
+                .iter()
+                .find(|platform| platform.compatibility_mask() == mask)
+                .with_context(|| {
+                    format!(
+                        "missing platform header for fallback context {fallback_context_name:?}"
+                    )
+                })?;
+            new_platforms.push(v1_platform_header(platform));
+        }
+        new_platforms.extend(platforms.iter().cloned());
+
+        let final_file = IgvmFile::new(
+            R::igvm_revision(),
+            new_platforms,
+            merged_igvm_file.initializations().to_vec(),
+            merged_igvm_file.directives().to_vec(),
+        )
+        .context("reconstructing igvm file with v1 fallbacks")?;
+
+        for (key, fallback_context_name) in &fallback_contexts {
+            let fallback_igvm = fallback_files.get(fallback_context_name).with_context(|| {
+                format!("missing v1 fallback igvm for context {fallback_context_name:?}")
+            })?;
+            let fallback_path = {
+                let ctx_sanitized = sanitize_filename_component(fallback_context_name);
+                let name = format!(
+                    "{}-fallback-{}-{}.igvm",
+                    base_path.to_string_lossy(),
+                    key.as_str(),
+                    ctx_sanitized,
+                );
+                output.with_file_name(name)
+            };
+            if fallback_path == output {
+                bail!("fallback output path collides with main output");
+            }
+
+            let mut fallback_binary = Vec::new();
+            fallback_igvm
+                .serialize(&mut fallback_binary)
+                .context("serializing fallback igvm")?;
+            fs_err::File::create(&fallback_path)
+                .context("creating fallback igvm file")?
+                .write_all(&fallback_binary)
+                .context("writing fallback igvm file")?;
+        }
+
+        igvm_file = Some(final_file);
     }
 
     let mut igvm_binary = Vec::new();

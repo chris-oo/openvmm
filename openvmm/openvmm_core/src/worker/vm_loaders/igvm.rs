@@ -143,21 +143,15 @@ fn vbs_platform_header(igvm_file: &IgvmFile) -> Result<&IgvmPlatformHeader, Erro
     igvm_file
         .platforms()
         .iter()
-        .find(|header| {
-            let IgvmPlatformHeader::SupportedPlatform(info) = header;
-            info.platform_type == IgvmPlatformType::VSM_ISOLATION
-        })
+        .find(|header| header.platform_type() == IgvmPlatformType::VSM_ISOLATION)
         .ok_or(Error::NoVbsSupport)
 }
 
 /// Determine if the given `igvm_file` supports relocations or not.
 pub fn supports_relocations(igvm_file: &IgvmFile) -> bool {
-    let (mask, _max_vtl) = match vbs_platform_header(igvm_file).unwrap() {
-        IgvmPlatformHeader::SupportedPlatform(info) => {
-            debug_assert_eq!(info.platform_type, IgvmPlatformType::VSM_ISOLATION);
-            (info.compatibility_mask, info.highest_vtl)
-        }
-    };
+    let platform = vbs_platform_header(igvm_file).unwrap();
+    debug_assert_eq!(platform.platform_type(), IgvmPlatformType::VSM_ISOLATION);
+    let mask = platform.compatibility_mask();
 
     igvm_file.relocations(mask).0.is_some()
 }
@@ -166,12 +160,9 @@ pub fn supports_relocations(igvm_file: &IgvmFile) -> bool {
 /// [`IgvmDirectiveHeader::RequiredMemory`] structure is looked for, with the
 /// flag set for vtl2_protectable.
 pub fn vtl2_memory_info(igvm_file: &IgvmFile) -> Result<MemoryRange, Error> {
-    let (mask, _max_vtl) = match vbs_platform_header(igvm_file)? {
-        IgvmPlatformHeader::SupportedPlatform(info) => {
-            debug_assert_eq!(info.platform_type, IgvmPlatformType::VSM_ISOLATION);
-            (info.compatibility_mask, info.highest_vtl)
-        }
-    };
+    let platform = vbs_platform_header(igvm_file)?;
+    debug_assert_eq!(platform.platform_type(), IgvmPlatformType::VSM_ISOLATION);
+    let mask = platform.compatibility_mask();
 
     let mut required_memory = None;
 
@@ -210,12 +201,9 @@ pub fn vtl2_memory_range(
     igvm_file: &IgvmFile,
     vtl2_size: Option<u64>,
 ) -> Result<MemoryRange, Error> {
-    let (mask, _max_vtl) = match vbs_platform_header(igvm_file)? {
-        IgvmPlatformHeader::SupportedPlatform(info) => {
-            debug_assert_eq!(info.platform_type, IgvmPlatformType::VSM_ISOLATION);
-            (info.compatibility_mask, info.highest_vtl)
-        }
-    };
+    let platform = vbs_platform_header(igvm_file)?;
+    debug_assert_eq!(platform.platform_type(), IgvmPlatformType::VSM_ISOLATION);
+    let mask = platform.compatibility_mask();
 
     let relocs = igvm_file.relocations(mask);
 
@@ -610,12 +598,9 @@ fn load_igvm_x86(
 
     let command_line = CString::new(cmdline).map_err(Error::InvalidCommandLine)?;
 
-    let (mask, max_vtl) = match vbs_platform_header(igvm_file)? {
-        IgvmPlatformHeader::SupportedPlatform(info) => {
-            debug_assert_eq!(info.platform_type, IgvmPlatformType::VSM_ISOLATION);
-            (info.compatibility_mask, info.highest_vtl)
-        }
-    };
+    let platform = vbs_platform_header(igvm_file)?;
+    debug_assert_eq!(platform.platform_type(), IgvmPlatformType::VSM_ISOLATION);
+    let (mask, max_vtl) = (platform.compatibility_mask(), platform.highest_vtl());
 
     let (relocation_regions, mut page_table_fixup) = igvm_file.relocations(mask);
 

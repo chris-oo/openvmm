@@ -31,11 +31,13 @@ use igvm::snp_defs::SevVmsa;
 use igvm_defs::IGVM_VHS_PARAMETER;
 use igvm_defs::IGVM_VHS_PARAMETER_INSERT;
 use igvm_defs::IGVM_VHS_SUPPORTED_PLATFORM;
+use igvm_defs::IGVM_VHS_SUPPORTED_PLATFORM_V2;
 use igvm_defs::IgvmPageDataFlags;
 use igvm_defs::IgvmPageDataType;
 use igvm_defs::IgvmPlatformType;
 use igvm_defs::PAGE_SIZE_4K;
 use igvm_defs::SnpPolicy;
+use igvm_defs::SupportedPlatformRequirements;
 use igvm_defs::TdxPolicy;
 use loader::importer::Aarch64Register;
 use loader::importer::BootPageAcceptance;
@@ -61,6 +63,28 @@ use zerocopy::IntoBytes;
 pub const DEFAULT_COMPATIBILITY_MASK: u32 = 0x1;
 
 const TDX_SHARED_GPA_BOUNDARY_BITS: u8 = 47;
+
+fn add_platform_requirements(
+    platform_header: IgvmPlatformHeader,
+    requirements: SupportedPlatformRequirements,
+) -> IgvmPlatformHeader {
+    match platform_header {
+        IgvmPlatformHeader::SupportedPlatform(info) => {
+            IgvmPlatformHeader::SupportedPlatformV2(IGVM_VHS_SUPPORTED_PLATFORM_V2 {
+                compatibility_mask: info.compatibility_mask,
+                highest_vtl: info.highest_vtl,
+                platform_type: info.platform_type,
+                platform_version: info.platform_version,
+                shared_gpa_boundary: info.shared_gpa_boundary,
+                requirements,
+            })
+        }
+        IgvmPlatformHeader::SupportedPlatformV2(mut info) => {
+            info.requirements = requirements;
+            IgvmPlatformHeader::SupportedPlatformV2(info)
+        }
+    }
+}
 
 fn to_igvm_vtl(vtl: Vtl) -> igvm::hv_defs::Vtl {
     match vtl {
@@ -494,9 +518,13 @@ pub struct IgvmOutput {
 }
 
 impl<R: IgvmLoaderRegister + GuestArch + 'static> IgvmLoader<R> {
-    pub fn new(with_paravisor: bool, isolation_type: LoaderIsolationType) -> Self {
+    pub fn new(
+        with_paravisor: bool,
+        isolation_type: LoaderIsolationType,
+        requirements: Option<SupportedPlatformRequirements>,
+    ) -> Self {
         let vp_context_builder: Option<Box<dyn VpContextBuilder<Register = R>>>;
-        let platform_header;
+        let mut platform_header;
         let max_vtl = if with_paravisor { Vtl::Vtl2 } else { Vtl::Vtl0 };
         let initialization_headers;
 
@@ -523,6 +551,10 @@ impl<R: IgvmLoaderRegister + GuestArch + 'static> IgvmLoader<R> {
                 initialization_headers = init_headers;
                 vp_context_builder = Some(vp_builder);
             }
+        }
+
+        if let Some(requirements) = requirements {
+            platform_header = add_platform_requirements(platform_header, requirements);
         }
 
         IgvmLoader {
@@ -1273,6 +1305,7 @@ mod tests {
                 injection_type: InjectionType::Restricted,
                 secure_avic: SecureAvic::Enabled,
             },
+            None,
         );
         let data = vec![0, 5];
         loader
@@ -1311,6 +1344,7 @@ mod tests {
                     .with_debug_allowed(0u8)
                     .with_sept_ve_disable(0u8),
             },
+            None,
         );
         let data = vec![0, 5];
         loader
@@ -1346,6 +1380,7 @@ mod tests {
             LoaderIsolationType::Vbs {
                 enable_debug: false,
             },
+            None,
         );
         {
             let mut loader = loader.loader();
@@ -1378,7 +1413,7 @@ mod tests {
 
     #[test]
     fn test_accepted_regions() {
-        let mut loader = IgvmLoader::<X86Register>::new(true, LoaderIsolationType::None);
+        let mut loader = IgvmLoader::<X86Register>::new(true, LoaderIsolationType::None, None);
 
         let data = vec![0, 5];
         loader
