@@ -500,8 +500,9 @@ iced-x86 = { version = "1.17", default-features = false, features = [
   "no_d3now",
 ] }
 ignore = "0.4"
-igvm = "0.4.0"
-igvm_defs = { version = "0.4.0", default-features = false }
+# PROTOTYPE: local path overrides for IGVM v2 multi-context work; replace with version bump when published.
+igvm = { path = "../igvm/igvm" }
+igvm_defs = { path = "../igvm/igvm_defs", default-features = false }
 image = { version = "0.25.1", default-features = false }
 io-uring = "0.7.11"
 jiff = "0.2.14"
