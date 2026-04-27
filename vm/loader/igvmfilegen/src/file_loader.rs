@@ -862,10 +862,11 @@ impl<R: IgvmLoaderRegister + GuestArch + 'static> IgvmLoader<R> {
                 }
             }
 
-            // Data size must match SNP VMSA size.
-            if data.len() != size_of::<SevVmsa>() {
-                anyhow::bail!("data len {:x} does not match VMSA size", data.len());
-            }
+            // FIXME: VMSA definition in igvm chaged to be a whole page. Our
+            // defn is smaller than one page, so pad out to a 4k vec of u8.
+            let mut page_data = vec![0u8; PAGE_SIZE_4K as usize];
+            page_data[..data.len()].copy_from_slice(data);
+            let page_data = page_data;
 
             // Page count must be 1.
             if page_count != 1 {
@@ -876,7 +877,9 @@ impl<R: IgvmLoaderRegister + GuestArch + 'static> IgvmLoader<R> {
                 gpa: page_base * PAGE_SIZE_4K,
                 compatibility_mask: DEFAULT_COMPATIBILITY_MASK,
                 vp_index: 0,
-                vmsa: Box::new(SevVmsa::read_from_bytes(data).expect("should be correct size")), // TODO: zerocopy: map_err (https://github.com/microsoft/openvmm/issues/759)
+                vmsa: Box::new(
+                    SevVmsa::read_from_bytes(&page_data).expect("should be correct size"),
+                ), // TODO: zerocopy: map_err (https://github.com/microsoft/openvmm/issues/759)
             });
         } else {
             for page in page_base..page_base + page_count {
