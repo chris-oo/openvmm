@@ -27,6 +27,25 @@ pub fn anonymous_serial_pair(
     Ok((OpenSocketSerialConfig::from(left).into_resource(), right))
 }
 
+#[cfg(unix)]
+pub fn anonymous_serial_pair_with_sync_writer(
+    driver: &(impl Driver + ?Sized),
+) -> io::Result<(
+    Resource<SerialBackendHandle>,
+    pal_async::socket::PolledSocket<unix_socket::UnixStream>,
+    Box<dyn io::Write + Send>,
+)> {
+    use std::os::fd::AsFd;
+
+    let (config, serial) = anonymous_serial_pair(driver)?;
+    let dup_fd = serial.get().as_fd().try_clone_to_owned()?;
+    Ok((
+        config,
+        serial,
+        Box::new(unix_socket::UnixStream::from(dup_fd)),
+    ))
+}
+
 #[cfg(windows)]
 pub fn anonymous_serial_pair(
     driver: &(impl Driver + ?Sized),
@@ -43,6 +62,31 @@ pub fn anonymous_serial_pair(
     Ok((
         OpenWindowsPipeSerialConfig::from(client).into_resource(),
         server,
+    ))
+}
+
+#[cfg(windows)]
+pub fn anonymous_serial_pair_with_sync_writer(
+    driver: &(impl Driver + ?Sized),
+) -> io::Result<(
+    Resource<SerialBackendHandle>,
+    PolledPipe,
+    Box<dyn io::Write + Send>,
+)> {
+    use serial_socket::windows::OpenWindowsPipeSerialConfig;
+
+    // Use named pipes on Windows even though we also support Unix sockets
+    // there. This avoids an unnecessary winsock dependency.
+    let (server, client) = pal::windows::pipe::bidirectional_pair(false)?;
+    let console_in = Box::new(server.try_clone()?) as Box<dyn io::Write + Send>;
+    let server = PolledPipe::new(driver, server)?;
+    // Use the client for the VM side so that it does not try to reconnect
+    // (which isn't possible via pal_async for pipes opened in non-overlapped
+    // mode, anyway).
+    Ok((
+        OpenWindowsPipeSerialConfig::from(client).into_resource(),
+        server,
+        console_in,
     ))
 }
 

@@ -251,19 +251,13 @@ async fn vm_config_from_command_line(
                 if let Some(console_state) = console_state.borrow().as_ref() {
                     bail!("console already set by {}", console_state.device);
                 }
-                let (config, serial) = serial_io::anonymous_serial_pair(&serial_driver)?;
                 if let Some(ring_buf) = mcp_serial_buffer.clone() {
-                    // MCP mode: dup the underlying fd for synchronous writes,
+                    // MCP mode: keep a synchronous writer for tool-driven input,
                     // then use the async side for reading serial output.
-                    use std::os::fd::AsFd;
-                    let dup_fd = serial
-                        .get()
-                        .as_fd()
-                        .try_clone_to_owned()
-                        .context("dup serial fd for MCP console input")?;
-                    *mcp_console_in.borrow_mut() =
-                        Some(Box::new(unix_socket::UnixStream::from(dup_fd))
-                            as Box<dyn Write + Send>);
+                    let (config, serial, console_in) =
+                        serial_io::anonymous_serial_pair_with_sync_writer(&serial_driver)
+                            .context("failed to create MCP serial console")?;
+                    *mcp_console_in.borrow_mut() = Some(console_in);
 
                     // Still need a ConsoleState for the rest of the code.
                     *console_state.borrow_mut() = Some(ConsoleState {
@@ -291,7 +285,9 @@ async fn vm_config_from_command_line(
                             });
                         })
                         .unwrap();
+                    Some(config)
                 } else {
+                    let (config, serial) = serial_io::anonymous_serial_pair(&serial_driver)?;
                     // Normal interactive mode.
                     let (serial_read, serial_write) = AsyncReadExt::split(serial);
                     *console_state.borrow_mut() = Some(ConsoleState {
@@ -307,8 +303,8 @@ async fn vm_config_from_command_line(
                             ));
                         })
                         .unwrap();
+                    Some(config)
                 }
-                Some(config)
             }
             SerialConfigCli::Stderr => {
                 let (config, serial) = serial_io::anonymous_serial_pair(&serial_driver)?;
