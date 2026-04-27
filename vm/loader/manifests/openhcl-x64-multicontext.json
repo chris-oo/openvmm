@@ -3,40 +3,150 @@
     "platform_headers": {
         "version": "v2",
         "v1_fallback_contexts": {
-            "vbs": "release"
+            "vbs": "vbs-release",
+            "snp": "snp-release",
+            "tdx": "tdx-release"
         }
     },
     "guest_configs": [
         {
-            "context_name": "release",
+            "context_name": "vbs-release",
             "requirements": {
                 "debug": "disabled",
                 "migration": "any"
             },
-            "guest_svn": 1,
+            "guest_svn": 10,
             "max_vtl": 2,
-            "isolation_type": "none",
+            "isolation_type": {
+                "vbs": {
+                    "enable_debug": false
+                }
+            },
             "image": {
                 "openhcl": {
-                    "command_line": "OPENHCL_IGVM_VTL2_GPA_POOL_CONFIG=release",
-                    "memory_page_count": 131072,
+                    "command_line": "",
+                    "memory_page_count": 163840,
+                    "memory_page_base": 32768,
                     "uefi": true
                 }
             }
         },
         {
-            "context_name": "debug",
+            "context_name": "vbs-debug",
             "requirements": {
                 "debug": "enabled",
                 "migration": "any"
             },
             "guest_svn": 1,
             "max_vtl": 2,
-            "isolation_type": "none",
+            "isolation_type": {
+                "vbs": {
+                    "enable_debug": true
+                }
+            },
             "image": {
                 "openhcl": {
-                    "command_line": "OPENHCL_CONFIDENTIAL_DEBUG=1 OPENHCL_BOOT_LOG=com3 OPENHCL_IGVM_VTL2_GPA_POOL_CONFIG=debug",
-                    "memory_page_count": 131072,
+                    "command_line": "OPENHCL_CONFIDENTIAL_DEBUG=1",
+                    "memory_page_count": 163840,
+                    "memory_page_base": 32768,
+                    "uefi": true
+                }
+            }
+        },
+        {
+            "context_name": "snp-release",
+            "requirements": {
+                "debug": "disabled",
+                "migration": "any"
+            },
+            "guest_svn": 10,
+            "max_vtl": 2,
+            "isolation_type": {
+                "snp": {
+                    "shared_gpa_boundary_bits": 46,
+                    "policy": 196639,
+                    "enable_debug": false,
+                    "injection_type": "normal",
+                    "secure_avic": "enabled"
+                }
+            },
+            "image": {
+                "openhcl": {
+                    "command_line": "",
+                    "memory_page_count": 163840,
+                    "memory_page_base": 32768,
+                    "uefi": true
+                }
+            }
+        },
+        {
+            "context_name": "snp-debug",
+            "requirements": {
+                "debug": "enabled",
+                "migration": "any"
+            },
+            "guest_svn": 1,
+            "max_vtl": 2,
+            "isolation_type": {
+                "snp": {
+                    "shared_gpa_boundary_bits": 46,
+                    "policy": 196639,
+                    "enable_debug": true,
+                    "injection_type": "normal",
+                    "secure_avic": "enabled"
+                }
+            },
+            "image": {
+                "openhcl": {
+                    "command_line": "OPENHCL_CONFIDENTIAL_DEBUG=1",
+                    "memory_page_count": 163840,
+                    "memory_page_base": 32768,
+                    "uefi": true
+                }
+            }
+        },
+        {
+            "context_name": "tdx-release",
+            "requirements": {
+                "debug": "disabled",
+                "migration": "any"
+            },
+            "guest_svn": 10,
+            "max_vtl": 2,
+            "isolation_type": {
+                "tdx": {
+                    "enable_debug": false,
+                    "sept_ve_disable": true
+                }
+            },
+            "image": {
+                "openhcl": {
+                    "command_line": "",
+                    "memory_page_count": 163840,
+                    "memory_page_base": 32768,
+                    "uefi": true
+                }
+            }
+        },
+        {
+            "context_name": "tdx-debug",
+            "requirements": {
+                "debug": "enabled",
+                "migration": "any"
+            },
+            "guest_svn": 1,
+            "max_vtl": 2,
+            "isolation_type": {
+                "tdx": {
+                    "enable_debug": true,
+                    "sept_ve_disable": true
+                }
+            },
+            "image": {
+                "openhcl": {
+                    "command_line": "OPENHCL_CONFIDENTIAL_DEBUG=1",
+                    "memory_page_count": 163840,
+                    "memory_page_base": 32768,
                     "uefi": true
                 }
             }
