@@ -282,6 +282,10 @@ memory are not implemented yet.
 - `vm/kvm` exposes a typed x86 SNP VM creation API that checks
   `KVM_CAP_VM_TYPES`, and `virt_kvm` uses it to create `KVM_X86_SNP_VM` when
   `virt::IsolationType::Snp` is requested.
+- `vm/kvm` exposes a `KVM_SEV_INIT2` wrapper through `KVM_MEMORY_ENCRYPT_OP`
+  using `kvm-bindings` UAPI definitions, and `virt_kvm` opens `/dev/sev`, calls
+  SNP init after creating `KVM_X86_SNP_VM`, and keeps the SEV fd alive with the
+  prototype partition.
 - The SNP CLI policy currently selects an enlightened Linux direct chipset with
   no emulated chipset devices and rejects Hyper-V enlightenments, VTL2, VMBus,
   PCI/VPCI/device assignment, legacy storage, framebuffer, and non-Linux direct
@@ -298,9 +302,10 @@ Evidence:
 - `openvmm/openvmm_defs/src/config.rs` maps `IsolationType::Snp` to
   `virt::IsolationType::Snp`.
 - `vm/kvm/src/lib.rs` defines `X86VmType::Snp` and checks `KVM_CAP_VM_TYPES`
-  before creating that VM type.
+  before creating that VM type, and wraps `KVM_SEV_INIT2` for SNP init.
 - `vmm_core/virt_kvm/src/arch/x86_64/mod.rs` creates `KVM_X86_SNP_VM` for SNP
-  isolation and returns `SnpLaunchNotImplemented` before launch setup.
+  isolation, opens `/dev/sev`, calls `KVM_SEV_INIT2`, and returns
+  `SnpPrivateMemoryNotImplemented` before normal memory setup.
 - `vmm_core/virt/src/generic.rs:137-145` defines `PageVisibility`.
 - `vmm_core/vm_loader/src/lib.rs:60-95` returns initial registers and accepted
   visibility ranges.
@@ -334,13 +339,13 @@ Evidence:
 
    Evidence: `vmm_core/virt_mshv/src/x86_64/mod.rs:73-79`.
 
-5. **OpenVMM can now request and create the KVM SNP VM type, but not launch it.**
+5. **OpenVMM can now request and initialize the KVM SNP VM type, but not launch it.**
    The CLI/config path supports `--isolation snp` for a strict minimal Linux
-   direct-boot configuration, and `virt_kvm` can create `KVM_X86_SNP_VM`. The
-   backend intentionally returns `SnpLaunchNotImplemented` before normal
-   build/load setup because `/dev/sev`, `KVM_SEV_INIT2`, guest_memfd,
-   memory-attribute setup, SNP launch update/finish, CPUID/secrets pages, and
-   VMSA measurement are still missing.
+   direct-boot configuration, and `virt_kvm` can create `KVM_X86_SNP_VM` and
+   issue `KVM_SEV_INIT2`. The backend intentionally returns
+   `SnpPrivateMemoryNotImplemented` before normal build/load setup because
+   guest_memfd, memory-attribute setup, SNP launch update/finish, CPUID/secrets
+   pages, and VMSA measurement are still missing.
 
    Evidence:
    - `vmm_tests/vmm_test_macros/src/lib.rs:57-66`
@@ -378,17 +383,18 @@ configure SNP launch policy.
 
 ### 1. Add a Linux/KVM SNP backend surface
 
-OpenVMM needs a backend path that can create `KVM_X86_SNP_VM`, call
-`KVM_SEV_INIT2`, manage `/dev/sev`, and issue `KVM_MEMORY_ENCRYPT_OP` with SNP
-launch commands. The current Linux MSHV backend rejecting isolation suggests
-this is not a small toggle in existing MSHV code.
+OpenVMM now has the first backend path that can create `KVM_X86_SNP_VM`, manage
+`/dev/sev`, and call `KVM_SEV_INIT2`. The remaining backend work is issuing the
+SNP launch commands and wiring the memory backing they require. The current
+Linux MSHV backend rejecting isolation suggests this is not a small toggle in
+existing MSHV code.
 
 Required backend capabilities:
 
 - query KVM support for `KVM_X86_SNP_VM`, `KVM_CAP_GUEST_MEMFD`,
   `KVM_CAP_MEMORY_ATTRIBUTES`, and SNP request-certs attributes;
-- create SNP VM type; **done for `KVM_CAP_VM_TYPES` + `KVM_X86_SNP_VM` only**;
-- open/pass `/dev/sev` fd in `kvm_sev_cmd`;
+- create SNP VM type; **done for `KVM_CAP_VM_TYPES` + `KVM_X86_SNP_VM`**;
+- open/pass `/dev/sev` fd in `kvm_sev_cmd`; **done for `KVM_SEV_INIT2`**;
 - implement `KVM_SEV_SNP_LAUNCH_START`, `UPDATE`, `FINISH`;
 - enable request-certs if OpenVMM will serve certificate blobs;
 - model SNP firmware errors distinctly enough for diagnostics.
@@ -510,21 +516,24 @@ This is the practical set of changes OpenVMM likely needs, grouped by subsystem.
 
 ### KVM bindings and `virt_kvm`
 
-- Add or update low-level KVM bindings for `KVM_SEV_INIT2`,
-  `KVM_SEV_SNP_LAUNCH_START`,
+- `kvm-bindings` is pinned to an upstream revision that exposes the SEV/SNP UAPI
+  structs used so far, and `vm/kvm` wraps `KVM_SEV_INIT2` through
+  `KVM_MEMORY_ENCRYPT_OP`.
+- Add or update the remaining low-level KVM bindings for `KVM_SEV_SNP_LAUNCH_START`,
   `KVM_SEV_SNP_LAUNCH_UPDATE`, `KVM_SEV_SNP_LAUNCH_FINISH`,
   `KVM_SEV_SNP_ENABLE_REQ_CERTS`, `KVM_CREATE_GUEST_MEMFD`,
   `KVM_SET_MEMORY_ATTRIBUTES`, `KVM_MEMORY_ATTRIBUTE_PRIVATE`, and
   `KVM_EXIT_SNP_REQ_CERTS`.
-- `KVM_CAP_VM_TYPES` probing and `KVM_X86_SNP_VM` creation are implemented in
-  `vm/kvm` and `virt_kvm`; add the remaining capability checks for
-  `KVM_CAP_GUEST_MEMFD`, `KVM_CAP_MEMORY_ATTRIBUTES`, SEV device attributes, and
-  `/dev/sev` availability.
+- `KVM_CAP_VM_TYPES` probing, `KVM_X86_SNP_VM` creation, `/dev/sev` opening, and
+  `KVM_SEV_INIT2` are implemented in `vm/kvm` and `virt_kvm`; add the remaining
+  capability checks for `KVM_CAP_GUEST_MEMFD`, `KVM_CAP_MEMORY_ATTRIBUTES`, SEV
+  device attributes, and more detailed `/dev/sev` availability diagnostics.
 - Teach the KVM partition build path to continue past the current
-  `SnpLaunchNotImplemented` stop once SNP initialization and memory backing are
+  `SnpPrivateMemoryNotImplemented` stop once guest-private memory backing is
   available.
-- Add a launch context object in `virt_kvm` that owns `/dev/sev`, the SNP policy
-  fields, launch state, and firmware error translation.
+- Extend the current `virt_kvm` SEV fd ownership into a launch context object
+  that also owns the SNP policy fields, launch state, and firmware error
+  translation.
 - Implement launch start/update/finish sequencing and ensure launch finish
   happens only after all initial memory, CPUID/secrets pages, and vCPU state are
   ready.
@@ -807,16 +816,15 @@ to service guest runtime conversions.
 
 ## Suggested implementation order
 
-1. Complete SNP VM initialization after the existing `KVM_X86_SNP_VM` creation:
-   add `/dev/sev`, `KVM_SEV_INIT2`, launch-start state, and remaining capability
-   checks.
-2. Add guest_memfd-backed RAM/memslot support and OpenVMM-owned page-state
+1. Add guest_memfd-backed RAM/memslot support and OpenVMM-owned page-state
    tracking.
-3. Extend loader/importer abstractions to preserve SNP page types.
-4. Implement SNP launch start/update/finish for IGVM or firmware loading.
-5. Add CPUID page generation and firmware mismatch diagnostics.
-6. Add runtime private/shared conversion exit handling.
-7. Add attestation certificate support.
+2. Extend loader/importer abstractions to preserve SNP page types.
+3. Implement SNP launch start/update/finish for IGVM or firmware loading.
+4. Add CPUID page generation and firmware mismatch diagnostics.
+5. Add runtime private/shared conversion exit handling.
+6. Add attestation certificate support.
+7. Add remaining capability checks for guest-private memory, memory attributes,
+   and SNP request-certs support.
 8. Gate/reject incompatible devices and lifecycle operations.
 9. Add docs and tests for the supported subset.
 
@@ -833,9 +841,9 @@ clear before code is written.
 These items have clear current-code seams and can be decomposed into concrete
 tasks with limited additional investigation:
 
-- add KVM SNP capability probing and clear rejection diagnostics for unsupported
-  hosts or backends;
-- add a minimal KVM SNP backend skeleton behind `IsolationType::Snp`;
+- add the remaining KVM SNP capability probing and clear rejection diagnostics
+  for unsupported hosts or backends;
+- extend the minimal KVM SNP backend skeleton behind `IsolationType::Snp`;
 - extend the loader-facing initial page model so SNP page acceptances are not
   flattened into only `PageVisibility::{Exclusive,Shared}`;
 - replace the current `todo!()` handling for SNP-specific
@@ -850,27 +858,22 @@ tasks with limited additional investigation:
 These should be tackled one by one before detailed implementation tasks are
 assigned:
 
-1. **KVM binding and ioctl surface.** Confirm which SNP, `guest_memfd`, memory
-   attribute, and certificate-exit constants and structs already exist in the
-   `vm/kvm` bindings, which need to be added, and how `/dev/sev` firmware errors
-   should be represented.
-2. **Guest-private memory ownership.** Decide where `guest_memfd` file
+1. **Guest-private memory ownership.** Decide where `guest_memfd` file
    descriptors live, how guest-private backing fits with `GuestMemory` and KVM
    memslot registration, how shared userspace mappings coexist with private
    backing, and how discard/punch-hole behavior is coordinated.
-3. **OpenVMM page-state tracking.** Define the owner and data structure for
+2. **OpenVMM page-state tracking.** Define the owner and data structure for
    private/shared page state, because KVM's memory-attributes API has no get
    operation. This state must be updated by launch, runtime conversion exits, and
    any future memory hotplug or discard paths.
-4. **Loader-to-backend launch contract.** Decide whether to extend
+3. **Loader-to-backend launch contract.** Decide whether to extend
    `PageVisibility` or introduce a new initial page/launch descriptor carrying
    visibility, SNP page type, measurement state, and special page purpose
    (`SECRETS`, `CPUID`, VMSA/VP context, etc.).
-5. **Launch lifecycle sequencing.** Identify the exact OpenVMM lifecycle points
-   for `KVM_SEV_INIT2`, `LAUNCH_START`, launch updates, vCPU protected-state/VMSA
-   setup, and `LAUNCH_FINISH`, and ensure VPs cannot run before finish
-   succeeds.
-6. **CPUID source and validation.** Determine where the final KVM vCPU CPUID
+4. **Launch lifecycle sequencing.** Identify the exact OpenVMM lifecycle points
+   for `LAUNCH_START`, launch updates, vCPU protected-state/VMSA setup, and
+   `LAUNCH_FINISH`, and ensure VPs cannot run before finish succeeds.
+5. **CPUID source and validation.** Determine where the final KVM vCPU CPUID
    policy is materialized, how to construct the SNP CPUID page from it, and how
    firmware mismatch information should be surfaced without panicking.
 7. **Runtime private/shared conversion handling.** Confirm the KVM exit shape
