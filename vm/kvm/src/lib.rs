@@ -101,6 +101,26 @@ mod ioctl {
     ioctl_write_ptr!(kvm_set_device_attr, KVMIO, 0xe1, kvm_device_attr);
 }
 
+#[cfg(target_arch = "x86_64")]
+const KVM_CAP_VM_TYPES_UAPI: u32 = 235;
+#[cfg(target_arch = "x86_64")]
+const KVM_X86_SNP_VM_UAPI: libc::c_int = 4;
+
+#[cfg(target_arch = "x86_64")]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum X86VmType {
+    Snp,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl X86VmType {
+    const fn as_raw(self) -> libc::c_int {
+        match self {
+            X86VmType::Snp => KVM_X86_SNP_VM_UAPI,
+        }
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("failed to open /dev/kvm")]
@@ -111,6 +131,9 @@ pub enum Error {
     SetMemoryRegion(#[source] nix::Error),
     #[error("CreateVm")]
     CreateVm(#[source] nix::Error),
+    #[cfg(target_arch = "x86_64")]
+    #[error("unsupported x86 VM type: {0:?}")]
+    UnsupportedX86VmType(X86VmType),
     #[error("EnableCap({0})")]
     EnableCap(&'static str, #[source] nix::Error),
     #[error("CreateVCpu")]
@@ -266,6 +289,22 @@ impl Kvm {
         // IPA on ARM64, and on x86_64 is the only option.
         let vm_type = self.check_extension(KVM_CAP_ARM_VM_IPA_SIZE).unwrap_or(0);
 
+        self.new_vm_with_type(vm_type)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn new_x86_vm(&self, vm_type: X86VmType) -> Result<Partition> {
+        let supported_vm_types = self
+            .check_extension(KVM_CAP_VM_TYPES_UAPI)
+            .map_err(Error::CheckExtension)?;
+        let raw_vm_type = vm_type.as_raw();
+        if supported_vm_types & (1 << raw_vm_type) == 0 {
+            return Err(Error::UnsupportedX86VmType(vm_type));
+        }
+        self.new_vm_with_type(raw_vm_type)
+    }
+
+    fn new_vm_with_type(&self, vm_type: libc::c_int) -> Result<Partition> {
         // SAFETY: Calling IOCTL as documented, with no special requirements.
         let vm = unsafe {
             let fd =
