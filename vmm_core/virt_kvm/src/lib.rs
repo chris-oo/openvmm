@@ -47,8 +47,10 @@ pub enum KvmError {
     IsolationNotSupported,
     #[error("unsupported isolation configuration: {0}")]
     UnsupportedIsolationConfiguration(&'static str),
-    #[error("SNP partition creation succeeded, but SNP launch is not implemented")]
-    SnpLaunchNotImplemented,
+    #[error("failed to open /dev/sev")]
+    OpenSev(#[source] std::io::Error),
+    #[error("SNP private memory is not implemented")]
+    SnpPrivateMemoryNotImplemented,
     #[error("kvm error")]
     Kvm(#[from] kvm::Error),
     #[error("failed to stat /dev/kvm")]
