@@ -45,6 +45,10 @@ pub enum KvmError {
     Vtl2NotSupported,
     #[error("isolation is not supported on this hypervisor")]
     IsolationNotSupported,
+    #[error("unsupported isolation configuration: {0}")]
+    UnsupportedIsolationConfiguration(&'static str),
+    #[error("SNP partition creation succeeded, but SNP launch is not implemented")]
+    SnpLaunchNotImplemented,
     #[error("kvm error")]
     Kvm(#[from] kvm::Error),
     #[error("failed to stat /dev/kvm")]

@@ -137,8 +137,18 @@ impl virt::Hypervisor for Kvm {
         &mut self,
         config: ProtoPartitionConfig<'a>,
     ) -> Result<Self::ProtoPartition<'a>, Self::Error> {
-        if config.isolation.is_isolated() {
-            return Err(KvmError::IsolationNotSupported);
+        match config.isolation {
+            virt::IsolationType::None => {}
+            virt::IsolationType::Snp => {
+                if config.hv_config.is_some() {
+                    return Err(KvmError::UnsupportedIsolationConfiguration(
+                        "SNP does not support Hyper-V enlightenments or VTL2",
+                    ));
+                }
+            }
+            virt::IsolationType::Vbs | virt::IsolationType::Tdx => {
+                return Err(KvmError::IsolationNotSupported);
+            }
         }
 
         let mut cpuid_entries = self
@@ -261,7 +271,11 @@ impl virt::Hypervisor for Kvm {
 
         let cpuid_entries = CpuidLeafSet::new(cpuid_entries);
 
-        let vm = self.kvm.new_vm()?;
+        let vm = match config.isolation {
+            virt::IsolationType::None => self.kvm.new_vm()?,
+            virt::IsolationType::Snp => self.kvm.new_x86_vm(kvm::X86VmType::Snp)?,
+            virt::IsolationType::Vbs | virt::IsolationType::Tdx => unreachable!(),
+        };
         vm.enable_split_irqchip(virt::irqcon::IRQ_LINES as u32)?;
         vm.enable_x2apic_api()?;
         vm.enable_unknown_msr_exits()?;
@@ -294,6 +308,10 @@ impl ProtoPartition for KvmProtoPartition<'_> {
         mut self,
         config: PartitionConfig<'_>,
     ) -> Result<(Self::Partition, Vec<Self::ProcessorBinder>), Self::Error> {
+        if self.config.isolation == virt::IsolationType::Snp {
+            return Err(KvmError::SnpLaunchNotImplemented);
+        }
+
         // Build topology leaves using the base cpuid before consuming it.
         let mut topology_leaves = Vec::new();
         virt::x86::topology::topology_cpuid(
