@@ -266,11 +266,26 @@ Evidence:
 
 OpenVMM already has some generic concepts for hardware isolation, but the KVM
 backend and loader abstractions do not currently implement SNP launch semantics.
+The first Linux/KVM milestone is now present: the CLI can request a minimal SNP
+configuration, the low-level KVM wrapper can create an SNP VM type after checking
+`KVM_CAP_VM_TYPES`, and `virt_kvm` can create `KVM_X86_SNP_VM`. The path then
+stops deliberately before normal build/load setup because SNP launch and private
+memory are not implemented yet.
 
 ### Existing useful abstractions
 
 - `IsolationType` already includes `Snp` and `Tdx`, with hardware isolation
   detection.
+- `openvmm` accepts `--isolation snp` for a strict minimal Linux direct-boot
+  configuration, and `openvmm_defs::IsolationType` carries `Snp` through to the
+  virt layer.
+- `vm/kvm` exposes a typed x86 SNP VM creation API that checks
+  `KVM_CAP_VM_TYPES`, and `virt_kvm` uses it to create `KVM_X86_SNP_VM` when
+  `virt::IsolationType::Snp` is requested.
+- The SNP CLI policy currently selects an enlightened Linux direct chipset with
+  no emulated chipset devices and rejects Hyper-V enlightenments, VTL2, VMBus,
+  PCI/VPCI/device assignment, legacy storage, framebuffer, and non-Linux direct
+  boot.
 - `PageVisibility` already distinguishes `Exclusive` and `Shared`.
 - The generic loader tracks imported/accepted page ranges and returns initial
   page visibility for the hypervisor backend.
@@ -278,6 +293,14 @@ backend and loader abstractions do not currently implement SNP launch semantics.
 Evidence:
 
 - `vmm_core/virt/src/generic.rs:85-108` defines `IsolationType::{None,Vbs,Snp,Tdx}`.
+- `openvmm/openvmm_entry/src/cli_args.rs` exposes `IsolationCli::Snp`, and
+  `openvmm/openvmm_entry/src/lib.rs` validates the current minimal SNP policy.
+- `openvmm/openvmm_defs/src/config.rs` maps `IsolationType::Snp` to
+  `virt::IsolationType::Snp`.
+- `vm/kvm/src/lib.rs` defines `X86VmType::Snp` and checks `KVM_CAP_VM_TYPES`
+  before creating that VM type.
+- `vmm_core/virt_kvm/src/arch/x86_64/mod.rs` creates `KVM_X86_SNP_VM` for SNP
+  isolation and returns `SnpLaunchNotImplemented` before launch setup.
 - `vmm_core/virt/src/generic.rs:137-145` defines `PageVisibility`.
 - `vmm_core/vm_loader/src/lib.rs:60-95` returns initial registers and accepted
   visibility ranges.
@@ -311,14 +334,19 @@ Evidence:
 
    Evidence: `vmm_core/virt_mshv/src/x86_64/mod.rs:73-79`.
 
-5. **The repo has tests and config names for SNP, but not a complete Linux/KVM
-   SNP launch implementation.** The OpenVMM test macro recognizes `snp` as an
-   isolation name, and high-level config has `with_isolation`, but those are not
-   enough for KVM SNP.
+5. **OpenVMM can now request and create the KVM SNP VM type, but not launch it.**
+   The CLI/config path supports `--isolation snp` for a strict minimal Linux
+   direct-boot configuration, and `virt_kvm` can create `KVM_X86_SNP_VM`. The
+   backend intentionally returns `SnpLaunchNotImplemented` before normal
+   build/load setup because `/dev/sev`, `KVM_SEV_INIT2`, guest_memfd,
+   memory-attribute setup, SNP launch update/finish, CPUID/secrets pages, and
+   VMSA measurement are still missing.
 
    Evidence:
    - `vmm_tests/vmm_test_macros/src/lib.rs:57-66`
-   - `openvmm/openvmm_defs/src/config.rs:359-364`
+   - `openvmm/openvmm_defs/src/config.rs`
+   - `vm/kvm/src/lib.rs`
+   - `vmm_core/virt_kvm/src/arch/x86_64/mod.rs`
 
 ## Scope: `virt_kvm` vs. cross-cutting changes
 
@@ -359,7 +387,7 @@ Required backend capabilities:
 
 - query KVM support for `KVM_X86_SNP_VM`, `KVM_CAP_GUEST_MEMFD`,
   `KVM_CAP_MEMORY_ATTRIBUTES`, and SNP request-certs attributes;
-- create SNP VM type;
+- create SNP VM type; **done for `KVM_CAP_VM_TYPES` + `KVM_X86_SNP_VM` only**;
 - open/pass `/dev/sev` fd in `kvm_sev_cmd`;
 - implement `KVM_SEV_SNP_LAUNCH_START`, `UPDATE`, `FINISH`;
 - enable request-certs if OpenVMM will serve certificate blobs;
@@ -482,17 +510,19 @@ This is the practical set of changes OpenVMM likely needs, grouped by subsystem.
 
 ### KVM bindings and `virt_kvm`
 
-- Add or update low-level KVM bindings for `KVM_X86_SNP_VM`,
-  `KVM_SEV_INIT2`, `KVM_SEV_SNP_LAUNCH_START`,
+- Add or update low-level KVM bindings for `KVM_SEV_INIT2`,
+  `KVM_SEV_SNP_LAUNCH_START`,
   `KVM_SEV_SNP_LAUNCH_UPDATE`, `KVM_SEV_SNP_LAUNCH_FINISH`,
   `KVM_SEV_SNP_ENABLE_REQ_CERTS`, `KVM_CREATE_GUEST_MEMFD`,
   `KVM_SET_MEMORY_ATTRIBUTES`, `KVM_MEMORY_ATTRIBUTE_PRIVATE`, and
   `KVM_EXIT_SNP_REQ_CERTS`.
-- Add KVM SNP capability probing before allowing SNP isolation:
-  `KVM_CAP_VM_TYPES`, `KVM_CAP_GUEST_MEMFD`, `KVM_CAP_MEMORY_ATTRIBUTES`, SEV
-  device attributes, and `/dev/sev` availability.
-- Teach the KVM partition creation path to create `KVM_X86_SNP_VM` when
-  `IsolationType::Snp` is requested.
+- `KVM_CAP_VM_TYPES` probing and `KVM_X86_SNP_VM` creation are implemented in
+  `vm/kvm` and `virt_kvm`; add the remaining capability checks for
+  `KVM_CAP_GUEST_MEMFD`, `KVM_CAP_MEMORY_ATTRIBUTES`, SEV device attributes, and
+  `/dev/sev` availability.
+- Teach the KVM partition build path to continue past the current
+  `SnpLaunchNotImplemented` stop once SNP initialization and memory backing are
+  available.
 - Add a launch context object in `virt_kvm` that owns `/dev/sev`, the SNP policy
   fields, launch state, and firmware error translation.
 - Implement launch start/update/finish sequencing and ensure launch finish
@@ -556,11 +586,15 @@ This is the practical set of changes OpenVMM likely needs, grouped by subsystem.
 
 ### Configuration and policy
 
+- `--isolation snp` is implemented for an intentionally narrow initial
+  configuration: Linux direct boot, KVM, no Hyper-V enlightenments, no VTL2, no
+  VMBus, no PCI/VPCI/device assignment, no legacy storage, no framebuffer, no
+  emulated chipset devices, and virtio-only devices.
 - Add user/config fields for SNP policy, guest-visible workarounds, ID block,
   ID auth, author-key-enabled, host data, VCEK/VLEK selection, and certificate
   blob paths if OpenVMM serves attestation certs.
-- Validate that SNP options are only accepted with a backend and firmware/IGVM
-  combination that can support SNP.
+- Broaden validation as more backends, firmware/IGVM paths, and device models
+  become SNP-capable.
 - Surface clear diagnostics for missing KVM caps, missing `/dev/sev`, unsupported
   VM type, firmware command failures, CPUID validation failures, and unsupported
   devices.
@@ -773,7 +807,9 @@ to service guest runtime conversions.
 
 ## Suggested implementation order
 
-1. Add capability probing and a minimal KVM SNP backend skeleton.
+1. Complete SNP VM initialization after the existing `KVM_X86_SNP_VM` creation:
+   add `/dev/sev`, `KVM_SEV_INIT2`, launch-start state, and remaining capability
+   checks.
 2. Add guest_memfd-backed RAM/memslot support and OpenVMM-owned page-state
    tracking.
 3. Extend loader/importer abstractions to preserve SNP page types.
