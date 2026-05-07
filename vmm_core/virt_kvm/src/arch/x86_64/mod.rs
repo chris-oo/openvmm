@@ -40,6 +40,8 @@ use parking_lot::Mutex;
 use parking_lot::RwLock;
 use pci_core::msi::SignalMsi;
 use std::convert::Infallible;
+use std::fs::File;
+use std::fs::OpenOptions;
 use std::future::poll_fn;
 use std::io;
 use std::os::unix::prelude::*;
@@ -108,7 +110,7 @@ impl Kvm {
     }
 
     /// Creates a KVM hypervisor instance from a pre-opened `/dev/kvm` fd.
-    pub fn from_kvm(file: std::fs::File) -> Result<Self, KvmError> {
+    pub fn from_kvm(file: File) -> Result<Self, KvmError> {
         let kvm = kvm::Kvm::from(file);
         Ok(Self { kvm })
     }
@@ -271,17 +273,33 @@ impl virt::Hypervisor for Kvm {
 
         let cpuid_entries = CpuidLeafSet::new(cpuid_entries);
 
+        let sev = match config.isolation {
+            virt::IsolationType::Snp => Some(
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open("/dev/sev")
+                    .map_err(KvmError::OpenSev)?,
+            ),
+            virt::IsolationType::None => None,
+            virt::IsolationType::Vbs | virt::IsolationType::Tdx => unreachable!(),
+        };
+
         let vm = match config.isolation {
             virt::IsolationType::None => self.kvm.new_vm()?,
             virt::IsolationType::Snp => self.kvm.new_x86_vm(kvm::X86VmType::Snp)?,
             virt::IsolationType::Vbs | virt::IsolationType::Tdx => unreachable!(),
         };
+        if let Some(sev) = &sev {
+            vm.sev_snp_init(sev.as_fd())?;
+        }
         vm.enable_split_irqchip(virt::irqcon::IRQ_LINES as u32)?;
         vm.enable_x2apic_api()?;
         vm.enable_unknown_msr_exits()?;
 
         Ok(KvmProtoPartition {
             vm,
+            _sev: sev,
             config,
             cpuid: cpuid_entries,
         })
@@ -291,6 +309,7 @@ impl virt::Hypervisor for Kvm {
 /// A prototype partition.
 pub struct KvmProtoPartition<'a> {
     vm: kvm::Partition,
+    _sev: Option<File>,
     config: ProtoPartitionConfig<'a>,
     cpuid: CpuidLeafSet,
 }
@@ -309,7 +328,7 @@ impl ProtoPartition for KvmProtoPartition<'_> {
         config: PartitionConfig<'_>,
     ) -> Result<(Self::Partition, Vec<Self::ProcessorBinder>), Self::Error> {
         if self.config.isolation == virt::IsolationType::Snp {
-            return Err(KvmError::SnpLaunchNotImplemented);
+            return Err(KvmError::SnpPrivateMemoryNotImplemented);
         }
 
         // Build topology leaves using the base cpuid before consuming it.
