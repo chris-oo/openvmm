@@ -783,3 +783,82 @@ to service guest runtime conversions.
 7. Add attestation certificate support.
 8. Gate/reject incompatible devices and lifecycle operations.
 9. Add docs and tests for the supported subset.
+
+## Readiness for concrete implementation breakdown
+
+The suggested implementation order is enough to organize the work into epics and
+to decide sequencing, but it is not yet enough to turn every item into
+implementation-ready tasks. Some areas can be broken down directly, while others
+need a short design/investigation pass first so the cross-layer contracts are
+clear before code is written.
+
+### Work that is concrete enough to start
+
+These items have clear current-code seams and can be decomposed into concrete
+tasks with limited additional investigation:
+
+- add KVM SNP capability probing and clear rejection diagnostics for unsupported
+  hosts or backends;
+- add a minimal KVM SNP backend skeleton behind `IsolationType::Snp`;
+- extend the loader-facing initial page model so SNP page acceptances are not
+  flattened into only `PageVisibility::{Exclusive,Shared}`;
+- replace the current `todo!()` handling for SNP-specific
+  `BootPageAcceptance` variants with explicit page descriptors;
+- add unit tests for page-acceptance to initial-page descriptor mapping,
+  duplicate detection, and overlap handling;
+- add documentation for the initially supported and unsupported SNP subset once
+  that subset is selected.
+
+### Areas that need more investigation or definition
+
+These should be tackled one by one before detailed implementation tasks are
+assigned:
+
+1. **KVM binding and ioctl surface.** Confirm which SNP, `guest_memfd`, memory
+   attribute, and certificate-exit constants and structs already exist in the
+   `vm/kvm` bindings, which need to be added, and how `/dev/sev` firmware errors
+   should be represented.
+2. **Guest-private memory ownership.** Decide where `guest_memfd` file
+   descriptors live, how guest-private backing fits with `GuestMemory` and KVM
+   memslot registration, how shared userspace mappings coexist with private
+   backing, and how discard/punch-hole behavior is coordinated.
+3. **OpenVMM page-state tracking.** Define the owner and data structure for
+   private/shared page state, because KVM's memory-attributes API has no get
+   operation. This state must be updated by launch, runtime conversion exits, and
+   any future memory hotplug or discard paths.
+4. **Loader-to-backend launch contract.** Decide whether to extend
+   `PageVisibility` or introduce a new initial page/launch descriptor carrying
+   visibility, SNP page type, measurement state, and special page purpose
+   (`SECRETS`, `CPUID`, VMSA/VP context, etc.).
+5. **Launch lifecycle sequencing.** Identify the exact OpenVMM lifecycle points
+   for `KVM_SEV_INIT2`, `LAUNCH_START`, launch updates, vCPU protected-state/VMSA
+   setup, and `LAUNCH_FINISH`, and ensure VPs cannot run before finish
+   succeeds.
+6. **CPUID source and validation.** Determine where the final KVM vCPU CPUID
+   policy is materialized, how to construct the SNP CPUID page from it, and how
+   firmware mismatch information should be surfaced without panicking.
+7. **Runtime private/shared conversion handling.** Confirm the KVM exit shape
+   OpenVMM must handle, define GPA/size validation rules, update ordering between
+   OpenVMM state and `KVM_SET_MEMORY_ATTRIBUTES`, and decide whether to pre-fault
+   converted ranges.
+8. **Device and DMA policy.** Audit which device models, MMIO paths, DMA paths,
+   remote mappers, debug/diagnostic features, and memory inspection paths assume
+   host-readable guest RAM, then define the initial rejection or shared-page-only
+   policy.
+9. **Supported MVP boot path.** Choose the first supported target before coding
+   the whole stack: IGVM plus OpenHCL-contained VTL0 Linux, direct VTL0 Linux
+   IGVM, OVMF-style firmware loading, or a smaller bring-up harness. This choice
+   affects loader metadata, CPUID/secrets pages, AP startup, and tests.
+10. **Lifecycle restrictions.** Explicitly decide which operations are disabled
+    for the first SNP implementation, including migration, save/restore, reset,
+    debug decrypt/encrypt, memory snapshots, ballooning, hotplug, assigned
+    devices, and SMM-like flows.
+11. **Attestation certificate scope.** Decide whether
+    `KVM_EXIT_SNP_REQ_CERTS` support is part of the MVP or a follow-up. If it is
+    included, define the config surface for certificate blobs and the locking
+    semantics expected by the kernel documentation.
+
+The highest-risk design dependencies are the memory backing/page-state model,
+the loader-to-backend launch descriptor API, and the launch lifecycle sequence.
+Those should be resolved before implementing the later CPUID, runtime
+conversion, attestation, and device-policy work.
