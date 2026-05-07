@@ -597,7 +597,7 @@ iced-x86 = { version = "1.17", default-features = false, features = [
 ] }
 igvm = "0.4.0"
 igvm_defs = { version = "0.4.0", default-features = false }
-kvm-bindings = "0.14.0"
+kvm-bindings = { git = "https://github.com/rust-vmm/kvm", rev = "3ffc9b62af5978553f73cc0ec79fad13fdd47146" }
 mshv-bindings = "0.6.8"
 mshv-ioctls = "0.6.8"
 uefi = "0.35.0"
