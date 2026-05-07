@@ -26,9 +26,12 @@ mod ioctl {
     use kvm_bindings::*;
     use nix::ioctl_read;
     use nix::ioctl_readwrite;
+    use nix::ioctl_readwrite_bad;
     use nix::ioctl_write_int_bad;
     use nix::ioctl_write_ptr;
     use nix::request_code_none;
+    use nix::request_code_readwrite;
+    use std::mem::size_of;
     const KVMIO: u8 = 0xae;
     ioctl_write_int_bad!(kvm_create_vm, request_code_none!(KVMIO, 0x1));
     ioctl_write_int_bad!(kvm_check_extension, request_code_none!(KVMIO, 0x03));
@@ -99,6 +102,12 @@ mod ioctl {
     ioctl_write_ptr!(kvm_set_guest_debug, KVMIO, 0x9b, kvm_guest_debug);
     ioctl_readwrite!(kvm_create_device, KVMIO, 0xe0, kvm_create_device);
     ioctl_write_ptr!(kvm_set_device_attr, KVMIO, 0xe1, kvm_device_attr);
+    #[cfg(target_arch = "x86_64")]
+    ioctl_readwrite_bad!(
+        kvm_memory_encrypt_op,
+        request_code_readwrite!(KVMIO, 0xba, size_of::<libc::c_ulong>()),
+        kvm_sev_cmd
+    );
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -134,6 +143,14 @@ pub enum Error {
     #[cfg(target_arch = "x86_64")]
     #[error("unsupported x86 VM type: {0:?}")]
     UnsupportedX86VmType(X86VmType),
+    #[cfg(target_arch = "x86_64")]
+    #[error("MemoryEncryptOp({command})")]
+    MemoryEncryptOp {
+        command: &'static str,
+        firmware_error: u32,
+        #[source]
+        source: nix::Error,
+    },
     #[error("EnableCap({0})")]
     EnableCap(&'static str, #[source] nix::Error),
     #[error("CreateVCpu")]
@@ -377,6 +394,30 @@ pub struct Partition {
 }
 
 impl Partition {
+    #[cfg(target_arch = "x86_64")]
+    pub fn sev_snp_init(&self, sev: BorrowedFd<'_>) -> Result<()> {
+        let mut init = kvm_sev_init::default();
+        let mut command = kvm_sev_cmd {
+            id: sev_cmd_id_KVM_SEV_INIT2,
+            data: std::ptr::from_mut(&mut init) as u64,
+            sev_fd: sev.as_raw_fd() as u32,
+            ..Default::default()
+        };
+
+        // SAFETY: `command` and its data pointer refer to stack-allocated C ABI
+        // structs that remain valid for the duration of the ioctl.
+        unsafe {
+            ioctl::kvm_memory_encrypt_op(self.vm.as_raw_fd(), &mut command).map_err(|err| {
+                Error::MemoryEncryptOp {
+                    command: "KVM_SEV_INIT2",
+                    firmware_error: command.error,
+                    source: err,
+                }
+            })?;
+        }
+        Ok(())
+    }
+
     pub fn enable_split_irqchip(&self, lines: u32) -> Result<()> {
         // TODO: We are not checking KVM_CAP_ENABLE_CAP_VM first.
         // TODO: We are not calling KVM_CHECK_EXTENSION first.
