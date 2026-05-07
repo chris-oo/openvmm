@@ -77,6 +77,8 @@ pub enum BaseChipsetType {
     HclHost,
     /// Unenlightened Linux VM, with basic architectural devices.
     UnenlightenedLinuxDirect,
+    /// Enlightened Linux VM with no emulated chipset devices.
+    EnlightenedLinuxDirect,
 }
 
 /// The machine architecture of the VM.
@@ -325,6 +327,9 @@ impl VmManifestBuilder {
                 if let Some(recv) = self.battery_status_recv {
                     result.attach_battery(self.arch, recv);
                 }
+            }
+            BaseChipsetType::EnlightenedLinuxDirect => {
+                result.chipset = BaseChipsetManifest::empty();
             }
             BaseChipsetType::HypervGen2Uefi | BaseChipsetType::HyperVGen2LinuxDirect => {
                 let is_x86 = matches!(self.arch, MachineArch::X86_64);
