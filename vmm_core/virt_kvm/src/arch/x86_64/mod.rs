@@ -137,8 +137,18 @@ impl virt::Hypervisor for Kvm {
         &mut self,
         config: ProtoPartitionConfig<'a>,
     ) -> Result<Self::ProtoPartition<'a>, Self::Error> {
-        if config.isolation.is_isolated() {
-            return Err(KvmError::IsolationNotSupported);
+        match config.isolation {
+            virt::IsolationType::None => {}
+            virt::IsolationType::Snp => {
+                if config.hv_config.is_some() {
+                    return Err(KvmError::UnsupportedIsolationConfiguration(
+                        "SNP does not support Hyper-V enlightenments or VTL2",
+                    ));
+                }
+            }
+            virt::IsolationType::Vbs | virt::IsolationType::Tdx | virt::IsolationType::Cca => {
+                return Err(KvmError::IsolationNotSupported);
+            }
         }
 
         let mut cpuid_entries = self
@@ -261,7 +271,33 @@ impl virt::Hypervisor for Kvm {
 
         let cpuid_entries = CpuidLeafSet::new(cpuid_entries);
 
-        let vm = self.kvm.new_vm()?;
+        let sev = match config.isolation {
+            virt::IsolationType::Snp => Some(
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open("/dev/sev")
+                    .map_err(KvmError::OpenSev)?,
+            ),
+            virt::IsolationType::None => None,
+            virt::IsolationType::Vbs | virt::IsolationType::Tdx | virt::IsolationType::Cca => {
+                unreachable!()
+            }
+        };
+
+        let vm = match config.isolation {
+            virt::IsolationType::None => self.kvm.new_vm()?,
+            virt::IsolationType::Snp => {
+                self.kvm.check_private_memory_extensions()?;
+                let vm = self.kvm.new_x86_vm(kvm::X86VmType::Snp)?;
+                vm.check_private_memory_extensions()?;
+                vm.enable_hypercall_exits(1 << kvm::KVM_HC_MAP_GPA_RANGE_UAPI)?;
+                vm
+            }
+            virt::IsolationType::Vbs | virt::IsolationType::Tdx | virt::IsolationType::Cca => {
+                unreachable!()
+            }
+        };
         vm.enable_split_irqchip(virt::irqcon::IRQ_LINES as u32)?;
         vm.enable_x2apic_api()?;
         vm.enable_unknown_msr_exits()?;
@@ -294,6 +330,10 @@ impl ProtoPartition for KvmProtoPartition<'_> {
         mut self,
         config: PartitionConfig<'_>,
     ) -> Result<(Self::Partition, Vec<Self::ProcessorBinder>), Self::Error> {
+        if self.config.isolation == virt::IsolationType::Snp {
+            return Err(KvmError::SnpLaunchNotImplemented);
+        }
+
         // Build topology leaves using the base cpuid before consuming it.
         let mut topology_leaves = Vec::new();
         virt::x86::topology::topology_cpuid(
@@ -445,6 +485,20 @@ impl ProtoPartition for KvmProtoPartition<'_> {
         let partition = Arc::new(KvmPartitionInner {
             kvm: self.vm,
             memory: Default::default(),
+            memory_backing_mode: match self.config.isolation {
+                virt::IsolationType::None => KvmMemoryBackingMode::Userspace,
+                virt::IsolationType::Snp => KvmMemoryBackingMode::GuestMemfd,
+                virt::IsolationType::Vbs | virt::IsolationType::Tdx | virt::IsolationType::Cca => {
+                    unreachable!()
+                }
+            },
+            ram_ranges: config
+                .mem_layout
+                .ram()
+                .iter()
+                .map(|range| range.range)
+                .chain(config.mem_layout.vtl2_range())
+                .collect(),
             hv1_enabled: self.config.hv_config.is_some(),
             gm: config.guest_memory.clone(),
             vps: self
