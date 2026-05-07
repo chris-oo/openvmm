@@ -186,8 +186,8 @@ Examples:
     #[clap(long, requires("vtl2"))]
     pub no_alias_map: bool,
 
-    /// enable isolation emulation
-    #[clap(long, requires("vtl2"))]
+    /// enable isolation
+    #[clap(long)]
     pub isolation: Option<IsolationCli>,
 
     /// the hybrid vsock listener path
@@ -2178,6 +2178,7 @@ pub enum GicMsiCli {
 #[derive(Debug, Copy, Clone, ValueEnum)]
 pub enum IsolationCli {
     Vbs,
+    Snp,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]

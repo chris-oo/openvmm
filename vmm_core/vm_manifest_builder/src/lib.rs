@@ -88,6 +88,8 @@ pub enum BaseChipsetType {
     HclHost,
     /// Unenlightened Linux VM, with basic architectural devices.
     UnenlightenedLinuxDirect,
+    /// Enlightened Linux VM with no emulated chipset devices.
+    EnlightenedLinuxDirect,
 }
 
 /// The machine architecture of the VM.
@@ -349,6 +351,47 @@ impl VmManifestBuilder {
                     result.attach_guest_watchdog();
                 }
             }
+            BaseChipsetType::EnlightenedLinuxDirect => {
+                let is_x86 = matches!(self.arch, MachineArch::X86_64);
+                result.chipset = BaseChipsetManifest {
+                    with_generic_cmos_rtc: is_x86,
+                    with_generic_isa_dma: false,
+                    with_generic_isa_floppy: false,
+                    with_generic_pci_bus: false,
+                    with_generic_psp: self.psp,
+                    with_hyperv_firmware_pcat: false,
+                    with_hyperv_firmware_uefi: false,
+                    with_hyperv_framebuffer: self.framebuffer,
+                    with_hyperv_ide: false,
+                    with_hyperv_vga: false,
+                    with_i440bx_host_pci_bridge: false,
+                    with_piix4_cmos_rtc: false,
+                    with_piix4_pci_bus: false,
+                    with_underhill_vga_proxy: false,
+                    with_winbond_super_io_and_floppy_stub: false,
+                    with_winbond_super_io_and_floppy_full: false,
+                };
+                result.capabilities.with_ioapic = is_x86;
+                result.capabilities.with_psp = self.psp;
+                if is_x86 {
+                    result.attach_generic_ioapic();
+                    result.attach_pic();
+                    result.attach_pit();
+                    result.attach_hyperv_power_management(self.platform_pm_timer_assist);
+                }
+                result
+                    .maybe_attach_arch_serial(
+                        self.arch,
+                        self.serial_wait_for_rts,
+                        false,
+                        self.serial,
+                    )?
+                    .attach_missing_arch_ports(self.arch, false)
+                    .attach_missing_pci_config_ports(self.arch);
+                if self.guest_watchdog {
+                    result.attach_guest_watchdog();
+                }
+            }
             BaseChipsetType::HypervGen2Uefi | BaseChipsetType::HyperVGen2LinuxDirect => {
                 let is_x86 = matches!(self.arch, MachineArch::X86_64);
                 result.chipset = BaseChipsetManifest {
@@ -427,7 +470,8 @@ impl VmManifestBuilder {
             BaseChipsetType::HypervGen1
             | BaseChipsetType::HypervGen2Uefi
             | BaseChipsetType::HyperVGen2LinuxDirect
-            | BaseChipsetType::UnenlightenedLinuxDirect => LayoutConfig {
+            | BaseChipsetType::UnenlightenedLinuxDirect
+            | BaseChipsetType::EnlightenedLinuxDirect => LayoutConfig {
                 chipset_low_mmio_size: default_low,
                 chipset_high_mmio_size: default_high,
                 vtl2_chipset_mmio_size: 0,

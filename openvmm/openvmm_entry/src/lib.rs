@@ -932,7 +932,9 @@ async fn vm_config_from_command_line(
     let has_com3 = serial2_cfg.is_some();
 
     let mut chipset = VmManifestBuilder::new(
-        if opt.igvm.is_some() {
+        if matches!(opt.isolation, Some(cli_args::IsolationCli::Snp)) {
+            BaseChipsetType::EnlightenedLinuxDirect
+        } else if opt.igvm.is_some() {
             BaseChipsetType::HclHost
         } else if opt.pcat {
             BaseChipsetType::HypervGen1
@@ -1397,18 +1399,21 @@ async fn vm_config_from_command_line(
         });
 
     let with_isolation = if let Some(isolation) = &opt.isolation {
-        // TODO: For now, isolation is only supported with VTL2.
-        if !opt.vtl2 {
-            anyhow::bail!("isolation is only currently supported with vtl2");
-        }
-
-        // TODO: Alias map support is not yet implement with isolation.
-        if !opt.no_alias_map {
-            anyhow::bail!("alias map not supported with isolation");
-        }
-
         match isolation {
-            cli_args::IsolationCli::Vbs => Some(openvmm_defs::config::IsolationType::Vbs),
+            cli_args::IsolationCli::Vbs => {
+                // TODO: For now, VBS isolation is only supported with VTL2.
+                if !opt.vtl2 {
+                    anyhow::bail!("VBS isolation is only currently supported with vtl2");
+                }
+
+                // TODO: Alias map support is not yet implemented with isolation.
+                if !opt.no_alias_map {
+                    anyhow::bail!("alias map not supported with isolation");
+                }
+
+                Some(openvmm_defs::config::IsolationType::Vbs)
+            }
+            cli_args::IsolationCli::Snp => Some(openvmm_defs::config::IsolationType::Snp),
         }
     } else {
         None
@@ -1753,7 +1758,55 @@ async fn vm_config_from_command_line(
     };
 
     storage.build_config(&mut cfg, &mut resources, opt.scsi_sub_channels)?;
+    validate_isolation_config(&cfg)?;
     Ok((cfg, resources))
+}
+
+fn validate_isolation_config(cfg: &Config) -> anyhow::Result<()> {
+    if !matches!(
+        cfg.hypervisor.with_isolation,
+        Some(openvmm_defs::config::IsolationType::Snp)
+    ) {
+        return Ok(());
+    }
+
+    if !matches!(cfg.load_mode, LoadMode::Linux { .. }) {
+        anyhow::bail!("SNP isolation currently only supports Linux direct boot");
+    }
+
+    if cfg.hypervisor.with_hv {
+        anyhow::bail!("SNP isolation currently does not support Hyper-V enlightenments");
+    }
+
+    if cfg.hypervisor.with_vtl2.is_some() {
+        anyhow::bail!("SNP isolation currently does not support VTL2");
+    }
+
+    if cfg.vmbus.is_some() || cfg.vtl2_vmbus.is_some() || !cfg.vmbus_devices.is_empty() {
+        anyhow::bail!("SNP isolation currently does not support VMBus devices");
+    }
+
+    if !cfg.floppy_disks.is_empty()
+        || !cfg.ide_disks.is_empty()
+        || !cfg.pcie_root_complexes.is_empty()
+        || !cfg.pcie_devices.is_empty()
+        || !cfg.pcie_switches.is_empty()
+        || !cfg.vpci_devices.is_empty()
+        || !cfg.chipset_devices.is_empty()
+        || !cfg.pci_chipset_devices.is_empty()
+    {
+        anyhow::bail!("SNP isolation currently only supports virtio devices");
+    }
+
+    if cfg.framebuffer.is_some()
+        || cfg.vga_firmware.is_some()
+        || cfg.debugger_rpc.is_some()
+        || cfg.generation_id_recv.is_some()
+    {
+        anyhow::bail!("SNP isolation currently does not support this VM configuration");
+    }
+
+    Ok(())
 }
 
 /// Gets the terminal to use for externally launched console windows.
