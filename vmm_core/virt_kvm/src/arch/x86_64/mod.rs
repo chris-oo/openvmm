@@ -287,7 +287,12 @@ impl virt::Hypervisor for Kvm {
 
         let vm = match config.isolation {
             virt::IsolationType::None => self.kvm.new_vm()?,
-            virt::IsolationType::Snp => self.kvm.new_x86_vm(kvm::X86VmType::Snp)?,
+            virt::IsolationType::Snp => {
+                self.kvm.check_private_memory_extensions()?;
+                let vm = self.kvm.new_x86_vm(kvm::X86VmType::Snp)?;
+                vm.check_private_memory_extensions()?;
+                vm
+            }
             virt::IsolationType::Vbs | virt::IsolationType::Tdx => unreachable!(),
         };
         if let Some(sev) = &sev {
