@@ -267,6 +267,13 @@ fn classify_guest_memfd_backing(
     Ok(KvmMemoryBacking::Userspace)
 }
 
+impl virt::PartitionMemoryMapper for KvmPartition {
+    fn memory_mapper(&self, vtl: Vtl) -> Arc<dyn virt::PartitionMemoryMap> {
+        assert_eq!(vtl, Vtl::Vtl0);
+        self.inner.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,13 +330,6 @@ mod tests {
             classify_guest_memfd_backing(range(0x2000, 0x4000), &ram_ranges),
             Err(KvmError::UnsupportedIsolationConfiguration(_))
         ));
-    }
-}
-
-impl virt::PartitionMemoryMapper for KvmPartition {
-    fn memory_mapper(&self, vtl: Vtl) -> Arc<dyn virt::PartitionMemoryMap> {
-        assert_eq!(vtl, Vtl::Vtl0);
-        self.inner.clone()
     }
 }
 
