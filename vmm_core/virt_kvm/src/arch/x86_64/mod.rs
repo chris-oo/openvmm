@@ -333,10 +333,6 @@ impl ProtoPartition for KvmProtoPartition<'_> {
         mut self,
         config: PartitionConfig<'_>,
     ) -> Result<(Self::Partition, Vec<Self::ProcessorBinder>), Self::Error> {
-        if self.config.isolation == virt::IsolationType::Snp {
-            return Err(KvmError::SnpPrivateMemoryNotImplemented);
-        }
-
         // Build topology leaves using the base cpuid before consuming it.
         let mut topology_leaves = Vec::new();
         virt::x86::topology::topology_cpuid(
@@ -690,6 +686,10 @@ impl virt::BindProcessor for KvmProcessorBinder {
     type Error = KvmError;
 
     fn bind(&mut self) -> Result<Self::Processor<'_>, Self::Error> {
+        if self.partition.memory_backing_mode == KvmMemoryBackingMode::GuestMemfd {
+            return Err(KvmError::GuestMemfdLaunchNotImplemented);
+        }
+
         // FUTURE: create the vcpu here to get better NUMA affinity.
 
         let inner = &self.partition.vps[self.vpindex.index() as usize];
