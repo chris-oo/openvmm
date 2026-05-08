@@ -37,6 +37,27 @@ For the first implementation, use a deliberately narrow RAM classifier inside `v
 
 ## Implementation steps
 
+### Completed so far
+
+- Added `vm/kvm` wrappers for `KVM_SET_USER_MEMORY_REGION2`, `KVM_CREATE_GUEST_MEMFD`, and `KVM_SET_MEMORY_ATTRIBUTES`.
+- Added private-memory capability checks for `KVM_CAP_USER_MEMORY2`, `KVM_CAP_GUEST_MEMFD`, and `KVM_CAP_MEMORY_ATTRIBUTES(KVM_MEMORY_ATTRIBUTE_PRIVATE)` on both `/dev/kvm` and the SNP VM fd.
+- Added `KvmMemoryBackingMode` and wired `IsolationType::Snp` to guest_memfd-backed KVM memory while keeping `Vbs` and `Tdx` unsupported.
+- Stored boot RAM ranges from `MemoryLayout`, including the VTL2 range, and added a temporary classifier that uses guest_memfd only for mappings fully contained in exactly one RAM range.
+- Added classifier tests for RAM, non-RAM, partial-overlap, adjacent-range, and ambiguous-overlap cases.
+- Added guest_memfd-backed RAM memslot registration with `KVM_SET_USER_MEMORY_REGION2`, private attribute setup with `KVM_SET_MEMORY_ATTRIBUTES`, fd lifetime tracking, and cleanup/rollback handling.
+- Preserved userspace-backed mappings for ranges outside stored RAM ranges.
+- Added OpenVMM-side gating that rejects SNP guest_memfd with PCAT, Hyper-V VGA, or i440BX host PCI bridge configurations.
+- Narrowed the early SNP private-memory build blocker to an explicit `GuestMemfdLaunchNotImplemented` blocker before vCPU launch. SNP support is still not bootable.
+
+### Remaining work
+
+- Implement SNP launch start/update/finish and measurement, including copying the existing userspace guest-memory contents into private guest_memfd-backed pages during launch update.
+- Add VMSA/protected CPU state handling before allowing vCPU launch.
+- Wire SNP CPUID/secrets/page-state expectations for the first direct-boot Linux target.
+- Add or factor additional guest_memfd bookkeeping tests where practical without SNP hardware.
+- Validate on SNP-capable hardware through VM creation, guest_memfd RAM registration, private attributes, cleanup, and the next explicit SNP launch blocker.
+- Follow up with runtime shared/private page conversion handling via `KVM_SET_MEMORY_ATTRIBUTES` and explicit GFN state tracking.
+
 1. Keep SNP VM creation as the only private-memory VM type in this plan.
    - Continue using `KVM_X86_SNP_VM` for `IsolationType::Snp`.
    - In `virt_kvm`, introduce a KVM-internal VM creation/memory backing selection type, for example:
@@ -185,18 +206,18 @@ SNP-specific VM creation and execution still requires an SNP-capable AMD host, f
 
 ## Milestones
 
-1. Add SNP-only private-memory VM creation and mode selection plumbing.
-2. Add wrappers and capability checks.
-3. Add `KvmMemoryBackingMode`, guestmemfd slot state, and the temporary `MemoryLayout` RAM-range classifier.
-4. Add configuration gating for the temporary classifier and legacy overlay rejection.
-5. Register guestmemfd RAM memslots with `KVM_SET_USER_MEMORY_REGION2`.
-6. Mark initial private RAM with `KVM_SET_MEMORY_ATTRIBUTES`.
-7. Remove or narrow the current SNP private-memory build blocker.
-8. Add generic guest_memfd wrapper/bookkeeping tests where the kernel and factoring support them.
-9. Add SNP-hardware smoke coverage for SNP VM creation, guestmemfd memslots, attributes, and cleanup.
-10. Implement the SNP launch flow for bootable SNP guests: launch start, launch update from the existing userspace guest-memory contents into private guest_memfd pages, measurement, and launch finish.
-11. Follow up with SNP page-state transition handling.
+1. [done] Add SNP-only private-memory VM creation and mode selection plumbing.
+2. [done] Add wrappers and capability checks.
+3. [done] Add `KvmMemoryBackingMode`, guestmemfd slot state, and the temporary `MemoryLayout` RAM-range classifier.
+4. [done] Add configuration gating for the temporary classifier and legacy overlay rejection.
+5. [done] Register guestmemfd RAM memslots with `KVM_SET_USER_MEMORY_REGION2`.
+6. [done] Mark initial private RAM with `KVM_SET_MEMORY_ATTRIBUTES`.
+7. [done] Remove or narrow the current SNP private-memory build blocker.
+8. [partial] Add generic guest_memfd wrapper/bookkeeping tests where the kernel and factoring support them.
+9. [next] Add SNP-hardware smoke coverage for SNP VM creation, guestmemfd memslots, attributes, cleanup, and the current launch blocker.
+10. [next] Implement the SNP launch flow for bootable SNP guests: launch start, launch update from the existing userspace guest-memory contents into private guest_memfd pages, measurement, and launch finish.
+11. [todo] Follow up with SNP page-state transition handling.
 
 ## Readiness assessment
 
-This plan is ready to start implementation for the initial KVM guest_memfd plumbing milestone: guest_memfd UAPI wrappers, guarded RAM-range classification, SNP memslot registration, private memory attributes, cleanup, and hardware-free unit/fake-backend coverage. It is not ready for end-to-end validation without SNP hardware. It intentionally does not support PCAT, Hyper-V VGA, i440BX/PAM/VGA behavior, or other dynamic overlapping device/RAM mappings for SNP guest_memfd.
+The initial KVM guest_memfd plumbing milestone is implemented through RAM memslot registration, private memory attributes, cleanup/rollback handling, and hardware-free classifier tests. It is not ready for end-to-end SNP boot: the current expected stop point is `GuestMemfdLaunchNotImplemented` before vCPU launch. It intentionally does not support PCAT, Hyper-V VGA, i440BX/PAM/VGA behavior, or other dynamic overlapping device/RAM mappings for SNP guest_memfd.
