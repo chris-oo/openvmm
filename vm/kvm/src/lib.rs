@@ -45,6 +45,12 @@ mod ioctl {
         0x46,
         kvm_userspace_memory_region
     );
+    ioctl_write_ptr!(
+        kvm_set_user_memory_region2,
+        KVMIO,
+        0x49,
+        kvm_userspace_memory_region2
+    );
     ioctl_write_ptr!(kvm_irq_line, KVMIO, 0x61, kvm_irq_level);
     ioctl_write_ptr!(kvm_set_gsi_routing, KVMIO, 0x6a, kvm_irq_routing);
     ioctl_write_ptr!(kvm_irqfd, KVMIO, 0x76, kvm_irqfd);
@@ -100,8 +106,15 @@ mod ioctl {
     ioctl_read!(kvm_arm_preferred_target, KVMIO, 0xaf, kvm_vcpu_init);
     ioctl_write_ptr!(kvm_ioeventfd, KVMIO, 0x79, kvm_ioeventfd);
     ioctl_write_ptr!(kvm_set_guest_debug, KVMIO, 0x9b, kvm_guest_debug);
+    ioctl_write_ptr!(
+        kvm_set_memory_attributes,
+        KVMIO,
+        0xd2,
+        kvm_memory_attributes
+    );
     ioctl_readwrite!(kvm_create_device, KVMIO, 0xe0, kvm_create_device);
     ioctl_write_ptr!(kvm_set_device_attr, KVMIO, 0xe1, kvm_device_attr);
+    ioctl_readwrite!(kvm_create_guest_memfd, KVMIO, 0xd4, kvm_create_guest_memfd);
     #[cfg(target_arch = "x86_64")]
     ioctl_readwrite_bad!(
         kvm_memory_encrypt_op,
@@ -138,8 +151,14 @@ pub enum Error {
     SignalMsi(#[source] nix::Error),
     #[error("SetMemoryRegion")]
     SetMemoryRegion(#[source] nix::Error),
+    #[error("SetMemoryAttributes")]
+    SetMemoryAttributes(#[source] nix::Error),
+    #[error("CreateGuestMemfd")]
+    CreateGuestMemfd(#[source] nix::Error),
     #[error("CreateVm")]
     CreateVm(#[source] nix::Error),
+    #[error("missing KVM capability: {0}")]
+    MissingCapability(&'static str),
     #[cfg(target_arch = "x86_64")]
     #[error("unsupported x86 VM type: {0:?}")]
     UnsupportedX86VmType(X86VmType),
@@ -297,6 +316,34 @@ impl Kvm {
     pub fn check_extension(&self, extension: u32) -> nix::Result<libc::c_int> {
         // SAFETY: Calling IOCTL as documented, with no special requirements.
         unsafe { ioctl::kvm_check_extension(self.as_fd().as_raw_fd(), extension as i32) }
+    }
+
+    pub fn check_private_memory_extensions(&self) -> Result<()> {
+        if self
+            .check_extension(KVM_CAP_USER_MEMORY2)
+            .map_err(Error::CheckExtension)?
+            == 0
+        {
+            return Err(Error::MissingCapability("KVM_CAP_USER_MEMORY2"));
+        }
+        if self
+            .check_extension(KVM_CAP_GUEST_MEMFD)
+            .map_err(Error::CheckExtension)?
+            == 0
+        {
+            return Err(Error::MissingCapability("KVM_CAP_GUEST_MEMFD"));
+        }
+        if self
+            .check_extension(KVM_CAP_MEMORY_ATTRIBUTES)
+            .map_err(Error::CheckExtension)?
+            & KVM_MEMORY_ATTRIBUTE_PRIVATE as libc::c_int
+            == 0
+        {
+            return Err(Error::MissingCapability(
+                "KVM_CAP_MEMORY_ATTRIBUTES(KVM_MEMORY_ATTRIBUTE_PRIVATE)",
+            ));
+        }
+        Ok(())
     }
 
     pub fn new_vm(&self) -> Result<Partition> {
@@ -581,6 +628,65 @@ impl Partition {
         unsafe {
             ioctl::kvm_set_user_memory_region(self.vm.as_raw_fd(), &region)
                 .map_err(Error::SetMemoryRegion)?;
+        }
+        Ok(())
+    }
+
+    #[expect(clippy::missing_safety_doc, clippy::undocumented_unsafe_blocks)]
+    pub unsafe fn set_user_memory_region2(
+        &self,
+        slot: u32,
+        data: *mut u8,
+        size: usize,
+        addr: u64,
+        readonly: bool,
+        guest_memfd: Option<(&File, u64)>,
+    ) -> Result<()> {
+        let (guest_memfd, guest_memfd_offset, guest_memfd_flag) = guest_memfd
+            .map(|(file, offset)| (file.as_raw_fd() as u32, offset, KVM_MEM_GUEST_MEMFD))
+            .unwrap_or((0, 0, 0));
+        let region = kvm_userspace_memory_region2 {
+            slot,
+            flags: if readonly { KVM_MEM_READONLY } else { 0 } | guest_memfd_flag,
+            guest_phys_addr: addr,
+            memory_size: size as u64,
+            userspace_addr: data as usize as u64,
+            guest_memfd_offset,
+            guest_memfd,
+            ..Default::default()
+        };
+        unsafe {
+            ioctl::kvm_set_user_memory_region2(self.vm.as_raw_fd(), &region)
+                .map_err(Error::SetMemoryRegion)?;
+        }
+        Ok(())
+    }
+
+    pub fn create_guest_memfd(&self, size: u64) -> Result<File> {
+        let mut guest_memfd = kvm_create_guest_memfd {
+            size,
+            ..Default::default()
+        };
+        // SAFETY: `guest_memfd` is a valid C ABI struct for KVM to read.
+        let fd = unsafe {
+            ioctl::kvm_create_guest_memfd(self.vm.as_raw_fd(), &mut guest_memfd)
+                .map_err(Error::CreateGuestMemfd)?
+        };
+        // SAFETY: On success, KVM returns a new owned file descriptor.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    pub fn set_memory_attributes(&self, addr: u64, size: u64, attributes: u64) -> Result<()> {
+        let attr = kvm_memory_attributes {
+            address: addr,
+            size,
+            attributes,
+            ..Default::default()
+        };
+        // SAFETY: `attr` is a valid C ABI struct for KVM to read.
+        unsafe {
+            ioctl::kvm_set_memory_attributes(self.vm.as_raw_fd(), &attr)
+                .map_err(Error::SetMemoryAttributes)?;
         }
         Ok(())
     }
