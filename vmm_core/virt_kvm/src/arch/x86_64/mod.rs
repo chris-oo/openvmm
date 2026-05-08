@@ -10,6 +10,7 @@ mod vm_state;
 mod vp_state;
 
 use crate::KvmError;
+use crate::KvmMemoryBackingMode;
 use crate::KvmPartition;
 use crate::KvmPartitionInner;
 use crate::KvmProcessorBinder;

@@ -11,6 +11,7 @@
 #![cfg(all(target_os = "linux", guest_arch = "aarch64"))]
 
 use crate::KvmError;
+use crate::KvmMemoryBackingMode;
 use crate::KvmPartition;
 use crate::KvmPartitionInner;
 use crate::KvmRunVpError;
@@ -834,6 +835,14 @@ impl virt::ProtoPartition for KvmProtoPartition<'_> {
         let partition = Arc::new(KvmPartitionInner {
             kvm: self.vm,
             memory: Default::default(),
+            memory_backing_mode: KvmMemoryBackingMode::Userspace,
+            ram_ranges: config
+                .mem_layout
+                .ram()
+                .iter()
+                .map(|range| range.range)
+                .chain(config.mem_layout.vtl2_range())
+                .collect(),
             hv1_enabled: self.config.hv_config.is_some(),
             gm: config.guest_memory.clone(),
             vps: self
