@@ -3,7 +3,7 @@
 This note summarizes how much of the work to support AMD SEV-SNP in OpenVMM is
 also useful for supporting Arm CCA/Realms, based on:
 
-- `SNP_VM_SUPPORT_FINDINGS.md` in this repository;
+- `SEV_SNP_SUPPORT_TRACKING.md` in this repository;
 - the Arm CCA v13 KVM patch series in `~/ai/eevee/kvm-mail`;
 - the CCA-enabled kvmtool tree in `~/ai/eevee/kvmtool-cca`.
 

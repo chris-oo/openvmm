@@ -1,7 +1,7 @@
-# SEV-SNP VM support findings
+# SEV-SNP support tracking
 
-This note summarizes how upstream Linux/KVM and upstream QEMU support AMD
-SEV-SNP guests, and what that implies for adding SNP VM support to OpenVMM.
+This note tracks OpenVMM's AMD SEV-SNP support work and summarizes how upstream
+Linux/KVM and upstream QEMU support SNP guests.
 
 ## Executive summary
 
@@ -264,13 +264,11 @@ Evidence:
 
 ## Current OpenVMM state
 
-OpenVMM already has some generic concepts for hardware isolation, but the KVM
-backend and loader abstractions do not currently implement SNP launch semantics.
-The first Linux/KVM milestone is now present: the CLI can request a minimal SNP
-configuration, the low-level KVM wrapper can create an SNP VM type after checking
-`KVM_CAP_VM_TYPES`, and `virt_kvm` can create `KVM_X86_SNP_VM`. The path then
-stops deliberately before normal build/load setup because SNP launch and private
-memory are not implemented yet.
+OpenVMM now has the first KVM SEV-SNP plumbing milestones implemented, but it is
+not yet bootable SNP support. The current path can accept a narrow SNP
+configuration, create and initialize an SNP KVM VM, register guest RAM with
+guest_memfd/private attributes, and then stops deliberately before vCPU launch
+because SNP launch/update/finish and protected vCPU state are not implemented.
 
 ### Existing useful abstractions
 
@@ -286,6 +284,26 @@ memory are not implemented yet.
   using `kvm-bindings` UAPI definitions, and `virt_kvm` opens `/dev/sev`, calls
   SNP init after creating `KVM_X86_SNP_VM`, and keeps the SEV fd alive with the
   prototype partition.
+- `vm/kvm` wraps `KVM_SET_USER_MEMORY_REGION2`, `KVM_CREATE_GUEST_MEMFD`, and
+  `KVM_SET_MEMORY_ATTRIBUTES`.
+- `virt_kvm` checks `KVM_CAP_USER_MEMORY2`, `KVM_CAP_GUEST_MEMFD`, and
+  `KVM_CAP_MEMORY_ATTRIBUTES(KVM_MEMORY_ATTRIBUTE_PRIVATE)` for SNP on both
+  `/dev/kvm` and the created VM fd.
+- `virt_kvm` has `KvmMemoryBackingMode::GuestMemfd` for SNP and keeps VBS/TDX
+  unsupported on KVM.
+- `virt_kvm` stores boot RAM ranges from `MemoryLayout`, including the VTL2
+  range, and only uses guest_memfd for mappings fully contained in exactly one
+  stored RAM range. Non-RAM mappings remain userspace-backed.
+- `virt_kvm` registers SNP RAM memslots with `KVM_SET_USER_MEMORY_REGION2`,
+  creates one guest_memfd per mapped slot, marks the GPA range private with
+  `KVM_SET_MEMORY_ATTRIBUTES`, owns the guest_memfd fd for the slot lifetime,
+  and clears attributes/slots on cleanup.
+- OpenVMM rejects the known legacy overlay configurations that are incompatible
+  with the temporary SNP guest_memfd RAM classifier: PCAT, Hyper-V VGA, and the
+  i440BX host PCI bridge.
+- The old early `SnpPrivateMemoryNotImplemented` build stop has been narrowed.
+  The current expected stop point is `GuestMemfdLaunchNotImplemented` before
+  vCPU launch.
 - The SNP CLI policy currently selects an enlightened Linux direct chipset with
   no emulated chipset devices and rejects Hyper-V enlightenments, VTL2, VMBus,
   PCI/VPCI/device assignment, legacy storage, framebuffer, and non-Linux direct
@@ -301,11 +319,18 @@ Evidence:
   `openvmm/openvmm_entry/src/lib.rs` validates the current minimal SNP policy.
 - `openvmm/openvmm_defs/src/config.rs` maps `IsolationType::Snp` to
   `virt::IsolationType::Snp`.
-- `vm/kvm/src/lib.rs` defines `X86VmType::Snp` and checks `KVM_CAP_VM_TYPES`
-  before creating that VM type, and wraps `KVM_SEV_INIT2` for SNP init.
+- `vm/kvm/src/lib.rs` defines `X86VmType::Snp`, checks `KVM_CAP_VM_TYPES`
+  before creating that VM type, wraps `KVM_SEV_INIT2` for SNP init, wraps the
+  guest_memfd/memory-attribute ioctls, and exposes private-memory capability
+  checks.
 - `vmm_core/virt_kvm/src/arch/x86_64/mod.rs` creates `KVM_X86_SNP_VM` for SNP
-  isolation, opens `/dev/sev`, calls `KVM_SEV_INIT2`, and returns
-  `SnpPrivateMemoryNotImplemented` before normal memory setup.
+  isolation, opens `/dev/sev`, calls `KVM_SEV_INIT2`, checks guest_memfd
+  capabilities, wires SNP to guest_memfd backing, and returns
+  `GuestMemfdLaunchNotImplemented` before vCPU launch.
+- `vmm_core/virt_kvm/src/lib.rs` tracks guest_memfd slot state, RAM-range
+  classification, private memory attributes, and cleanup/rollback state.
+- `openvmm/openvmm_core/src/worker/dispatch.rs` rejects PCAT, Hyper-V VGA, and
+  i440BX for SNP guest_memfd.
 - `vmm_core/virt/src/generic.rs:137-145` defines `PageVisibility`.
 - `vmm_core/vm_loader/src/lib.rs:60-95` returns initial registers and accepted
   visibility ranges.
@@ -339,13 +364,15 @@ Evidence:
 
    Evidence: `vmm_core/virt_mshv/src/x86_64/mod.rs:73-79`.
 
-5. **OpenVMM can now request and initialize the KVM SNP VM type, but not launch it.**
+5. **OpenVMM can now request, initialize, and guest_memfd-map a KVM SNP VM, but
+   not launch it.**
    The CLI/config path supports `--isolation snp` for a strict minimal Linux
-   direct-boot configuration, and `virt_kvm` can create `KVM_X86_SNP_VM` and
-   issue `KVM_SEV_INIT2`. The backend intentionally returns
-   `SnpPrivateMemoryNotImplemented` before normal build/load setup because
-   guest_memfd, memory-attribute setup, SNP launch update/finish, CPUID/secrets
-   pages, and VMSA measurement are still missing.
+   direct-boot configuration, and `virt_kvm` can create `KVM_X86_SNP_VM`, issue
+   `KVM_SEV_INIT2`, register RAM with guest_memfd, and mark it private. The
+   backend intentionally returns `GuestMemfdLaunchNotImplemented` before vCPU
+   launch because SNP launch update/finish, CPUID/secrets pages, VMSA
+   measurement/protected state, and runtime conversion handling are still
+   missing.
 
    Evidence:
    - `vmm_tests/vmm_test_macros/src/lib.rs:57-66`
@@ -384,15 +411,16 @@ configure SNP launch policy.
 ### 1. Add a Linux/KVM SNP backend surface
 
 OpenVMM now has the first backend path that can create `KVM_X86_SNP_VM`, manage
-`/dev/sev`, and call `KVM_SEV_INIT2`. The remaining backend work is issuing the
-SNP launch commands and wiring the memory backing they require. The current
-Linux MSHV backend rejecting isolation suggests this is not a small toggle in
-existing MSHV code.
+`/dev/sev`, call `KVM_SEV_INIT2`, and register SNP RAM with guest_memfd/private
+attributes. The remaining backend work is issuing the SNP launch commands and
+wiring the launch-time page metadata they require. The current Linux MSHV backend
+rejecting isolation suggests this is not a small toggle in existing MSHV code.
 
 Required backend capabilities:
 
 - query KVM support for `KVM_X86_SNP_VM`, `KVM_CAP_GUEST_MEMFD`,
-  `KVM_CAP_MEMORY_ATTRIBUTES`, and SNP request-certs attributes;
+  `KVM_CAP_MEMORY_ATTRIBUTES`, and SNP request-certs attributes; **done except
+  request-certs attributes**;
 - create SNP VM type; **done for `KVM_CAP_VM_TYPES` + `KVM_X86_SNP_VM`**;
 - open/pass `/dev/sev` fd in `kvm_sev_cmd`; **done for `KVM_SEV_INIT2`**;
 - implement `KVM_SEV_SNP_LAUNCH_START`, `UPDATE`, `FINISH`;
@@ -401,16 +429,19 @@ Required backend capabilities:
 
 ### 2. Add guest-private memory backing and page-attribute tracking
 
-SNP on upstream KVM depends on `guest_memfd` for private pages. OpenVMM would
-need memory backing that can create/register guest_memfd-backed RAM/memslots and
-track shared/private attributes per GPA, because KVM has no get API for memory
+SNP on upstream KVM depends on `guest_memfd` for private pages. OpenVMM now has
+initial KVM-backend guest_memfd RAM memslot support, but still needs page-state
+tracking and runtime conversion support because KVM has no get API for memory
 attributes.
 
 Required memory changes:
 
-- allocate private RAM through `KVM_CREATE_GUEST_MEMFD`;
-- register memslots with guest_memfd and offsets;
-- call `KVM_SET_MEMORY_ATTRIBUTES` before launch update;
+- allocate private RAM through `KVM_CREATE_GUEST_MEMFD`; **done per mapped KVM
+  RAM slot**;
+- register memslots with guest_memfd and offsets; **done for classified RAM
+  mappings**;
+- call `KVM_SET_MEMORY_ATTRIBUTES` before launch update; **done for initial RAM
+  private marking**;
 - track page visibility/private/shared state in OpenVMM;
 - support runtime shared/private conversion exits;
 - coordinate discard/punch-hole semantics where KVM expects them.
@@ -519,18 +550,21 @@ This is the practical set of changes OpenVMM likely needs, grouped by subsystem.
 - `kvm-bindings` is pinned to an upstream revision that exposes the SEV/SNP UAPI
   structs used so far, and `vm/kvm` wraps `KVM_SEV_INIT2` through
   `KVM_MEMORY_ENCRYPT_OP`.
-- Add or update the remaining low-level KVM bindings for `KVM_SEV_SNP_LAUNCH_START`,
-  `KVM_SEV_SNP_LAUNCH_UPDATE`, `KVM_SEV_SNP_LAUNCH_FINISH`,
-  `KVM_SEV_SNP_ENABLE_REQ_CERTS`, `KVM_CREATE_GUEST_MEMFD`,
+- Add or update the remaining low-level KVM bindings for
+  `KVM_SEV_SNP_LAUNCH_START`, `KVM_SEV_SNP_LAUNCH_UPDATE`,
+  `KVM_SEV_SNP_LAUNCH_FINISH`, `KVM_SEV_SNP_ENABLE_REQ_CERTS`, and
+  `KVM_EXIT_SNP_REQ_CERTS`. `KVM_CREATE_GUEST_MEMFD`,
   `KVM_SET_MEMORY_ATTRIBUTES`, `KVM_MEMORY_ATTRIBUTE_PRIVATE`, and
-  `KVM_EXIT_SNP_REQ_CERTS`.
+  `KVM_SET_USER_MEMORY_REGION2` are wrapped.
 - `KVM_CAP_VM_TYPES` probing, `KVM_X86_SNP_VM` creation, `/dev/sev` opening, and
-  `KVM_SEV_INIT2` are implemented in `vm/kvm` and `virt_kvm`; add the remaining
-  capability checks for `KVM_CAP_GUEST_MEMFD`, `KVM_CAP_MEMORY_ATTRIBUTES`, SEV
-  device attributes, and more detailed `/dev/sev` availability diagnostics.
-- Teach the KVM partition build path to continue past the current
-  `SnpPrivateMemoryNotImplemented` stop once guest-private memory backing is
-  available.
+  `KVM_SEV_INIT2` are implemented in `vm/kvm` and `virt_kvm`; private-memory
+  capability checks for guest_memfd and memory attributes are also implemented.
+  Add SEV device-attribute checks and more detailed `/dev/sev` availability
+  diagnostics.
+- The KVM partition build path now continues past the old
+  `SnpPrivateMemoryNotImplemented` stop far enough to register guest_memfd RAM
+  and private attributes. It stops at `GuestMemfdLaunchNotImplemented` before
+  vCPU launch.
 - Extend the current `virt_kvm` SEV fd ownership into a launch context object
   that also owns the SNP policy fields, launch state, and firmware error
   translation.
@@ -544,10 +578,11 @@ This is the practical set of changes OpenVMM likely needs, grouped by subsystem.
 
 ### Memory backing and page-state tracking
 
-- Add a guest-private memory backing mode using `guest_memfd`.
+- Add a guest-private memory backing mode using `guest_memfd`; **done in
+  `virt_kvm` for SNP RAM mappings**.
 - Extend memslot registration so KVM slots can carry `guest_memfd` and
   `guest_memfd_offset`, while still preserving shared userspace mappings where
-  needed.
+  needed; **done for KVM slots, using userspace-backed mappings outside RAM**.
 - Add OpenVMM-owned page-state tracking for private/shared state because KVM's
   memory-attributes API has no get operation.
 - Add helpers to convert GPA ranges between private and shared by updating both
