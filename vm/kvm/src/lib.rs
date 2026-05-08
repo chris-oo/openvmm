@@ -441,6 +441,39 @@ pub struct Partition {
 }
 
 impl Partition {
+    pub fn check_private_memory_extensions(&self) -> Result<()> {
+        if self
+            .check_extension(KVM_CAP_USER_MEMORY2)
+            .map_err(Error::CheckExtension)?
+            == 0
+        {
+            return Err(Error::MissingCapability("KVM_CAP_USER_MEMORY2"));
+        }
+        if self
+            .check_extension(KVM_CAP_GUEST_MEMFD)
+            .map_err(Error::CheckExtension)?
+            == 0
+        {
+            return Err(Error::MissingCapability("KVM_CAP_GUEST_MEMFD"));
+        }
+        if self
+            .check_extension(KVM_CAP_MEMORY_ATTRIBUTES)
+            .map_err(Error::CheckExtension)?
+            & KVM_MEMORY_ATTRIBUTE_PRIVATE as libc::c_int
+            == 0
+        {
+            return Err(Error::MissingCapability(
+                "KVM_CAP_MEMORY_ATTRIBUTES(KVM_MEMORY_ATTRIBUTE_PRIVATE)",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn check_extension(&self, extension: u32) -> nix::Result<libc::c_int> {
+        // SAFETY: Calling IOCTL as documented, with no special requirements.
+        unsafe { ioctl::kvm_check_extension(self.vm.as_raw_fd(), extension as i32) }
+    }
+
     #[cfg(target_arch = "x86_64")]
     pub fn sev_snp_init(&self, sev: BorrowedFd<'_>) -> Result<()> {
         let mut init = kvm_sev_init::default();
