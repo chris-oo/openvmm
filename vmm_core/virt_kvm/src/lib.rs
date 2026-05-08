@@ -313,65 +313,65 @@ impl virt::PartitionMemoryMap for KvmPartitionInner {
                 );
             }
         }
-
-        #[cfg(test)]
-        mod tests {
-            use super::*;
-
-            fn range(start: u64, end: u64) -> MemoryRange {
-                MemoryRange::new(start..end)
-            }
-
-            #[test]
-            fn guest_memfd_classifier_selects_contained_ram() {
-                let ram_ranges = [range(0x1000, 0x9000), range(0x1_0000, 0x2_0000)];
-
-                assert_eq!(
-                    classify_guest_memfd_backing(range(0x2000, 0x4000), &ram_ranges).unwrap(),
-                    KvmMemoryBacking::GuestMemfd
-                );
-            }
-
-            #[test]
-            fn guest_memfd_classifier_keeps_non_ram_userspace() {
-                let ram_ranges = [range(0x1000, 0x9000), range(0x1_0000, 0x2_0000)];
-
-                assert_eq!(
-                    classify_guest_memfd_backing(range(0xa000, 0xc000), &ram_ranges).unwrap(),
-                    KvmMemoryBacking::Userspace
-                );
-            }
-
-            #[test]
-            fn guest_memfd_classifier_rejects_partial_ram_overlap() {
-                let ram_ranges = [range(0x1000, 0x9000), range(0x1_0000, 0x2_0000)];
-
-                assert!(matches!(
-                    classify_guest_memfd_backing(range(0x8000, 0xa000), &ram_ranges),
-                    Err(KvmError::UnsupportedIsolationConfiguration(_))
-                ));
-            }
-
-            #[test]
-            fn guest_memfd_classifier_does_not_merge_adjacent_ram_ranges() {
-                let ram_ranges = [range(0x1000, 0x3000), range(0x3000, 0x5000)];
-
-                assert!(matches!(
-                    classify_guest_memfd_backing(range(0x2000, 0x4000), &ram_ranges),
-                    Err(KvmError::UnsupportedIsolationConfiguration(_))
-                ));
-            }
-
-            #[test]
-            fn guest_memfd_classifier_rejects_ambiguous_ram_containment() {
-                let ram_ranges = [range(0x1000, 0x5000), range(0x2000, 0x4000)];
-
-                assert!(matches!(
-                    classify_guest_memfd_backing(range(0x2000, 0x4000), &ram_ranges),
-                    Err(KvmError::UnsupportedIsolationConfiguration(_))
-                ));
-            }
-        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn range(start: u64, end: u64) -> MemoryRange {
+        MemoryRange::new(start..end)
+    }
+
+    #[test]
+    fn guest_memfd_classifier_selects_contained_ram() {
+        let ram_ranges = [range(0x1000, 0x9000), range(0x1_0000, 0x2_0000)];
+
+        assert_eq!(
+            classify_guest_memfd_backing(range(0x2000, 0x4000), &ram_ranges).unwrap(),
+            KvmMemoryBacking::GuestMemfd
+        );
+    }
+
+    #[test]
+    fn guest_memfd_classifier_keeps_non_ram_userspace() {
+        let ram_ranges = [range(0x1000, 0x9000), range(0x1_0000, 0x2_0000)];
+
+        assert_eq!(
+            classify_guest_memfd_backing(range(0xa000, 0xc000), &ram_ranges).unwrap(),
+            KvmMemoryBacking::Userspace
+        );
+    }
+
+    #[test]
+    fn guest_memfd_classifier_rejects_partial_ram_overlap() {
+        let ram_ranges = [range(0x1000, 0x9000), range(0x1_0000, 0x2_0000)];
+
+        assert!(matches!(
+            classify_guest_memfd_backing(range(0x8000, 0xa000), &ram_ranges),
+            Err(KvmError::UnsupportedIsolationConfiguration(_))
+        ));
+    }
+
+    #[test]
+    fn guest_memfd_classifier_does_not_merge_adjacent_ram_ranges() {
+        let ram_ranges = [range(0x1000, 0x3000), range(0x3000, 0x5000)];
+
+        assert!(matches!(
+            classify_guest_memfd_backing(range(0x2000, 0x4000), &ram_ranges),
+            Err(KvmError::UnsupportedIsolationConfiguration(_))
+        ));
+    }
+
+    #[test]
+    fn guest_memfd_classifier_rejects_ambiguous_ram_containment() {
+        let ram_ranges = [range(0x1000, 0x5000), range(0x2000, 0x4000)];
+
+        assert!(matches!(
+            classify_guest_memfd_backing(range(0x2000, 0x4000), &ram_ranges),
+            Err(KvmError::UnsupportedIsolationConfiguration(_))
+        ));
     }
 }
