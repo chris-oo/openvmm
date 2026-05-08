@@ -718,15 +718,34 @@ must be accepted lazily.
 
 There are two plausible ways to unblock testing:
 
+- for the first bring-up milestone, pre-populate/prevalidate all guest RAM at SNP
+  launch time so the kernel starts with no unaccepted RAM to discover;
 - teach OpenVMM's x86 direct Linux loader to synthesize enough fake EFI metadata
   for Linux to parse the unaccepted-memory table; or
 - write a small freestanding bootshim, similar in spirit to `openhcl_boot`, that
   runs before Linux, constructs the Linux boot params and fake EFI tables, and
   then jumps to the enlightened Linux kernel.
 
-For bring-up, the bootshim is likely the faster and lower-risk route. It can be
-kept small, focused on the SNP Linux direct-boot ABI, and later either retired
-or folded into OpenVMM's x86 direct loader if the path becomes productized.
+For the earliest "can we run anything?" milestone, upfront acceptance is likely
+the simplest path. OpenVMM cannot call Linux's `accept_memory()` for the guest,
+but it can launch-update all RAM that Linux may use as private/valid pages before
+the first guest instruction. If all e820 RAM is already accepted, Linux does not
+need a `LINUX_EFI_UNACCEPTED_MEM_TABLE_GUID` table and can treat the e820 RAM map
+as ordinary RAM.
+
+This shortcut is intentionally a bring-up/testing option, not the desired final
+model. It will be slower for large guests, may measure or otherwise initialize
+more memory than the eventual lazy-accept design, and does not test Linux's
+unaccepted-memory path. It still requires the core SNP launch plumbing:
+guest_memfd-backed private RAM, private memory attributes, launch update for
+normal/zero pages, CPUID/secrets/VMSA handling, and launch finish. Once that path
+boots, investigate the bootshim or x86 fake-EFI loader support to get realistic
+lazy acceptance.
+
+After the upfront-acceptance smoke path, the bootshim is likely the faster and
+lower-risk route for testing lazy acceptance. It can be kept small, focused on
+the SNP Linux direct-boot ABI, and later either retired or folded into OpenVMM's
+x86 direct loader if the path becomes productized.
 
 The bootshim should construct:
 
@@ -798,8 +817,9 @@ The host/runtime changes depend on the chosen mode:
 
 #### Bootshim-assisted direct Linux bring-up
 
-This is the recommended near-term test path for actually running an enlightened
-Linux kernel before the full OpenVMM x86 fake-EFI loader path exists.
+This is the recommended follow-up after the upfront-acceptance smoke path for
+actually testing lazy acceptance with an enlightened Linux kernel before the full
+OpenVMM x86 fake-EFI loader path exists.
 
 - Add a small freestanding x86_64 bootshim crate/binary, modeled after the
   focused style of `openhcl_boot`, that can be loaded/measured as part of the SNP
@@ -943,19 +963,23 @@ to service guest runtime conversions.
 1. Add guest_memfd-backed RAM/memslot support and OpenVMM-owned page-state
    tracking.
 2. Extend loader/importer abstractions to preserve SNP page types.
-3. Add the small bootshim-assisted direct Linux bring-up path so an enlightened
-   SNP-capable `vmlinux` can receive Linux boot params, fake EFI metadata, and
-   the unaccepted-memory bitmap before the full x86 direct-loader integration is
-   productized.
-4. Implement SNP launch start/update/finish for IGVM, bootshim, or firmware
-   loading.
+3. Add an upfront-acceptance direct Linux smoke path: launch-update all guest RAM
+   that Linux may use as private/valid pages and omit the Linux unaccepted-memory
+   EFI handoff for this first boot milestone.
+4. Implement SNP launch start/update/finish for IGVM, upfront-acceptance direct
+   Linux, or firmware loading.
 5. Add CPUID page generation and firmware mismatch diagnostics.
 6. Add runtime private/shared conversion exit handling.
-7. Add attestation certificate support.
-8. Add remaining capability checks for guest-private memory, memory attributes,
+7. Gate/reject incompatible devices and lifecycle operations.
+8. Add the small bootshim-assisted direct Linux bring-up path so an enlightened
+   SNP-capable `vmlinux` can receive Linux boot params, fake EFI metadata, and
+   the unaccepted-memory bitmap for lazy acceptance.
+9. Implement bootshim or x86 fake-EFI startup performance improvements once the
+   basic SNP Linux boot path works.
+10. Add attestation certificate support.
+11. Add remaining capability checks for guest-private memory, memory attributes,
    and SNP request-certs support.
-9. Gate/reject incompatible devices and lifecycle operations.
-10. Add docs and tests for the supported subset.
+12. Add docs and tests for the supported subset.
 
 ## Readiness for concrete implementation breakdown
 
@@ -979,8 +1003,9 @@ tasks with limited additional investigation:
   `BootPageAcceptance` variants with explicit page descriptors;
 - add unit tests for page-acceptance to initial-page descriptor mapping,
   duplicate detection, and overlap handling;
-- prototype the bootshim-assisted direct Linux path, including the bootshim input
-  block format and generated Linux EFI unaccepted-memory table;
+- prototype the upfront-acceptance direct Linux smoke path, including the policy
+  for which e820 RAM ranges are launch-updated as private/valid pages and how the
+  resulting measurement tradeoff is documented;
 - add documentation for the initially supported and unsupported SNP subset once
   that subset is selected.
 
@@ -1007,10 +1032,10 @@ assigned:
 5. **CPUID source and validation.** Determine where the final KVM vCPU CPUID
    policy is materialized, how to construct the SNP CPUID page from it, and how
    firmware mismatch information should be surfaced without panicking.
-6. **Bootshim ABI and measurement model.** Define the bootshim input block,
-   generated metadata layout, launch page types for shim-owned pages, and the
-   long-term boundary between bootshim responsibilities and OpenVMM's direct
-   Linux loader.
+6. **Upfront-acceptance launch policy.** Decide whether the smoke path
+   launch-updates every e820 RAM page or only RAM the kernel can reach before
+   runtime conversion support exists, how zero pages are represented, and how the
+   larger launch measurement/performance cost is surfaced.
 7. **Runtime private/shared conversion handling.** Confirm the KVM exit shape
    OpenVMM must handle, define GPA/size validation rules, update ordering between
    OpenVMM state and `KVM_SET_MEMORY_ATTRIBUTES`, and decide whether to pre-fault
@@ -1027,7 +1052,12 @@ assigned:
     for the first SNP implementation, including migration, save/restore, reset,
     debug decrypt/encrypt, memory snapshots, ballooning, hotplug, assigned
     devices, and SMM-like flows.
-11. **Attestation certificate scope.** Decide whether
+11. **Bootshim ABI and measurement model.** Define the bootshim input block,
+    generated metadata layout, launch page types for shim-owned pages, and the
+    long-term boundary between bootshim responsibilities and OpenVMM's direct
+    Linux loader. Treat this as a startup performance/lazy-acceptance follow-up
+    after the upfront-acceptance boot path works.
+12. **Attestation certificate scope.** Decide whether
     `KVM_EXIT_SNP_REQ_CERTS` support is part of the MVP or a follow-up. If it is
     included, define the config surface for certificate blobs and the locking
     semantics expected by the kernel documentation.
@@ -1035,4 +1065,4 @@ assigned:
 The highest-risk design dependencies are the memory backing/page-state model,
 the loader-to-backend launch descriptor API, and the launch lifecycle sequence.
 Those should be resolved before implementing the later CPUID, runtime
-conversion, attestation, and device-policy work.
+conversion, attestation, device-policy, and bootshim/lazy-acceptance work.
