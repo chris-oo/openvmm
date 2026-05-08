@@ -24,6 +24,7 @@ use thiserror::Error;
 
 mod ioctl {
     use kvm_bindings::*;
+    use nix::errno::Errno;
     use nix::ioctl_read;
     use nix::ioctl_readwrite;
     use nix::ioctl_readwrite_bad;
@@ -121,12 +122,64 @@ mod ioctl {
         request_code_readwrite!(KVMIO, 0xba, size_of::<libc::c_ulong>()),
         kvm_sev_cmd
     );
+    #[cfg(target_arch = "x86_64")]
+    /// # Safety
+    ///
+    /// `fd` must refer to a valid KVM VM file descriptor.
+    pub unsafe fn kvm_memory_encrypt_op_supported(fd: libc::c_int) -> nix::Result<()> {
+        // SAFETY: Calling the KVM_MEMORY_ENCRYPT_OP ioctl with a null argument is
+        // the documented availability probe for SEV support.
+        match unsafe {
+            libc::ioctl(
+                fd,
+                request_code_readwrite!(KVMIO, 0xba, size_of::<libc::c_ulong>()),
+                std::ptr::null_mut::<libc::c_void>(),
+            )
+        } {
+            0 => Ok(()),
+            _ => Err(Errno::last()),
+        }
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
 const KVM_CAP_VM_TYPES_UAPI: u32 = 235;
 #[cfg(target_arch = "x86_64")]
 const KVM_X86_SNP_VM_UAPI: libc::c_int = 4;
+
+#[cfg(target_arch = "x86_64")]
+pub const KVM_SEV_SNP_PAGE_TYPE_NORMAL_UAPI: u8 = KVM_SEV_SNP_PAGE_TYPE_NORMAL as u8;
+#[cfg(target_arch = "x86_64")]
+pub const KVM_SEV_SNP_PAGE_TYPE_ZERO_UAPI: u8 = KVM_SEV_SNP_PAGE_TYPE_ZERO as u8;
+#[cfg(target_arch = "x86_64")]
+pub const KVM_SEV_SNP_PAGE_TYPE_UNMEASURED_UAPI: u8 = KVM_SEV_SNP_PAGE_TYPE_UNMEASURED as u8;
+#[cfg(target_arch = "x86_64")]
+pub const KVM_SEV_SNP_PAGE_TYPE_SECRETS_UAPI: u8 = KVM_SEV_SNP_PAGE_TYPE_SECRETS as u8;
+#[cfg(target_arch = "x86_64")]
+pub const KVM_SEV_SNP_PAGE_TYPE_CPUID_UAPI: u8 = KVM_SEV_SNP_PAGE_TYPE_CPUID as u8;
+
+#[cfg(target_arch = "x86_64")]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum SevSnpPageType {
+    Normal,
+    Zero,
+    Unmeasured,
+    Secrets,
+    Cpuid,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl SevSnpPageType {
+    pub const fn as_uapi(self) -> u8 {
+        match self {
+            SevSnpPageType::Normal => KVM_SEV_SNP_PAGE_TYPE_NORMAL_UAPI,
+            SevSnpPageType::Zero => KVM_SEV_SNP_PAGE_TYPE_ZERO_UAPI,
+            SevSnpPageType::Unmeasured => KVM_SEV_SNP_PAGE_TYPE_UNMEASURED_UAPI,
+            SevSnpPageType::Secrets => KVM_SEV_SNP_PAGE_TYPE_SECRETS_UAPI,
+            SevSnpPageType::Cpuid => KVM_SEV_SNP_PAGE_TYPE_CPUID_UAPI,
+        }
+    }
+}
 
 #[cfg(target_arch = "x86_64")]
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -469,6 +522,21 @@ impl Partition {
         Ok(())
     }
 
+    #[cfg(target_arch = "x86_64")]
+    pub fn check_sev_snp_launch_extensions(&self) -> Result<()> {
+        self.check_private_memory_extensions()?;
+        // SAFETY: This is the documented KVM_MEMORY_ENCRYPT_OP availability
+        // probe, and does not pass any userspace data pointer to KVM.
+        unsafe { ioctl::kvm_memory_encrypt_op_supported(self.vm.as_raw_fd()) }.map_err(|err| {
+            Error::MemoryEncryptOp {
+                command: "KVM_MEMORY_ENCRYPT_OP(NULL)",
+                firmware_error: 0,
+                source: err,
+            }
+        })?;
+        Ok(())
+    }
+
     pub fn check_extension(&self, extension: u32) -> nix::Result<libc::c_int> {
         // SAFETY: Calling IOCTL as documented, with no special requirements.
         unsafe { ioctl::kvm_check_extension(self.vm.as_raw_fd(), extension as i32) }
@@ -496,6 +564,95 @@ impl Partition {
             })?;
         }
         Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn sev_snp_cmd<T>(
+        &self,
+        sev: BorrowedFd<'_>,
+        command_name: &'static str,
+        command_id: sev_cmd_id,
+        data: &mut T,
+    ) -> Result<()> {
+        let mut command = kvm_sev_cmd {
+            id: command_id,
+            data: std::ptr::from_mut(data) as u64,
+            sev_fd: sev.as_raw_fd() as u32,
+            ..Default::default()
+        };
+
+        loop {
+            // SAFETY: `command` and its data pointer refer to stack-allocated C ABI
+            // structs that remain valid for the duration of the ioctl.
+            match unsafe { ioctl::kvm_memory_encrypt_op(self.vm.as_raw_fd(), &mut command) } {
+                Ok(_) => break,
+                Err(nix::errno::Errno::EAGAIN) => {}
+                Err(err) => {
+                    return Err(Error::MemoryEncryptOp {
+                        command: command_name,
+                        firmware_error: command.error,
+                        source: err,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn sev_snp_launch_start(
+        &self,
+        sev: BorrowedFd<'_>,
+        data: &mut kvm_sev_snp_launch_start,
+    ) -> Result<()> {
+        self.sev_snp_cmd(
+            sev,
+            "KVM_SEV_SNP_LAUNCH_START",
+            sev_cmd_id_KVM_SEV_SNP_LAUNCH_START,
+            data,
+        )
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn sev_snp_launch_update(
+        &self,
+        sev: BorrowedFd<'_>,
+        gfn_start: u64,
+        uaddr: u64,
+        len: u64,
+        page_type: SevSnpPageType,
+    ) -> Result<()> {
+        let mut update = kvm_sev_snp_launch_update {
+            gfn_start,
+            uaddr,
+            len,
+            type_: page_type.as_uapi(),
+            ..Default::default()
+        };
+
+        while update.len != 0 {
+            self.sev_snp_cmd(
+                sev,
+                "KVM_SEV_SNP_LAUNCH_UPDATE",
+                sev_cmd_id_KVM_SEV_SNP_LAUNCH_UPDATE,
+                &mut update,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn sev_snp_launch_finish(
+        &self,
+        sev: BorrowedFd<'_>,
+        data: &mut kvm_sev_snp_launch_finish,
+    ) -> Result<()> {
+        self.sev_snp_cmd(
+            sev,
+            "KVM_SEV_SNP_LAUNCH_FINISH",
+            sev_cmd_id_KVM_SEV_SNP_LAUNCH_FINISH,
+            data,
+        )
     }
 
     pub fn enable_split_irqchip(&self, lines: u32) -> Result<()> {
@@ -1830,4 +1987,35 @@ pub struct DebugRegisters {
     pub db: [u64; 4],
     pub dr6: u64,
     pub dr7: u64,
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sev_snp_page_type_values_match_kvm_uapi() {
+        assert_eq!(SevSnpPageType::Normal.as_uapi(), 1);
+        assert_eq!(SevSnpPageType::Zero.as_uapi(), 3);
+        assert_eq!(SevSnpPageType::Unmeasured.as_uapi(), 4);
+        assert_eq!(SevSnpPageType::Secrets.as_uapi(), 5);
+        assert_eq!(SevSnpPageType::Cpuid.as_uapi(), 6);
+    }
+
+    #[test]
+    fn sev_snp_launch_update_uses_expected_zero_page_shape() {
+        let update = kvm_sev_snp_launch_update {
+            gfn_start: 0x1234,
+            uaddr: 0,
+            len: 0x2000,
+            type_: SevSnpPageType::Zero.as_uapi(),
+            ..Default::default()
+        };
+
+        assert_eq!(update.gfn_start, 0x1234);
+        assert_eq!(update.uaddr, 0);
+        assert_eq!(update.len, 0x2000);
+        assert_eq!(update.type_, KVM_SEV_SNP_PAGE_TYPE_ZERO_UAPI);
+        assert_eq!(update.flags, 0);
+    }
 }
