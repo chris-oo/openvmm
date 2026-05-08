@@ -33,6 +33,7 @@ pub fn is_available() -> Result<bool, KvmError> {
 
 use arch::KvmVpInner;
 use hvdef::Vtl;
+use std::fs::File;
 use std::sync::atomic::Ordering;
 use virt::VpIndex;
 use vmcore::vmtime::VmTimeAccess;
@@ -59,6 +60,10 @@ pub enum KvmError {
     State(#[from] Box<StateError<KvmError>>),
     #[error("invalid state while restoring: {0}")]
     InvalidState(&'static str),
+    #[error("misaligned memory range for KVM guest_memfd")]
+    MisalignedMemoryRange,
+    #[error("cannot resize KVM guest_memfd memory slot")]
+    CannotResizeGuestMemfdSlot,
     #[error("misaligned gic base address")]
     Misaligned,
     #[error("host does not support GICv2 or GICv3")]
@@ -74,6 +79,9 @@ pub enum KvmError {
 struct KvmMemoryRange {
     host_addr: *mut u8,
     range: MemoryRange,
+    #[inspect(skip)]
+    guest_memfd: Option<File>,
+    private_attributes_set: bool,
 }
 
 unsafe impl Sync for KvmMemoryRange {}
@@ -202,7 +210,10 @@ impl KvmPartitionInner {
         readonly: bool,
     ) -> anyhow::Result<()> {
         let range = MemoryRange::new(addr..addr + size as u64);
-        let _backing = self.memory_backing(range)?;
+        let backing = self.memory_backing(range)?;
+        if backing == KvmMemoryBacking::GuestMemfd && !is_page_aligned(data, addr, size as u64) {
+            return Err(KvmError::MisalignedMemoryRange.into());
+        }
         let mut state = self.memory.lock();
 
         // Memory slots cannot be resized but can be moved within the guest
@@ -223,13 +234,100 @@ impl KvmPartitionInner {
             state.ranges.push(None);
         }
         let slot_to_use = slot_to_use.unwrap();
-        unsafe {
-            self.kvm
-                .set_user_memory_region(slot_to_use as u32, data, size, addr, readonly)?
+        if let Some(existing_range) = &state.ranges[slot_to_use] {
+            if existing_range.guest_memfd.is_some() && existing_range.range.len() != size as u64 {
+                return Err(KvmError::CannotResizeGuestMemfdSlot.into());
+            }
+            if existing_range.private_attributes_set {
+                self.kvm.set_memory_attributes(
+                    existing_range.range.start(),
+                    existing_range.range.len(),
+                    0,
+                )?;
+            }
+            if existing_range.guest_memfd.is_some() {
+                // SAFETY: clearing a slot removes the memory reference.
+                unsafe {
+                    self.kvm.set_user_memory_region2(
+                        slot_to_use as u32,
+                        std::ptr::null_mut(),
+                        0,
+                        0,
+                        false,
+                        None,
+                    )?;
+                }
+                state.ranges[slot_to_use] = None;
+            }
+        }
+        let guest_memfd = match backing {
+            KvmMemoryBacking::Userspace => {
+                // SAFETY: guaranteed by caller.
+                unsafe {
+                    self.kvm.set_user_memory_region(
+                        slot_to_use as u32,
+                        data,
+                        size,
+                        addr,
+                        readonly,
+                    )?
+                };
+                None
+            }
+            KvmMemoryBacking::GuestMemfd => {
+                let guest_memfd = self.kvm.create_guest_memfd(size as u64)?;
+                // SAFETY: guaranteed by caller. The slot record below owns the
+                // guest_memfd for at least as long as KVM references it.
+                unsafe {
+                    self.kvm.set_user_memory_region2(
+                        slot_to_use as u32,
+                        data,
+                        size,
+                        addr,
+                        readonly,
+                        Some((&guest_memfd, 0)),
+                    )?;
+                };
+                if let Err(err) = self.kvm.set_memory_attributes(
+                    addr,
+                    size as u64,
+                    kvm::KVM_MEMORY_ATTRIBUTE_PRIVATE as u64,
+                ) {
+                    // SAFETY: clearing a slot removes the memory reference.
+                    let clear_result = unsafe {
+                        self.kvm.set_user_memory_region2(
+                            slot_to_use as u32,
+                            std::ptr::null_mut(),
+                            0,
+                            0,
+                            false,
+                            None,
+                        )
+                    };
+                    if let Err(clear_err) = clear_result {
+                        tracing::error!(
+                            error = &clear_err as &dyn std::error::Error,
+                            "failed to clear KVM guest_memfd slot after private attribute setup failed"
+                        );
+                        state.ranges[slot_to_use] = Some(KvmMemoryRange {
+                            host_addr: data,
+                            range,
+                            guest_memfd: Some(guest_memfd),
+                            private_attributes_set: false,
+                        });
+                    } else {
+                        state.ranges[slot_to_use] = None;
+                    }
+                    return Err(err.into());
+                }
+                Some(guest_memfd)
+            }
         };
         state.ranges[slot_to_use] = Some(KvmMemoryRange {
             host_addr: data,
-            range: MemoryRange::new(addr..addr + size as u64),
+            range,
+            guest_memfd,
+            private_attributes_set: backing == KvmMemoryBacking::GuestMemfd,
         });
         Ok(())
     }
@@ -242,6 +340,11 @@ impl KvmPartitionInner {
             }
         }
     }
+}
+
+fn is_page_aligned(data: *mut u8, addr: u64, size: u64) -> bool {
+    const PAGE_SIZE: u64 = 4096;
+    (data as usize as u64 | addr | size) & (PAGE_SIZE - 1) == 0
 }
 
 fn classify_guest_memfd_backing(
@@ -299,16 +402,35 @@ impl virt::PartitionMemoryMap for KvmPartitionInner {
         for (slot, entry) in state.ranges.iter_mut().enumerate() {
             let Some(kvm_range) = entry else { continue };
             if range.contains(&kvm_range.range) {
+                let guest_memfd_backed = kvm_range.guest_memfd.is_some();
+                if kvm_range.private_attributes_set {
+                    self.kvm.set_memory_attributes(
+                        kvm_range.range.start(),
+                        kvm_range.range.len(),
+                        0,
+                    )?;
+                }
                 // SAFETY: clearing a slot should always be safe since it removes
                 // and does not add memory references.
                 unsafe {
-                    self.kvm.set_user_memory_region(
-                        slot as u32,
-                        std::ptr::null_mut(),
-                        0,
-                        0,
-                        false,
-                    )?;
+                    if guest_memfd_backed {
+                        self.kvm.set_user_memory_region2(
+                            slot as u32,
+                            std::ptr::null_mut(),
+                            0,
+                            0,
+                            false,
+                            None,
+                        )?;
+                    } else {
+                        self.kvm.set_user_memory_region(
+                            slot as u32,
+                            std::ptr::null_mut(),
+                            0,
+                            0,
+                            false,
+                        )?;
+                    }
                 }
                 *entry = None;
             } else {
