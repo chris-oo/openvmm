@@ -52,6 +52,8 @@ pub enum KvmError {
     OpenSev(#[source] std::io::Error),
     #[error("SNP private memory is not implemented")]
     SnpPrivateMemoryNotImplemented,
+    #[error("guest_memfd-backed KVM VM launch is not implemented")]
+    GuestMemfdLaunchNotImplemented,
     #[error("kvm error")]
     Kvm(#[from] kvm::Error),
     #[error("failed to stat /dev/kvm")]

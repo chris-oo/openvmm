@@ -59,6 +59,7 @@ use openvmm_defs::config::DeviceVtl;
 use openvmm_defs::config::EfiDiagnosticsLogLevelType;
 use openvmm_defs::config::GicConfig;
 use openvmm_defs::config::HypervisorConfig;
+use openvmm_defs::config::IsolationType;
 use openvmm_defs::config::LoadMode;
 use openvmm_defs::config::MemoryConfig;
 use openvmm_defs::config::PcieDeviceConfig;
@@ -1007,6 +1008,18 @@ impl InitializedVm {
             && !cfg.memory.hugepages
         {
             anyhow::bail!("hugepage_size={size} requires hugepages=on");
+        }
+
+        if cfg.hypervisor.with_isolation == Some(IsolationType::Snp) {
+            if matches!(cfg.load_mode, LoadMode::Pcat { .. }) {
+                anyhow::bail!("KVM SNP guest_memfd does not support PCAT load mode");
+            }
+            if cfg.chipset.with_hyperv_vga {
+                anyhow::bail!("KVM SNP guest_memfd does not support Hyper-V VGA");
+            }
+            if cfg.chipset.with_i440bx_host_pci_bridge {
+                anyhow::bail!("KVM SNP guest_memfd does not support the i440BX host PCI bridge");
+            }
         }
 
         // Collect RAM ranges for the backing request. All ranges go into a
