@@ -313,17 +313,51 @@ Prerequisites:
 - uncompressed `vmlinux`;
 - initrd that can reach a serial shell or at least print early boot logs.
 
-Suggested minimal command:
+The repo root has helper scripts for the available SNP host workflow:
+
+- `copy-snp-artifacts.sh` copies the OpenVMM binary, kernel, initrd, and run helper to an SNP-capable host.
+- `run-snp-openvmm.sh` runs the minimal KVM SNP Linux direct-boot command from the copied artifacts.
+
+Local setup before copying:
 
 ```bash
-cargo run -p openvmm -- \
+cargo xflowey restore-packages
+cargo build --target x86_64-unknown-linux-gnu -p openvmm
+```
+
+Copy artifacts to the SNP host:
+
+```bash
+./copy-snp-artifacts.sh
+```
+
+Defaults used by the copy helper:
+
+- `SNP_HOST=cho-snp-ubuntu`
+- `SNP_DEST=~/snp-openvmm`
+- `OPENVMM_BIN=target/x86_64-unknown-linux-gnu/debug/openvmm`
+- `SNP_KERNEL=.packages/underhill-deps-private/x64/vmlinux`
+- `SNP_INITRD=.packages/underhill-deps-private/x64/initrd`
+
+Override those environment variables when using a different host, destination, binary, kernel, or initrd.
+
+Run on the SNP host:
+
+```bash
+ssh -t "${SNP_HOST:-cho-snp-ubuntu}" '${SNP_DEST:-~/snp-openvmm}/run-snp-openvmm.sh'
+```
+
+The run helper expands to the minimal command:
+
+```bash
+"$OPENVMM_BIN" \
   --hypervisor kvm \
   --isolation snp \
-  --kernel <path-to-vmlinux> \
-  --initrd <path-to-initrd> \
-  -m 1GB \
-  -p 1 \
-  -c "console=ttyS0 earlyprintk=serial earlycon panic=-1"
+  --kernel "$SNP_KERNEL" \
+  --initrd "$SNP_INITRD" \
+  -m "${SNP_MEMORY:-1GB}" \
+  -p "${SNP_PROCESSORS:-1}" \
+  -c "${SNP_CMDLINE:-console=ttyS0 earlyprintk=serial earlycon panic=-1}"
 ```
 
 Expected validation checkpoints:
