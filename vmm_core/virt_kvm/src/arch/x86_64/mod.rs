@@ -10,6 +10,7 @@ mod vm_state;
 mod vp_state;
 
 use crate::KvmError;
+use crate::KvmMemoryBackingMode;
 use crate::KvmPartition;
 use crate::KvmPartitionInner;
 use crate::KvmProcessorBinder;
@@ -480,6 +481,18 @@ impl ProtoPartition for KvmProtoPartition<'_> {
         let partition = Arc::new(KvmPartitionInner {
             kvm: self.vm,
             memory: Default::default(),
+            memory_backing_mode: match self.config.isolation {
+                virt::IsolationType::None => KvmMemoryBackingMode::Userspace,
+                virt::IsolationType::Snp => KvmMemoryBackingMode::GuestMemfd,
+                virt::IsolationType::Vbs | virt::IsolationType::Tdx => unreachable!(),
+            },
+            ram_ranges: config
+                .mem_layout
+                .ram()
+                .iter()
+                .map(|range| range.range)
+                .chain(config.mem_layout.vtl2_range())
+                .collect(),
             hv1_enabled: self.config.hv_config.is_some(),
             gm: config.guest_memory.clone(),
             vps: self
