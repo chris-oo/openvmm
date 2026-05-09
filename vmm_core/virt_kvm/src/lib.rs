@@ -481,22 +481,107 @@ impl KvmPartitionInner {
                     tag = page.tag.as_str(),
                     "KVM_SEV_SNP_LAUNCH_UPDATE"
                 );
-                self.kvm.sev_snp_launch_update(
+                let cpuid_page_before =
+                    (page.acceptance == BootPageAcceptance::CpuidPage).then(|| unsafe {
+                        std::slice::from_raw_parts(private_range.hva, page.range.len() as usize)
+                            .to_vec()
+                    });
+                if let Err(err) = self.kvm.sev_snp_launch_update(
                     sev.as_fd(),
                     gpa / hvdef::HV_PAGE_SIZE,
                     uaddr,
                     run.byte_len as u64,
                     page_type,
-                )?;
+                ) {
+                    if let Some(cpuid_page_before) = cpuid_page_before {
+                        Self::trace_snp_cpuid_page_diff(
+                            &cpuid_page_before,
+                            private_range.hva,
+                            page.range.len(),
+                        );
+                    }
+                    return Err(err.into());
+                }
             }
         }
-        tracing::debug!("KVM_SEV_LAUNCH_UPDATE_VMSA");
-        self.kvm.sev_launch_update_vmsa(sev.as_fd())?;
         tracing::debug!("KVM_SEV_SNP_LAUNCH_FINISH");
         self.kvm
             .sev_snp_launch_finish(sev.as_fd(), &mut Default::default())?;
         Ok(())
     }
+
+    #[cfg(guest_arch = "x86_64")]
+    fn trace_snp_cpuid_page_diff(before: &[u8], after: *const u8, page_len: u64) {
+        const SNP_CPUID_COUNT_MAX: usize = 64;
+        const SNP_CPUID_TABLE_HEADER_SIZE: usize = 16;
+        const SNP_CPUID_FN_SIZE: usize = 48;
+
+        if page_len < (SNP_CPUID_TABLE_HEADER_SIZE + SNP_CPUID_COUNT_MAX * SNP_CPUID_FN_SIZE) as u64
+        {
+            tracing::warn!(page_len, "SNP CPUID debug page is too small");
+            return;
+        }
+
+        let after = unsafe { std::slice::from_raw_parts(after, page_len as usize) };
+        let count = u32::from_le_bytes(after[0..4].try_into().unwrap()) as usize;
+        tracing::warn!(count, "SNP CPUID page after firmware rejection");
+        for index in 0..count.min(SNP_CPUID_COUNT_MAX) {
+            let offset = SNP_CPUID_TABLE_HEADER_SIZE + index * SNP_CPUID_FN_SIZE;
+            let before_entry = &before[offset..][..SNP_CPUID_FN_SIZE];
+            let after_entry = &after[offset..][..SNP_CPUID_FN_SIZE];
+            if before_entry == after_entry {
+                continue;
+            }
+            let before = Self::read_snp_cpuid_fn(before_entry);
+            let after = Self::read_snp_cpuid_fn(after_entry);
+            tracing::warn!(
+                index,
+                before.eax_in,
+                before.ecx_in,
+                before.xcr0_in,
+                before.xss_in,
+                before.eax,
+                before.ebx,
+                before.ecx,
+                before.edx,
+                after.eax_in,
+                after.ecx_in,
+                after.xcr0_in,
+                after.xss_in,
+                after.eax,
+                after.ebx,
+                after.ecx,
+                after.edx,
+                "SNP CPUID entry changed by firmware"
+            );
+        }
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    fn read_snp_cpuid_fn(entry: &[u8]) -> SnpCpuidFn {
+        SnpCpuidFn {
+            eax_in: u32::from_le_bytes(entry[0..4].try_into().unwrap()),
+            ecx_in: u32::from_le_bytes(entry[4..8].try_into().unwrap()),
+            xcr0_in: u64::from_le_bytes(entry[8..16].try_into().unwrap()),
+            xss_in: u64::from_le_bytes(entry[16..24].try_into().unwrap()),
+            eax: u32::from_le_bytes(entry[24..28].try_into().unwrap()),
+            ebx: u32::from_le_bytes(entry[28..32].try_into().unwrap()),
+            ecx: u32::from_le_bytes(entry[32..36].try_into().unwrap()),
+            edx: u32::from_le_bytes(entry[36..40].try_into().unwrap()),
+        }
+    }
+}
+
+#[cfg(guest_arch = "x86_64")]
+struct SnpCpuidFn {
+    eax_in: u32,
+    ecx_in: u32,
+    xcr0_in: u64,
+    xss_in: u64,
+    eax: u32,
+    ebx: u32,
+    ecx: u32,
+    edx: u32,
 }
 
 #[cfg(guest_arch = "x86_64")]
@@ -520,7 +605,9 @@ fn write_snp_cpuid_page(
     page.fill(0);
     page[..4].copy_from_slice(&(cpuid.len() as u32).to_le_bytes());
 
-    for (index, cpuid) in cpuid.iter().enumerate() {
+    for (index, cpuid) in cpuid.iter().copied().enumerate() {
+        let mut cpuid = cpuid;
+        sanitize_snp_cpuid_entry(&mut cpuid);
         let entry = &mut page[SNP_CPUID_TABLE_HEADER_SIZE + index * SNP_CPUID_FN_SIZE..]
             [..SNP_CPUID_FN_SIZE];
         entry[0..4].copy_from_slice(&cpuid.function.to_le_bytes());
@@ -543,6 +630,25 @@ fn write_snp_cpuid_page(
     }
 
     Ok(())
+}
+
+#[cfg(guest_arch = "x86_64")]
+fn sanitize_snp_cpuid_entry(entry: &mut kvm::kvm_cpuid_entry2) {
+    match (entry.function, entry.index) {
+        // SNP firmware validates the CPUID page against hardware-supported
+        // CPUID values, not KVM's synthetic guest CPUID additions.
+        (0x1, _) => entry.ecx &= !0x01000000,
+        (0x7, 0) => {
+            entry.ebx &= !0x2;
+            entry.edx = 0;
+        }
+        (0x80000008, _) => entry.ebx &= !0x02000000,
+        (0x80000021, _) => {
+            entry.eax &= !0x200;
+            entry.ecx = 0;
+        }
+        _ => {}
+    }
 }
 
 #[cfg(guest_arch = "x86_64")]
