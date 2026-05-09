@@ -9136,6 +9136,7 @@ dependencies = [
  "inspect",
  "jiff",
  "kvm",
+ "libc",
  "loader",
  "memory_range",
  "open_enum",

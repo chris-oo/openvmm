@@ -40,6 +40,8 @@ use std::mem::size_of;
 #[cfg(all(test, guest_arch = "x86_64"))]
 use std::mem::size_of_val;
 use std::os::fd::AsFd;
+#[cfg(guest_arch = "x86_64")]
+use std::os::fd::AsRawFd;
 use std::sync::atomic::Ordering;
 use virt::VpIndex;
 use vmcore::vmtime::VmTimeAccess;
@@ -92,6 +94,10 @@ pub enum KvmError {
     InvalidMapGpaRange,
     #[error("unsupported KVM_HC_MAP_GPA_RANGE attributes: {0:#x}")]
     UnsupportedMapGpaRangeAttributes(u64),
+    #[error("failed to discard shared backing for SNP private conversion")]
+    DiscardSharedBacking(#[source] std::io::Error),
+    #[error("failed to discard private backing for SNP shared conversion")]
+    DiscardPrivateBacking(#[source] std::io::Error),
     #[error("misaligned gic base address")]
     Misaligned,
     #[error("host does not support GICv2 or GICv3")]
@@ -458,6 +464,60 @@ impl KvmPartitionInner {
             "KVM_HC_MAP_GPA_RANGE set memory attributes"
         );
         self.kvm.set_memory_attributes(gpa, size, attributes)?;
+        self.discard_stale_snp_backing(range, private)?;
+        Ok(())
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    fn discard_stale_snp_backing(&self, range: MemoryRange, private: bool) -> Result<(), KvmError> {
+        let state = self.memory.lock();
+        let slot = state
+            .ranges
+            .iter()
+            .flatten()
+            .find(|slot| slot.range.contains(&range))
+            .ok_or(KvmError::InvalidMapGpaRange)?;
+        let offset = range.start() - slot.range.start();
+        if private {
+            let addr = slot.host_addr.wrapping_add(offset as usize);
+            tracing::debug!(
+                gpa = range.start(),
+                size = range.len(),
+                hva = addr as usize,
+                "discarding shared backing after SNP private conversion"
+            );
+            let ret =
+                unsafe { libc::madvise(addr.cast(), range.len() as usize, libc::MADV_DONTNEED) };
+            if ret != 0 {
+                return Err(KvmError::DiscardSharedBacking(
+                    std::io::Error::last_os_error(),
+                ));
+            }
+        } else {
+            let guest_memfd = slot
+                .guest_memfd
+                .as_ref()
+                .ok_or(KvmError::InvalidMapGpaRange)?;
+            tracing::debug!(
+                gpa = range.start(),
+                size = range.len(),
+                guest_memfd_offset = offset,
+                "discarding private backing after SNP shared conversion"
+            );
+            let ret = unsafe {
+                libc::fallocate(
+                    guest_memfd.as_raw_fd(),
+                    libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                    offset as libc::off_t,
+                    range.len() as libc::off_t,
+                )
+            };
+            if ret != 0 {
+                return Err(KvmError::DiscardPrivateBacking(
+                    std::io::Error::last_os_error(),
+                ));
+            }
+        }
         Ok(())
     }
 
