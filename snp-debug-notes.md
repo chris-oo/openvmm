@@ -33,6 +33,71 @@ If userspace-visible launch logs and serial output are not enough, the next usef
    - Capture the SVM exit code / exit info that led to shutdown when available.
    - For SNP, expect normal architectural register APIs to be insufficient after launch; prefer VMSA decrypt output over `KVM_GET_REGS`-style state.
 
+## OpenVMM debug action items
+
+OpenVMM still needs changes to consume the private KVM debug hooks and to make its launch inputs easier to correlate with kernel-side dumps.
+
+1. Replace the exploratory `KVM_SEV_DBG_DECRYPT` SNP path.
+   - The old SEV `KVM_SEV_DBG_DECRYPT` command returns `-EPERM` for SNP guests on upstream KVM, so OpenVMM should not keep using it as the primary SNP debug path.
+   - If the private host kernel exposes a temporary SNP debug decrypt ioctl/debugfs file, add an explicitly debug-only OpenVMM wrapper for that interface instead.
+   - Keep the wrapper out of normal launch flow and gate it behind a local debug option/environment variable so production SNP launch does not depend on private kernel patches.
+
+2. Add OpenVMM-side debug requests for launch-critical GPAs.
+   - On triple fault or `KVM_EXIT_SHUTDOWN`, request decrypt/dump of the pages most likely to explain early boot failure: kernel entry page, initial page tables, Linux zero page / boot params, CC blob setup-data chain, SNP CPUID page, secrets page, and any VMSA GPA if exposed by the kernel hook.
+   - Print hexdumps and decoded forms where OpenVMM already has structure definitions, especially page-table entries, Linux boot params, CC blob fields, and SNP CPUID table entries.
+   - Include GPA, length, page tag, `BootPageAcceptance`, and launch page type in every dump header so output can be matched to KVM launch-update logs.
+
+3. Improve launch metadata logging before `KVM_SEV_SNP_LAUNCH_FINISH`.
+   - Log the SNP policy in hex and decoded bits.
+   - Log page-type counts and total bytes for normal, zero, unmeasured, secrets, CPUID, and VMSA updates.
+   - Log special page GPAs, including the CPUID page, secrets page, Linux zero page, CC blob, page tables, and entry page.
+   - Log the BSP initial register state that OpenVMM intended to encode into the protected VMSA.
+
+4. Add script support for private-kernel debug collection.
+   - Extend `run-snp-openvmm-repro.sh` to preserve OpenVMM logs plus the relevant host `dmesg`/kernel log lines after the repro terminates.
+   - Keep handling OpenVMM panics/aborts and triple faults as terminal conditions so the script does not hang before collecting host-side debug output.
+   - Make debug collection optional when it requires privileged commands on the SNP host.
+
+## Ubuntu SNP host private-kernel build/deploy plan
+
+The test system is an Ubuntu physical host, so before building and deploying a private debug kernel collect enough information to avoid producing an unbootable or inconvenient kernel package.
+
+1. Collect host facts.
+   - Ubuntu release: `lsb_release -a`.
+   - Current kernel: `uname -a`.
+   - Bootloader and boot mode: check GRUB/EFI state, e.g. `bootctl status` when available and `/boot/grub/grub.cfg`.
+   - Secure Boot state: `mokutil --sb-state`.
+   - Current KVM/SNP module state and kernel log baseline: `lsmod | grep kvm`, `dmesg` snippets for SEV/SNP/KVM.
+
+2. Collect the kernel config source.
+   - Prefer `/boot/config-$(uname -r)`.
+   - Use `/proc/config.gz` if available.
+   - Base the private kernel config on the currently booted Ubuntu config, then enable only missing KVM/SNP/debug options needed for the temporary instrumentation.
+
+3. Decide where to build.
+   - Build directly on the SNP host if it has enough CPU, disk, and installed build dependencies.
+   - Otherwise build Debian kernel packages elsewhere from the same kernel tree/config and copy the `.deb` files to the host.
+   - Confirm available disk space in the build directory and `/boot`.
+
+4. Confirm deployment permissions and recovery path.
+   - Verify sudo/root access on the host.
+   - Confirm the host can be rebooted for debugging.
+   - Confirm console/IPMI/serial or other out-of-band recovery access in case the private kernel fails to boot.
+   - Decide whether the new kernel should become the default GRUB entry or be selected for a one-time boot.
+
+5. Choose the exact kernel source base.
+   - Default to the same Ubuntu kernel series/source branch as the kernel currently running on the SNP host, then apply only the temporary KVM SNP debug patches.
+   - Treat the local upstream Linux tree at `~/ai/eevee/linux` as the KVM SNP reference unless it already matches the host kernel closely.
+   - If the host is running an Ubuntu HWE, OEM, cloud, or other flavor branch, patch that matching Ubuntu source branch/package rather than switching the host to an unrelated upstream kernel.
+   - Confirm the selected source version is acceptable for the Ubuntu host's userspace, firmware, and drivers before deploying it.
+
+6. Build and install flow.
+   - Copy the host's current config into the chosen kernel tree.
+   - Set a unique local version string so the debug kernel is easy to identify in GRUB and `uname -a`.
+   - Build Debian packages for the kernel image/modules/headers.
+   - Copy packages to the SNP host and install with `dpkg -i`.
+   - Update GRUB if needed, reboot into the debug kernel, verify `uname -a`, and then run the SNP repro while collecting OpenVMM logs and host kernel logs.
+
 References in the Linux tree used for this check:
 
 - `include/linux/psp-sev.h`
