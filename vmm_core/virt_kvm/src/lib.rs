@@ -436,8 +436,13 @@ impl KvmPartitionInner {
         self.kvm
             .sev_snp_launch_start(sev.as_fd(), &mut launch_start)?;
 
+        // HACK: Until the loader provides complete launch metadata for SNP, fill in the
+        // rest of RAM as accepted private pages so KVM can populate every private GFN
+        // before the guest runs.
+        let pages = snp_launch_pages_with_ram_hack(pages, &self.ram_ranges);
+
         let memory = self.memory.lock();
-        for page in pages {
+        for page in &pages {
             let launch_page_type = arch::snp::snp_launch_page_type(page.acceptance)?;
             let Some(kvm_page_type) = launch_page_type.kvm_page_type() else {
                 return Err(KvmError::UnsupportedSnpPageAcceptance(page.acceptance));
@@ -582,6 +587,46 @@ struct SnpCpuidFn {
     ebx: u32,
     ecx: u32,
     edx: u32,
+}
+
+#[cfg(guest_arch = "x86_64")]
+fn snp_launch_pages_with_ram_hack(
+    pages: &[virt::InitialAcceptedPage],
+    ram_ranges: &[MemoryRange],
+) -> Vec<virt::InitialAcceptedPage> {
+    let mut pages = pages.to_vec();
+    let mut imported_ranges: Vec<_> = pages.iter().map(|page| page.range).collect();
+    imported_ranges.sort_by_key(|range| (range.start(), range.end()));
+
+    for ram_range in ram_ranges {
+        let mut cursor = ram_range.start();
+        for imported_range in &imported_ranges {
+            let start = imported_range.start().max(ram_range.start());
+            let end = imported_range.end().min(ram_range.end());
+            if start >= end {
+                continue;
+            }
+            if cursor < start {
+                pages.push(snp_ram_hack_page(MemoryRange::new(cursor..start)));
+            }
+            cursor = cursor.max(end);
+        }
+        if cursor < ram_range.end() {
+            pages.push(snp_ram_hack_page(MemoryRange::new(cursor..ram_range.end())));
+        }
+    }
+
+    pages
+}
+
+#[cfg(guest_arch = "x86_64")]
+fn snp_ram_hack_page(range: MemoryRange) -> virt::InitialAcceptedPage {
+    virt::InitialAcceptedPage {
+        range,
+        visibility: virt::PageVisibility::Exclusive,
+        acceptance: BootPageAcceptance::Exclusive,
+        tag: "kvm-snp-ram-hack".into(),
+    }
 }
 
 #[cfg(guest_arch = "x86_64")]
@@ -932,6 +977,33 @@ mod tests {
             private_memory_range_from_slots(range(0x1000, 0x2000), &shared_slots),
             Err(KvmError::InvalidSnpLaunchRange)
         ));
+    }
+
+    #[test]
+    fn snp_launch_pages_with_ram_hack_fills_unaccepted_ram_gaps() {
+        let pages = [virt::InitialAcceptedPage {
+            range: range(0x2000, 0x4000),
+            visibility: virt::PageVisibility::Exclusive,
+            acceptance: BootPageAcceptance::Exclusive,
+            tag: "loader".into(),
+        }];
+        let ram_ranges = [range(0x1000, 0x5000), range(0x8000, 0xa000)];
+
+        let launch_pages = snp_launch_pages_with_ram_hack(&pages, &ram_ranges);
+        let hack_ranges: Vec<_> = launch_pages
+            .iter()
+            .filter(|page| page.tag == "kvm-snp-ram-hack")
+            .map(|page| page.range)
+            .collect();
+
+        assert_eq!(
+            hack_ranges,
+            vec![
+                range(0x1000, 0x2000),
+                range(0x4000, 0x5000),
+                range(0x8000, 0xa000)
+            ]
+        );
     }
 
     #[test]
