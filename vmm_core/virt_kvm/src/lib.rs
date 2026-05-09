@@ -428,7 +428,9 @@ impl KvmPartitionInner {
         if !gpa.is_multiple_of(hvdef::HV_PAGE_SIZE) || size == 0 {
             return Err(KvmError::InvalidMapGpaRange);
         }
-        if map_attributes & KVM_MAP_GPA_RANGE_PAGE_SIZE_MASK != 0 {
+        let unsupported_attributes = map_attributes
+            & !(KVM_MAP_GPA_RANGE_PAGE_SIZE_MASK | KVM_MAP_GPA_RANGE_ENC_STATUS_MASK);
+        if unsupported_attributes != 0 {
             return Err(KvmError::UnsupportedMapGpaRangeAttributes(map_attributes));
         }
         let private = match map_attributes & KVM_MAP_GPA_RANGE_ENC_STATUS_MASK {
