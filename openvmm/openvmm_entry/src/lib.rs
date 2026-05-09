@@ -1787,13 +1787,18 @@ fn validate_isolation_config(cfg: &Config) -> anyhow::Result<()> {
         anyhow::bail!("SNP isolation currently does not support VMBus devices");
     }
 
+    let only_supported_chipset_devices = cfg
+        .chipset_devices
+        .iter()
+        .all(|device| device.resource.id() == "serial_16550");
+
     if !cfg.floppy_disks.is_empty()
         || !cfg.ide_disks.is_empty()
         || !cfg.pcie_root_complexes.is_empty()
         || !cfg.pcie_devices.is_empty()
         || !cfg.pcie_switches.is_empty()
         || !cfg.vpci_devices.is_empty()
-        || !cfg.chipset_devices.is_empty()
+        || !only_supported_chipset_devices
         || !cfg.pci_chipset_devices.is_empty()
     {
         anyhow::bail!("SNP isolation currently only supports virtio devices");
