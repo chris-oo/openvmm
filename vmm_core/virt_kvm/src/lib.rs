@@ -69,6 +69,10 @@ pub enum KvmError {
     MisalignedMemoryRange,
     #[error("cannot resize KVM guest_memfd memory slot")]
     CannotResizeGuestMemfdSlot,
+    #[error("SNP launch range is not page aligned")]
+    UnalignedSnpLaunchRange,
+    #[error("SNP launch range is not contained in guest_memfd private memory")]
+    InvalidSnpLaunchRange,
     #[error("misaligned gic base address")]
     Misaligned,
     #[error("host does not support GICv2 or GICv3")]
@@ -96,6 +100,13 @@ unsafe impl Send for KvmMemoryRange {}
 struct KvmMemoryRangeState {
     #[inspect(flatten, iter_by_index)]
     ranges: Vec<Option<KvmMemoryRange>>,
+}
+
+#[cfg(guest_arch = "x86_64")]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) struct KvmPrivateMemoryRange {
+    gpa: MemoryRange,
+    hva: *mut u8,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Inspect)]
@@ -342,6 +353,81 @@ impl KvmPartitionInner {
     }
 }
 
+#[cfg(guest_arch = "x86_64")]
+pub(crate) fn validate_snp_launch_range(range: MemoryRange) -> Result<(), KvmError> {
+    if !is_page_aligned(std::ptr::null_mut(), range.start(), range.len()) {
+        return Err(KvmError::UnalignedSnpLaunchRange);
+    }
+    Ok(())
+}
+
+#[cfg(guest_arch = "x86_64")]
+pub(crate) fn private_memory_range_from_slots(
+    range: MemoryRange,
+    slots: &[Option<KvmMemoryRange>],
+) -> Result<KvmPrivateMemoryRange, KvmError> {
+    validate_snp_launch_range(range)?;
+    let slot = slots
+        .iter()
+        .flatten()
+        .find(|slot| slot.range.contains(&range))
+        .ok_or(KvmError::InvalidSnpLaunchRange)?;
+
+    if slot.guest_memfd.is_none() || !slot.private_attributes_set {
+        return Err(KvmError::InvalidSnpLaunchRange);
+    }
+
+    let offset = range.start() - slot.range.start();
+    Ok(KvmPrivateMemoryRange {
+        gpa: range,
+        hva: slot.host_addr.wrapping_add(offset as usize),
+    })
+}
+
+#[cfg(guest_arch = "x86_64")]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) enum SnpPageRunKind {
+    Zero,
+    NonZero,
+}
+
+#[cfg(guest_arch = "x86_64")]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) struct SnpPageRun {
+    byte_offset: usize,
+    byte_len: usize,
+    kind: SnpPageRunKind,
+}
+
+#[cfg(guest_arch = "x86_64")]
+pub(crate) fn split_zero_page_runs(bytes: &[u8]) -> Result<Vec<SnpPageRun>, KvmError> {
+    const PAGE_SIZE: usize = hvdef::HV_PAGE_SIZE as usize;
+    if !bytes.len().is_multiple_of(PAGE_SIZE) {
+        return Err(KvmError::UnalignedSnpLaunchRange);
+    }
+
+    let mut runs: Vec<SnpPageRun> = Vec::new();
+    for (page_index, page) in bytes.chunks_exact(PAGE_SIZE).enumerate() {
+        let kind = if page.iter().all(|&byte| byte == 0) {
+            SnpPageRunKind::Zero
+        } else {
+            SnpPageRunKind::NonZero
+        };
+        if let Some(run) = runs.last_mut()
+            && run.kind == kind
+        {
+            run.byte_len += PAGE_SIZE;
+            continue;
+        }
+        runs.push(SnpPageRun {
+            byte_offset: page_index * PAGE_SIZE,
+            byte_len: PAGE_SIZE,
+            kind,
+        });
+    }
+    Ok(runs)
+}
+
 fn is_page_aligned(data: *mut u8, addr: u64, size: u64) -> bool {
     const PAGE_SIZE: u64 = 4096;
     (data as usize as u64 | addr | size) & (PAGE_SIZE - 1) == 0
@@ -452,6 +538,10 @@ mod tests {
         MemoryRange::new(start..end)
     }
 
+    fn dummy_file() -> File {
+        File::open("/dev/null").unwrap()
+    }
+
     #[test]
     fn guest_memfd_classifier_selects_contained_ram() {
         let ram_ranges = [range(0x1000, 0x9000), range(0x1_0000, 0x2_0000)];
@@ -499,6 +589,94 @@ mod tests {
         assert!(matches!(
             classify_guest_memfd_backing(range(0x2000, 0x4000), &ram_ranges),
             Err(KvmError::UnsupportedIsolationConfiguration(_))
+        ));
+    }
+
+    #[test]
+    fn private_memory_range_resolves_hva_offset() {
+        let mut backing = vec![0u8; 0x4000];
+        let host_addr = backing.as_mut_ptr();
+        let slots = [Some(KvmMemoryRange {
+            host_addr,
+            range: range(0x1000, 0x5000),
+            guest_memfd: Some(dummy_file()),
+            private_attributes_set: true,
+        })];
+
+        let resolved = private_memory_range_from_slots(range(0x3000, 0x5000), &slots).unwrap();
+
+        assert_eq!(resolved.gpa, range(0x3000, 0x5000));
+        assert_eq!(resolved.hva, host_addr.wrapping_add(0x2000));
+    }
+
+    #[test]
+    fn private_memory_range_rejects_non_private_or_non_guest_memfd_slots() {
+        let mut backing = vec![0u8; 0x4000];
+        let host_addr = backing.as_mut_ptr();
+        let userspace_slots = [Some(KvmMemoryRange {
+            host_addr,
+            range: range(0x1000, 0x5000),
+            guest_memfd: None,
+            private_attributes_set: true,
+        })];
+        assert!(matches!(
+            private_memory_range_from_slots(range(0x1000, 0x2000), &userspace_slots),
+            Err(KvmError::InvalidSnpLaunchRange)
+        ));
+
+        let shared_slots = [Some(KvmMemoryRange {
+            host_addr,
+            range: range(0x1000, 0x5000),
+            guest_memfd: Some(dummy_file()),
+            private_attributes_set: false,
+        })];
+        assert!(matches!(
+            private_memory_range_from_slots(range(0x1000, 0x2000), &shared_slots),
+            Err(KvmError::InvalidSnpLaunchRange)
+        ));
+    }
+
+    #[test]
+    fn split_zero_page_runs_coalesces_adjacent_pages_by_zero_state() {
+        let mut bytes = vec![0u8; 5 * hvdef::HV_PAGE_SIZE as usize];
+        bytes[hvdef::HV_PAGE_SIZE as usize] = 1;
+        bytes[2 * hvdef::HV_PAGE_SIZE as usize] = 2;
+        bytes[4 * hvdef::HV_PAGE_SIZE as usize] = 3;
+
+        let runs = split_zero_page_runs(&bytes).unwrap();
+
+        assert_eq!(
+            runs,
+            vec![
+                SnpPageRun {
+                    byte_offset: 0,
+                    byte_len: hvdef::HV_PAGE_SIZE as usize,
+                    kind: SnpPageRunKind::Zero,
+                },
+                SnpPageRun {
+                    byte_offset: hvdef::HV_PAGE_SIZE as usize,
+                    byte_len: 2 * hvdef::HV_PAGE_SIZE as usize,
+                    kind: SnpPageRunKind::NonZero,
+                },
+                SnpPageRun {
+                    byte_offset: 3 * hvdef::HV_PAGE_SIZE as usize,
+                    byte_len: hvdef::HV_PAGE_SIZE as usize,
+                    kind: SnpPageRunKind::Zero,
+                },
+                SnpPageRun {
+                    byte_offset: 4 * hvdef::HV_PAGE_SIZE as usize,
+                    byte_len: hvdef::HV_PAGE_SIZE as usize,
+                    kind: SnpPageRunKind::NonZero,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn split_zero_page_runs_rejects_partial_pages() {
+        assert!(matches!(
+            split_zero_page_runs(&[0; 17]),
+            Err(KvmError::UnalignedSnpLaunchRange)
         ));
     }
 }
