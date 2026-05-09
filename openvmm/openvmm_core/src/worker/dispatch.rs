@@ -2507,7 +2507,7 @@ impl LoadedVmInner {
                         }
                     })?;
 
-                (load_info.into_initial_regs(), Vec::new())
+                load_info.into_initial_regs_and_accepted_ranges()
             }
             #[cfg(guest_arch = "aarch64")]
             &LoadMode::Linux {

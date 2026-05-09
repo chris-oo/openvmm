@@ -708,10 +708,6 @@ impl virt::BindProcessor for KvmProcessorBinder {
     type Error = KvmError;
 
     fn bind(&mut self) -> Result<Self::Processor<'_>, Self::Error> {
-        if self.partition.memory_backing_mode == KvmMemoryBackingMode::GuestMemfd {
-            return Err(KvmError::GuestMemfdLaunchNotImplemented);
-        }
-
         // FUTURE: create the vcpu here to get better NUMA affinity.
 
         let inner = &self.partition.vps[self.vpindex.index() as usize];
