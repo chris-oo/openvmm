@@ -1403,6 +1403,49 @@ impl Processor for KvmProcessor<'_> {
                         KvmHypercallExit::DISPATCHER.dispatch(&self.partition.gm, &mut handler);
                         *result = handler.registers.result;
                     }
+                    kvm::Exit::Hypercall {
+                        nr,
+                        args,
+                        result,
+                        flags,
+                    } => {
+                        if nr == kvm::KVM_HC_MAP_GPA_RANGE_UAPI {
+                            tracing::debug!(
+                                gpa = args[0],
+                                page_count = args[1],
+                                map_attributes = args[2],
+                                flags,
+                                "handling KVM_HC_MAP_GPA_RANGE"
+                            );
+                            match self
+                                .partition
+                                .set_map_gpa_range_attributes(args[0], args[1], args[2])
+                            {
+                                Ok(()) => {
+                                    *result = 0;
+                                    tracing::debug!(
+                                        gpa = args[0],
+                                        page_count = args[1],
+                                        map_attributes = args[2],
+                                        "handled KVM_HC_MAP_GPA_RANGE"
+                                    );
+                                }
+                                Err(err) => {
+                                    tracing::error!(
+                                        error = &err as &dyn std::error::Error,
+                                        gpa = args[0],
+                                        page_count = args[1],
+                                        map_attributes = args[2],
+                                        "failed KVM_HC_MAP_GPA_RANGE"
+                                    );
+                                    *result = 1;
+                                }
+                            }
+                        } else {
+                            tracing::error!(nr, ?args, flags, "unhandled KVM hypercall");
+                            *result = 1;
+                        }
+                    }
                     kvm::Exit::Debug {
                         exception: _,
                         pc: _,
