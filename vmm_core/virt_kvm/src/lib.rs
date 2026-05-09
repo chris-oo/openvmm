@@ -429,6 +429,7 @@ impl KvmPartitionInner {
                 )?;
             }
         }
+        self.kvm.sev_launch_update_vmsa(sev.as_fd())?;
         Ok(())
     }
 }
