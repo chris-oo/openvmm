@@ -424,7 +424,7 @@ impl KvmPartitionInner {
         let sev = self.sev.as_ref().ok_or(KvmError::IsolationNotSupported)?;
         self.kvm.check_sev_snp_launch_extensions()?;
         let mut launch_start = kvm::kvm_sev_snp_launch_start {
-            policy: (1 << 17) | (1 << 16),
+            policy: (1 << 19) | (1 << 17) | (1 << 16),
             ..Default::default()
         };
         tracing::debug!(policy = launch_start.policy, "KVM_SEV_SNP_LAUNCH_START");
