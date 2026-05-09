@@ -237,6 +237,15 @@ pub enum Error {
     SetSRegs(#[source] nix::Error),
     #[error("Run")]
     Run(#[source] nix::Error),
+    #[cfg(target_arch = "x86_64")]
+    #[error("RunMemoryFault(flags={flags:#x}, gpa={gpa:#x}, size={size:#x})")]
+    RunMemoryFault {
+        flags: u64,
+        gpa: u64,
+        size: u64,
+        #[source]
+        source: nix::Error,
+    },
     #[error("GetVCpuMmapSize")]
     GetVCpuMmapSize(#[source] nix::Error),
     #[error("MmapVCpu")]
@@ -1641,6 +1650,16 @@ impl<'a> VpRunner<'a> {
                 Ok(_) => Ok(true),
                 Err(err) => match err {
                     nix::errno::Errno::EINTR | nix::errno::Errno::EAGAIN => Ok(false),
+                    _ if self.run_data().exit_reason == KVM_EXIT_MEMORY_FAULT => {
+                        // SAFETY: KVM reported KVM_EXIT_MEMORY_FAULT, so this is the active union field.
+                        let memory_fault = unsafe { self.run_data().__bindgen_anon_1.memory_fault };
+                        Err(Error::RunMemoryFault {
+                            flags: memory_fault.flags,
+                            gpa: memory_fault.gpa,
+                            size: memory_fault.size,
+                            source: err,
+                        })
+                    }
                     _ => Err(Error::Run(err)),
                 },
             }

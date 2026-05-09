@@ -35,6 +35,10 @@ use arch::KvmVpInner;
 use hvdef::Vtl;
 use loader::importer::BootPageAcceptance;
 use std::fs::File;
+#[cfg(guest_arch = "x86_64")]
+use std::mem::size_of;
+#[cfg(all(test, guest_arch = "x86_64"))]
+use std::mem::size_of_val;
 use std::os::fd::AsFd;
 use std::sync::atomic::Ordering;
 use virt::VpIndex;
@@ -76,6 +80,10 @@ pub enum KvmError {
     InvalidSnpLaunchRange,
     #[error("too many CPUID entries for SNP launch page: {0}")]
     TooManySnpCpuidEntries(usize),
+    #[error("missing SNP C-bit CPUID information")]
+    MissingSnpCBit,
+    #[error("invalid SNP direct-boot page table length: {0:#x}")]
+    InvalidSnpPageTableLength(u64),
     #[error("SNP launch is already in progress")]
     SnpLaunchInProgress,
     #[error("SNP launch previously failed")]
@@ -453,6 +461,16 @@ impl KvmPartitionInner {
                 );
                 write_snp_cpuid_page(private_range.hva, page.range.len(), &self.bsp_cpuid)?;
             }
+            if page.tag == "linux-pagetables" {
+                let c_bit = snp_c_bit_from_cpuid(&self.bsp_cpuid)?;
+                tracing::debug!(
+                    gpa = page.range.start(),
+                    len = page.range.len(),
+                    c_bit,
+                    "setting SNP C-bit in Linux direct-boot page tables"
+                );
+                set_snp_c_bit_in_page_tables(private_range.hva, page.range.len(), c_bit)?;
+            }
             let bytes = unsafe {
                 std::slice::from_raw_parts(
                     private_range.hva.cast_const(),
@@ -622,6 +640,40 @@ fn snp_ram_hack_page(range: MemoryRange) -> virt::InitialAcceptedPage {
         acceptance: BootPageAcceptance::Exclusive,
         tag: "kvm-snp-ram-hack".into(),
     }
+}
+
+#[cfg(guest_arch = "x86_64")]
+fn snp_c_bit_from_cpuid(cpuid: &[kvm::kvm_cpuid_entry2]) -> Result<u8, KvmError> {
+    cpuid
+        .iter()
+        .find(|entry| entry.function == 0x8000_001f && entry.index == 0)
+        .map(|entry| (entry.ebx & 0x3f) as u8)
+        .ok_or(KvmError::MissingSnpCBit)
+}
+
+#[cfg(guest_arch = "x86_64")]
+fn set_snp_c_bit_in_page_tables(
+    page_table: *mut u8,
+    page_table_len: u64,
+    c_bit: u8,
+) -> Result<(), KvmError> {
+    if !page_table_len.is_multiple_of(size_of::<u64>() as u64) {
+        return Err(KvmError::InvalidSnpPageTableLength(page_table_len));
+    }
+
+    let c_bit_mask = 1u64 << c_bit;
+    // SAFETY: The caller provides a valid page-table backing region, and the
+    // length is validated to be a whole number of u64 entries.
+    let entries = unsafe {
+        std::slice::from_raw_parts_mut(page_table.cast::<u64>(), page_table_len as usize / 8)
+    };
+    for entry in entries {
+        if *entry & 1 != 0 {
+            *entry |= c_bit_mask;
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(guest_arch = "x86_64")]
@@ -1043,6 +1095,37 @@ mod tests {
             split_zero_page_runs(&[0; 17]),
             Err(KvmError::UnalignedSnpLaunchRange)
         ));
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    #[test]
+    fn snp_c_bit_from_cpuid_reads_memory_encryption_bit() {
+        let cpuid = [kvm::kvm_cpuid_entry2 {
+            function: 0x8000_001f,
+            index: 0,
+            ebx: 51,
+            ..Default::default()
+        }];
+
+        assert_eq!(snp_c_bit_from_cpuid(&cpuid).unwrap(), 51);
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    #[test]
+    fn set_snp_c_bit_in_page_tables_updates_present_entries() {
+        let mut entries = [0x1000u64 | 1, 0, 0x2000u64 | 1 << 1, 0x3000u64 | 1];
+
+        set_snp_c_bit_in_page_tables(
+            entries.as_mut_ptr().cast::<u8>(),
+            size_of_val(&entries) as u64,
+            51,
+        )
+        .unwrap();
+
+        assert_eq!(entries[0], (1u64 << 51) | 0x1001);
+        assert_eq!(entries[1], 0);
+        assert_eq!(entries[2], 0x2002);
+        assert_eq!(entries[3], (1u64 << 51) | 0x3001);
     }
 
     #[cfg(guest_arch = "x86_64")]
