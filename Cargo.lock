@@ -8918,6 +8918,7 @@ dependencies = [
  "guestmem",
  "hvdef",
  "inspect",
+ "loader",
  "memory_range",
  "mesh_protobuf",
  "pal_event",

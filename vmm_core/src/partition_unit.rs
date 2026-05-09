@@ -20,7 +20,6 @@ use futures::StreamExt;
 use guestmem::GuestMemory;
 use hvdef::Vtl;
 use inspect::InspectMut;
-use memory_range::MemoryRange;
 use mesh::Receiver;
 use mesh::rpc::Rpc;
 use mesh::rpc::RpcSend;
@@ -33,8 +32,8 @@ use state_unit::UnitBuilder;
 use state_unit::UnitHandle;
 use std::sync::Arc;
 use thiserror::Error;
+use virt::InitialAcceptedPage;
 use virt::InitialRegs;
-use virt::PageVisibility;
 use vm_topology::processor::ProcessorTopology;
 use vmcore::save_restore::ProtobufSaveRestore;
 use vmcore::save_restore::RestoreError;
@@ -59,10 +58,7 @@ pub trait VmPartition: 'static + Send + Sync + InspectMut + ProtobufSaveRestore 
     fn scrub_vtl(&mut self, vtl: Vtl) -> anyhow::Result<()>;
 
     /// Accepts pages on behalf of the loader.
-    fn accept_initial_pages(
-        &mut self,
-        pages: Vec<(MemoryRange, PageVisibility)>,
-    ) -> anyhow::Result<()>;
+    fn accept_initial_pages(&mut self, pages: Vec<InitialAcceptedPage>) -> anyhow::Result<()>;
 }
 
 /// An object to run the VM partition state unit.
@@ -116,9 +112,7 @@ impl InspectMut for PartitionUnitRunner {
 enum PartitionRequest {
     ClearHalt(Rpc<(), bool>), // TODO: remove this, and use DebugRequest::Resume
     SetInitialRegs(Rpc<(Vtl, Arc<InitialRegs>), Result<(), InitialRegError>>),
-    SetInitialPageVisibility(
-        Rpc<Vec<(MemoryRange, PageVisibility)>, Result<(), InitialVisibilityError>>,
-    ),
+    SetInitialPageVisibility(Rpc<Vec<InitialAcceptedPage>, Result<(), InitialVisibilityError>>),
     StopVps(Rpc<(), ()>),
     StartVps,
 }
@@ -278,7 +272,7 @@ impl PartitionUnit {
 
     pub async fn set_initial_page_visibility(
         &mut self,
-        vis: Vec<(MemoryRange, PageVisibility)>,
+        vis: Vec<InitialAcceptedPage>,
     ) -> Result<(), InitialVisibilityError> {
         self.req_send
             .call(PartitionRequest::SetInitialPageVisibility, vis)
@@ -466,7 +460,7 @@ impl PartitionUnitRunner {
 
     async fn set_initial_page_visibility(
         &mut self,
-        visibility: Vec<(MemoryRange, PageVisibility)>,
+        visibility: Vec<InitialAcceptedPage>,
     ) -> Result<(), InitialVisibilityError> {
         assert!(!self.unit_started);
 

@@ -35,6 +35,7 @@ use arch::KvmVpInner;
 use hvdef::Vtl;
 use loader::importer::BootPageAcceptance;
 use std::fs::File;
+use std::os::fd::AsFd;
 use std::sync::atomic::Ordering;
 use virt::VpIndex;
 use vmcore::vmtime::VmTimeAccess;
@@ -135,6 +136,9 @@ pub struct KvmPartition {
 struct KvmPartitionInner {
     #[inspect(skip)]
     kvm: kvm::Partition,
+    #[cfg(guest_arch = "x86_64")]
+    #[inspect(skip)]
+    sev: Option<File>,
     memory: Mutex<KvmMemoryRangeState>,
     memory_backing_mode: KvmMemoryBackingMode,
     #[inspect(iter_by_index)]
@@ -162,6 +166,15 @@ struct KvmPartitionInner {
     #[cfg(guest_arch = "aarch64")]
     gic_nr_irqs: u32,
     synic_ports: virt::synic::SynicPortMap,
+}
+
+#[cfg(guest_arch = "x86_64")]
+impl virt::AcceptInitialPages for KvmPartition {
+    type Error = KvmError;
+
+    fn accept_initial_pages(&self, pages: &[virt::InitialAcceptedPage]) -> Result<(), Self::Error> {
+        self.inner.snp_launch_update_initial_pages(pages)
+    }
 }
 
 // TODO: Chunk this up into smaller types.
@@ -350,6 +363,60 @@ impl KvmPartitionInner {
                 classify_guest_memfd_backing(range, &self.ram_ranges)
             }
         }
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    fn snp_launch_update_initial_pages(
+        &self,
+        pages: &[virt::InitialAcceptedPage],
+    ) -> Result<(), KvmError> {
+        let sev = self.sev.as_ref().ok_or(KvmError::IsolationNotSupported)?;
+        self.kvm.check_sev_snp_launch_extensions()?;
+        self.kvm
+            .sev_snp_launch_start(sev.as_fd(), &mut Default::default())?;
+
+        let memory = self.memory.lock();
+        for page in pages {
+            if page.visibility == virt::PageVisibility::Shared {
+                continue;
+            }
+
+            let launch_page_type = arch::snp::snp_launch_page_type(page.acceptance)?;
+            let Some(kvm_page_type) = launch_page_type.kvm_page_type() else {
+                return Err(KvmError::UnsupportedSnpPageAcceptance(page.acceptance));
+            };
+
+            let private_range = private_memory_range_from_slots(page.range, &memory.ranges)?;
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    private_range.hva.cast_const(),
+                    page.range.len() as usize,
+                )
+            };
+            for run in split_zero_page_runs(bytes)? {
+                let page_type = if run.kind == SnpPageRunKind::Zero
+                    && kvm_page_type == kvm::SevSnpPageType::Normal
+                {
+                    kvm::SevSnpPageType::Zero
+                } else {
+                    kvm_page_type
+                };
+                let gpa = page.range.start() + run.byte_offset as u64;
+                let uaddr = if page_type == kvm::SevSnpPageType::Zero {
+                    0
+                } else {
+                    private_range.hva.wrapping_add(run.byte_offset) as u64
+                };
+                self.kvm.sev_snp_launch_update(
+                    sev.as_fd(),
+                    gpa / hvdef::HV_PAGE_SIZE,
+                    uaddr,
+                    run.byte_len as u64,
+                    page_type,
+                )?;
+            }
+        }
+        Ok(())
     }
 }
 

@@ -34,7 +34,7 @@ use std::ffi::CString;
 use std::io::Read;
 use std::io::Seek;
 use thiserror::Error;
-use virt::PageVisibility;
+use virt::InitialAcceptedPage;
 use vm_loader::Loader;
 use vm_topology::memory::MemoryLayout;
 use vm_topology::memory::MemoryRangeWithNode;
@@ -553,13 +553,7 @@ pub struct LoadIgvmParams<'a, T: ArchTopology> {
 
 pub fn load_igvm(
     params: LoadIgvmParams<'_, vm_topology::processor::TargetTopology>,
-) -> Result<
-    (
-        Vec<loader::importer::Register>,
-        Vec<(MemoryRange, PageVisibility)>,
-    ),
-    Error,
-> {
+) -> Result<(Vec<loader::importer::Register>, Vec<InitialAcceptedPage>), Error> {
     #[cfg(guest_arch = "x86_64")]
     {
         load_igvm_x86(params)
@@ -577,7 +571,7 @@ pub fn load_igvm(
 #[cfg_attr(not(guest_arch = "x86_64"), expect(dead_code))]
 fn load_igvm_x86(
     params: LoadIgvmParams<'_, X86Topology>,
-) -> Result<(Vec<X86Register>, Vec<(MemoryRange, PageVisibility)>), Error> {
+) -> Result<(Vec<X86Register>, Vec<InitialAcceptedPage>), Error> {
     let LoadIgvmParams {
         igvm_file,
         gm,
@@ -1280,7 +1274,7 @@ fn build_memory_map(
 #[cfg_attr(not(guest_arch = "aarch64"), expect(dead_code))]
 fn load_igvm_aarch64(
     _params: LoadIgvmParams<'_, Aarch64Topology>,
-) -> Result<(Vec<Aarch64Register>, Vec<(MemoryRange, PageVisibility)>), Error> {
+) -> Result<(Vec<Aarch64Register>, Vec<InitialAcceptedPage>), Error> {
     Err(Error::UnsupportedGuestArch)
 }
 

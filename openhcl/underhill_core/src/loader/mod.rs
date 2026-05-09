@@ -393,6 +393,7 @@ fn load_linux(params: LoadLinuxParams<'_>) -> Result<VpContext, Error> {
         zero_page_config,
         acpi_config,
         register_config,
+        None,
     )
     .map_err(Error::LinuxLoader)?;
 
