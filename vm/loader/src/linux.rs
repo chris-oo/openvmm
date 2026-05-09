@@ -7,12 +7,13 @@ use crate::common::ChunkBuf;
 use crate::common::ImportFileRegion;
 use crate::common::ImportFileRegionError;
 use crate::common::ReadSeek;
-use crate::common::import_default_gdt;
 use crate::elf::load_static_elf;
 use crate::importer::Aarch64Register;
 use crate::importer::BootPageAcceptance;
 use crate::importer::GuestArch;
 use crate::importer::ImageLoad;
+use crate::importer::SegmentRegister;
+use crate::importer::TableRegister;
 use crate::importer::X86Register;
 use aarch64defs::Cpsr64;
 use aarch64defs::IntermPhysAddrSize;
@@ -37,6 +38,9 @@ use std::io::Seek;
 use std::mem::size_of;
 use thiserror::Error;
 use vm_topology::memory::MemoryLayout;
+use x86defs::GdtEntry;
+use x86defs::X64_DEFAULT_CODE_SEGMENT_ATTRIBUTES;
+use x86defs::X64_DEFAULT_DATA_SEGMENT_ATTRIBUTES;
 use zerocopy::FromBytes;
 use zerocopy::FromZeros;
 use zerocopy::Immutable;
@@ -190,6 +194,69 @@ pub struct InitrdConfig<'a> {
     pub initrd_address: InitrdAddressType,
     pub initrd: &'a mut dyn ReadSeek,
     pub size: u64,
+}
+
+fn import_linux_boot_gdt(
+    importer: &mut impl ImageLoad<X86Register>,
+    gdt_page_base: u64,
+) -> anyhow::Result<()> {
+    const LINUX_BOOT_CS: u16 = 0x10;
+    const LINUX_BOOT_DS: u16 = 0x18;
+    const LINUX_BOOT_GDT_COUNT: usize = 4;
+
+    let data_attributes: u16 = X64_DEFAULT_DATA_SEGMENT_ATTRIBUTES.into();
+    let code_attributes: u16 = X64_DEFAULT_CODE_SEGMENT_ATTRIBUTES.into();
+    let gdt = [
+        GdtEntry::new_zeroed(),
+        GdtEntry::new_zeroed(),
+        GdtEntry {
+            limit_low: 0xffff,
+            attr_low: code_attributes as u8,
+            attr_high: (code_attributes >> 8) as u8,
+            ..GdtEntry::new_zeroed()
+        },
+        GdtEntry {
+            limit_low: 0xffff,
+            attr_low: data_attributes as u8,
+            attr_high: (data_attributes >> 8) as u8,
+            ..GdtEntry::new_zeroed()
+        },
+    ];
+
+    importer.import_pages(
+        gdt_page_base,
+        1,
+        "linux-boot-gdt",
+        BootPageAcceptance::Exclusive,
+        gdt.as_bytes(),
+    )?;
+
+    let mut import_reg = |register| importer.import_vp_register(register);
+    import_reg(X86Register::Gdtr(TableRegister {
+        base: gdt_page_base * HV_PAGE_SIZE,
+        limit: (size_of::<GdtEntry>() * LINUX_BOOT_GDT_COUNT - 1) as u16,
+    }))?;
+
+    let ds = SegmentRegister {
+        selector: LINUX_BOOT_DS,
+        base: 0,
+        limit: 0xffffffff,
+        attributes: data_attributes,
+    };
+    import_reg(X86Register::Ds(ds))?;
+    import_reg(X86Register::Es(ds))?;
+    import_reg(X86Register::Fs(ds))?;
+    import_reg(X86Register::Gs(ds))?;
+    import_reg(X86Register::Ss(ds))?;
+
+    import_reg(X86Register::Cs(SegmentRegister {
+        selector: LINUX_BOOT_CS,
+        base: 0,
+        limit: 0xffffffff,
+        attributes: code_attributes,
+    }))?;
+
+    Ok(())
 }
 
 /// Information returned about the kernel loaded.
@@ -427,7 +494,8 @@ pub fn load_config(
     }
 
     check_address_alignment(registers.gdt_address)?;
-    import_default_gdt(importer, registers.gdt_address / HV_PAGE_SIZE).map_err(Error::Importer)?;
+    import_linux_boot_gdt(importer, registers.gdt_address / HV_PAGE_SIZE)
+        .map_err(Error::Importer)?;
     check_address_alignment(registers.page_table_address)?;
     let mut page_table_work_buffer: Vec<PageTable> =
         vec![PageTable::new_zeroed(); PAGE_TABLE_MAX_COUNT];
@@ -974,6 +1042,60 @@ mod tests {
         fn set_imported_regions_config_page(&mut self, _page_base: u64) {
             unimplemented!()
         }
+    }
+
+    #[test]
+    fn imports_linux_boot_protocol_gdt_selectors() {
+        let mut importer = TestImporter::default();
+
+        import_linux_boot_gdt(&mut importer, 1).unwrap();
+
+        assert_eq!(importer.imports.len(), 1);
+        assert_eq!(importer.imports[0].tag, "linux-boot-gdt");
+        assert_eq!(importer.imports[0].page_base, 1);
+        assert_eq!(importer.imports[0].page_count, 1);
+        assert_eq!(
+            importer.imports[0].acceptance,
+            BootPageAcceptance::Exclusive
+        );
+
+        let cs = importer
+            .regs
+            .iter()
+            .find_map(|reg| match reg {
+                X86Register::Cs(reg) => Some(*reg),
+                _ => None,
+            })
+            .unwrap();
+        let ds = importer
+            .regs
+            .iter()
+            .find_map(|reg| match reg {
+                X86Register::Ds(reg) => Some(*reg),
+                _ => None,
+            })
+            .unwrap();
+        let es = importer
+            .regs
+            .iter()
+            .find_map(|reg| match reg {
+                X86Register::Es(reg) => Some(*reg),
+                _ => None,
+            })
+            .unwrap();
+        let ss = importer
+            .regs
+            .iter()
+            .find_map(|reg| match reg {
+                X86Register::Ss(reg) => Some(*reg),
+                _ => None,
+            })
+            .unwrap();
+
+        assert_eq!(cs.selector, 0x10);
+        assert_eq!(ds.selector, 0x18);
+        assert_eq!(es.selector, 0x18);
+        assert_eq!(ss.selector, 0x18);
     }
 
     #[test]

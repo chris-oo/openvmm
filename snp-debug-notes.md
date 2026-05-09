@@ -60,6 +60,45 @@ OpenVMM still needs changes to consume the private KVM debug hooks and to make i
 
 ## Ubuntu SNP host private-kernel build/deploy plan
 
+### Collected host/build facts
+
+- Local build host: Ubuntu 24.04 WSL2 on x86_64 with 32 CPUs, about 30 GiB RAM, and about 49 GiB free on `/`.
+- Local kernel tree: `~/ai/eevee/linux`, upstream Linux `7.1.0-rc2`, git tree, no local 6.17 branch; only upstream `v6.17`/`v6.17-rc*` tags were present.
+- Local missing build dependency discovered so far: `pahole`.
+- SNP target host: `cho-snp-ubuntu`.
+- Target OS/kernel: Ubuntu 25.10 questing, `6.17.0-23-generic`, package version `6.17.0-23.23`.
+- Target boot/deployment state: EFI boot, GRUB config present, `/boot/efi` present, `grub-reboot` available, Secure Boot disabled.
+- Target KVM/SNP state: `kvm_amd` and `kvm` loaded; `/dev/sev` exists.
+- Target config source: `/boot/config-6.17.0-23-generic`.
+- Relevant target config options are already enabled: `CONFIG_AMD_MEM_ENCRYPT=y`, `CONFIG_KVM=m`, `CONFIG_KVM_AMD=m`, `CONFIG_SEV_GUEST=m`, `CONFIG_CRYPTO_DEV_SP_PSP=y`, `CONFIG_DEBUG_FS=y`, `CONFIG_DEBUG_INFO=y`, `CONFIG_GDB_SCRIPTS=y`, `CONFIG_FRAME_POINTER=y`.
+- Target build/deploy constraints: target has plenty of disk (`/` about 82 GiB free, `/boot` about 1.7 GiB free), but build tools are mostly absent and passwordless sudo is not available.
+- Target kernel log baseline still needs privileged collection: unprivileged `dmesg` did not return SEV/SNP/KVM snippets.
+
+### Current approach
+
+Use the local upstream `7.1.0-rc2` tree for the private debug-kernel bring-up instead of first importing Ubuntu's matching 6.17 source. To reduce variables, build and boot a stock `7.1.0-rc2` kernel on the target before adding any KVM SNP instrumentation. Only after the stock kernel boots, loads KVM, exposes `/dev/sev`, and can run the current SNP repro should temporary debug patches be added.
+
+1. Prepare a stock `7.1.0-rc2` build.
+   - Install missing local build dependencies, at minimum `pahole`.
+   - Copy the target's `/boot/config-6.17.0-23-generic` into the local `~/ai/eevee/linux` tree as the base config.
+   - Use `olddefconfig` or equivalent to accept defaults for new `7.1.0-rc2` options.
+   - Set a unique local version string so the stock test kernel is easy to identify in GRUB and `uname -a`.
+   - Build Debian packages for the kernel image/modules/headers from the unmodified `7.1.0-rc2` source.
+
+2. Deploy and validate the stock `7.1.0-rc2` kernel.
+   - Copy the `.deb` packages to `cho-snp-ubuntu`.
+   - Install with interactive sudo on the target.
+   - Prefer one-time/manual GRUB selection for the first boot rather than making the kernel the persistent default.
+   - Reboot into the stock test kernel and verify `uname -a`, `kvm_amd`, `/dev/sev`, and the current SNP OpenVMM repro.
+   - Collect privileged host logs after boot/repro once sudo is available.
+
+3. Add private KVM SNP debug instrumentation only after the stock kernel is validated.
+   - Add the minimal temporary KVM debug changes to the same `7.1.0-rc2` tree.
+   - Rebuild packages with a distinct local version string from the stock test kernel.
+   - Deploy as an additional kernel so the stock `7.1.0-rc2` test kernel remains available as a fallback comparison point.
+
+### Original prep checklist
+
 The test system is an Ubuntu physical host, so before building and deploying a private debug kernel collect enough information to avoid producing an unbootable or inconvenient kernel package.
 
 1. Collect host facts.

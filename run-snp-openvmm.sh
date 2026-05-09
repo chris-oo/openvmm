@@ -10,7 +10,7 @@ KERNEL="${SNP_KERNEL:-$SCRIPT_DIR/vmlinux}"
 INITRD="${SNP_INITRD:-$SCRIPT_DIR/initrd}"
 # Keep the default small while the virt_kvm whole-RAM SNP acceptance hack is in
 # use; launch-updating every private page is slow. Override with SNP_MEMORY.
-MEMORY="${SNP_MEMORY:-128MB}"
+MEMORY="${SNP_MEMORY:-64MB}"
 PROCESSORS="${SNP_PROCESSORS:-1}"
 KERNEL_CMDLINE="${SNP_CMDLINE:-console=ttyS0 earlyprintk=serial earlycon panic=-1}"
 OPENVMM_LOG="${OPENVMM_LOG:-info,virt_kvm=trace,kvm=trace,openvmm_core::worker::dispatch=debug}"
