@@ -74,6 +74,8 @@ pub enum KvmError {
     UnalignedSnpLaunchRange,
     #[error("SNP launch range is not contained in guest_memfd private memory")]
     InvalidSnpLaunchRange,
+    #[error("too many CPUID entries for SNP launch page: {0}")]
+    TooManySnpCpuidEntries(usize),
     #[error("misaligned gic base address")]
     Misaligned,
     #[error("host does not support GICv2 or GICv3")]
@@ -145,6 +147,9 @@ struct KvmPartitionInner {
     ram_ranges: Vec<MemoryRange>,
     hv1_enabled: bool,
     gm: GuestMemory,
+    #[cfg(guest_arch = "x86_64")]
+    #[inspect(skip)]
+    bsp_cpuid: Vec<kvm::kvm_cpuid_entry2>,
     #[inspect(skip)]
     vps: Vec<KvmVpInner>,
     #[inspect(skip)]
@@ -392,6 +397,9 @@ impl KvmPartitionInner {
             };
 
             let private_range = private_memory_range_from_slots(page.range, &memory.ranges)?;
+            if page.acceptance == BootPageAcceptance::CpuidPage {
+                write_snp_cpuid_page(private_range.hva, page.range.len(), &self.bsp_cpuid)?;
+            }
             let bytes = unsafe {
                 std::slice::from_raw_parts(
                     private_range.hva.cast_const(),
@@ -423,6 +431,52 @@ impl KvmPartitionInner {
         }
         Ok(())
     }
+}
+
+#[cfg(guest_arch = "x86_64")]
+fn write_snp_cpuid_page(
+    page: *mut u8,
+    page_len: u64,
+    cpuid: &[kvm::kvm_cpuid_entry2],
+) -> Result<(), KvmError> {
+    const SNP_CPUID_COUNT_MAX: usize = 64;
+    const SNP_CPUID_TABLE_HEADER_SIZE: usize = 16;
+    const SNP_CPUID_FN_SIZE: usize = 48;
+
+    if cpuid.len() > SNP_CPUID_COUNT_MAX {
+        return Err(KvmError::TooManySnpCpuidEntries(cpuid.len()));
+    }
+    if page_len < (SNP_CPUID_TABLE_HEADER_SIZE + SNP_CPUID_COUNT_MAX * SNP_CPUID_FN_SIZE) as u64 {
+        return Err(KvmError::InvalidSnpLaunchRange);
+    }
+
+    let page = unsafe { std::slice::from_raw_parts_mut(page, page_len as usize) };
+    page.fill(0);
+    page[..4].copy_from_slice(&(cpuid.len() as u32).to_le_bytes());
+
+    for (index, cpuid) in cpuid.iter().enumerate() {
+        let entry = &mut page[SNP_CPUID_TABLE_HEADER_SIZE + index * SNP_CPUID_FN_SIZE..]
+            [..SNP_CPUID_FN_SIZE];
+        entry[0..4].copy_from_slice(&cpuid.function.to_le_bytes());
+        entry[4..8].copy_from_slice(&cpuid.index.to_le_bytes());
+        let initial_xsave_leaf = cpuid.function
+            == x86defs::cpuid::CpuidFunction::ExtendedStateEnumeration.0
+            && (cpuid.index == 0 || cpuid.index == 1);
+        let (xcr0, xss) = if initial_xsave_leaf {
+            (1_u64, 0_u64)
+        } else {
+            (0_u64, 0_u64)
+        };
+        entry[8..16].copy_from_slice(&xcr0.to_le_bytes());
+        entry[16..24].copy_from_slice(&xss.to_le_bytes());
+        entry[24..28].copy_from_slice(&cpuid.eax.to_le_bytes());
+        let ebx = if initial_xsave_leaf { 0x240 } else { cpuid.ebx };
+        entry[28..32].copy_from_slice(&ebx.to_le_bytes());
+        entry[32..36].copy_from_slice(&cpuid.ecx.to_le_bytes());
+        entry[36..40].copy_from_slice(&cpuid.edx.to_le_bytes());
+    }
+
+    Ok(())
 }
 
 #[cfg(guest_arch = "x86_64")]
@@ -750,5 +804,51 @@ mod tests {
             split_zero_page_runs(&[0; 17]),
             Err(KvmError::UnalignedSnpLaunchRange)
         ));
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    #[test]
+    fn write_snp_cpuid_page_writes_linux_table_and_xsave_inputs() {
+        let mut page = vec![0xff; hvdef::HV_PAGE_SIZE as usize];
+        let cpuid = [
+            kvm::kvm_cpuid_entry2 {
+                function: 1,
+                index: 0,
+                eax: 0x11,
+                ebx: 0x12,
+                ecx: 0x13,
+                edx: 0x14,
+                ..Default::default()
+            },
+            kvm::kvm_cpuid_entry2 {
+                function: x86defs::cpuid::CpuidFunction::ExtendedStateEnumeration.0,
+                index: 0,
+                eax: 0x21,
+                ebx: 0x22,
+                ecx: 0x23,
+                edx: 0x24,
+                ..Default::default()
+            },
+        ];
+
+        write_snp_cpuid_page(page.as_mut_ptr(), page.len() as u64, &cpuid).unwrap();
+
+        assert_eq!(u32::from_le_bytes(page[0..4].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(page[16..20].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(page[40..44].try_into().unwrap()), 0x11);
+        assert_eq!(u32::from_le_bytes(page[44..48].try_into().unwrap()), 0x12);
+        let xsave = 16 + 48;
+        assert_eq!(
+            u32::from_le_bytes(page[xsave..xsave + 4].try_into().unwrap()),
+            x86defs::cpuid::CpuidFunction::ExtendedStateEnumeration.0
+        );
+        assert_eq!(
+            u64::from_le_bytes(page[xsave + 8..xsave + 16].try_into().unwrap()),
+            1
+        );
+        assert_eq!(
+            u32::from_le_bytes(page[xsave + 28..xsave + 32].try_into().unwrap()),
+            0x240
+        );
     }
 }

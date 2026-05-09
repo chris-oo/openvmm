@@ -77,6 +77,7 @@ use virt::vm::AccessVmState;
 use virt::x86::HardwareBreakpoint;
 use virt::x86::max_physical_address_size_from_cpuid;
 use virt::x86::vp::AccessVpState;
+use vm_topology::processor::ProcessorTopology;
 use vm_topology::processor::x86::ApicMode;
 use vm_topology::processor::x86::X86VpInfo;
 use vmcore::interrupt::Interrupt;
@@ -403,64 +404,7 @@ impl ProtoPartition for KvmProtoPartition<'_> {
             //
             // TODO: centralize this code, probably in the topology crate, for
             // use by other hypervisors.
-            let cpuid_entries = cpuid
-                .leaves()
-                .iter()
-                .map(|leaf| {
-                    let mut entry = kvm::kvm_cpuid_entry2 {
-                        function: leaf.function,
-                        index: leaf.index.unwrap_or(0),
-                        flags: if leaf.index.is_some() {
-                            KVM_CPUID_FLAG_SIGNIFCANT_INDEX
-                        } else {
-                            0
-                        },
-                        eax: leaf.result[0],
-                        ebx: leaf.result[1],
-                        ecx: leaf.result[2],
-                        edx: leaf.result[3],
-                        padding: [0; 3],
-                    };
-                    match CpuidFunction(leaf.function) {
-                        CpuidFunction::VersionAndFeatures => {
-                            entry.ebx &= 0x00ffffff;
-                            entry.ebx |= vp_info.apic_id << 24;
-                        }
-                        CpuidFunction::ExtendedTopologyEnumeration => {
-                            entry.edx = vp_info.apic_id;
-                        }
-                        CpuidFunction::V2ExtendedTopologyEnumeration => {
-                            entry.edx = vp_info.apic_id;
-                        }
-                        CpuidFunction::ProcessorTopologyDefinition => {
-                            let eax =
-                                x86defs::cpuid::ProcessorTopologyDefinitionEax::from(entry.eax);
-                            entry.eax = eax.with_extended_apic_id(vp_info.apic_id).into();
-                            let ebx =
-                                x86defs::cpuid::ProcessorTopologyDefinitionEbx::from(entry.ebx);
-                            entry.ebx = ebx
-                                .with_compute_unit_id(
-                                    (vp_info.apic_id
-                                        % self.config.processor_topology.reserved_vps_per_socket()
-                                        / (ebx.threads_per_compute_unit() as u32 + 1))
-                                        as u8,
-                                )
-                                .into();
-                            let ecx =
-                                x86defs::cpuid::ProcessorTopologyDefinitionEcx::from(entry.ecx);
-                            entry.ecx = ecx
-                                .with_node_id(
-                                    (vp_info.apic_id
-                                        / self.config.processor_topology.reserved_vps_per_socket())
-                                        as u8,
-                                )
-                                .into();
-                        }
-                        _ => (),
-                    }
-                    entry
-                })
-                .collect::<Vec<_>>();
+            let cpuid_entries = kvm_cpuid_entries(&cpuid, &vp_info, self.config.processor_topology);
 
             vp.set_cpuid(&cpuid_entries)?;
         }
@@ -507,6 +451,11 @@ impl ProtoPartition for KvmProtoPartition<'_> {
                 .collect(),
             hv1_enabled: self.config.hv_config.is_some(),
             gm: config.guest_memory.clone(),
+            bsp_cpuid: kvm_cpuid_entries(
+                &cpuid,
+                &self.config.processor_topology.vp_arch(VpIndex::BSP),
+                self.config.processor_topology,
+            ),
             vps: self
                 .config
                 .processor_topology
@@ -548,6 +497,69 @@ impl ProtoPartition for KvmProtoPartition<'_> {
 
         if cfg!(debug_assertions) {
             (&partition).check_reset_all(&partition.inner.bsp().vp_info);
+        }
+
+        pub(crate) fn kvm_cpuid_entries(
+            cpuid: &CpuidLeafSet,
+            vp_info: &X86VpInfo,
+            processor_topology: &ProcessorTopology,
+        ) -> Vec<kvm::kvm_cpuid_entry2> {
+            cpuid
+                .leaves()
+                .iter()
+                .map(|leaf| {
+                    let mut entry = kvm::kvm_cpuid_entry2 {
+                        function: leaf.function,
+                        index: leaf.index.unwrap_or(0),
+                        flags: if leaf.index.is_some() {
+                            KVM_CPUID_FLAG_SIGNIFCANT_INDEX
+                        } else {
+                            0
+                        },
+                        eax: leaf.result[0],
+                        ebx: leaf.result[1],
+                        ecx: leaf.result[2],
+                        edx: leaf.result[3],
+                        padding: [0; 3],
+                    };
+                    match CpuidFunction(leaf.function) {
+                        CpuidFunction::VersionAndFeatures => {
+                            entry.ebx &= 0x00ffffff;
+                            entry.ebx |= vp_info.apic_id << 24;
+                        }
+                        CpuidFunction::ExtendedTopologyEnumeration => {
+                            entry.edx = vp_info.apic_id;
+                        }
+                        CpuidFunction::V2ExtendedTopologyEnumeration => {
+                            entry.edx = vp_info.apic_id;
+                        }
+                        CpuidFunction::ProcessorTopologyDefinition => {
+                            let eax =
+                                x86defs::cpuid::ProcessorTopologyDefinitionEax::from(entry.eax);
+                            entry.eax = eax.with_extended_apic_id(vp_info.apic_id).into();
+                            let ebx =
+                                x86defs::cpuid::ProcessorTopologyDefinitionEbx::from(entry.ebx);
+                            entry.ebx = ebx
+                                .with_compute_unit_id(
+                                    (vp_info.apic_id % processor_topology.reserved_vps_per_socket()
+                                        / (ebx.threads_per_compute_unit() as u32 + 1))
+                                        as u8,
+                                )
+                                .into();
+                            let ecx =
+                                x86defs::cpuid::ProcessorTopologyDefinitionEcx::from(entry.ecx);
+                            entry.ecx = ecx
+                                .with_node_id(
+                                    (vp_info.apic_id / processor_topology.reserved_vps_per_socket())
+                                        as u8,
+                                )
+                                .into();
+                        }
+                        _ => (),
+                    }
+                    entry
+                })
+                .collect()
         }
 
         Ok((partition, vps))
