@@ -2454,7 +2454,7 @@ impl LoadedVmInner {
                 if custom_dsdt.is_none() && self.mem_layout.mmio().len() < 2 {
                     anyhow::bail!("at least two mmio regions are required");
                 }
-                let regs =
+                let load_info =
                     super::vm_loaders::linux::load_linux_x86(&kernel_config, &self.gm, |gpa| {
                         let tables = if let Some(dsdt) = custom_dsdt {
                             acpi_builder.build_acpi_tables_custom_dsdt(gpa, dsdt)
@@ -2478,7 +2478,7 @@ impl LoadedVmInner {
                         }
                     })?;
 
-                (regs, Vec::new())
+                (load_info.into_initial_regs(), Vec::new())
             }
             #[cfg(guest_arch = "aarch64")]
             &LoadMode::Linux {

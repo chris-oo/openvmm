@@ -14,6 +14,7 @@ use openvmm_defs::config::DEFAULT_MMIO_GAPS_AARCH64;
 use std::ffi::CString;
 use std::io::Seek;
 use thiserror::Error;
+use vm_loader::InitialLoadInfo;
 use vm_loader::Loader;
 use vm_topology::memory::MemoryLayout;
 use vm_topology::pcie::PcieHostBridge;
@@ -65,7 +66,7 @@ pub fn load_linux_x86(
     cfg: &KernelConfig<'_>,
     gm: &GuestMemory,
     acpi_at_gpa: impl FnOnce(u64) -> AcpiTables,
-) -> Result<Vec<X86Register>, Error> {
+) -> Result<InitialLoadInfo<X86Register>, Error> {
     const GDT_BASE: u64 = 0x1000;
     const CR3_BASE: u64 = 0x4000;
     const ZERO_PAGE_BASE: u64 = 0x2000;
@@ -133,7 +134,7 @@ pub fn load_linux_x86(
     )
     .map_err(Error::Loader)?;
 
-    Ok(loader.initial_regs())
+    Ok(loader.initial_load_info())
 }
 
 /// Returns the device tree blob.

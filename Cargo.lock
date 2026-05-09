@@ -9445,6 +9445,7 @@ dependencies = [
  "loader",
  "memory_range",
  "range_map_vec",
+ "test_with_tracing",
  "tracing",
  "virt",
  "vm_topology",
