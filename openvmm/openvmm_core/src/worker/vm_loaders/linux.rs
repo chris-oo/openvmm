@@ -51,6 +51,7 @@ pub struct KernelConfig<'a> {
     pub initrd: &'a Option<std::fs::File>,
     pub cmdline: &'a str,
     pub mem_layout: &'a MemoryLayout,
+    pub snp_isolation: bool,
 }
 
 pub struct AcpiTables {
@@ -71,6 +72,10 @@ pub fn load_linux_x86(
     const ZERO_PAGE_BASE: u64 = 0x2000;
     const CMDLINE_BASE: u64 = 0x3000;
     const ACPI_BASE: u64 = 0xe0000;
+    const SNP_SECRETS_BASE: u64 = 0x10000;
+    const SNP_CPUID_BASE: u64 = 0x11000;
+    const SNP_CC_BLOB_BASE: u64 = 0x12000;
+    const SNP_CC_SETUP_DATA_BASE: u64 = 0x13000;
 
     let kaddr: u64 = 0x100000;
     let mut kernel_file = cfg.kernel;
@@ -100,6 +105,12 @@ pub fn load_linux_x86(
         gdt_address: GDT_BASE,
         page_table_address: CR3_BASE,
     };
+    let snp_boot = cfg.snp_isolation.then_some(loader::linux::SnpBootConfig {
+        secrets_address: SNP_SECRETS_BASE,
+        cpuid_address: SNP_CPUID_BASE,
+        cc_blob_address: SNP_CC_BLOB_BASE,
+        cc_setup_data_address: SNP_CC_SETUP_DATA_BASE,
+    });
 
     let acpi_tables = acpi_at_gpa(ACPI_BASE);
 
@@ -130,6 +141,7 @@ pub fn load_linux_x86(
         zero_page_config,
         acpi_config,
         register_config,
+        snp_boot,
     )
     .map_err(Error::Loader)?;
 
