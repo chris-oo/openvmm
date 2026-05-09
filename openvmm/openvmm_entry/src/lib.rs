@@ -1034,6 +1034,7 @@ async fn vm_config_from_command_line(
             kernel: kernel.into(),
             initrd: initrd.map(Into::into),
             cmdline,
+            kernel_format: opt.linux_kernel_format.into(),
             custom_dsdt,
             enable_serial: any_serial_configured,
             boot_mode: if opt.device_tree {

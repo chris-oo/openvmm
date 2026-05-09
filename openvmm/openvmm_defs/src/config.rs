@@ -139,12 +139,19 @@ pub enum LinuxDirectBootMode {
     Acpi,
 }
 
+#[derive(MeshPayload, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinuxKernelFormat {
+    Elf,
+    BzImage,
+}
+
 #[derive(MeshPayload, Debug)]
 pub enum LoadMode {
     Linux {
         kernel: File,
         initrd: Option<File>,
         cmdline: String,
+        kernel_format: LinuxKernelFormat,
         enable_serial: bool,
         custom_dsdt: Option<Vec<u8>>,
         boot_mode: LinuxDirectBootMode,

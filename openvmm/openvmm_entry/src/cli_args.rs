@@ -23,6 +23,7 @@ use clap::Parser;
 use clap::ValueEnum;
 use openvmm_defs::config::DEFAULT_PCAT_BOOT_ORDER;
 use openvmm_defs::config::DeviceVtl;
+use openvmm_defs::config::LinuxKernelFormat;
 use openvmm_defs::config::PcatBootDevice;
 use openvmm_defs::config::Vtl2BaseAddressType;
 use openvmm_defs::config::X2ApicConfig;
@@ -150,6 +151,10 @@ Examples:
     /// initrd image (when using linux direct boot)
     #[clap(short = 'r', long, value_name = "FILE", default_value = default_value_from_arch_env("OPENVMM_LINUX_DIRECT_INITRD"))]
     pub initrd: OptionalPathBuf,
+
+    /// kernel image format (when using x86 linux direct boot)
+    #[clap(long, value_enum, default_value_t = LinuxKernelFormatCli::Elf)]
+    pub linux_kernel_format: LinuxKernelFormatCli,
 
     /// extra kernel command line args
     #[clap(short = 'c', long, value_name = "STRING")]
@@ -909,6 +914,26 @@ Syntax: <port_name>:<pci_bdf>
     #[cfg(target_os = "linux")]
     #[clap(long, conflicts_with("pcat"))]
     pub vfio: Vec<VfioDeviceCli>,
+}
+
+/// Kernel image format for Linux direct boot.
+#[derive(Debug, Copy, Clone, ValueEnum, Default)]
+pub enum LinuxKernelFormatCli {
+    /// Uncompressed ELF vmlinux image.
+    #[default]
+    Elf,
+    /// x86 bzImage/vmlinuz compressed kernel image.
+    #[value(name = "bzimage", alias = "bz-image")]
+    BzImage,
+}
+
+impl From<LinuxKernelFormatCli> for LinuxKernelFormat {
+    fn from(value: LinuxKernelFormatCli) -> Self {
+        match value {
+            LinuxKernelFormatCli::Elf => LinuxKernelFormat::Elf,
+            LinuxKernelFormatCli::BzImage => LinuxKernelFormat::BzImage,
+        }
+    }
 }
 
 impl Options {

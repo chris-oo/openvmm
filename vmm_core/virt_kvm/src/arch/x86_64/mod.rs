@@ -1387,6 +1387,39 @@ impl Processor for KvmProcessor<'_> {
                         tracing::error!(hardware_entry_failure_reason, "VP entry failed");
                         return Err(dev.fatal_error(KvmRunVpError::InvalidVpState.into()));
                     }
+                    kvm::Exit::SystemEvent {
+                        event_type,
+                        event_flags,
+                    } => {
+                        tracing::info!(event_type, event_flags, "system event");
+                        match event_type {
+                            kvm::KVM_SYSTEM_EVENT_SHUTDOWN => {
+                                return Err(VpHaltReason::PowerOff);
+                            }
+                            kvm::KVM_SYSTEM_EVENT_RESET => {
+                                return Err(VpHaltReason::Reset);
+                            }
+                            kvm::KVM_SYSTEM_EVENT_CRASH => {
+                                return Err(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 });
+                            }
+                            kvm::KVM_SYSTEM_EVENT_SEV_TERM => {
+                                let ghcb_msr = event_flags;
+                                return Err(dev.fatal_error(
+                                    KvmRunVpError::SevTermination {
+                                        ghcb_msr,
+                                        reason_set: (ghcb_msr >> 12) & 0xf,
+                                        reason: (ghcb_msr >> 16) & 0xff,
+                                    }
+                                    .into(),
+                                ));
+                            }
+                            _ => {
+                                return Err(dev.fatal_error(
+                                    KvmRunVpError::UnhandledSystemEvent(event_type).into(),
+                                ));
+                            }
+                        }
+                    }
                 }
             }
         }

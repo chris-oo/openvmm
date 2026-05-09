@@ -1029,6 +1029,7 @@ where
                 gpa: kernel_base,
                 size: kernel_size,
                 entrypoint: kernel_entry_point,
+                ..
             },
         initrd: initrd_info,
         dtb,
