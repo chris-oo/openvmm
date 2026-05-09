@@ -763,4 +763,17 @@ impl VmChipsetResult {
         }
         self
     }
+
+    fn attach_missing_pci_config_ports(&mut self, arch: MachineArch) -> &mut Self {
+        if arch == MachineArch::X86_64 {
+            self.chipset_devices.push(ChipsetDeviceHandle {
+                name: "missing-pci".to_owned(),
+                resource: MissingDevHandle::new()
+                    .claim_pio("address", 0xcf8..=0xcfb)
+                    .claim_pio("data", 0xcfc..=0xcff)
+                    .into_resource(),
+            });
+        }
+        self
+    }
 }
