@@ -951,9 +951,18 @@ impl InitializedVm {
             if !cfg.floppy_disks.is_empty()
                 || !cfg.ide_disks.is_empty()
                 || !cfg.virtio_devices.is_empty()
-                || cfg.vmgs.is_some()
             {
                 anyhow::bail!("KVM SNP guest_memfd does not support disks");
+            }
+            if matches!(
+                cfg.vmgs,
+                Some(
+                    VmgsResource::Disk(_)
+                        | VmgsResource::ReprovisionOnFailure(_)
+                        | VmgsResource::Reprovision(_)
+                )
+            ) {
+                anyhow::bail!("KVM SNP guest_memfd does not support VMGS disks");
             }
         }
 
