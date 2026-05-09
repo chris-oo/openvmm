@@ -216,7 +216,7 @@ pub enum Error {
     #[error("unsupported x86 VM type: {0:?}")]
     UnsupportedX86VmType(X86VmType),
     #[cfg(target_arch = "x86_64")]
-    #[error("MemoryEncryptOp({command})")]
+    #[error("MemoryEncryptOp({command}, firmware_error={firmware_error:#x})")]
     MemoryEncryptOp {
         command: &'static str,
         firmware_error: u32,
@@ -639,17 +639,6 @@ impl Partition {
             )?;
         }
         Ok(())
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    pub fn sev_launch_update_vmsa(&self, sev: BorrowedFd<'_>) -> Result<()> {
-        let mut data = 0_u8;
-        self.sev_snp_cmd(
-            sev,
-            "KVM_SEV_LAUNCH_UPDATE_VMSA",
-            sev_cmd_id_KVM_SEV_LAUNCH_UPDATE_VMSA,
-            &mut data,
-        )
     }
 
     #[cfg(target_arch = "x86_64")]
