@@ -1787,10 +1787,17 @@ fn validate_isolation_config(cfg: &Config) -> anyhow::Result<()> {
         anyhow::bail!("SNP isolation currently does not support VMBus devices");
     }
 
-    let only_supported_chipset_devices = cfg
-        .chipset_devices
-        .iter()
-        .all(|device| device.resource.id() == "serial_16550");
+    let only_supported_chipset_devices = cfg.chipset_devices.iter().all(|device| {
+        matches!(
+            device.resource.id(),
+            "serial_16550"
+                | "pic"
+                | "pit"
+                | "generic-ioapic"
+                | "hyperv_power_management"
+                | "missing-dev"
+        )
+    });
 
     if !cfg.floppy_disks.is_empty()
         || !cfg.ide_disks.is_empty()
