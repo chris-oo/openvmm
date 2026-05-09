@@ -33,6 +33,52 @@ struct RangeInfo {
     acceptance: BootPageAcceptance,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedPageRange {
+    pub range: MemoryRange,
+    pub acceptance: BootPageAcceptance,
+    pub tag: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitialLoadInfo<R> {
+    pub initial_regs: Vec<R>,
+    pub imported_ranges: Vec<ImportedPageRange>,
+}
+
+impl<R> InitialLoadInfo<R> {
+    pub fn into_initial_regs(self) -> Vec<R> {
+        self.initial_regs
+    }
+
+    pub fn into_initial_regs_and_accepted_ranges(
+        self,
+    ) -> (Vec<R>, Vec<(MemoryRange, PageVisibility)>) {
+        let pages = self
+            .imported_ranges
+            .into_iter()
+            .map(|range| {
+                let vis = match range.acceptance {
+                    BootPageAcceptance::Exclusive => PageVisibility::Exclusive,
+                    BootPageAcceptance::ExclusiveUnmeasured => PageVisibility::Exclusive,
+                    BootPageAcceptance::Shared => PageVisibility::Shared,
+                    // TODO: These are required for hardware isolation but
+                    // support for that doesn't exist in any virt backend yet.
+                    // Handling these will require more virt::generic types.
+                    BootPageAcceptance::VpContext => todo!(),
+                    BootPageAcceptance::ErrorPage => todo!(),
+                    BootPageAcceptance::SecretsPage => todo!(),
+                    BootPageAcceptance::CpuidPage => todo!(),
+                    BootPageAcceptance::CpuidExtendedStatePage => todo!(),
+                };
+                (range.range, vis)
+            })
+            .collect();
+
+        (self.initial_regs, pages)
+    }
+}
+
 #[derive(Debug)]
 pub struct Loader<'a, R> {
     gm: GuestMemory,
@@ -54,44 +100,59 @@ impl<R> Loader<'_, R> {
     }
 
     pub fn initial_regs(self) -> Vec<R> {
-        self.regs.into_values().collect()
+        self.initial_load_info().into_initial_regs()
     }
 
-    pub fn initial_regs_and_accepted_ranges(
-        mut self,
-    ) -> (Vec<R>, Vec<(MemoryRange, PageVisibility)>) {
-        let regs = self.regs.into_values().collect();
+    pub fn initial_regs_and_accepted_ranges(self) -> (Vec<R>, Vec<(MemoryRange, PageVisibility)>) {
+        self.initial_load_info()
+            .into_initial_regs_and_accepted_ranges()
+    }
 
+    pub fn initial_load_info(mut self) -> InitialLoadInfo<R> {
         // Merge adjacent ranges first to help cut down on the number of entries
         // in the initial acceptance list. Since we load from an IGVM file, most
         // ranges are a single 4K page which can be merged for easier viewing.
         self.accepted_ranges
             .merge_adjacent(range_map_vec::u64_is_adjacent);
 
-        let pages = self
+        let imported_ranges = self
             .accepted_ranges
             .into_vec()
-            .iter()
-            .map(|(start, end, info)| {
-                let range = MemoryRange::from_4k_gpn_range(*start..(*end + 1));
-                let vis = match info.acceptance {
-                    BootPageAcceptance::Exclusive => PageVisibility::Exclusive,
-                    BootPageAcceptance::ExclusiveUnmeasured => PageVisibility::Exclusive,
-                    BootPageAcceptance::Shared => PageVisibility::Shared,
-                    // TODO: These are required for hardware isolation but
-                    // support for that doesn't exist in any virt backend yet.
-                    // Handling these will require more virt::generic types.
-                    BootPageAcceptance::VpContext => todo!(),
-                    BootPageAcceptance::ErrorPage => todo!(),
-                    BootPageAcceptance::SecretsPage => todo!(),
-                    BootPageAcceptance::CpuidPage => todo!(),
-                    BootPageAcceptance::CpuidExtendedStatePage => todo!(),
-                };
-                (range, vis)
+            .into_iter()
+            .map(|(start, end, info)| ImportedPageRange {
+                range: MemoryRange::from_4k_gpn_range(start..(end + 1)),
+                acceptance: info.acceptance,
+                tag: info.tag,
             })
             .collect();
 
-        (regs, pages)
+        InitialLoadInfo {
+            initial_regs: self.regs.into_values().collect(),
+            imported_ranges,
+        }
+    }
+
+    pub fn initial_load_info_ref(&self) -> InitialLoadInfo<R>
+    where
+        R: Clone,
+    {
+        let mut accepted_ranges = self.accepted_ranges.clone();
+        accepted_ranges.merge_adjacent(range_map_vec::u64_is_adjacent);
+
+        let imported_ranges = accepted_ranges
+            .into_vec()
+            .into_iter()
+            .map(|(start, end, info)| ImportedPageRange {
+                range: MemoryRange::from_4k_gpn_range(start..(end + 1)),
+                acceptance: info.acceptance,
+                tag: info.tag,
+            })
+            .collect();
+
+        InitialLoadInfo {
+            initial_regs: self.regs.values().cloned().collect(),
+            imported_ranges,
+        }
     }
 
     /// Accept a new page range with a given acceptance into the map of accepted ranges.
@@ -183,7 +244,7 @@ impl<R: Debug + GuestArch> ImageLoad<R> for Loader<'_, R> {
         let entry = self.regs.entry(std::mem::discriminant(&register));
         match entry {
             std::collections::hash_map::Entry::Occupied(_) => {
-                panic!("duplicate register import {:?}", register)
+                anyhow::bail!("duplicate register import {:?}", register)
             }
             std::collections::hash_map::Entry::Vacant(ve) => ve.insert(register),
         };
@@ -324,5 +385,64 @@ impl<R: Debug + GuestArch> ImageLoad<R> for Loader<'_, R> {
 
     fn set_imported_regions_config_page(&mut self, _page_base: u64) {
         unimplemented!()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use loader::importer::X86Register;
+    use test_with_tracing::test;
+
+    fn test_memory_layout() -> MemoryLayout {
+        MemoryLayout::new(0x10000, &[], &[], &[], None).unwrap()
+    }
+
+    #[test]
+    fn initial_load_info_preserves_import_metadata() {
+        let gm = GuestMemory::allocate(0x10000);
+        let mem_layout = test_memory_layout();
+        let mut loader = Loader::<X86Register>::new(gm, &mem_layout, Vtl::Vtl0);
+
+        loader
+            .import_pages(
+                1,
+                2,
+                "test-pages",
+                BootPageAcceptance::ExclusiveUnmeasured,
+                &[1, 2, 3, 4],
+            )
+            .unwrap();
+        loader
+            .import_vp_register(X86Register::Rip(0x100000))
+            .unwrap();
+
+        let load_info = loader.initial_load_info();
+
+        assert_eq!(load_info.initial_regs, vec![X86Register::Rip(0x100000)]);
+        assert_eq!(
+            load_info.imported_ranges,
+            vec![ImportedPageRange {
+                range: MemoryRange::from_4k_gpn_range(1..3),
+                acceptance: BootPageAcceptance::ExclusiveUnmeasured,
+                tag: "test-pages".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn duplicate_register_import_returns_error() {
+        let gm = GuestMemory::allocate(0x10000);
+        let mem_layout = test_memory_layout();
+        let mut loader = Loader::<X86Register>::new(gm, &mem_layout, Vtl::Vtl0);
+
+        loader
+            .import_vp_register(X86Register::Rip(0x100000))
+            .unwrap();
+        let err = loader
+            .import_vp_register(X86Register::Rip(0x200000))
+            .unwrap_err();
+
+        assert!(err.to_string().contains("duplicate register import"));
     }
 }
