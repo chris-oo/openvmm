@@ -145,6 +145,14 @@ mod ioctl {
 #[cfg(target_arch = "x86_64")]
 const KVM_CAP_VM_TYPES_UAPI: u32 = 235;
 #[cfg(target_arch = "x86_64")]
+const KVM_CAP_EXIT_HYPERCALL_UAPI: u32 = 201;
+#[cfg(target_arch = "x86_64")]
+pub const KVM_HC_MAP_GPA_RANGE_UAPI: u64 = 12;
+#[cfg(target_arch = "x86_64")]
+pub const KVM_MAP_GPA_RANGE_ENCRYPTED_UAPI: u64 = 1 << 4;
+#[cfg(target_arch = "x86_64")]
+pub const KVM_MAP_GPA_RANGE_DECRYPTED_UAPI: u64 = 0 << 4;
+#[cfg(target_arch = "x86_64")]
 const KVM_X86_SNP_VM_UAPI: libc::c_int = 4;
 
 #[cfg(target_arch = "x86_64")]
@@ -543,6 +551,23 @@ impl Partition {
                 source: err,
             }
         })?;
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn enable_hypercall_exits(&self, hypercall_mask: u64) -> Result<()> {
+        // SAFETY: Calling IOCTL as documented, with no special requirements.
+        unsafe {
+            ioctl::kvm_enable_cap(
+                self.vm.as_raw_fd(),
+                &kvm_enable_cap {
+                    cap: KVM_CAP_EXIT_HYPERCALL_UAPI,
+                    args: [hypercall_mask, 0, 0, 0],
+                    ..Default::default()
+                },
+            )
+            .map_err(|err| Error::EnableCap("exit_hypercall", err))?;
+        }
         Ok(())
     }
 
@@ -1814,6 +1839,17 @@ impl<'a> VpRunner<'a> {
                 }
             }
             #[cfg(target_arch = "x86_64")]
+            KVM_EXIT_HYPERCALL => {
+                // SAFETY: this is the active union field.
+                let hypercall = unsafe { &mut self.run_data().__bindgen_anon_1.hypercall };
+                Exit::Hypercall {
+                    nr: hypercall.nr,
+                    args: hypercall.args,
+                    result: &mut hypercall.ret,
+                    flags: unsafe { hypercall.__bindgen_anon_1.flags },
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
             KVM_EXIT_X86_WRMSR => {
                 // SAFETY: this is the active union field.
                 let msr = unsafe { &mut self.run_data().__bindgen_anon_1.msr };
@@ -1903,6 +1939,13 @@ pub enum Exit<'a> {
     MmioWrite {
         address: u64,
         data: &'a [u8],
+    },
+    #[cfg(target_arch = "x86_64")]
+    Hypercall {
+        nr: u64,
+        args: [u64; 6],
+        result: &'a mut u64,
+        flags: u64,
     },
     #[cfg(target_arch = "x86_64")]
     MsrRead {
