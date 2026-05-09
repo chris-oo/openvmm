@@ -22,6 +22,7 @@ use range_map_vec::RangeMap;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::mem::Discriminant;
+use virt::InitialAcceptedPage;
 use virt::PageVisibility;
 use vm_topology::memory::MemoryLayout;
 
@@ -51,27 +52,27 @@ impl<R> InitialLoadInfo<R> {
         self.initial_regs
     }
 
-    pub fn into_initial_regs_and_accepted_ranges(
-        self,
-    ) -> (Vec<R>, Vec<(MemoryRange, PageVisibility)>) {
+    pub fn into_initial_regs_and_accepted_ranges(self) -> (Vec<R>, Vec<InitialAcceptedPage>) {
         let pages = self
             .imported_ranges
             .into_iter()
             .map(|range| {
-                let vis = match range.acceptance {
-                    BootPageAcceptance::Exclusive => PageVisibility::Exclusive,
-                    BootPageAcceptance::ExclusiveUnmeasured => PageVisibility::Exclusive,
+                let visibility = match range.acceptance {
                     BootPageAcceptance::Shared => PageVisibility::Shared,
-                    // TODO: These are required for hardware isolation but
-                    // support for that doesn't exist in any virt backend yet.
-                    // Handling these will require more virt::generic types.
-                    BootPageAcceptance::VpContext => todo!(),
-                    BootPageAcceptance::ErrorPage => todo!(),
-                    BootPageAcceptance::SecretsPage => todo!(),
-                    BootPageAcceptance::CpuidPage => todo!(),
-                    BootPageAcceptance::CpuidExtendedStatePage => todo!(),
+                    BootPageAcceptance::Exclusive
+                    | BootPageAcceptance::ExclusiveUnmeasured
+                    | BootPageAcceptance::VpContext
+                    | BootPageAcceptance::ErrorPage
+                    | BootPageAcceptance::SecretsPage
+                    | BootPageAcceptance::CpuidPage
+                    | BootPageAcceptance::CpuidExtendedStatePage => PageVisibility::Exclusive,
                 };
-                (range.range, vis)
+                InitialAcceptedPage {
+                    range: range.range,
+                    visibility,
+                    acceptance: range.acceptance,
+                    tag: range.tag,
+                }
             })
             .collect();
 
@@ -103,7 +104,7 @@ impl<R> Loader<'_, R> {
         self.initial_load_info().into_initial_regs()
     }
 
-    pub fn initial_regs_and_accepted_ranges(self) -> (Vec<R>, Vec<(MemoryRange, PageVisibility)>) {
+    pub fn initial_regs_and_accepted_ranges(self) -> (Vec<R>, Vec<InitialAcceptedPage>) {
         self.initial_load_info()
             .into_initial_regs_and_accepted_ranges()
     }
@@ -427,6 +428,45 @@ mod tests {
                 acceptance: BootPageAcceptance::ExclusiveUnmeasured,
                 tag: "test-pages".to_string(),
             }]
+        );
+    }
+
+    #[test]
+    fn initial_acceptance_preserves_loader_acceptance_for_private_pages() {
+        let load_info = InitialLoadInfo::<X86Register> {
+            initial_regs: Vec::new(),
+            imported_ranges: vec![
+                ImportedPageRange {
+                    range: MemoryRange::from_4k_gpn_range(1..2),
+                    acceptance: BootPageAcceptance::SecretsPage,
+                    tag: "secrets".to_string(),
+                },
+                ImportedPageRange {
+                    range: MemoryRange::from_4k_gpn_range(2..3),
+                    acceptance: BootPageAcceptance::CpuidPage,
+                    tag: "cpuid".to_string(),
+                },
+            ],
+        };
+
+        let (_, pages) = load_info.into_initial_regs_and_accepted_ranges();
+
+        assert_eq!(
+            pages,
+            vec![
+                InitialAcceptedPage {
+                    range: MemoryRange::from_4k_gpn_range(1..2),
+                    visibility: PageVisibility::Exclusive,
+                    acceptance: BootPageAcceptance::SecretsPage,
+                    tag: "secrets".to_string(),
+                },
+                InitialAcceptedPage {
+                    range: MemoryRange::from_4k_gpn_range(2..3),
+                    visibility: PageVisibility::Exclusive,
+                    acceptance: BootPageAcceptance::CpuidPage,
+                    tag: "cpuid".to_string(),
+                },
+            ]
         );
     }
 

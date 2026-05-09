@@ -6,7 +6,7 @@
 #![cfg(all(target_os = "linux", guest_arch = "x86_64"))]
 
 mod regs;
-mod snp;
+pub(crate) mod snp;
 mod vm_state;
 mod vp_state;
 
@@ -311,7 +311,7 @@ impl virt::Hypervisor for Kvm {
 
         Ok(KvmProtoPartition {
             vm,
-            _sev: sev,
+            sev,
             config,
             cpuid: cpuid_entries,
         })
@@ -321,7 +321,7 @@ impl virt::Hypervisor for Kvm {
 /// A prototype partition.
 pub struct KvmProtoPartition<'a> {
     vm: kvm::Partition,
-    _sev: Option<File>,
+    sev: Option<File>,
     config: ProtoPartitionConfig<'a>,
     cpuid: CpuidLeafSet,
 }
@@ -489,6 +489,7 @@ impl ProtoPartition for KvmProtoPartition<'_> {
 
         let partition = Arc::new(KvmPartitionInner {
             kvm: self.vm,
+            sev: self.sev,
             memory: Default::default(),
             memory_backing_mode: match self.config.isolation {
                 virt::IsolationType::None => KvmMemoryBackingMode::Userspace,
@@ -626,6 +627,12 @@ impl ResetPartition for KvmPartition {
 impl Partition for KvmPartition {
     fn supports_reset(&self) -> Option<&dyn ResetPartition<Error = Self::Error>> {
         Some(self)
+    }
+
+    fn supports_initial_accept_pages(
+        &self,
+    ) -> Option<&dyn virt::AcceptInitialPages<Error = <Self as Hv1>::Error>> {
+        self.inner.sev.is_some().then_some(self)
     }
 
     fn doorbell_registration(
