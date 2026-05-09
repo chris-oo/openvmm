@@ -16,6 +16,7 @@ use crate::KvmPartition;
 use crate::KvmPartitionInner;
 use crate::KvmProcessorBinder;
 use crate::KvmRunVpError;
+use crate::SnpLaunchState;
 use crate::gsi::GsiRouting;
 use crate::gsi::KvmIrqFdState;
 use crate::gsi::MsiRouteBuilder;
@@ -434,6 +435,7 @@ impl ProtoPartition for KvmProtoPartition<'_> {
         let partition = Arc::new(KvmPartitionInner {
             kvm: self.vm,
             sev: self.sev,
+            snp_launch_state: Mutex::new(SnpLaunchState::NotStarted),
             memory: Default::default(),
             memory_backing_mode: match self.config.isolation {
                 virt::IsolationType::None => KvmMemoryBackingMode::Userspace,
