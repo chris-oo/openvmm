@@ -330,6 +330,12 @@ impl VmManifestBuilder {
             }
             BaseChipsetType::EnlightenedLinuxDirect => {
                 result.chipset = BaseChipsetManifest::empty();
+                result.maybe_attach_arch_serial(
+                    self.arch,
+                    self.serial_wait_for_rts,
+                    false,
+                    self.serial,
+                )?;
             }
             BaseChipsetType::HypervGen2Uefi | BaseChipsetType::HyperVGen2LinuxDirect => {
                 let is_x86 = matches!(self.arch, MachineArch::X86_64);
