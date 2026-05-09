@@ -220,9 +220,17 @@ enum KvmRunVpError {
     InvalidVpState,
     #[error("failed to run VP")]
     Run(#[source] kvm::Error),
-    #[cfg_attr(guest_arch = "x86_64", expect(dead_code))]
     #[error("unhandled system event type: {0:#x}")]
     UnhandledSystemEvent(u32),
+    #[cfg(guest_arch = "x86_64")]
+    #[error(
+        "SEV guest requested termination: ghcb_msr={ghcb_msr:#x} reason_set={reason_set:#x} reason={reason:#x}"
+    )]
+    SevTermination {
+        ghcb_msr: u64,
+        reason_set: u64,
+        reason: u64,
+    },
     #[cfg(guest_arch = "x86_64")]
     #[error("failed to inject an extint interrupt")]
     ExtintInterrupt(#[source] kvm::Error),

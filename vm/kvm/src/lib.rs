@@ -1836,7 +1836,6 @@ impl<'a> VpRunner<'a> {
                     error: &mut msr.error,
                 }
             }
-            #[cfg(target_arch = "aarch64")]
             KVM_EXIT_SYSTEM_EVENT => {
                 // SAFETY: this is the active union field.
                 let system_event = unsafe { &self.run_data().__bindgen_anon_1.system_event };
@@ -1952,7 +1951,6 @@ pub enum Exit<'a> {
     Eoi {
         irq: u8,
     },
-    #[cfg(target_arch = "aarch64")]
     SystemEvent {
         event_type: u32,
         event_flags: u64,

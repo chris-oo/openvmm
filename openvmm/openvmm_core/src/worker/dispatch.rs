@@ -2790,6 +2790,7 @@ impl LoadedVmInner {
                 ref kernel,
                 ref initrd,
                 ref cmdline,
+                kernel_format,
                 enable_serial,
                 ref custom_dsdt,
                 boot_mode,
@@ -2804,6 +2805,7 @@ impl LoadedVmInner {
                     kernel,
                     initrd,
                     cmdline,
+                    kernel_format,
                     mem_layout: &self.mem_layout,
                     snp_isolation: self.hypervisor_cfg.with_isolation == Some(IsolationType::Snp),
                 };
@@ -2841,6 +2843,7 @@ impl LoadedVmInner {
                 ref kernel,
                 ref initrd,
                 ref cmdline,
+                kernel_format,
                 enable_serial,
                 custom_dsdt: _,
                 boot_mode,
@@ -2851,6 +2854,7 @@ impl LoadedVmInner {
                     kernel,
                     initrd,
                     cmdline,
+                    kernel_format,
                     mem_layout: &self.mem_layout,
                     snp_isolation: false,
                 };

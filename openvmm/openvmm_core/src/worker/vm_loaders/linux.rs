@@ -8,8 +8,10 @@ use loader::linux::AcpiConfig;
 use loader::linux::CommandLineConfig;
 use loader::linux::InitrdAddressType;
 use loader::linux::InitrdConfig;
+use loader::linux::KernelFormat;
 use loader::linux::RegisterConfig;
 use loader::linux::ZeroPageConfig;
+use openvmm_defs::config::LinuxKernelFormat;
 use std::ffi::CString;
 use std::io::Seek;
 use thiserror::Error;
@@ -50,6 +52,7 @@ pub struct KernelConfig<'a> {
     pub kernel: &'a std::fs::File,
     pub initrd: &'a Option<std::fs::File>,
     pub cmdline: &'a str,
+    pub kernel_format: LinuxKernelFormat,
     pub mem_layout: &'a MemoryLayout,
     pub snp_isolation: bool,
 }
@@ -141,6 +144,10 @@ pub fn load_linux_x86(
         zero_page_config,
         acpi_config,
         register_config,
+        match cfg.kernel_format {
+            LinuxKernelFormat::Elf => KernelFormat::Elf,
+            LinuxKernelFormat::BzImage => KernelFormat::BzImage,
+        },
         snp_boot,
     )
     .map_err(Error::Loader)?;

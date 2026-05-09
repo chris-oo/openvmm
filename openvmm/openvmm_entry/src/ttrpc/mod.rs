@@ -518,6 +518,7 @@ impl VmService {
                     kernel,
                     initrd,
                     cmdline: boot.kernel_cmdline,
+                    kernel_format: openvmm_defs::config::LinuxKernelFormat::Elf,
                     custom_dsdt: None,
                     enable_serial: true,
                     boot_mode: openvmm_defs::config::LinuxDirectBootMode::Acpi,

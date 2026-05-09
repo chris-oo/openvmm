@@ -1,6 +1,6 @@
 #!/bin/bash
-# Copy OpenVMM plus the OpenHCL kernel package artifacts used by IGVM builds to
-# an SNP-capable host for the current Linux-direct KVM SNP bring-up path.
+# Copy OpenVMM plus the Linux direct-boot artifacts to an SNP-capable host for
+# the current KVM SNP bring-up path.
 
 set -euo pipefail
 
@@ -10,7 +10,7 @@ DEST="${SNP_DEST:-~/snp-openvmm}"
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 OPENVMM_BIN="${OPENVMM_BIN:-$REPO_ROOT/target/x86_64-unknown-linux-gnu/debug/openvmm}"
-OPENHCL_KERNEL="${SNP_KERNEL:-$REPO_ROOT/.packages/underhill-deps-private/x64/vmlinux}"
+LINUX_KERNEL="${SNP_KERNEL:-$REPO_ROOT/vmlinuz-6.17.0-23-generic}"
 OPENHCL_INITRD="${SNP_INITRD:-$REPO_ROOT/.packages/underhill-deps-private/x64/initrd}"
 RUN_SCRIPT="$REPO_ROOT/run-snp-openvmm.sh"
 
@@ -35,7 +35,7 @@ check_artifact() {
 }
 
 check_artifact "OpenVMM binary" "$OPENVMM_BIN" "cargo build --target x86_64-unknown-linux-gnu -p openvmm"
-check_artifact "OpenHCL kernel package vmlinux" "$OPENHCL_KERNEL" "cargo xflowey restore-packages"
+check_artifact "Linux bzImage kernel" "$LINUX_KERNEL" "copy vmlinuz-6.17.0-23-generic to the repo root or set SNP_KERNEL"
 check_artifact "OpenHCL kernel package initrd" "$OPENHCL_INITRD" "cargo xflowey restore-packages"
 check_artifact "SNP run helper" "$RUN_SCRIPT" "restore or recreate run-snp-openvmm.sh at the repo root"
 
@@ -48,11 +48,15 @@ if (( missing != 0 )); then
 fi
 
 ssh "$HOST" "mkdir -p $DEST"
-scp "$OPENVMM_BIN" "$HOST:$DEST/openvmm"
+scp "$OPENVMM_BIN" "$HOST:$DEST/openvmm.new"
+ssh "$HOST" "mv -f $DEST/openvmm.new $DEST/openvmm"
 ssh "$HOST" "rm -f $DEST/openhcl.bin"
-scp "$OPENHCL_KERNEL" "$HOST:$DEST/vmlinux"
-scp "$OPENHCL_INITRD" "$HOST:$DEST/initrd"
-scp "$RUN_SCRIPT" "$HOST:$DEST/run-snp-openvmm.sh"
+scp "$LINUX_KERNEL" "$HOST:$DEST/vmlinuz-6.17.0-23-generic.new"
+ssh "$HOST" "mv -f $DEST/vmlinuz-6.17.0-23-generic.new $DEST/vmlinuz-6.17.0-23-generic"
+scp "$OPENHCL_INITRD" "$HOST:$DEST/initrd.new"
+ssh "$HOST" "mv -f $DEST/initrd.new $DEST/initrd"
+scp "$RUN_SCRIPT" "$HOST:$DEST/run-snp-openvmm.sh.new"
+ssh "$HOST" "mv -f $DEST/run-snp-openvmm.sh.new $DEST/run-snp-openvmm.sh"
 
 echo "Copied SNP artifacts to $HOST:$DEST"
 echo "Run with:"
