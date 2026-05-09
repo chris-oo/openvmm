@@ -76,6 +76,10 @@ pub enum KvmError {
     InvalidSnpLaunchRange,
     #[error("too many CPUID entries for SNP launch page: {0}")]
     TooManySnpCpuidEntries(usize),
+    #[error("SNP launch is already in progress")]
+    SnpLaunchInProgress,
+    #[error("SNP launch previously failed")]
+    SnpLaunchFailed,
     #[error("misaligned gic base address")]
     Misaligned,
     #[error("host does not support GICv2 or GICv3")]
@@ -141,6 +145,9 @@ struct KvmPartitionInner {
     #[cfg(guest_arch = "x86_64")]
     #[inspect(skip)]
     sev: Option<File>,
+    #[cfg(guest_arch = "x86_64")]
+    #[inspect(skip)]
+    snp_launch_state: Mutex<SnpLaunchState>,
     memory: Mutex<KvmMemoryRangeState>,
     memory_backing_mode: KvmMemoryBackingMode,
     #[inspect(iter_by_index)]
@@ -174,11 +181,20 @@ struct KvmPartitionInner {
 }
 
 #[cfg(guest_arch = "x86_64")]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) enum SnpLaunchState {
+    NotStarted,
+    Started,
+    Finished,
+    Failed,
+}
+
+#[cfg(guest_arch = "x86_64")]
 impl virt::AcceptInitialPages for KvmPartition {
     type Error = KvmError;
 
     fn accept_initial_pages(&self, pages: &[virt::InitialAcceptedPage]) -> Result<(), Self::Error> {
-        self.inner.snp_launch_update_initial_pages(pages)
+        self.inner.snp_launch_initial_pages(pages)
     }
 }
 
@@ -371,7 +387,34 @@ impl KvmPartitionInner {
     }
 
     #[cfg(guest_arch = "x86_64")]
-    fn snp_launch_update_initial_pages(
+    fn snp_launch_initial_pages(
+        &self,
+        pages: &[virt::InitialAcceptedPage],
+    ) -> Result<(), KvmError> {
+        {
+            let mut state = self.snp_launch_state.lock();
+            match *state {
+                SnpLaunchState::NotStarted => *state = SnpLaunchState::Started,
+                SnpLaunchState::Started => return Err(KvmError::SnpLaunchInProgress),
+                SnpLaunchState::Finished => return Ok(()),
+                SnpLaunchState::Failed => return Err(KvmError::SnpLaunchFailed),
+            }
+        }
+
+        match self.snp_launch_initial_pages_inner(pages) {
+            Ok(()) => {
+                *self.snp_launch_state.lock() = SnpLaunchState::Finished;
+                Ok(())
+            }
+            Err(err) => {
+                *self.snp_launch_state.lock() = SnpLaunchState::Failed;
+                Err(err)
+            }
+        }
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    fn snp_launch_initial_pages_inner(
         &self,
         pages: &[virt::InitialAcceptedPage],
     ) -> Result<(), KvmError> {
@@ -425,6 +468,8 @@ impl KvmPartitionInner {
             }
         }
         self.kvm.sev_launch_update_vmsa(sev.as_fd())?;
+        self.kvm
+            .sev_snp_launch_finish(sev.as_fd(), &mut Default::default())?;
         Ok(())
     }
 }
