@@ -1011,14 +1011,33 @@ impl InitializedVm {
         }
 
         if cfg.hypervisor.with_isolation == Some(IsolationType::Snp) {
-            if matches!(cfg.load_mode, LoadMode::Pcat { .. }) {
-                anyhow::bail!("KVM SNP guest_memfd does not support PCAT load mode");
+            if !matches!(cfg.load_mode, LoadMode::Linux { .. }) {
+                anyhow::bail!("KVM SNP guest_memfd currently only supports direct Linux load mode");
+            }
+            if cfg.processor_topology.proc_count != 1 {
+                anyhow::bail!("KVM SNP guest_memfd currently supports exactly one VP");
+            }
+            if cfg.hypervisor.with_hv {
+                anyhow::bail!("KVM SNP guest_memfd does not support Hyper-V enlightenments");
+            }
+            if cfg.hypervisor.with_vtl2.is_some() {
+                anyhow::bail!("KVM SNP guest_memfd does not support VTL2");
             }
             if cfg.chipset.with_hyperv_vga {
                 anyhow::bail!("KVM SNP guest_memfd does not support Hyper-V VGA");
             }
             if cfg.chipset.with_i440bx_host_pci_bridge {
                 anyhow::bail!("KVM SNP guest_memfd does not support the i440BX host PCI bridge");
+            }
+            if cfg.vmbus.is_some() || cfg.vtl2_vmbus.is_some() || !cfg.vmbus_devices.is_empty() {
+                anyhow::bail!("KVM SNP guest_memfd does not support VMBus");
+            }
+            if !cfg.floppy_disks.is_empty()
+                || !cfg.ide_disks.is_empty()
+                || !cfg.virtio_devices.is_empty()
+                || cfg.vmgs.is_some()
+            {
+                anyhow::bail!("KVM SNP guest_memfd does not support disks");
             }
         }
 

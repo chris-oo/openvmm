@@ -430,10 +430,6 @@ impl KvmPartitionInner {
 
         let memory = self.memory.lock();
         for page in pages {
-            if page.visibility == virt::PageVisibility::Shared {
-                continue;
-            }
-
             let launch_page_type = arch::snp::snp_launch_page_type(page.acceptance)?;
             let Some(kvm_page_type) = launch_page_type.kvm_page_type() else {
                 return Err(KvmError::UnsupportedSnpPageAcceptance(page.acceptance));
