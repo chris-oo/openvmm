@@ -406,13 +406,16 @@ impl KvmPartitionInner {
             }
         }
 
+        tracing::info!(page_ranges = pages.len(), "starting SNP launch");
         match self.snp_launch_initial_pages_inner(pages) {
             Ok(()) => {
                 *self.snp_launch_state.lock() = SnpLaunchState::Finished;
+                tracing::info!("finished SNP launch");
                 Ok(())
             }
             Err(err) => {
                 *self.snp_launch_state.lock() = SnpLaunchState::Failed;
+                tracing::error!(error = &err as &dyn std::error::Error, "failed SNP launch");
                 Err(err)
             }
         }
@@ -425,8 +428,13 @@ impl KvmPartitionInner {
     ) -> Result<(), KvmError> {
         let sev = self.sev.as_ref().ok_or(KvmError::IsolationNotSupported)?;
         self.kvm.check_sev_snp_launch_extensions()?;
+        let mut launch_start = kvm::kvm_sev_snp_launch_start {
+            policy: (1 << 17) | (1 << 16),
+            ..Default::default()
+        };
+        tracing::debug!(policy = launch_start.policy, "KVM_SEV_SNP_LAUNCH_START");
         self.kvm
-            .sev_snp_launch_start(sev.as_fd(), &mut Default::default())?;
+            .sev_snp_launch_start(sev.as_fd(), &mut launch_start)?;
 
         let memory = self.memory.lock();
         for page in pages {
@@ -437,6 +445,12 @@ impl KvmPartitionInner {
 
             let private_range = private_memory_range_from_slots(page.range, &memory.ranges)?;
             if page.acceptance == BootPageAcceptance::CpuidPage {
+                tracing::debug!(
+                    gpa = page.range.start(),
+                    len = page.range.len(),
+                    cpuid_entries = self.bsp_cpuid.len(),
+                    "writing SNP CPUID page"
+                );
                 write_snp_cpuid_page(private_range.hva, page.range.len(), &self.bsp_cpuid)?;
             }
             let bytes = unsafe {
@@ -459,6 +473,14 @@ impl KvmPartitionInner {
                 } else {
                     private_range.hva.wrapping_add(run.byte_offset) as u64
                 };
+                tracing::trace!(
+                    gpa,
+                    len = run.byte_len,
+                    ?page_type,
+                    acceptance = ?page.acceptance,
+                    tag = page.tag.as_str(),
+                    "KVM_SEV_SNP_LAUNCH_UPDATE"
+                );
                 self.kvm.sev_snp_launch_update(
                     sev.as_fd(),
                     gpa / hvdef::HV_PAGE_SIZE,
@@ -468,7 +490,9 @@ impl KvmPartitionInner {
                 )?;
             }
         }
+        tracing::debug!("KVM_SEV_LAUNCH_UPDATE_VMSA");
         self.kvm.sev_launch_update_vmsa(sev.as_fd())?;
+        tracing::debug!("KVM_SEV_SNP_LAUNCH_FINISH");
         self.kvm
             .sev_snp_launch_finish(sev.as_fd(), &mut Default::default())?;
         Ok(())
