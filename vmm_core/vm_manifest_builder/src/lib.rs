@@ -365,7 +365,8 @@ impl VmManifestBuilder {
                         false,
                         self.serial,
                     )?
-                    .attach_missing_arch_ports(self.arch, false);
+                    .attach_missing_arch_ports(self.arch, false)
+                    .attach_missing_pci_config_ports(self.arch);
             }
             BaseChipsetType::HypervGen2Uefi | BaseChipsetType::HyperVGen2LinuxDirect => {
                 let is_x86 = matches!(self.arch, MachineArch::X86_64);
@@ -665,6 +666,19 @@ impl VmChipsetResult {
                         .into_resource(),
                 },
             ]);
+        }
+        self
+    }
+
+    fn attach_missing_pci_config_ports(&mut self, arch: MachineArch) -> &mut Self {
+        if arch == MachineArch::X86_64 {
+            self.chipset_devices.push(ChipsetDeviceHandle {
+                name: "missing-pci".to_owned(),
+                resource: MissingDevHandle::new()
+                    .claim_pio("address", 0xcf8..=0xcfb)
+                    .claim_pio("data", 0xcfc..=0xcff)
+                    .into_resource(),
+            });
         }
         self
     }
