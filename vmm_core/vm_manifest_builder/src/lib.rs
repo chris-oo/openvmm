@@ -329,13 +329,43 @@ impl VmManifestBuilder {
                 }
             }
             BaseChipsetType::EnlightenedLinuxDirect => {
-                result.chipset = BaseChipsetManifest::empty();
-                result.maybe_attach_arch_serial(
-                    self.arch,
-                    self.serial_wait_for_rts,
-                    false,
-                    self.serial,
-                )?;
+                let is_x86 = matches!(self.arch, MachineArch::X86_64);
+                result.chipset = BaseChipsetManifest {
+                    with_generic_cmos_rtc: is_x86,
+                    with_generic_ioapic: is_x86,
+                    with_generic_isa_dma: false,
+                    with_generic_isa_floppy: false,
+                    with_generic_pci_bus: false,
+                    with_generic_psp: self.psp,
+                    with_hyperv_firmware_pcat: false,
+                    with_hyperv_firmware_uefi: false,
+                    with_hyperv_framebuffer: self.framebuffer,
+                    with_hyperv_guest_watchdog: self.guest_watchdog,
+                    with_hyperv_ide: false,
+                    with_hyperv_power_management: is_x86,
+                    with_hyperv_vga: false,
+                    with_i440bx_host_pci_bridge: false,
+                    with_piix4_cmos_rtc: false,
+                    with_piix4_pci_bus: false,
+                    with_piix4_power_management: false,
+                    with_underhill_vga_proxy: false,
+                    with_winbond_super_io_and_floppy_stub: false,
+                    with_winbond_super_io_and_floppy_full: false,
+                };
+                result.capabilities.with_ioapic = is_x86;
+                result.capabilities.with_psp = self.psp;
+                if is_x86 {
+                    result.attach_pic();
+                    result.attach_pit();
+                }
+                result
+                    .maybe_attach_arch_serial(
+                        self.arch,
+                        self.serial_wait_for_rts,
+                        false,
+                        self.serial,
+                    )?
+                    .attach_missing_arch_ports(self.arch, false);
             }
             BaseChipsetType::HypervGen2Uefi | BaseChipsetType::HyperVGen2LinuxDirect => {
                 let is_x86 = matches!(self.arch, MachineArch::X86_64);
