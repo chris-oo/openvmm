@@ -31,6 +31,7 @@ done
 exec env OPENVMM_LOG="$OPENVMM_LOG" "$OPENVMM_BIN" \
     --hypervisor kvm \
     --isolation snp \
+    --com1 console \
     --kernel "$KERNEL" \
     --linux-kernel-format "$KERNEL_FORMAT" \
     --initrd "$INITRD" \
