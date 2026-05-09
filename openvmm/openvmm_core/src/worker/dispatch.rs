@@ -2625,15 +2625,6 @@ impl LoadedVmInner {
             );
         }
 
-        // Only set initial page visibility on isolated partitions.
-        if self.hypervisor_cfg.with_isolation.is_some() {
-            tracing::debug!(?initial_page_vis, "initial_page_vis");
-            self.partition_unit
-                .set_initial_page_visibility(initial_page_vis)
-                .await
-                .context("failed to set initial page visibility")?;
-        }
-
         let initial_regs = initial_regs(
             &regs,
             self.partition.caps(),
@@ -2652,6 +2643,16 @@ impl LoadedVmInner {
             )
             .await
             .context("failed to set initial register state")?;
+
+        // Only set initial page visibility on isolated partitions. Keep this
+        // after register setup so backends can finalize protected CPU state.
+        if self.hypervisor_cfg.with_isolation.is_some() {
+            tracing::debug!(?initial_page_vis, "initial_page_vis");
+            self.partition_unit
+                .set_initial_page_visibility(initial_page_vis)
+                .await
+                .context("failed to set initial page visibility")?;
+        }
 
         Ok(())
     }
