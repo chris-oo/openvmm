@@ -33,6 +33,7 @@ pub fn is_available() -> Result<bool, KvmError> {
 
 use arch::KvmVpInner;
 use hvdef::Vtl;
+use loader::importer::BootPageAcceptance;
 use std::fs::File;
 use std::sync::atomic::Ordering;
 use virt::VpIndex;
@@ -54,6 +55,8 @@ pub enum KvmError {
     SnpPrivateMemoryNotImplemented,
     #[error("guest_memfd-backed KVM VM launch is not implemented")]
     GuestMemfdLaunchNotImplemented,
+    #[error("unsupported SNP launch page acceptance: {0:?}")]
+    UnsupportedSnpPageAcceptance(BootPageAcceptance),
     #[error("kvm error")]
     Kvm(#[from] kvm::Error),
     #[error("failed to stat /dev/kvm")]

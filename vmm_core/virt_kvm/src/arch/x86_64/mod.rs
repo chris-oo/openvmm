@@ -6,6 +6,7 @@
 #![cfg(all(target_os = "linux", guest_arch = "x86_64"))]
 
 mod regs;
+mod snp;
 mod vm_state;
 mod vp_state;
 
