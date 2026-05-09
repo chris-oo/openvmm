@@ -794,6 +794,17 @@ impl virt::BindProcessor for KvmProcessorBinder {
             vp.access_state(Vtl::Vtl0).check_reset_all(&vp_info);
         }
 
+        if self.partition.sev.is_some() && !vp_info.base.is_bsp() {
+            // SNP APs are started through the guest's GHCB AP creation request.
+            // Keep them halted so KVM can wake them to install the
+            // guest-provided VMSA instead of blocking in the uninitialized/APIC
+            // startup path.
+            //
+            // It is unclear exactly what the inteneded initial starting state
+            // should be. KVM_MP_STATE_INIT_RECEIVED does not work.
+            vp.kvm.set_mp_state(kvm::KVM_MP_STATE_HALTED)?;
+        }
+
         Ok(vp)
     }
 }
@@ -1328,7 +1339,7 @@ impl Processor for KvmProcessor<'_> {
                 pending_exit = true;
                 match exit {
                     kvm::Exit::Interrupted => {
-                        tracing::trace!("interrupted");
+                        tracing::trace!(vp_index = self.vpindex.index(), "interrupted");
                         pending_exit = false;
                     }
                     kvm::Exit::InterruptWindow => {

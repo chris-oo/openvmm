@@ -1014,9 +1014,6 @@ impl InitializedVm {
             if !matches!(cfg.load_mode, LoadMode::Linux { .. }) {
                 anyhow::bail!("KVM SNP guest_memfd currently only supports direct Linux load mode");
             }
-            if cfg.processor_topology.proc_count != 1 {
-                anyhow::bail!("KVM SNP guest_memfd currently supports exactly one VP");
-            }
             if cfg.hypervisor.with_hv {
                 anyhow::bail!("KVM SNP guest_memfd does not support Hyper-V enlightenments");
             }
