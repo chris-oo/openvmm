@@ -2450,6 +2450,7 @@ impl LoadedVmInner {
                     initrd,
                     cmdline,
                     mem_layout: &self.mem_layout,
+                    snp_isolation: self.hypervisor_cfg.with_isolation == Some(IsolationType::Snp),
                 };
                 if custom_dsdt.is_none() && self.mem_layout.mmio().len() < 2 {
                     anyhow::bail!("at least two mmio regions are required");
@@ -2496,6 +2497,7 @@ impl LoadedVmInner {
                     initrd,
                     cmdline,
                     mem_layout: &self.mem_layout,
+                    snp_isolation: false,
                 };
 
                 let with_hv = self.hypervisor_cfg.with_hv;
