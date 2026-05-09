@@ -11,7 +11,7 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 OPENVMM_BIN="${OPENVMM_BIN:-$REPO_ROOT/target/x86_64-unknown-linux-gnu/debug/openvmm}"
 LINUX_KERNEL="${SNP_KERNEL:-$REPO_ROOT/vmlinuz-6.17.0-23-generic}"
-OPENHCL_INITRD="${SNP_INITRD:-$REPO_ROOT/.packages/underhill-deps-private/x64/initrd}"
+LINUX_INITRD="${SNP_INITRD:-$REPO_ROOT/target/vmm-tests/x64/initrd}"
 RUN_SCRIPT="$REPO_ROOT/run-snp-openvmm.sh"
 
 echo "Building OpenVMM..."
@@ -36,7 +36,7 @@ check_artifact() {
 
 check_artifact "OpenVMM binary" "$OPENVMM_BIN" "cargo build --target x86_64-unknown-linux-gnu -p openvmm"
 check_artifact "Linux bzImage kernel" "$LINUX_KERNEL" "copy vmlinuz-6.17.0-23-generic to the repo root or set SNP_KERNEL"
-check_artifact "OpenHCL kernel package initrd" "$OPENHCL_INITRD" "cargo xflowey restore-packages"
+check_artifact "Linux direct-boot initrd" "$LINUX_INITRD" "build or restore the vmm-tests initrd, or set SNP_INITRD"
 check_artifact "SNP run helper" "$RUN_SCRIPT" "restore or recreate run-snp-openvmm.sh at the repo root"
 
 if (( missing != 0 )); then
@@ -53,7 +53,7 @@ ssh "$HOST" "mv -f $DEST/openvmm.new $DEST/openvmm"
 ssh "$HOST" "rm -f $DEST/openhcl.bin"
 scp "$LINUX_KERNEL" "$HOST:$DEST/vmlinuz-6.17.0-23-generic.new"
 ssh "$HOST" "mv -f $DEST/vmlinuz-6.17.0-23-generic.new $DEST/vmlinuz-6.17.0-23-generic"
-scp "$OPENHCL_INITRD" "$HOST:$DEST/initrd.new"
+scp "$LINUX_INITRD" "$HOST:$DEST/initrd.new"
 ssh "$HOST" "mv -f $DEST/initrd.new $DEST/initrd"
 scp "$RUN_SCRIPT" "$HOST:$DEST/run-snp-openvmm.sh.new"
 ssh "$HOST" "mv -f $DEST/run-snp-openvmm.sh.new $DEST/run-snp-openvmm.sh"
