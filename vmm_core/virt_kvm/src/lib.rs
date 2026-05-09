@@ -88,6 +88,10 @@ pub enum KvmError {
     SnpLaunchInProgress,
     #[error("SNP launch previously failed")]
     SnpLaunchFailed,
+    #[error("invalid KVM_HC_MAP_GPA_RANGE request")]
+    InvalidMapGpaRange,
+    #[error("unsupported KVM_HC_MAP_GPA_RANGE attributes: {0:#x}")]
+    UnsupportedMapGpaRangeAttributes(u64),
     #[error("misaligned gic base address")]
     Misaligned,
     #[error("host does not support GICv2 or GICv3")]
@@ -400,6 +404,54 @@ impl KvmPartitionInner {
                 classify_guest_memfd_backing(range, &self.ram_ranges)
             }
         }
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    fn set_map_gpa_range_attributes(
+        &self,
+        gpa: u64,
+        page_count: u64,
+        map_attributes: u64,
+    ) -> Result<(), KvmError> {
+        const KVM_MAP_GPA_RANGE_PAGE_SIZE_MASK: u64 = 0x3;
+        const KVM_MAP_GPA_RANGE_ENC_STATUS_MASK: u64 = 0xf << 4;
+
+        let size = page_count
+            .checked_mul(hvdef::HV_PAGE_SIZE)
+            .ok_or(KvmError::InvalidMapGpaRange)?;
+        let end = gpa.checked_add(size).ok_or(KvmError::InvalidMapGpaRange)?;
+        if !gpa.is_multiple_of(hvdef::HV_PAGE_SIZE) || size == 0 {
+            return Err(KvmError::InvalidMapGpaRange);
+        }
+        if map_attributes & KVM_MAP_GPA_RANGE_PAGE_SIZE_MASK != 0 {
+            return Err(KvmError::UnsupportedMapGpaRangeAttributes(map_attributes));
+        }
+        let private = match map_attributes & KVM_MAP_GPA_RANGE_ENC_STATUS_MASK {
+            kvm::KVM_MAP_GPA_RANGE_DECRYPTED_UAPI => false,
+            kvm::KVM_MAP_GPA_RANGE_ENCRYPTED_UAPI => true,
+            _ => return Err(KvmError::UnsupportedMapGpaRangeAttributes(map_attributes)),
+        };
+
+        let range = MemoryRange::new(gpa..end);
+        if !self.ram_ranges.iter().any(|ram| ram.contains(&range)) {
+            return Err(KvmError::InvalidMapGpaRange);
+        }
+
+        let attributes = if private {
+            kvm::KVM_MEMORY_ATTRIBUTE_PRIVATE as u64
+        } else {
+            0
+        };
+        tracing::debug!(
+            gpa,
+            size,
+            page_count,
+            map_attributes,
+            private,
+            "KVM_HC_MAP_GPA_RANGE set memory attributes"
+        );
+        self.kvm.set_memory_attributes(gpa, size, attributes)?;
+        Ok(())
     }
 
     #[cfg(guest_arch = "x86_64")]
