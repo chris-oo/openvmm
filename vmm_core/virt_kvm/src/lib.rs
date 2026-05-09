@@ -465,6 +465,11 @@ impl KvmPartitionInner {
                     "writing SNP CPUID page"
                 );
                 write_snp_cpuid_page(private_range.hva, page.range.len(), &self.bsp_cpuid)?;
+                Self::trace_snp_cpuid_page(
+                    "SNP CPUID page before launch update",
+                    private_range.hva,
+                    page.range.len(),
+                );
             }
             if page.tag == "linux-pagetables" {
                 let c_bit = snp_c_bit_from_cpuid(&self.bsp_cpuid)?;
@@ -525,12 +530,80 @@ impl KvmPartitionInner {
                     }
                     return Err(err.into());
                 }
+                if page.acceptance == BootPageAcceptance::CpuidPage {
+                    Self::trace_snp_cpuid_page(
+                        "SNP CPUID page after launch update",
+                        private_range.hva,
+                        page.range.len(),
+                    );
+                }
             }
         }
+        self.prepare_snp_vmsa_register_state()?;
         tracing::debug!("KVM_SEV_SNP_LAUNCH_FINISH");
         self.kvm
             .sev_snp_launch_finish(sev.as_fd(), &mut Default::default())?;
         Ok(())
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    fn prepare_snp_vmsa_register_state(&self) -> Result<(), KvmError> {
+        for vp in &self.vps {
+            let vp_info = vp.vp_info();
+            let kvm_vp = self.kvm.vp(vp_info.apic_id);
+            let sregs = kvm_vp.get_sregs()?;
+
+            let xcr0 = kvm_vp.get_xcr0()?;
+            if xcr0 & x86defs::xsave::XFEATURE_X87 == 0 {
+                kvm_vp.set_xcr0(xcr0 | x86defs::xsave::XFEATURE_X87)?;
+            }
+
+            if vp_info.base.vp_index.is_bsp() {
+                validate_snp_bsp_register_state(&kvm_vp.get_regs()?, &sregs)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    fn trace_snp_cpuid_page(message: &'static str, page: *const u8, page_len: u64) {
+        const SNP_CPUID_COUNT_MAX: usize = 64;
+        const SNP_CPUID_TABLE_HEADER_SIZE: usize = 16;
+        const SNP_CPUID_FN_SIZE: usize = 48;
+
+        if page_len < (SNP_CPUID_TABLE_HEADER_SIZE + SNP_CPUID_COUNT_MAX * SNP_CPUID_FN_SIZE) as u64
+        {
+            tracing::warn!(page_len, message);
+            return;
+        }
+
+        let page = unsafe { std::slice::from_raw_parts(page, page_len as usize) };
+        let count = u32::from_le_bytes(page[0..4].try_into().unwrap()) as usize;
+        let mut standard_range = None;
+        let mut hypervisor_range = None;
+        let mut extended_range = None;
+        let mut snp_leaf = None;
+        for index in 0..count.min(SNP_CPUID_COUNT_MAX) {
+            let offset = SNP_CPUID_TABLE_HEADER_SIZE + index * SNP_CPUID_FN_SIZE;
+            let entry = Self::read_snp_cpuid_fn(&page[offset..][..SNP_CPUID_FN_SIZE]);
+            match (entry.eax_in, entry.ecx_in) {
+                (0, 0) => standard_range = Some(entry.eax),
+                (0x4000_0000, 0) => hypervisor_range = Some(entry.eax),
+                (0x8000_0000, 0) => extended_range = Some(entry.eax),
+                (0x8000_001f, 0) => snp_leaf = Some((entry.eax, entry.ebx, entry.ecx, entry.edx)),
+                _ => {}
+            }
+        }
+
+        tracing::debug!(
+            count,
+            ?standard_range,
+            ?hypervisor_range,
+            ?extended_range,
+            ?snp_leaf,
+            message
+        );
     }
 
     #[cfg(guest_arch = "x86_64")]
@@ -645,6 +718,61 @@ fn snp_ram_hack_page(range: MemoryRange) -> virt::InitialAcceptedPage {
         acceptance: BootPageAcceptance::Exclusive,
         tag: "kvm-snp-ram-hack".into(),
     }
+}
+
+#[cfg(guest_arch = "x86_64")]
+fn validate_snp_bsp_register_state(
+    regs: &kvm::kvm_regs,
+    sregs: &kvm::kvm_sregs,
+) -> Result<(), KvmError> {
+    const REQUIRED_CR0: u64 = x86defs::X64_CR0_PE | x86defs::X64_CR0_PG;
+    const REQUIRED_CR4: u64 = x86defs::X64_CR4_PAE;
+    const REQUIRED_EFER: u64 =
+        x86defs::X64_EFER_LME | x86defs::X64_EFER_LMA | x86defs::X64_EFER_NXE;
+
+    if sregs.cr0 & REQUIRED_CR0 != REQUIRED_CR0 {
+        return Err(KvmError::InvalidState("invalid SNP BSP CR0"));
+    }
+    if sregs.cr3 == 0 {
+        return Err(KvmError::InvalidState("invalid SNP BSP CR3"));
+    }
+    if sregs.cr4 & REQUIRED_CR4 != REQUIRED_CR4 {
+        return Err(KvmError::InvalidState("invalid SNP BSP CR4"));
+    }
+    if sregs.efer & REQUIRED_EFER != REQUIRED_EFER {
+        return Err(KvmError::InvalidState("invalid SNP BSP EFER"));
+    }
+    if sregs.cs.present == 0 || sregs.cs.l == 0 {
+        return Err(KvmError::InvalidState("invalid SNP BSP CS"));
+    }
+    if sregs.cs.selector != 0x10 || sregs.ds.selector != 0x18 || sregs.es.selector != 0x18 {
+        return Err(KvmError::InvalidState(
+            "invalid SNP BSP Linux boot selectors",
+        ));
+    }
+    if regs.rip == 0 {
+        return Err(KvmError::InvalidState("invalid SNP BSP RIP"));
+    }
+
+    tracing::debug!(
+        rip = regs.rip,
+        rsi = regs.rsi,
+        cr0 = sregs.cr0,
+        cr3 = sregs.cr3,
+        cr4 = sregs.cr4,
+        efer = sregs.efer,
+        vmsa_efer = sregs.efer | x86defs::X64_EFER_SVME,
+        cs_selector = sregs.cs.selector,
+        cs_base = sregs.cs.base,
+        cs_limit = sregs.cs.limit,
+        cs_type = sregs.cs.type_,
+        ds_selector = sregs.ds.selector,
+        es_selector = sregs.es.selector,
+        ss_selector = sregs.ss.selector,
+        "validated SNP BSP register state"
+    );
+
+    Ok(())
 }
 
 #[cfg(guest_arch = "x86_64")]
