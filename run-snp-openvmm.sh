@@ -9,9 +9,8 @@ OPENVMM_BIN="${OPENVMM_BIN:-$SCRIPT_DIR/openvmm}"
 KERNEL="${SNP_KERNEL:-$SCRIPT_DIR/vmlinuz-6.17.0-23-generic}"
 KERNEL_FORMAT="${SNP_KERNEL_FORMAT:-bzimage}"
 INITRD="${SNP_INITRD:-$SCRIPT_DIR/initrd}"
-# The compressed Ubuntu kernel touches memory above 64MB during early boot.
-# Override with SNP_MEMORY when testing smaller/larger launch sizes.
-MEMORY="${SNP_MEMORY:-128MB}"
+# need 160 mb with compressed kernel and initrd
+MEMORY="${SNP_MEMORY:-160MB}"
 PROCESSORS="${SNP_PROCESSORS:-1}"
 KERNEL_CMDLINE="${SNP_CMDLINE:-console=ttyS0 earlyprintk=serial earlycon panic=-1}"
 OPENVMM_LOG="${OPENVMM_LOG:-info,virt_kvm=trace,kvm=trace,openvmm_core::worker::dispatch=debug}"
