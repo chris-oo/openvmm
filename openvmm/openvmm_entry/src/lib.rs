@@ -1798,12 +1798,14 @@ fn validate_isolation_config(cfg: &Config) -> anyhow::Result<()> {
                 | "missing-dev"
         )
     });
+    let only_virtio_pcie_devices = cfg
+        .pcie_devices
+        .iter()
+        .all(|device| device.resource.id() == "virtio");
 
     if !cfg.floppy_disks.is_empty()
         || !cfg.ide_disks.is_empty()
-        || !cfg.pcie_root_complexes.is_empty()
-        || !cfg.pcie_devices.is_empty()
-        || !cfg.pcie_switches.is_empty()
+        || !only_virtio_pcie_devices
         || !cfg.vpci_devices.is_empty()
         || !only_supported_chipset_devices
         || !cfg.pci_chipset_devices.is_empty()
