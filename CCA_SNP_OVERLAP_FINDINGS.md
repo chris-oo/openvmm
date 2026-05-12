@@ -4,7 +4,7 @@ This note summarizes how much of the work to support AMD SEV-SNP in OpenVMM is
 also useful for supporting Arm CCA/Realms, based on:
 
 - `SEV_SNP_SUPPORT_TRACKING.md` in this repository;
-- the Arm CCA v13 KVM patch series in `~/ai/eevee/kvm-mail`;
+- the Arm CCA v13 KVM patch series in `~/ai/eevee/kvm-mail` git history;
 - the CCA-enabled kvmtool tree in `~/ai/eevee/kvmtool-cca`.
 
 ## Executive summary
@@ -118,6 +118,17 @@ The CCA-enabled kvmtool tree models Realm support as a distinct Arm path:
 
 ## Evidence from CCA v13 on LKML
 
+The actual v13 CCA KVM series is present in the git history of
+`~/ai/eevee/kvm-mail`. The currently checked-out mailbox file is a later SNP
+thread, but the CCA series starts at commit `b8278cbee`:
+`[PATCH v13 00/48] arm64: Support for Arm CCA in KVM`.
+
+The v13 cover letter says the series targets RMM v2.0-beta0, uses the same page
+size in the RMM as the host, adds range-based RMI APIs, changes GIC handling so
+system registers carry GIC state, and points to the reference branches
+`linux-cca cca-host/v13`, `kvmtool-cca cca/v11`, and TF-RMM
+`topics/rmm-v2.0-poc`.
+
 The v13 CCA series in `~/ai/eevee/kvm-mail` is broad and includes:
 
 - RMI SMC definitions and wrappers;
@@ -143,18 +154,43 @@ The v13 CCA series in `~/ai/eevee/kvm-mail` is broad and includes:
 Two particularly important overlaps with SNP are visible in the series:
 
 1. **Private memory support.** The patch titled
-   `[PATCH v13 23/48] KVM: arm64: Expose support for private memory` selects
-   `KVM_GUEST_MEMFD` and `KVM_GENERIC_MEMORY_ATTRIBUTES`, and makes private
-   memory depend on the VM being a Realm.
+    `[PATCH v13 23/48] KVM: arm64: Expose support for private memory` selects
+    `KVM_GUEST_MEMFD` and `KVM_GENERIC_MEMORY_ATTRIBUTES`, and makes private
+    memory depend on the VM being a Realm. In the local archive this is commit
+    `0795c6df5`, and its implementation exposes private memory through
+    `kvm_arch_has_private_mem(kvm) ((kvm)->arch.is_realm)`.
 2. **Initial protected population.** The patch titled
-   `[PATCH v13 24/48] arm64: RMI: Allow populating initial contents` adds an
-   ioctl path for userspace to populate Realm memory from userspace buffers,
-   optionally measuring the populated data.
+    `[PATCH v13 24/48] arm64: RMI: Allow populating initial contents` adds an
+    ioctl path for userspace to populate Realm memory from userspace buffers,
+    optionally measuring the populated data. In the local archive this is commit
+    `2e2a5976a`; it adds `KVM_ARM_RMI_POPULATE` and
+    `KVM_ARM_RMI_POPULATE_FLAGS_MEASURE` and adapts the path to generic
+    `kvm_gmem_populate()`.
 
 The RIPAS conversion patch also shows a direct conceptual match with SNP runtime
 conversion handling: `RMI_EXIT_RIPAS_CHANGE` represents a Realm request to move
 memory between protected and unprotected states, and userspace must coordinate
 the backing guest memory and mappings before KVM completes the change.
+
+Other concrete local commits that matter for OpenVMM are:
+
+- `090fc4810` (`[PATCH v13 11/48] arm64: RMI: Define the user ABI`), which adds
+  the RMI userspace ABI including `KVM_ARM_RMI_POPULATE` and
+  `KVM_ARM_VCPU_RMI_PSCI_COMPLETE`;
+- `83be1f29b` (`[PATCH v13 14/48] KVM: arm64: Allow passing machine type in KVM
+  creation`), which implies OpenVMM needs a Realm machine-type path for
+  `KVM_CREATE_VM`;
+- `cf5509763` (`[PATCH v13 16/48] arm64: RMI: Activate realm on first VCPU
+  run`) and `cf0d9ce3c` (`[PATCH v13 17/48] arm64: RMI: Allocate/free RECs to
+  match vCPUs`), which define the Realm activation/REC lifecycle shape;
+- `5afed3c7f`, `94f4b078e`, and `06abb37c2`, which cover Realm enter/exit,
+  `RMI_EXIT_RIPAS_CHANGE`, and Realm MMIO emulation;
+- `f8febed70` (`[PATCH v13 30/48] KVM: arm64: Handle Realm PSCI requests`),
+  which confirms Realm PSCI is a VMM-visible responsibility;
+- `ac787af0e` (`[PATCH v13 37/48] arm64: RMI: Prevent Device mappings for
+  Realms`), which requires strict device/DMA policy; and
+- `660d53c2b` and `29db34d15`, which expose `KVM_ARM_VCPU_REC` and enable Realm
+  VM creation.
 
 ## Implication for OpenVMM
 
