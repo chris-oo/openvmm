@@ -162,10 +162,6 @@ pub enum Error {
     ImportInitrd(#[source] ImportFileRegionError),
     #[error("failed to import bzImage payload")]
     ImportBzImage(#[source] ImportFileRegionError),
-    #[error("invalid bzImage: {0}")]
-    InvalidBzImage(&'static str),
-    #[error("failed to read bzImage")]
-    ReadBzImage(#[source] std::io::Error),
     #[error("PageTableBuilder: {0}")]
     PageTableBuilder(#[from] page_table::Error),
 }
@@ -298,8 +294,6 @@ pub struct KernelInfo {
     pub size: u64,
     /// The gpa of the entrypoint of the kernel.
     pub entrypoint: u64,
-    /// The setup header copied from a bzImage, when applicable.
-    pub setup_header: Option<defs::setup_header>,
 }
 
 /// Information returned about the initrd loaded.
@@ -501,94 +495,6 @@ where
             gpa: min_addr,
             size: next_addr - min_addr,
             entrypoint,
-            setup_header: None,
-        },
-        initrd: initrd_info,
-        dtb: None,
-    })
-}
-
-pub fn load_bzimage_kernel_and_initrd_x64<F>(
-    importer: &mut dyn ImageLoad<X86Register>,
-    kernel_image: &mut F,
-    kernel_start_address: u64,
-    initrd: Option<InitrdConfig<'_>>,
-) -> Result<LoadInfo, Error>
-where
-    F: Read + Seek,
-{
-    const SETUP_HEADER_OFFSET: u64 = 0x1f1;
-    const HDRS_MAGIC: u32 = 0x53726448;
-    const XLF_KERNEL_64: u16 = 1 << 0;
-    const BZIMAGE_ENTRY_OFFSET: u64 = 0x200;
-
-    check_address_alignment(kernel_start_address)?;
-
-    let mut setup_header = defs::setup_header::new_zeroed();
-    kernel_image
-        .seek(SeekFrom::Start(SETUP_HEADER_OFFSET))
-        .map_err(Error::ReadBzImage)?;
-    kernel_image
-        .read_exact(setup_header.as_mut_bytes())
-        .map_err(Error::ReadBzImage)?;
-
-    if u16::from(setup_header.boot_flag) != 0xaa55 {
-        return Err(Error::InvalidBzImage("missing boot signature"));
-    }
-    if u32::from(setup_header.header) != HDRS_MAGIC {
-        return Err(Error::InvalidBzImage("missing HdrS setup header"));
-    }
-    if u16::from(setup_header.xloadflags) & XLF_KERNEL_64 == 0 {
-        return Err(Error::InvalidBzImage(
-            "kernel does not advertise 64-bit entry support",
-        ));
-    }
-
-    let setup_sects = if setup_header.setup_sects == 0 {
-        4
-    } else {
-        setup_header.setup_sects
-    };
-    let payload_offset = (u64::from(setup_sects) + 1) * 512;
-    let file_len = kernel_image
-        .seek(SeekFrom::End(0))
-        .map_err(Error::ReadBzImage)?;
-    if file_len <= payload_offset + BZIMAGE_ENTRY_OFFSET {
-        return Err(Error::InvalidBzImage("payload is too small"));
-    }
-    let payload_len = file_len - payload_offset;
-    let payload_memory_len = align_up_to_page_size(payload_len);
-    tracing::trace!(
-        kernel_start_address,
-        payload_offset,
-        payload_len,
-        "loading x86_64 bzImage payload"
-    );
-
-    ChunkBuf::new()
-        .import_file_region(
-            importer,
-            ImportFileRegion {
-                file: kernel_image,
-                file_offset: payload_offset,
-                file_length: payload_len,
-                gpa: kernel_start_address,
-                memory_length: payload_memory_len,
-                acceptance: BootPageAcceptance::Exclusive,
-                tag: "linux-kernel",
-            },
-        )
-        .map_err(Error::ImportBzImage)?;
-
-    let next_addr = kernel_start_address + payload_memory_len;
-    let initrd_info = import_initrd(initrd, next_addr, importer)?;
-
-    Ok(LoadInfo {
-        kernel: KernelInfo {
-            gpa: kernel_start_address,
-            size: payload_memory_len,
-            entrypoint: kernel_start_address + BZIMAGE_ENTRY_OFFSET,
-            setup_header: Some(setup_header),
         },
         initrd: initrd_info,
         dtb: None,
@@ -841,12 +747,9 @@ where
             kernel_minimum_start_address,
             initrd,
         )?,
-        KernelFormat::BzImage => load_bzimage_kernel_and_initrd_x64(
-            importer,
-            kernel_image,
-            kernel_minimum_start_address,
-            initrd,
-        )?,
+        KernelFormat::BzImage => {
+            load_bzimage(importer, kernel_image, kernel_minimum_start_address, initrd)?
+        }
     };
 
     load_config(
@@ -1059,7 +962,6 @@ where
             gpa: kernel_minimum_start_address,
             size: kernel_size,
             entrypoint: kernel_load_offset as u64,
-            setup_header: None,
         },
         initrd: initrd_info,
         dtb,
@@ -1273,7 +1175,11 @@ mod tests {
         setup_header.setup_sects = 4;
         setup_header.boot_flag = 0xaa55.into();
         setup_header.header = 0x53726448.into();
+        setup_header.version = 0x020c.into();
+        setup_header.loadflags = 1;
         setup_header.xloadflags = 1.into();
+        setup_header.syssize = 0x100.into();
+        setup_header.init_size = 0x200000.into();
         image[0x1f1..0x1f1 + size_of::<defs::setup_header>()]
             .copy_from_slice(setup_header.as_bytes());
         image[5 * 512 + 0x200] = 0xcc;
@@ -1285,12 +1191,11 @@ mod tests {
         let mut importer = TestImporter::default();
         let mut image = Cursor::new(test_bzimage());
 
-        let load_info =
-            load_bzimage_kernel_and_initrd_x64(&mut importer, &mut image, 0x1000000, None).unwrap();
+        let load_info = load_bzimage(&mut importer, &mut image, 0x1000000, None).unwrap();
 
         assert_eq!(load_info.kernel.gpa, 0x1000000);
         assert_eq!(load_info.kernel.entrypoint, 0x1000200);
-        assert_eq!(load_info.kernel.setup_header.unwrap().setup_sects, 4);
+        assert_eq!(load_info.bzimage_setup_header.unwrap().setup_sects, 4);
         assert_eq!(importer.imports.len(), 1);
         assert_eq!(importer.imports[0].tag, "linux-kernel");
         assert_eq!(importer.imports[0].page_base, 0x1000);
@@ -1303,7 +1208,7 @@ mod tests {
         image[0x236] = 0;
         image[0x237] = 0;
 
-        let err = load_bzimage_kernel_and_initrd_x64(
+        let err = load_bzimage(
             &mut TestImporter::default(),
             &mut Cursor::new(image),
             0x1000000,
@@ -1311,7 +1216,10 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(matches!(err, Error::InvalidBzImage(_)));
+        assert!(matches!(
+            err,
+            Error::BzImage(crate::bzimage::Error::No64BitEntry)
+        ));
     }
 
     #[test]
