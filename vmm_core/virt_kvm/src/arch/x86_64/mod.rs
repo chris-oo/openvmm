@@ -747,13 +747,17 @@ impl virt::BindProcessor for KvmProcessorBinder {
         }
 
         if self.partition.sev.is_some() && !vp_info.base.is_bsp() {
-            // SNP APs are started through the guest's GHCB AP creation request.
-            // Keep them halted so KVM can wake them to install the
+            // NOTE: SNP APs are started through the guest's GHCB AP creation
+            // request. Keep them halted so KVM can wake them to install the
             // guest-provided VMSA instead of blocking in the uninitialized/APIC
-            // startup path.
+            // startup path, which would return -EAGAIN from kvm_run to usermode
+            // instead of making forward progress.
             //
-            // It is unclear exactly what the inteneded initial starting state
-            // should be. KVM_MP_STATE_INIT_RECEIVED does not work.
+            // The flow on KVM + QEMU + OVMF is that QEMU first programs a VMSA
+            // for each AP pointing to QEMU's reset vector, then OVMF sends an
+            // INIT_SIPI to each AP to then place it into the halted state. We
+            // may need to change this depending on the contract with what we
+            // expect to load (UEFI vs direct boot).
             vp.kvm.set_mp_state(kvm::KVM_MP_STATE_HALTED)?;
         }
 
