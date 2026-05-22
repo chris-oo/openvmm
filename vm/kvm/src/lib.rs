@@ -23,7 +23,10 @@ use std::sync::atomic::Ordering;
 use thiserror::Error;
 
 mod ioctl {
+    #[cfg(target_arch = "aarch64")]
+    use super::KvmArmRmiPopulate;
     use kvm_bindings::*;
+    #[cfg(target_arch = "x86_64")]
     use nix::errno::Errno;
     use nix::ioctl_read;
     use nix::ioctl_readwrite;
@@ -116,6 +119,12 @@ mod ioctl {
     ioctl_readwrite!(kvm_create_device, KVMIO, 0xe0, kvm_create_device);
     ioctl_write_ptr!(kvm_set_device_attr, KVMIO, 0xe1, kvm_device_attr);
     ioctl_readwrite!(kvm_create_guest_memfd, KVMIO, 0xd4, kvm_create_guest_memfd);
+    #[cfg(target_arch = "aarch64")]
+    ioctl_readwrite_bad!(
+        kvm_arm_rmi_populate,
+        request_code_readwrite!(KVMIO, 0xd7, size_of::<KvmArmRmiPopulate>()),
+        KvmArmRmiPopulate
+    );
     #[cfg(target_arch = "x86_64")]
     ioctl_readwrite_bad!(
         kvm_memory_encrypt_op,
@@ -154,6 +163,15 @@ pub const KVM_MAP_GPA_RANGE_ENCRYPTED_UAPI: u64 = 1 << 4;
 pub const KVM_MAP_GPA_RANGE_DECRYPTED_UAPI: u64 = 0 << 4;
 #[cfg(target_arch = "x86_64")]
 const KVM_X86_SNP_VM_UAPI: libc::c_int = 4;
+
+#[cfg(target_arch = "aarch64")]
+pub const KVM_CAP_ARM_RMI_UAPI: u32 = 249;
+#[cfg(target_arch = "aarch64")]
+pub const KVM_ARM_RMI_POPULATE_FLAGS_MEASURE_UAPI: u32 = 1 << 0;
+#[cfg(target_arch = "aarch64")]
+const KVM_VM_TYPE_ARM_IPA_SIZE_MASK_UAPI: u64 = 0xff;
+#[cfg(target_arch = "aarch64")]
+const KVM_VM_TYPE_ARM_REALM_UAPI: u64 = 1 << 30;
 
 #[cfg(target_arch = "x86_64")]
 pub const KVM_SEV_SNP_PAGE_TYPE_NORMAL_UAPI: u8 = KVM_SEV_SNP_PAGE_TYPE_NORMAL as u8;
@@ -204,6 +222,36 @@ impl X86VmType {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum Aarch64VmType {
+    Realm { ipa_bits: u8 },
+}
+
+#[cfg(target_arch = "aarch64")]
+impl Aarch64VmType {
+    const fn as_raw(self) -> libc::c_int {
+        match self {
+            Aarch64VmType::Realm { ipa_bits } => {
+                (KVM_VM_TYPE_ARM_REALM_UAPI
+                    | ((ipa_bits as u64) & KVM_VM_TYPE_ARM_IPA_SIZE_MASK_UAPI))
+                    as libc::c_int
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Default, Eq, PartialEq)]
+pub struct KvmArmRmiPopulate {
+    pub base: u64,
+    pub size: u64,
+    pub source_uaddr: u64,
+    pub flags: u32,
+    pub reserved: u32,
+}
+
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("failed to open /dev/kvm")]
@@ -218,6 +266,9 @@ pub enum Error {
     CreateGuestMemfd(#[source] nix::Error),
     #[error("CreateVm")]
     CreateVm(#[source] nix::Error),
+    #[cfg(target_arch = "aarch64")]
+    #[error("ArmRmiPopulate")]
+    ArmRmiPopulate(#[source] nix::Error),
     #[error("missing KVM capability: {0}")]
     MissingCapability(&'static str),
     #[cfg(target_arch = "x86_64")]
@@ -245,7 +296,6 @@ pub enum Error {
     SetSRegs(#[source] nix::Error),
     #[error("Run")]
     Run(#[source] nix::Error),
-    #[cfg(target_arch = "x86_64")]
     #[error("RunMemoryFault(flags={flags:#x}, gpa={gpa:#x}, size={size:#x})")]
     RunMemoryFault {
         flags: u64,
@@ -438,6 +488,11 @@ impl Kvm {
         self.new_vm_with_type(raw_vm_type)
     }
 
+    #[cfg(target_arch = "aarch64")]
+    pub fn new_aarch64_vm(&self, vm_type: Aarch64VmType) -> Result<Partition> {
+        self.new_vm_with_type(vm_type.as_raw())
+    }
+
     fn new_vm_with_type(&self, vm_type: libc::c_int) -> Result<Partition> {
         // SAFETY: Calling IOCTL as documented, with no special requirements.
         let vm = unsafe {
@@ -574,6 +629,15 @@ impl Partition {
     pub fn check_extension(&self, extension: u32) -> nix::Result<libc::c_int> {
         // SAFETY: Calling IOCTL as documented, with no special requirements.
         unsafe { ioctl::kvm_check_extension(self.vm.as_raw_fd(), extension as i32) }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn arm_rmi_populate(&self, populate: &mut KvmArmRmiPopulate) -> Result<()> {
+        // SAFETY: `populate` points to a valid KVM_ARM_RMI_POPULATE argument for
+        // the duration of the ioctl. KVM may update it to report partial progress.
+        unsafe { ioctl::kvm_arm_rmi_populate(self.vm.as_raw_fd(), populate) }
+            .map_err(Error::ArmRmiPopulate)?;
+        Ok(())
     }
 
     #[cfg(target_arch = "x86_64")]
