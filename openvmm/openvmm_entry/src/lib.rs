@@ -1415,6 +1415,8 @@ async fn vm_config_from_command_line(
                 Some(openvmm_defs::config::IsolationType::Vbs)
             }
             cli_args::IsolationCli::Snp => Some(openvmm_defs::config::IsolationType::Snp),
+            #[cfg(guest_arch = "aarch64")]
+            cli_args::IsolationCli::Cca => Some(openvmm_defs::config::IsolationType::Cca),
         }
     } else {
         None
@@ -1764,27 +1766,44 @@ async fn vm_config_from_command_line(
 }
 
 fn validate_isolation_config(cfg: &Config) -> anyhow::Result<()> {
+    let Some(isolation) = cfg.hypervisor.with_isolation else {
+        return Ok(());
+    };
+
+    #[cfg(not(guest_arch = "aarch64"))]
+    if isolation == openvmm_defs::config::IsolationType::Cca {
+        anyhow::bail!("CCA isolation currently only supports aarch64 guests");
+    }
+
     if !matches!(
-        cfg.hypervisor.with_isolation,
-        Some(openvmm_defs::config::IsolationType::Snp)
+        isolation,
+        openvmm_defs::config::IsolationType::Snp | openvmm_defs::config::IsolationType::Cca
     ) {
         return Ok(());
     }
 
+    let isolation_name = match isolation {
+        openvmm_defs::config::IsolationType::Snp => "SNP",
+        openvmm_defs::config::IsolationType::Cca => "CCA",
+        openvmm_defs::config::IsolationType::Vbs => unreachable!(),
+    };
+
     if !matches!(cfg.load_mode, LoadMode::Linux { .. }) {
-        anyhow::bail!("SNP isolation currently only supports Linux direct boot");
+        anyhow::bail!("{isolation_name} isolation currently only supports Linux direct boot");
     }
 
     if cfg.hypervisor.with_hv {
-        anyhow::bail!("SNP isolation currently does not support Hyper-V enlightenments");
+        anyhow::bail!(
+            "{isolation_name} isolation currently does not support Hyper-V enlightenments"
+        );
     }
 
     if cfg.hypervisor.with_vtl2.is_some() {
-        anyhow::bail!("SNP isolation currently does not support VTL2");
+        anyhow::bail!("{isolation_name} isolation currently does not support VTL2");
     }
 
     if cfg.vmbus.is_some() || cfg.vtl2_vmbus.is_some() || !cfg.vmbus_devices.is_empty() {
-        anyhow::bail!("SNP isolation currently does not support VMBus devices");
+        anyhow::bail!("{isolation_name} isolation currently does not support VMBus devices");
     }
 
     let only_supported_chipset_devices = cfg.chipset_devices.iter().all(|device| {
@@ -1810,7 +1829,7 @@ fn validate_isolation_config(cfg: &Config) -> anyhow::Result<()> {
         || !only_supported_chipset_devices
         || !cfg.pci_chipset_devices.is_empty()
     {
-        anyhow::bail!("SNP isolation currently only supports virtio devices");
+        anyhow::bail!("{isolation_name} isolation currently only supports virtio devices");
     }
 
     if cfg.framebuffer.is_some()
@@ -1818,7 +1837,9 @@ fn validate_isolation_config(cfg: &Config) -> anyhow::Result<()> {
         || cfg.debugger_rpc.is_some()
         || cfg.generation_id_recv.is_some()
     {
-        anyhow::bail!("SNP isolation currently does not support this VM configuration");
+        anyhow::bail!(
+            "{isolation_name} isolation currently does not support this VM configuration"
+        );
     }
 
     Ok(())

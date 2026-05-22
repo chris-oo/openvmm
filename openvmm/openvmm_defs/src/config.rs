@@ -470,6 +470,7 @@ pub struct Vtl2Config {
 pub enum IsolationType {
     Vbs,
     Snp,
+    Cca,
 }
 
 impl From<IsolationType> for virt::IsolationType {
@@ -477,6 +478,7 @@ impl From<IsolationType> for virt::IsolationType {
         match value {
             IsolationType::Vbs => Self::Vbs,
             IsolationType::Snp => Self::Snp,
+            IsolationType::Cca => Self::Cca,
         }
     }
 }

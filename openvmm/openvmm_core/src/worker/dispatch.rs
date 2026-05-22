@@ -1010,30 +1010,44 @@ impl InitializedVm {
             anyhow::bail!("hugepage_size={size} requires hugepages=on");
         }
 
-        if cfg.hypervisor.with_isolation == Some(IsolationType::Snp) {
+        if matches!(
+            cfg.hypervisor.with_isolation,
+            Some(IsolationType::Snp | IsolationType::Cca)
+        ) {
+            let isolation_name = match cfg.hypervisor.with_isolation {
+                Some(IsolationType::Snp) => "SNP",
+                Some(IsolationType::Cca) => "CCA",
+                _ => unreachable!(),
+            };
             if !matches!(cfg.load_mode, LoadMode::Linux { .. }) {
-                anyhow::bail!("KVM SNP guest_memfd currently only supports direct Linux load mode");
+                anyhow::bail!(
+                    "KVM {isolation_name} guest_memfd currently only supports direct Linux load mode"
+                );
             }
             if cfg.hypervisor.with_hv {
-                anyhow::bail!("KVM SNP guest_memfd does not support Hyper-V enlightenments");
+                anyhow::bail!(
+                    "KVM {isolation_name} guest_memfd does not support Hyper-V enlightenments"
+                );
             }
             if cfg.hypervisor.with_vtl2.is_some() {
-                anyhow::bail!("KVM SNP guest_memfd does not support VTL2");
+                anyhow::bail!("KVM {isolation_name} guest_memfd does not support VTL2");
             }
             if cfg.chipset.with_hyperv_vga {
-                anyhow::bail!("KVM SNP guest_memfd does not support Hyper-V VGA");
+                anyhow::bail!("KVM {isolation_name} guest_memfd does not support Hyper-V VGA");
             }
             if cfg.chipset.with_i440bx_host_pci_bridge {
-                anyhow::bail!("KVM SNP guest_memfd does not support the i440BX host PCI bridge");
+                anyhow::bail!(
+                    "KVM {isolation_name} guest_memfd does not support the i440BX host PCI bridge"
+                );
             }
             if cfg.vmbus.is_some() || cfg.vtl2_vmbus.is_some() || !cfg.vmbus_devices.is_empty() {
-                anyhow::bail!("KVM SNP guest_memfd does not support VMBus");
+                anyhow::bail!("KVM {isolation_name} guest_memfd does not support VMBus");
             }
             if !cfg.floppy_disks.is_empty()
                 || !cfg.ide_disks.is_empty()
                 || !cfg.virtio_devices.is_empty()
             {
-                anyhow::bail!("KVM SNP guest_memfd does not support disks");
+                anyhow::bail!("KVM {isolation_name} guest_memfd does not support disks");
             }
             if matches!(
                 cfg.vmgs,
@@ -1043,7 +1057,7 @@ impl InitializedVm {
                         | VmgsResource::Reprovision(_)
                 )
             ) {
-                anyhow::bail!("KVM SNP guest_memfd does not support VMGS disks");
+                anyhow::bail!("KVM {isolation_name} guest_memfd does not support VMGS disks");
             }
         }
 
