@@ -95,6 +95,16 @@ pub enum KvmError {
     SnpLaunchInProgress,
     #[error("SNP launch previously failed")]
     SnpLaunchFailed,
+    #[error("unsupported CCA initial page acceptance: {0:?}")]
+    UnsupportedCcaPageAcceptance(BootPageAcceptance),
+    #[error("CCA initial page population is already in progress")]
+    CcaPopulateInProgress,
+    #[error("CCA initial page population previously failed")]
+    CcaPopulateFailed,
+    #[error("CCA initial population range is not page aligned")]
+    UnalignedCcaPopulateRange,
+    #[error("CCA initial population range is not contained in guest_memfd private memory")]
+    InvalidCcaPopulateRange,
     #[error("invalid KVM_HC_MAP_GPA_RANGE request")]
     InvalidMapGpaRange,
     #[error("unsupported KVM_HC_MAP_GPA_RANGE attributes: {0:#x}")]
@@ -132,7 +142,6 @@ struct KvmMemoryRangeState {
     ranges: Vec<Option<KvmMemoryRange>>,
 }
 
-#[cfg(guest_arch = "x86_64")]
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub(crate) struct KvmPrivateMemoryRange {
     gpa: MemoryRange,
@@ -171,6 +180,9 @@ struct KvmPartitionInner {
     #[cfg(guest_arch = "x86_64")]
     #[inspect(skip)]
     snp_launch_state: Mutex<SnpLaunchState>,
+    #[cfg(guest_arch = "aarch64")]
+    #[inspect(skip)]
+    cca_launch_state: Mutex<CcaLaunchState>,
     memory: Mutex<KvmMemoryRangeState>,
     memory_backing_mode: KvmMemoryBackingMode,
     #[inspect(iter_by_index)]
@@ -217,12 +229,30 @@ pub(crate) enum SnpLaunchState {
     Failed,
 }
 
+#[cfg(guest_arch = "aarch64")]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) enum CcaLaunchState {
+    NotStarted,
+    Populating,
+    Populated,
+    Failed,
+}
+
 #[cfg(guest_arch = "x86_64")]
 impl virt::AcceptInitialPages for KvmPartition {
     type Error = KvmError;
 
     fn accept_initial_pages(&self, pages: &[virt::InitialAcceptedPage]) -> Result<(), Self::Error> {
         self.inner.snp_launch_initial_pages(pages)
+    }
+}
+
+#[cfg(guest_arch = "aarch64")]
+impl virt::AcceptInitialPages for KvmPartition {
+    type Error = KvmError;
+
+    fn accept_initial_pages(&self, pages: &[virt::InitialAcceptedPage]) -> Result<(), Self::Error> {
+        self.inner.cca_populate_initial_pages(pages)
     }
 }
 
@@ -673,6 +703,89 @@ impl KvmPartitionInner {
         Ok(())
     }
 
+    #[cfg(guest_arch = "aarch64")]
+    fn cca_populate_initial_pages(
+        &self,
+        pages: &[virt::InitialAcceptedPage],
+    ) -> Result<(), KvmError> {
+        {
+            let mut state = self.cca_launch_state.lock();
+            match *state {
+                CcaLaunchState::NotStarted => *state = CcaLaunchState::Populating,
+                CcaLaunchState::Populating => return Err(KvmError::CcaPopulateInProgress),
+                CcaLaunchState::Populated => return Ok(()),
+                CcaLaunchState::Failed => return Err(KvmError::CcaPopulateFailed),
+            }
+        }
+
+        tracing::info!(page_ranges = pages.len(), "starting CCA initial population");
+        match self.cca_populate_initial_pages_inner(pages) {
+            Ok(()) => {
+                *self.cca_launch_state.lock() = CcaLaunchState::Populated;
+                tracing::info!("finished CCA initial population");
+                Ok(())
+            }
+            Err(err) => {
+                *self.cca_launch_state.lock() = CcaLaunchState::Failed;
+                tracing::error!(
+                    error = &err as &dyn std::error::Error,
+                    "failed CCA initial population"
+                );
+                Err(err)
+            }
+        }
+    }
+
+    #[cfg(guest_arch = "aarch64")]
+    fn cca_populate_initial_pages_inner(
+        &self,
+        pages: &[virt::InitialAcceptedPage],
+    ) -> Result<(), KvmError> {
+        self.kvm
+            .check_private_memory_extensions()
+            .map_err(map_cca_capability_error)?;
+
+        let memory = self.memory.lock();
+        for page in pages {
+            if page.visibility == virt::PageVisibility::Shared {
+                tracing::trace!(
+                    gpa = page.range.start(),
+                    len = page.range.len(),
+                    acceptance = ?page.acceptance,
+                    tag = page.tag.as_str(),
+                    "skipping shared CCA initial page"
+                );
+                continue;
+            }
+
+            let flags = cca_populate_flags(page.acceptance)?;
+            let private_range = private_memory_range_from_slots(page.range, &memory.ranges)
+                .map_err(map_cca_private_range_error)?;
+            let mut populate = kvm::KvmArmRmiPopulate {
+                base: private_range.gpa.start(),
+                size: private_range.gpa.len(),
+                source_uaddr: private_range.hva as u64,
+                flags,
+                reserved: 0,
+            };
+
+            while populate.size != 0 {
+                tracing::trace!(
+                    gpa = populate.base,
+                    len = populate.size,
+                    source_uaddr = populate.source_uaddr,
+                    flags = populate.flags,
+                    acceptance = ?page.acceptance,
+                    tag = page.tag.as_str(),
+                    "KVM_ARM_RMI_POPULATE"
+                );
+                self.kvm.arm_rmi_populate(&mut populate)?;
+            }
+        }
+
+        Ok(())
+    }
+
     #[cfg(guest_arch = "x86_64")]
     fn prepare_snp_vmsa_register_state(&self) -> Result<(), KvmError> {
         for vp in &self.vps {
@@ -1003,7 +1116,6 @@ fn sanitize_snp_cpuid_entry(entry: &mut kvm::kvm_cpuid_entry2) {
     }
 }
 
-#[cfg(guest_arch = "x86_64")]
 pub(crate) fn validate_snp_launch_range(range: MemoryRange) -> Result<(), KvmError> {
     if !is_page_aligned(std::ptr::null_mut(), range.start(), range.len()) {
         return Err(KvmError::UnalignedSnpLaunchRange);
@@ -1011,7 +1123,6 @@ pub(crate) fn validate_snp_launch_range(range: MemoryRange) -> Result<(), KvmErr
     Ok(())
 }
 
-#[cfg(guest_arch = "x86_64")]
 pub(crate) fn private_memory_range_from_slots(
     range: MemoryRange,
     slots: &[Option<KvmMemoryRange>],
@@ -1032,6 +1143,37 @@ pub(crate) fn private_memory_range_from_slots(
         gpa: range,
         hva: slot.host_addr.wrapping_add(offset as usize),
     })
+}
+
+#[cfg(guest_arch = "aarch64")]
+fn cca_populate_flags(acceptance: BootPageAcceptance) -> Result<u32, KvmError> {
+    match acceptance {
+        BootPageAcceptance::Exclusive => Ok(kvm::KVM_ARM_RMI_POPULATE_FLAGS_MEASURE_UAPI),
+        BootPageAcceptance::ExclusiveUnmeasured => Ok(0),
+        BootPageAcceptance::Shared => Ok(0),
+        BootPageAcceptance::VpContext
+        | BootPageAcceptance::SecretsPage
+        | BootPageAcceptance::CpuidPage
+        | BootPageAcceptance::CpuidExtendedStatePage
+        | BootPageAcceptance::ErrorPage => Err(KvmError::UnsupportedCcaPageAcceptance(acceptance)),
+    }
+}
+
+#[cfg(guest_arch = "aarch64")]
+fn map_cca_private_range_error(err: KvmError) -> KvmError {
+    match err {
+        KvmError::UnalignedSnpLaunchRange => KvmError::UnalignedCcaPopulateRange,
+        KvmError::InvalidSnpLaunchRange => KvmError::InvalidCcaPopulateRange,
+        err => err,
+    }
+}
+
+#[cfg(guest_arch = "aarch64")]
+fn map_cca_capability_error(err: kvm::Error) -> KvmError {
+    match err {
+        kvm::Error::MissingCapability(capability) => KvmError::MissingCcaCapability(capability),
+        err => KvmError::Kvm(err),
+    }
 }
 
 #[cfg(guest_arch = "x86_64")]

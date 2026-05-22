@@ -840,6 +840,7 @@ impl virt::ProtoPartition for KvmProtoPartition<'_> {
         let partition = Arc::new(KvmPartitionInner {
             kvm: self.vm,
             memory: Default::default(),
+            cca_launch_state: Mutex::new(crate::CcaLaunchState::NotStarted),
             memory_backing_mode: match self.config.isolation {
                 virt::IsolationType::None => KvmMemoryBackingMode::Userspace,
                 virt::IsolationType::Cca => KvmMemoryBackingMode::GuestMemfd,
