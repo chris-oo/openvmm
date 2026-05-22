@@ -26,6 +26,8 @@ use core::panic;
 use hvdef::Vtl;
 use inspect::Inspect;
 use inspect::InspectMut;
+use kvm::Aarch64VmType;
+use kvm::KVM_CAP_ARM_RMI_UAPI;
 use kvm::KVM_CAP_ARM_VM_IPA_SIZE;
 use kvm::KVM_DEV_ARM_VGIC_CTRL_INIT;
 use kvm::KVM_DEV_ARM_VGIC_GRP_ADDR;
@@ -796,6 +798,9 @@ impl virt::ProtoPartition for KvmProtoPartition<'_> {
             GicVersion::V3 {
                 redistributors_base,
             } => self.add_gicv3(redistributors_base)?,
+            GicVersion::V2 { .. } if self.config.isolation == virt::IsolationType::Cca => {
+                return Err(KvmError::CcaRequiresGicV3);
+            }
             GicVersion::V2 { cpu_interface_base } => self.add_gicv2(cpu_interface_base)?,
         };
 
@@ -826,7 +831,7 @@ impl virt::ProtoPartition for KvmProtoPartition<'_> {
                 pfr0 & 0xf == 2
             };
             PartitionCapabilities {
-                isolation: virt::IsolationType::None,
+                isolation: self.config.isolation,
                 vendor: Vendor::ARM,
                 supports_aarch32_el0,
             }
@@ -835,7 +840,13 @@ impl virt::ProtoPartition for KvmProtoPartition<'_> {
         let partition = Arc::new(KvmPartitionInner {
             kvm: self.vm,
             memory: Default::default(),
-            memory_backing_mode: KvmMemoryBackingMode::Userspace,
+            memory_backing_mode: match self.config.isolation {
+                virt::IsolationType::None => KvmMemoryBackingMode::Userspace,
+                virt::IsolationType::Cca => KvmMemoryBackingMode::GuestMemfd,
+                virt::IsolationType::Vbs | virt::IsolationType::Snp | virt::IsolationType::Tdx => {
+                    unreachable!()
+                }
+            },
             ram_ranges: config
                 .mem_layout
                 .ram()
@@ -1165,8 +1176,29 @@ impl virt::Hypervisor for Kvm {
         &'a mut self,
         config: ProtoPartitionConfig<'a>,
     ) -> Result<Self::ProtoPartition<'a>, Self::Error> {
-        if config.isolation.is_isolated() {
-            return Err(KvmError::IsolationNotSupported);
+        match config.isolation {
+            virt::IsolationType::None => {}
+            virt::IsolationType::Cca => {
+                if config.hv_config.is_some() {
+                    return Err(KvmError::UnsupportedIsolationConfiguration(
+                        "CCA does not support Hyper-V enlightenments or VTL2",
+                    ));
+                }
+                if !self.supports_gic_v3 {
+                    return Err(KvmError::CcaRequiresGicV3);
+                }
+                if self
+                    .kvm
+                    .check_extension(KVM_CAP_ARM_RMI_UAPI)
+                    .map_err(kvm::Error::CheckExtension)?
+                    == 0
+                {
+                    return Err(KvmError::MissingCcaCapability("KVM_CAP_ARM_RMI"));
+                }
+            }
+            virt::IsolationType::Vbs | virt::IsolationType::Snp | virt::IsolationType::Tdx => {
+                return Err(KvmError::IsolationNotSupported);
+            }
         }
 
         if let Some(hv_config) = &config.hv_config {
@@ -1184,12 +1216,32 @@ impl virt::Hypervisor for Kvm {
             _ => 40,
         };
 
-        let vm = self.kvm.new_vm()?;
+        let vm = match config.isolation {
+            virt::IsolationType::None => self.kvm.new_vm()?,
+            virt::IsolationType::Cca => {
+                let vm = self
+                    .kvm
+                    .new_aarch64_vm(Aarch64VmType::Realm { ipa_bits: ipa_size })?;
+                vm.check_private_memory_extensions()
+                    .map_err(map_cca_capability_error)?;
+                vm
+            }
+            virt::IsolationType::Vbs | virt::IsolationType::Snp | virt::IsolationType::Tdx => {
+                unreachable!()
+            }
+        };
 
         Ok(KvmProtoPartition {
             vm,
             config,
             ipa_size,
         })
+    }
+}
+
+fn map_cca_capability_error(err: kvm::Error) -> KvmError {
+    match err {
+        kvm::Error::MissingCapability(capability) => KvmError::MissingCcaCapability(capability),
+        err => KvmError::Kvm(err),
     }
 }

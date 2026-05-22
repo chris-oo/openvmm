@@ -39,6 +39,7 @@ use std::fs::File;
 use std::mem::size_of;
 #[cfg(all(test, guest_arch = "x86_64"))]
 use std::mem::size_of_val;
+#[cfg(guest_arch = "x86_64")]
 use std::os::fd::AsFd;
 #[cfg(guest_arch = "x86_64")]
 use std::os::fd::AsRawFd;
@@ -60,6 +61,10 @@ pub enum KvmError {
     OpenSev(#[source] std::io::Error),
     #[error("SNP private memory is not implemented")]
     SnpPrivateMemoryNotImplemented,
+    #[error("missing KVM CCA capability: {0}")]
+    MissingCcaCapability(&'static str),
+    #[error("CCA realm VMs require GICv3")]
+    CcaRequiresGicV3,
     #[error("guest_memfd-backed KVM VM launch is not implemented")]
     GuestMemfdLaunchNotImplemented,
     #[error("unsupported SNP launch page acceptance: {0:?}")]
