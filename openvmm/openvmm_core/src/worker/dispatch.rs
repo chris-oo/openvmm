@@ -2870,6 +2870,14 @@ impl LoadedVmInner {
                     snp_isolation: false,
                 };
 
+                if self.hypervisor_cfg.with_isolation == Some(IsolationType::Cca)
+                    && boot_mode == LinuxDirectBootMode::Acpi
+                {
+                    anyhow::bail!(
+                        "CCA isolation currently only supports device tree Linux direct boot"
+                    );
+                }
+
                 let with_hv = self.hypervisor_cfg.with_hv;
                 let build_acpi = if boot_mode == LinuxDirectBootMode::Acpi {
                     Some(|rsdp_gpa: u64| {
@@ -2881,7 +2889,7 @@ impl LoadedVmInner {
                     None
                 };
 
-                let regs = super::vm_loaders::linux::load_linux_arm64(
+                let load_info = super::vm_loaders::linux::load_linux_arm64(
                     &kernel_config,
                     &self.gm,
                     enable_serial,
@@ -2890,7 +2898,7 @@ impl LoadedVmInner {
                     build_acpi,
                 )?;
 
-                (regs, Vec::new())
+                load_info.into_initial_regs_and_accepted_ranges()
             }
             &LoadMode::Uefi {
                 ref firmware,

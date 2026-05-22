@@ -808,7 +808,7 @@ pub fn load_linux_arm64(
     processor_topology: &ProcessorTopology<Aarch64Topology>,
     pcie_host_bridges: &[PcieHostBridge],
     build_acpi: Option<impl FnOnce(u64) -> vmm_core::acpi_builder::BuiltAcpiTables>,
-) -> Result<Vec<Aarch64Register>, Error> {
+) -> Result<InitialLoadInfo<Aarch64Register>, Error> {
     let mut loader = Loader::new(gm.clone(), cfg.mem_layout, hvdef::Vtl::Vtl0);
     let mut kernel_file = cfg.kernel;
 
@@ -893,5 +893,5 @@ pub fn load_linux_arm64(
     loader::linux::set_direct_boot_registers_arm64(&mut loader, &load_info)
         .map_err(Error::Loader)?;
 
-    Ok(loader.initial_regs())
+    Ok(loader.initial_load_info())
 }
