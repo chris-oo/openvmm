@@ -265,6 +265,14 @@ enum KvmRunVpError {
     InvalidVpState,
     #[error("failed to run VP")]
     Run(#[source] kvm::Error),
+    #[cfg(guest_arch = "aarch64")]
+    #[error(
+        "unsupported KVM memory fault/RIPAS change: flags={flags:#x}, gpa={gpa:#x}, size={size:#x}"
+    )]
+    UnsupportedMemoryFault { flags: u64, gpa: u64, size: u64 },
+    #[cfg(guest_arch = "aarch64")]
+    #[error("unhandled KVM exit: {0}")]
+    UnhandledExit(String),
     #[error("unhandled system event type: {0:#x}")]
     UnhandledSystemEvent(u32),
     #[cfg(guest_arch = "x86_64")]
@@ -279,6 +287,26 @@ enum KvmRunVpError {
     #[cfg(guest_arch = "x86_64")]
     #[error("failed to inject an extint interrupt")]
     ExtintInterrupt(#[source] kvm::Error),
+}
+
+impl KvmRunVpError {
+    #[cfg(guest_arch = "aarch64")]
+    fn from_kvm_run_error(err: kvm::Error) -> Self {
+        match err {
+            kvm::Error::RunMemoryFault {
+                flags, gpa, size, ..
+            } => {
+                tracelimit::warn_ratelimited!(
+                    flags,
+                    gpa,
+                    size,
+                    "unsupported KVM memory fault/RIPAS change"
+                );
+                KvmRunVpError::UnsupportedMemoryFault { flags, gpa, size }
+            }
+            err => KvmRunVpError::Run(err),
+        }
+    }
 }
 
 #[cfg_attr(guest_arch = "aarch64", expect(dead_code))]

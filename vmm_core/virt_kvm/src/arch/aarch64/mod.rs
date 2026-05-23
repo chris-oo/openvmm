@@ -491,7 +491,9 @@ impl virt::Processor for KvmProcessor<'_> {
                     self.runner.run()
                 };
 
-                let exit = exit.map_err(|err| dev.fatal_error(KvmRunVpError::Run(err).into()))?;
+                let exit = exit.map_err(|err| {
+                    dev.fatal_error(KvmRunVpError::from_kvm_run_error(err).into())
+                })?;
                 pending_exit = true;
                 match exit {
                     kvm::Exit::Interrupted => {
@@ -508,6 +510,12 @@ impl virt::Processor for KvmProcessor<'_> {
                     }
                     kvm::Exit::InternalError { error, .. } => {
                         return Err(dev.fatal_error(KvmRunVpError::InternalError(error).into()));
+                    }
+                    kvm::Exit::EmulationFailure { instruction_bytes } => {
+                        tracing::error!(?instruction_bytes, "KVM reported an emulation failure");
+                        return Err(dev.fatal_error(
+                            KvmRunVpError::UnhandledExit(format!("{exit:?}")).into(),
+                        ));
                     }
                     kvm::Exit::FailEntry {
                         hardware_entry_failure_reason,
@@ -537,7 +545,6 @@ impl virt::Processor for KvmProcessor<'_> {
                             }
                         }
                     }
-                    _ => panic!("unhandled exit: {:?}", exit),
                 }
             }
         }
