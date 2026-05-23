@@ -273,6 +273,12 @@ enum KvmRunVpError {
     #[cfg(guest_arch = "aarch64")]
     #[error("unhandled KVM exit: {0}")]
     UnhandledExit(String),
+    #[cfg(guest_arch = "aarch64")]
+    #[error("CCA initial page population has not completed")]
+    CcaNotPopulated,
+    #[cfg(guest_arch = "aarch64")]
+    #[error("CCA initial page population failed")]
+    CcaPopulationFailed,
     #[error("unhandled system event type: {0:#x}")]
     UnhandledSystemEvent(u32),
     #[cfg(guest_arch = "x86_64")]

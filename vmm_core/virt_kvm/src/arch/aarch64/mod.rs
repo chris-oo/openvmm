@@ -488,6 +488,20 @@ impl virt::Processor for KvmProcessor<'_> {
                     self.runner.complete_exit()
                 } else {
                     // Run the VP.
+                    if self.partition.caps.isolation == virt::IsolationType::Cca {
+                        match *self.partition.cca_launch_state.lock() {
+                            crate::CcaLaunchState::Populated => {}
+                            crate::CcaLaunchState::Failed => {
+                                return Err(
+                                    dev.fatal_error(KvmRunVpError::CcaPopulationFailed.into())
+                                );
+                            }
+                            crate::CcaLaunchState::NotStarted
+                            | crate::CcaLaunchState::Populating => {
+                                return Err(dev.fatal_error(KvmRunVpError::CcaNotPopulated.into()));
+                            }
+                        }
+                    }
                     self.runner.run()
                 };
 
