@@ -382,10 +382,12 @@ impl virt::vp::AccessVpState for &'_ mut KvmProcessor<'_> {
         set_reg(KvmRegisterId::X28, value.x28)?;
         set_reg(KvmRegisterId::X29, value.fp)?;
         set_reg(KvmRegisterId::X30, value.lr)?;
-        set_reg(KvmRegisterId::SP, value.sp_el0)?;
         set_reg(KvmRegisterId::PC, value.pc)?;
-        set_reg(KvmRegisterId::SP_EL1, value.sp_el1)?;
-        set_reg(KvmRegisterId::PSTATE, value.cpsr)?;
+        if self.partition.caps.isolation != virt::IsolationType::Cca {
+            set_reg(KvmRegisterId::SP, value.sp_el0)?;
+            set_reg(KvmRegisterId::SP_EL1, value.sp_el1)?;
+            set_reg(KvmRegisterId::PSTATE, value.cpsr)?;
+        }
 
         Ok(())
     }
@@ -411,6 +413,10 @@ impl virt::vp::AccessVpState for &'_ mut KvmProcessor<'_> {
     }
 
     fn set_system_registers(&mut self, value: &SystemRegisters) -> Result<(), Self::Error> {
+        if self.partition.caps.isolation == virt::IsolationType::Cca {
+            return Ok(());
+        }
+
         let set_reg = |id: KvmRegisterId, value: u64| -> Result<(), KvmError> {
             // tracing::warn!("set_sreg: {:?}({:#x}) = {:x}", id, id.0, value);
             self.kvm.set_reg64(id.into(), value).map_err(KvmError::Kvm)
