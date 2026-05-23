@@ -164,6 +164,8 @@ pub const KVM_MAP_GPA_RANGE_DECRYPTED_UAPI: u64 = 0 << 4;
 #[cfg(target_arch = "x86_64")]
 const KVM_X86_SNP_VM_UAPI: libc::c_int = 4;
 
+pub const KVM_MEMORY_EXIT_FLAG_PRIVATE_UAPI: u64 = 1 << 3;
+
 #[cfg(target_arch = "aarch64")]
 pub const KVM_CAP_ARM_RMI_UAPI: u32 = 249;
 #[cfg(target_arch = "aarch64")]

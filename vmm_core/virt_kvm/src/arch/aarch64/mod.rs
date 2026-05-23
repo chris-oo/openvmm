@@ -505,9 +505,25 @@ impl virt::Processor for KvmProcessor<'_> {
                     self.runner.run()
                 };
 
-                let exit = exit.map_err(|err| {
-                    dev.fatal_error(KvmRunVpError::from_kvm_run_error(err).into())
-                })?;
+                let exit = match exit {
+                    Ok(exit) => exit,
+                    Err(kvm::Error::RunMemoryFault {
+                        flags, gpa, size, ..
+                    }) if self.partition.caps.isolation == virt::IsolationType::Cca => {
+                        match self.partition.set_cca_memory_attributes(gpa, size, flags) {
+                            Ok(()) => {
+                                pending_exit = false;
+                                continue;
+                            }
+                            Err(err) => {
+                                return Err(dev.fatal_error(err.into()));
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        return Err(dev.fatal_error(KvmRunVpError::from_kvm_run_error(err).into()));
+                    }
+                };
                 pending_exit = true;
                 match exit {
                     kvm::Exit::Interrupted => {

@@ -41,7 +41,6 @@ use std::mem::size_of;
 use std::mem::size_of_val;
 #[cfg(guest_arch = "x86_64")]
 use std::os::fd::AsFd;
-#[cfg(guest_arch = "x86_64")]
 use std::os::fd::AsRawFd;
 use std::sync::atomic::Ordering;
 use virt::VpIndex;
@@ -109,10 +108,16 @@ pub enum KvmError {
     InvalidMapGpaRange,
     #[error("unsupported KVM_HC_MAP_GPA_RANGE attributes: {0:#x}")]
     UnsupportedMapGpaRangeAttributes(u64),
-    #[error("failed to discard shared backing for SNP private conversion")]
+    #[error("failed to discard shared backing after private conversion")]
     DiscardSharedBacking(#[source] std::io::Error),
-    #[error("failed to discard private backing for SNP shared conversion")]
+    #[error("failed to discard private backing after shared conversion")]
     DiscardPrivateBacking(#[source] std::io::Error),
+    #[cfg(guest_arch = "aarch64")]
+    #[error("invalid CCA memory fault")]
+    InvalidCcaMemoryFault,
+    #[cfg(guest_arch = "aarch64")]
+    #[error("unsupported CCA memory fault flags: {0:#x}")]
+    UnsupportedCcaMemoryFaultFlags(u64),
     #[error("misaligned gic base address")]
     Misaligned,
     #[error("host does not support GICv2 or GICv3")]
@@ -533,12 +538,51 @@ impl KvmPartitionInner {
             "KVM_HC_MAP_GPA_RANGE set memory attributes"
         );
         self.kvm.set_memory_attributes(gpa, size, attributes)?;
-        self.discard_stale_snp_backing(range, private)?;
+        self.discard_stale_private_memory_backing(range, private, "SNP")?;
         Ok(())
     }
 
-    #[cfg(guest_arch = "x86_64")]
-    fn discard_stale_snp_backing(&self, range: MemoryRange, private: bool) -> Result<(), KvmError> {
+    #[cfg(guest_arch = "aarch64")]
+    fn set_cca_memory_attributes(&self, gpa: u64, size: u64, flags: u64) -> Result<(), KvmError> {
+        let end = gpa
+            .checked_add(size)
+            .ok_or(KvmError::InvalidCcaMemoryFault)?;
+        if !gpa.is_multiple_of(hvdef::HV_PAGE_SIZE)
+            || !size.is_multiple_of(hvdef::HV_PAGE_SIZE)
+            || size == 0
+        {
+            return Err(KvmError::InvalidCcaMemoryFault);
+        }
+
+        let unsupported_flags = flags & !kvm::KVM_MEMORY_EXIT_FLAG_PRIVATE_UAPI;
+        if unsupported_flags != 0 {
+            return Err(KvmError::UnsupportedCcaMemoryFaultFlags(flags));
+        }
+
+        let private = flags & kvm::KVM_MEMORY_EXIT_FLAG_PRIVATE_UAPI != 0;
+        let range = MemoryRange::new(gpa..end);
+        if !self.ram_ranges.iter().any(|ram| ram.contains(&range)) {
+            return Err(KvmError::InvalidCcaMemoryFault);
+        }
+
+        let attributes = if private {
+            kvm::KVM_MEMORY_ATTRIBUTE_PRIVATE as u64
+        } else {
+            0
+        };
+        tracing::debug!(gpa, size, flags, private, "KVM CCA set memory attributes");
+        self.kvm.set_memory_attributes(gpa, size, attributes)?;
+        self.discard_stale_private_memory_backing(range, private, "CCA")
+            .map_err(map_cca_conversion_error)?;
+        Ok(())
+    }
+
+    fn discard_stale_private_memory_backing(
+        &self,
+        range: MemoryRange,
+        private: bool,
+        isolation_name: &'static str,
+    ) -> Result<(), KvmError> {
         let state = self.memory.lock();
         let slot = state
             .ranges
@@ -553,7 +597,8 @@ impl KvmPartitionInner {
                 gpa = range.start(),
                 size = range.len(),
                 hva = addr as usize,
-                "discarding shared backing after SNP private conversion"
+                isolation_name,
+                "discarding shared backing after private conversion"
             );
             let ret =
                 unsafe { libc::madvise(addr.cast(), range.len() as usize, libc::MADV_DONTNEED) };
@@ -571,7 +616,8 @@ impl KvmPartitionInner {
                 gpa = range.start(),
                 size = range.len(),
                 guest_memfd_offset = offset,
-                "discarding private backing after SNP shared conversion"
+                isolation_name,
+                "discarding private backing after shared conversion"
             );
             let ret = unsafe {
                 libc::fallocate(
@@ -1198,6 +1244,14 @@ fn map_cca_private_range_error(err: KvmError) -> KvmError {
     match err {
         KvmError::UnalignedSnpLaunchRange => KvmError::UnalignedCcaPopulateRange,
         KvmError::InvalidSnpLaunchRange => KvmError::InvalidCcaPopulateRange,
+        err => err,
+    }
+}
+
+#[cfg(guest_arch = "aarch64")]
+fn map_cca_conversion_error(err: KvmError) -> KvmError {
+    match err {
+        KvmError::InvalidMapGpaRange => KvmError::InvalidCcaMemoryFault,
         err => err,
     }
 }
