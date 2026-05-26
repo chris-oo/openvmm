@@ -414,12 +414,17 @@ Concrete Flowey implementation outline for the MVP:
   registration.
 - Add CLI options for:
   - `--test-root`, defaulting to `target/cca-test`;
-  - one mutually-exclusive mode selector: `--preflight`, `--stage-only`,
+  - terminal maintenance modes `--install-emu` and `--update-emu`. These should
+    perform the requested maintenance and exit; unlike the existing
+    `cca-tests --update-emu` behavior, they should not continue into a run mode.
+    Combining maintenance modes with `--preflight`, `--stage-only`,
+    `--interactive-host`, or `--run-openvmm` should fail fast with a clear CLI
+    error;
+  - one mutually-exclusive run-mode selector: `--preflight`, `--stage-only`,
     `--interactive-host`, or `--run-openvmm`;
   - existing environment maintenance options equivalent to `cca-tests`
-    (`--install-emu`, `--update-emu`, `--rebuild-plane0-linux`,
-    `--rebuild-rootfs`) either by sharing the existing structs or by delegating
-    to the existing jobs;
+    (`--rebuild-plane0-linux`, `--rebuild-rootfs`) either by sharing the
+    existing structs or by delegating to the existing jobs;
   - explicit Plane0 host kernel input for the FVP run, defaulting to the
     existing `--test-root/plane0-linux/arch/arm64/boot/Image` only when that
     image was built from the requested source/config. Also allow an explicit
@@ -461,6 +466,13 @@ Concrete Flowey implementation outline for the MVP:
   - copy the OpenVMM binary, preflight binary, Realm guest kernel/initrd, and
     scripts into `/cca`;
   - always unmount/sync/cleanup on failure.
+- Ensure FVP actually boots the explicit `--host-kernel`, not merely a kernel
+  copied into the rootfs. Implement this by passing the appropriate shrinkwrap
+  runtime variable or overlay for the Plane0 Linux `Image` (or by updating the
+  isolated package/config copy under `--test-root` if shrinkwrap does not expose
+  such a runtime variable). The preflight/run scripts should print and log
+  `uname -a` plus any available kernel build identifier so the booted host
+  kernel can be matched to the requested input.
 - For `preflight` under FVP, stage only the preflight binary and a small script,
   boot FVP, and run the script inside Plane0. If the current shrinkwrap setup
   does not provide a reliable non-interactive Plane0 command transport, make the
@@ -482,6 +494,69 @@ Concrete Flowey implementation outline for the MVP:
   not reliable enough for non-interactive execution, keep `run-openvmm` behind
   an explicit "not implemented" error rather than silently hanging.
 - Keep the existing `cargo xflowey cca-tests` behavior unchanged.
+
+Expected command usage for the MVP:
+
+```bash
+# One-time or after toolchain/FVP setup changes. Reuses existing cca-tests
+# emulator prerequisite and shrinkwrap/FVP installation infrastructure.
+cargo xflowey kvm-cca-tests --install-emu
+
+# Rebuild/update the Plane0 host kernel used by native OpenVMM KVM CCA tests.
+# The source tree/revision is explicit because this path tests a different KVM
+# feature set than the TMK/OpenHCL cca-tests payload.
+cargo xflowey kvm-cca-tests --update-emu \
+  --host-kernel-src ~/ai/eevee/NV-Kernels \
+  --host-kernel-rev <rev-or-branch> \
+  --rebuild-plane0-linux
+
+# Stage artifacts into an isolated rootfs copy, but do not launch FVP.
+cargo xflowey kvm-cca-tests --stage-only \
+  --host-kernel target/cca-test/plane0-linux/arch/arm64/boot/Image \
+  --guest-kernel /path/to/realm/Image \
+  --guest-initrd /path/to/realm/initrd
+
+# Boot FVP/Plane0 and run only the KVM CCA preflight probe. Guest kernel/initrd
+# are not needed for this mode.
+cargo xflowey kvm-cca-tests --preflight \
+  --host-kernel target/cca-test/plane0-linux/arch/arm64/boot/Image
+
+# Boot FVP/Plane0 with the staged artifacts and leave it available for manual
+# debugging. The command output should print artifact locations under /cca and
+# the exact OpenVMM command/script to run manually inside Plane0.
+cargo xflowey kvm-cca-tests --interactive-host \
+  --host-kernel target/cca-test/plane0-linux/arch/arm64/boot/Image \
+  --guest-kernel /path/to/realm/Image \
+  --guest-initrd /path/to/realm/initrd
+
+# Stage artifacts, boot FVP/Plane0, run the preflight and OpenVMM via the
+# boot-time init hook, then collect logs and shut down/clean up.
+cargo xflowey kvm-cca-tests --run-openvmm \
+  --host-kernel target/cca-test/plane0-linux/arch/arm64/boot/Image \
+  --guest-kernel /path/to/realm/Image \
+  --guest-initrd /path/to/realm/initrd \
+  --openvmm-extra-args "<extra debug args if needed>"
+```
+
+Mode behavior:
+
+- `--install-emu` should only install or validate common emulator prerequisites
+  and shrinkwrap/FVP assets. It should not stage native OpenVMM artifacts.
+- `--update-emu --rebuild-plane0-linux` should build the requested host kernel
+  and record enough metadata under `--test-root` to know which source/revision
+  produced the default `--host-kernel` image, then exit without staging or
+  launching FVP.
+- `--stage-only` should produce the isolated rootfs path and logs path, then
+  exit. It should not run shrinkwrap.
+- `--preflight` should stage the preflight binary and boot FVP with the explicit
+  host kernel. It should not require `--guest-kernel` or `--guest-initrd`.
+- `--interactive-host` should launch shrinkwrap/FVP with the isolated rootfs and
+  provided host kernel, then leave control/log output suitable for manual
+  debugging. It should not interpret guest success or failure.
+- `--run-openvmm` should fail fast if the boot-time init hook cannot be staged.
+  On success it should run `/cca/kvm_cca_preflight`, then
+  `/cca/run-openvmm-kvm-cca.sh`, enforce a timeout, collect logs, and clean up
+  FVP/rootfs mounts.
 
 ### 12. Kernel and userspace prerequisites for FVP
 
