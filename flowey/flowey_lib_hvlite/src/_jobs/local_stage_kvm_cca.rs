@@ -440,6 +440,7 @@ fn run_fsck(e2fsck: &Path, rootfs: &Path) -> anyhow::Result<()> {
 }
 
 fn run_sudo(description: &str, args: &[&OsStr]) -> anyhow::Result<()> {
+    check_sudo_auth()?;
     let status = Command::new("sudo")
         .args(args)
         .status()
@@ -470,6 +471,7 @@ fn check_preflight_status(rootfs: &Path, mnt_dir: &Path) -> anyhow::Result<()> {
             "KVM CCA preflight did not complete; missing {} (possible timeout or Plane0 crash)",
             status_path.display()
         );
+        check_sudo_auth()?;
         let output = Command::new("sudo")
             .arg("cat")
             .arg(&status_path)
@@ -516,5 +518,18 @@ fn check_preflight_status(rootfs: &Path, mnt_dir: &Path) -> anyhow::Result<()> {
     unmount_result?;
     let status = result?;
     anyhow::ensure!(status == 0, "KVM CCA preflight failed with status {status}");
+    Ok(())
+}
+
+fn check_sudo_auth() -> anyhow::Result<()> {
+    let status = Command::new("sudo")
+        .arg("-n")
+        .arg("true")
+        .status()
+        .context("failed to check sudo authentication status")?;
+    anyhow::ensure!(
+        status.success(),
+        "sudo requires authentication; run `sudo -v` first or configure passwordless sudo for local CCA rootfs staging"
+    );
     Ok(())
 }
