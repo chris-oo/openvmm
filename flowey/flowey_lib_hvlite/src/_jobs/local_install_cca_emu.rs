@@ -11,6 +11,7 @@ use flowey::node::prelude::*;
 use std::env;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
 use std::thread;
 
 const SHRINKWRAP_REPO: &str = "https://git.gitlab.arm.com/tooling/shrinkwrap.git";
@@ -39,6 +40,7 @@ flowey_request! {
         pub test_root: PathBuf,
         pub openvmm_root: PathBuf,
         pub skip_plane0_linux: bool,
+        pub use_kvm_cca_overlay: bool,
         pub done: WriteVar<SideEffect>,
     }
 }
@@ -121,11 +123,19 @@ pub(crate) fn build_plane0_linux(
 fn sync_shrinkwrap_overlay_assets(
     openvmm_root: &Path,
     shrinkwrap_dir: &Path,
+    use_kvm_cca_overlay: bool,
 ) -> anyhow::Result<()> {
+    let planes_overlay = if use_kvm_cca_overlay {
+        "kvm_cca_planes.yaml"
+    } else {
+        "cca_planes.yaml"
+    };
     let overlay_assets = [
         (
-            openvmm_root.join("vmm_tests/vmm_tests/test_data/cca_planes.yaml"),
-            shrinkwrap_dir.join("config/cca_planes.yaml"),
+            openvmm_root
+                .join("vmm_tests/vmm_tests/test_data")
+                .join(planes_overlay),
+            shrinkwrap_dir.join("config").join(planes_overlay),
             "planes.yaml",
         ),
         (
@@ -166,21 +176,31 @@ fn sync_shrinkwrap_overlay_assets(
 }
 
 pub(crate) fn build_cca_rootfs(
-    rt: &RustRuntimeServices<'_>,
+    _rt: &RustRuntimeServices<'_>,
     test_root: &Path,
     shrinkwrap_dir: &Path,
     venv_dir: &Path,
+    planes_overlay: &str,
+    guest_rootfs: &str,
+    buildroot_overlay: bool,
+    use_docker_runtime: bool,
 ) -> anyhow::Result<()> {
-    let shrinkwrap_exe = shrinkwrap_dir.join("shrinkwrap/shrinkwrap");
+    let shrinkwrap_py = shrinkwrap_dir.join("shrinkwrap/shrinkwrap.py");
+    let venv_python = venv_dir.join("bin/python3");
     anyhow::ensure!(
-        shrinkwrap_exe.exists(),
+        shrinkwrap_py.exists(),
         "shrinkwrap installation is missing or broken at {}, try --install-emu first",
-        shrinkwrap_exe.display()
+        shrinkwrap_py.display()
     );
     anyhow::ensure!(
         venv_dir.exists(),
         "shrinkwrap venv is missing at {}, try --install-emu first",
         venv_dir.display()
+    );
+    anyhow::ensure!(
+        venv_python.exists(),
+        "shrinkwrap venv python is missing at {}, try --install-emu first",
+        venv_python.display()
     );
 
     let log_dir = test_root.join("logs");
@@ -193,25 +213,41 @@ pub(crate) fn build_cca_rootfs(
         env::var("PATH").unwrap_or_default()
     );
 
-    let rootfs = "${artifact:BUILDROOT}";
     let tfa_revision = "8dae0862c502e08568a61a1050091fa9357f1240";
-    let cmd = format!(
-        "{} build cca-3world.yaml \
-        --overlay buildroot.yaml \
-        --overlay cca_realm_overlay.yaml \
-        --overlay cca_planes.yaml \
-        --btvar GUEST_ROOTFS={rootfs} \
-        --btvar TFA_REVISION={tfa_revision} \
-        2>&1 | tee {}",
-        shrinkwrap_exe.display(),
-        log_file.display()
-    );
-
-    flowey::shell_cmd!(rt, "bash -c {cmd}")
+    log::info!("shrinkwrap build log: {}", log_file.display());
+    let mut cmd = Command::new(&venv_python);
+    cmd.arg(&shrinkwrap_py);
+    if use_docker_runtime {
+        cmd.arg("--runtime=docker")
+            .arg("--image=shrinkwraptool/base-slim:2026.3.0.dev0");
+    }
+    cmd.arg("build").arg("cca-3world.yaml");
+    if buildroot_overlay {
+        cmd.arg("--overlay").arg("buildroot.yaml");
+    }
+    cmd.arg("--overlay")
+        .arg("cca_realm_overlay.yaml")
+        .arg("--overlay")
+        .arg(planes_overlay)
+        .arg("--btvar")
+        .arg(format!("GUEST_ROOTFS={guest_rootfs}"))
+        .arg("--btvar")
+        .arg(format!("TFA_REVISION={tfa_revision}"))
         .env("VIRTUAL_ENV", venv_dir)
         .env("PATH", path)
-        .run()
-        .with_context(|| "failed to do shrinkwrap build")?;
+        .current_dir(shrinkwrap_dir.join("config"));
+    let output = cmd.output().context("failed to execute shrinkwrap build")?;
+    let mut log = Vec::new();
+    log.extend_from_slice(&output.stdout);
+    log.extend_from_slice(&output.stderr);
+    fs_err::write(&log_file, &log)?;
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    anyhow::ensure!(
+        output.status.success(),
+        "failed to do shrinkwrap build; see {}",
+        log_file.display()
+    );
 
     log::info!("shrinkwrap build finished, emulation env have been setup");
     Ok(())
@@ -229,6 +265,7 @@ impl SimpleFlowNode for Node {
             test_root,
             openvmm_root,
             skip_plane0_linux,
+            use_kvm_cca_overlay,
             done,
         } = request;
         let plane0_linux = test_root.join("plane0-linux");
@@ -336,17 +373,52 @@ impl SimpleFlowNode for Node {
                     flowey::shell_cmd!(rt, "{pip} install pyyaml termcolor tuxmake").run()?;
                 }
 
-                sync_shrinkwrap_overlay_assets(&openvmm_root, &shrinkwrap_dir)?;
+                sync_shrinkwrap_overlay_assets(
+                    &openvmm_root,
+                    &shrinkwrap_dir,
+                    use_kvm_cca_overlay,
+                )?;
 
                 let home_dir = env::var("HOME").map(PathBuf::from).expect("HOME not set");
                 let rootfs_file = home_dir.join(".shrinkwrap/package/cca-3world/rootfs.ext2");
-                if rootfs_file.exists() {
+                let planes_overlay = if use_kvm_cca_overlay {
+                    "kvm_cca_planes.yaml"
+                } else {
+                    "cca_planes.yaml"
+                };
+                if rootfs_file.exists() && !use_kvm_cca_overlay {
                     log::info!(
                         "cca emulation rootfs is already generated at: {}",
                         rootfs_file.display()
                     );
                 } else {
-                    build_cca_rootfs(rt, &test_root, &shrinkwrap_dir, &venv_dir)?;
+                    let guest_rootfs = if use_kvm_cca_overlay {
+                        let build_rootfs = home_dir
+                            .join(".shrinkwrap/build/build/cca-3world/buildroot/images/rootfs.ext2");
+                        if rootfs_file.exists() {
+                            rootfs_file.to_string_lossy().into_owned()
+                        } else if build_rootfs.exists() {
+                            build_rootfs.to_string_lossy().into_owned()
+                        } else {
+                            anyhow::bail!(
+                                "no CCA buildroot rootfs found at {} or {}; run `cargo xflowey cca-tests --install-emu` or build the CCA rootfs before kvm-cca-tests",
+                                rootfs_file.display(),
+                                build_rootfs.display()
+                            );
+                        }
+                    } else {
+                        "${artifact:BUILDROOT}".to_string()
+                    };
+                    build_cca_rootfs(
+                        rt,
+                        &test_root,
+                        &shrinkwrap_dir,
+                        &venv_dir,
+                        planes_overlay,
+                        &guest_rootfs,
+                        !use_kvm_cca_overlay,
+                        use_kvm_cca_overlay,
+                    )?;
                 }
 
                 Ok(())

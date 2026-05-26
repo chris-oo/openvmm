@@ -120,7 +120,14 @@ impl SimpleFlowNode for Node {
 
                 let home_dir = env::var("HOME").map(PathBuf::from).expect("HOME not set");
                 let firmware_dir = home_dir.join(".shrinkwrap/package/cca-3world");
-                let source_rootfs = firmware_dir.join("rootfs.ext2");
+                let packaged_rootfs = firmware_dir.join("rootfs.ext2");
+                let build_rootfs =
+                    home_dir.join(".shrinkwrap/build/build/cca-3world/buildroot/images/rootfs.ext2");
+                let source_rootfs = if packaged_rootfs.is_file() {
+                    packaged_rootfs
+                } else {
+                    build_rootfs
+                };
                 validate_regular_file(&source_rootfs, "CCA shrinkwrap rootfs")?;
 
                 let e2fsck_bin =
@@ -317,7 +324,7 @@ exit 0
                     );
                     flowey::shell_cmd!(
                         rt,
-                        "timeout --foreground 20m {venv_python} {shrinkwrap_py} run cca-3world.yaml --rtvar ROOTFS={rootfs_file} --rtvar KERNEL={host_kernel}"
+                        "timeout --foreground 20m {venv_python} {shrinkwrap_py} --runtime=docker --image=shrinkwraptool/base-slim:2026.3.0.dev0 run cca-3world.yaml --rtvar ROOTFS={rootfs_file} --rtvar KERNEL={host_kernel}"
                     )
                         .env("VIRTUAL_ENV", &venv_dir)
                         .env("PATH", &venv_bin_path)

@@ -159,6 +159,7 @@ impl IntoPipeline for KvmCcaTestsCli {
                         test_root: test_root.clone(),
                         openvmm_root: crate::repo_root(),
                         skip_plane0_linux: true,
+                        use_kvm_cca_overlay: true,
                         done: ctx.new_done_handle(),
                     },
                 )
