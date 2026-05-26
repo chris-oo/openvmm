@@ -38,6 +38,7 @@ flowey_request! {
         /// The CCA test root directory, defaults to target/cca-test.
         pub test_root: PathBuf,
         pub openvmm_root: PathBuf,
+        pub skip_plane0_linux: bool,
         pub done: WriteVar<SideEffect>,
     }
 }
@@ -227,13 +228,16 @@ impl SimpleFlowNode for Node {
         let Params {
             test_root,
             openvmm_root,
+            skip_plane0_linux,
             done,
         } = request;
         let plane0_linux = test_root.join("plane0-linux");
         let shrinkwrap_dir = test_root.join("shrinkwrap");
 
-        let plane0_linux = if plane0_linux.exists() {
-            ReadVar::from_static(plane0_linux)
+        let plane0_linux = if skip_plane0_linux {
+            None
+        } else if plane0_linux.exists() {
+            Some(ReadVar::from_static(plane0_linux))
         } else {
             ctx.req(flowey_lib_common::git_checkout::Request::RegisterRepo {
                 repo_id: "cca-plane0-linux".into(),
@@ -246,11 +250,13 @@ impl SimpleFlowNode for Node {
                 depth: None,
                 pre_run_deps: Vec::new(),
             });
-            ctx.reqv(|v| flowey_lib_common::git_checkout::Request::CheckoutRepo {
-                repo_id: ReadVar::from_static("cca-plane0-linux".into()),
-                repo_path: v,
-                persist_credentials: false,
-            })
+            Some(
+                ctx.reqv(|v| flowey_lib_common::git_checkout::Request::CheckoutRepo {
+                    repo_id: ReadVar::from_static("cca-plane0-linux".into()),
+                    repo_path: v,
+                    persist_credentials: false,
+                }),
+            )
         };
 
         let shrinkwrap_dir = if shrinkwrap_dir.exists() {
@@ -276,7 +282,7 @@ impl SimpleFlowNode for Node {
 
         ctx.emit_rust_step("install cca emulation environment", |ctx| {
             done.claim(ctx);
-            let plane0_linux = plane0_linux.claim(ctx);
+            let plane0_linux = plane0_linux.map(|plane0_linux| plane0_linux.claim(ctx));
             let shrinkwrap_dir = shrinkwrap_dir.claim(ctx);
             move |rt| {
                 // emulation environment is under 'test_root'
@@ -284,23 +290,29 @@ impl SimpleFlowNode for Node {
 
                 // 'shrinkwrap' only build host Linux kernel, plane0 Linux kernel
                 // needs to be downloaded and built separately.
-                let plane0_linux = rt.read(plane0_linux);
-                let plane0_image = plane0_linux
-                    .join("arch")
-                    .join("arm64")
-                    .join("boot")
-                    .join("Image");
-                rt.sh.change_dir(&plane0_linux);
-                flowey::shell_cmd!(rt, "git checkout {PLANE0_LINUX_BRANCH}").run()?;
+                if let Some(plane0_linux) = plane0_linux {
+                    let plane0_linux = rt.read(plane0_linux);
+                    let plane0_image = plane0_linux
+                        .join("arch")
+                        .join("arm64")
+                        .join("boot")
+                        .join("Image");
+                    rt.sh.change_dir(&plane0_linux);
+                    flowey::shell_cmd!(rt, "git checkout {PLANE0_LINUX_BRANCH}").run()?;
 
-                // Now check if image has been built
-                if plane0_image.exists() {
-                    log::info!(
-                        "plane0 Linux image also has been built and found at: {}",
-                        plane0_image.display()
-                    );
+                    // Now check if image has been built
+                    if plane0_image.exists() {
+                        log::info!(
+                            "plane0 Linux image also has been built and found at: {}",
+                            plane0_image.display()
+                        );
+                    } else {
+                        build_plane0_linux(rt, &plane0_linux, &plane0_image)?;
+                    }
                 } else {
-                    build_plane0_linux(rt, &plane0_linux, &plane0_image)?;
+                    log::info!(
+                        "skipping Plane0 Linux build; native kvm-cca-tests uses an explicit host kernel"
+                    );
                 }
 
                 // Install the remaining emulation environment components

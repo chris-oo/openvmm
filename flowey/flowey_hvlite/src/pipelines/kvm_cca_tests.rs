@@ -158,6 +158,7 @@ impl IntoPipeline for KvmCcaTestsCli {
                     |ctx| flowey_lib_hvlite::_jobs::local_install_cca_emu::Params {
                         test_root: test_root.clone(),
                         openvmm_root: crate::repo_root(),
+                        skip_plane0_linux: true,
                         done: ctx.new_done_handle(),
                     },
                 )
