@@ -379,9 +379,13 @@ behavior intact.
 Add a separate native KVM CCA pipeline, tentatively
 `cargo xflowey kvm-cca-tests`, so the native OpenVMM/KVM Realm path can evolve
 without overloading the TMK/OpenHCL `cca-tests` command. The new pipeline should
-reuse the same environment checks, install/update jobs, rootfs handling,
-shrinkwrap/FVP launch, and logging conventions where possible, but stage and run
-OpenVMM-native payloads.
+reuse the same emulator prerequisite checks, shrinkwrap install/update jobs,
+rootfs handling helpers, shrinkwrap/FVP launch, and logging conventions where
+possible, but stage and run OpenVMM-native payloads. Reuse the emulator
+installation infrastructure; do not duplicate the FVP/shrinkwrap install logic.
+However, the native KVM CCA path must accept explicit host and guest kernel
+inputs, because it needs a Plane0 host kernel with the v14 KVM CCA ABI being
+tested and a Realm guest kernel with the matching CCA/RSI enlightenments.
 
 For the first MVP, implement only these modes:
 
@@ -416,9 +420,16 @@ Concrete Flowey implementation outline for the MVP:
     (`--install-emu`, `--update-emu`, `--rebuild-plane0-linux`,
     `--rebuild-rootfs`) either by sharing the existing structs or by delegating
     to the existing jobs;
-  - local guest kernel/initrd paths for the Realm guest, with later fallback to
-    `resolve_openvmm_test_linux_kernel` and `resolve_openvmm_test_initrd` once
-    the default artifacts are known to be CCA-enlightened enough;
+  - explicit Plane0 host kernel input for the FVP run, defaulting to the
+    existing `--test-root/plane0-linux/arch/arm64/boot/Image` only when that
+    image was built from the requested source/config. Also allow an explicit
+    host kernel source tree/revision for rebuilds, because native KVM CCA tests
+    need a different host kernel feature set than the existing TMK/OpenHCL
+    `cca-tests` path;
+  - explicit local guest kernel/initrd paths for the Realm guest, with later
+    fallback to `resolve_openvmm_test_linux_kernel` and
+    `resolve_openvmm_test_initrd` only once the default artifacts are known to be
+    CCA-enlightened enough;
   - an optional extra OpenVMM command-line string for local debugging.
 - Reuse `flowey_lib_hvlite::build_openvmm::Node` to cross-build an aarch64
   Linux `openvmm` binary (`CommonArch::Aarch64`,
@@ -439,7 +450,8 @@ Concrete Flowey implementation outline for the MVP:
   - copy the shrinkwrap `rootfs.ext2` into a per-run isolated file under
     `--test-root` before modification, and pass that copy to shrinkwrap. If a
     stable path is needed for interactive reuse, guard it with a lock file under
-    `--test-root`;
+    `--test-root`; a second concurrent invocation must fail fast with a clear
+    error instead of waiting or retrying;
   - run the same fsck/resize/rootfs mount flow as `local_run_cca_test` against
     the isolated copy;
   - use a unique absolute mount directory under `--test-root` instead of the
@@ -478,14 +490,22 @@ enlightened guest kernel.
 
 Concrete work:
 
-- Build Plane0 Linux from `~/ai/eevee/NV-Kernels`, the reference Linux tree with
-  the v14 Arm CCA KVM series applied. It must provide `guest_memfd`, generic
-  memory attributes, Realm VM creation, `KVM_ARM_RMI_POPULATE`, RIPAS changes,
-  Realm MMIO, VGIC/timer, and in-kernel Realm PSCI completion support.
+- For native OpenVMM KVM CCA validation, treat the Plane0 host kernel as an
+  explicit input to `kvm-cca-tests`, not an implicit artifact inherited from the
+  existing TMK/OpenHCL `cca-tests` flow. Use `~/ai/eevee/NV-Kernels` or another
+  specified source tree/revision for the host kernel under test. It must provide
+  `guest_memfd`, generic memory attributes, Realm VM creation,
+  `KVM_ARM_RMI_POPULATE`, RIPAS changes, Realm MMIO, VGIC/timer, and in-kernel
+  Realm PSCI completion support.
+- Keep sharing the emulator/shrinkwrap install and rootfs build infrastructure
+  from `cca-tests`; only the staged payloads and host/guest kernel inputs differ
+  for the native OpenVMM KVM CCA path.
 - Ensure the KVM userspace headers used by OpenVMM expose the v14 RMI/CCA ioctls
   and constants listed in section 2.
-- Build the guest Linux kernel with Arm CCA/Realm awareness and the enlightenments
-  expected by the existing OpenVMM + KVM Linux path.
+- Build or provide the guest Linux kernel with Arm CCA/Realm awareness and the
+  enlightenments expected by the existing OpenVMM + KVM Linux path. The guest
+  kernel is also an explicit input for the MVP; do not assume the default
+  `openvmm-deps` aarch64 test kernel is suitable until verified.
 - Include kvmtool in the FVP environment as a reference/debug tool, but use
   OpenVMM for the target launch.
 - Add a preflight command that prints KVM RMI capability, supported Realm VM type
@@ -526,8 +546,8 @@ FVP validation:
   preflight probe and verifies the CCA KVM ABI inside Plane0 (or documents the
   manual command when the first version is interactive-only).
 - `cargo xflowey kvm-cca-tests --stage-only` stages OpenVMM, the preflight
-  probe, guest kernel/initrd, and run scripts into the CCA rootfs without
-  launching FVP.
+  probe, explicit Plane0 host kernel, guest kernel/initrd, and run scripts into
+  the isolated CCA rootfs without launching FVP.
 - `cargo xflowey kvm-cca-tests --interactive-host` boots the CCA FVP/Plane0
   environment with those artifacts staged for manual debugging.
 - `cargo xflowey kvm-cca-tests --run-openvmm` builds or stages OpenVMM and
@@ -589,6 +609,13 @@ aarch64 dependency checks, and avoid concurrent rootfs staging collisions. The
 plan now specifies a Plane0 boot-time init hook for `run-openvmm`, cross-safe
 ELF/interpreter inspection for staged aarch64 binaries, and per-run rootfs
 copies or a `--test-root` lock for reusable staging paths.
+
+User follow-up clarified that lock contention should fail fast and that native
+OpenVMM KVM CCA validation must use explicitly selected host and guest kernels.
+The plan now says a second concurrent stable-rootfs staging invocation must
+error immediately, the emulator/shrinkwrap install infrastructure should be
+shared with existing `cca-tests`, and `kvm-cca-tests` must take explicit Plane0
+host-kernel and Realm guest-kernel inputs for the feature set under test.
 
 ## Files likely touched
 
