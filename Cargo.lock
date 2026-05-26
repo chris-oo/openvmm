@@ -3960,6 +3960,14 @@ version = "0.14.0"
 source = "git+https://github.com/rust-vmm/kvm?rev=3ffc9b62af5978553f73cc0ec79fad13fdd47146#3ffc9b62af5978553f73cc0ec79fad13fdd47146"
 
 [[package]]
+name = "kvm_cca_preflight"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "kvm",
+]
+
+[[package]]
 name = "landlock"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

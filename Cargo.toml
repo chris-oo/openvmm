@@ -24,6 +24,7 @@ members = [
   # VMM tests
   "vmm_tests/prep_steps",
   "vmm_tests/vmm_tests",
+  "vm/kvm/kvm_cca_preflight",
   # Performance tests
   "petri/burette",
   # hyper-v tooling
