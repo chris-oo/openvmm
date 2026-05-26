@@ -1043,6 +1043,40 @@ impl InitializedVm {
             if cfg.vmbus.is_some() || cfg.vtl2_vmbus.is_some() || !cfg.vmbus_devices.is_empty() {
                 anyhow::bail!("KVM {isolation_name} guest_memfd does not support VMBus");
             }
+            if cfg.hypervisor.with_isolation == Some(IsolationType::Cca) {
+                if !matches!(
+                    cfg.load_mode,
+                    LoadMode::Linux {
+                        boot_mode: openvmm_defs::config::LinuxDirectBootMode::DeviceTree,
+                        ..
+                    }
+                ) {
+                    anyhow::bail!(
+                        "KVM CCA guest_memfd only supports device tree Linux direct boot"
+                    );
+                }
+                if !cfg.virtio_devices.is_empty() {
+                    anyhow::bail!(
+                        "KVM CCA guest_memfd only supports virtio devices on PCIe root ports"
+                    );
+                }
+                if !cfg.pcie_switches.is_empty() {
+                    anyhow::bail!("KVM CCA guest_memfd does not support PCIe switches");
+                }
+                let unsupported_pcie_root_complex =
+                    cfg.pcie_root_complexes.iter().any(|root_complex| {
+                        root_complex.cxl.is_some()
+                            || root_complex
+                                .ports
+                                .iter()
+                                .any(|port| port.hotplug || port.cxl)
+                    });
+                if unsupported_pcie_root_complex {
+                    anyhow::bail!(
+                        "KVM CCA guest_memfd does not support PCIe hotplug or CXL root ports"
+                    );
+                }
+            }
             if !cfg.floppy_disks.is_empty()
                 || !cfg.ide_disks.is_empty()
                 || !cfg.virtio_devices.is_empty()

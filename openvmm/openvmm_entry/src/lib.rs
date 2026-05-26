@@ -1806,6 +1806,41 @@ fn validate_isolation_config(cfg: &Config) -> anyhow::Result<()> {
         anyhow::bail!("{isolation_name} isolation currently does not support VMBus devices");
     }
 
+    if isolation == openvmm_defs::config::IsolationType::Cca {
+        if !matches!(
+            cfg.load_mode,
+            LoadMode::Linux {
+                boot_mode: openvmm_defs::config::LinuxDirectBootMode::DeviceTree,
+                ..
+            }
+        ) {
+            anyhow::bail!("CCA isolation currently only supports device tree Linux direct boot");
+        }
+
+        if !cfg.virtio_devices.is_empty() {
+            anyhow::bail!(
+                "CCA isolation currently only supports virtio devices on PCIe root ports"
+            );
+        }
+
+        if !cfg.pcie_switches.is_empty() {
+            anyhow::bail!("CCA isolation currently does not support PCIe switches");
+        }
+
+        let unsupported_pcie_root_complex = cfg.pcie_root_complexes.iter().any(|root_complex| {
+            root_complex.cxl.is_some()
+                || root_complex
+                    .ports
+                    .iter()
+                    .any(|port| port.hotplug || port.cxl)
+        });
+        if unsupported_pcie_root_complex {
+            anyhow::bail!(
+                "CCA isolation currently does not support PCIe hotplug or CXL root ports"
+            );
+        }
+    }
+
     let only_supported_chipset_devices = cfg.chipset_devices.iter().all(|device| {
         matches!(
             device.resource.id(),
@@ -1824,6 +1859,7 @@ fn validate_isolation_config(cfg: &Config) -> anyhow::Result<()> {
 
     if !cfg.floppy_disks.is_empty()
         || !cfg.ide_disks.is_empty()
+        || !cfg.virtio_devices.is_empty()
         || !only_virtio_pcie_devices
         || !cfg.vpci_devices.is_empty()
         || !only_supported_chipset_devices
