@@ -367,6 +367,110 @@ Concrete work:
   phase; decide whether it lives under `cca-tests` or a separate
   `kvm-cca-tests` command when doing Flowey integration.
 
+#### Native KVM CCA debug/test modes
+
+The PR 3455 infrastructure is now present in-tree. The existing
+`cargo xflowey cca-tests` pipeline builds and injects the TMK/OpenHCL payload
+(`tmk_vmm`, `simple_tmk`, `guest-disk.img`, `KVMTOOL_EFI.fd`, `lkvm`, and the
+Plane0 Linux `Image`) into the shrinkwrap `cca-3world` rootfs, then runs
+`shrinkwrap run cca-3world.yaml --rtvar ROOTFS=<rootfs.ext2>`. Keep that
+behavior intact.
+
+Add a separate native KVM CCA pipeline, tentatively
+`cargo xflowey kvm-cca-tests`, so the native OpenVMM/KVM Realm path can evolve
+without overloading the TMK/OpenHCL `cca-tests` command. The new pipeline should
+reuse the same environment checks, install/update jobs, rootfs handling,
+shrinkwrap/FVP launch, and logging conventions where possible, but stage and run
+OpenVMM-native payloads.
+
+For the first MVP, implement only these modes:
+
+| Mode | Runs FVP? | Purpose | First implementation shape |
+| --- | --- | --- | --- |
+| `preflight` | Optional | Check whether the target Linux host exposes the KVM CCA ABI needed by OpenVMM. | Build a tiny aarch64 Rust probe binary, stage it into Plane0 for FVP runs, and print `/dev/kvm`, `KVM_CAP_ARM_RMI`, `KVM_CAP_GUEST_MEMFD`, `KVM_CAP_MEMORY_ATTRIBUTES(PRIVATE)`, `KVM_CAP_ARM_VM_IPA_SIZE`, Realm VM creation, VM private-memory caps, and VGICv3 availability. The same binary may be run manually on native CCA hosts, but automated native-host transport is deferred. |
+| `stage-only` | No | Build/copy artifacts into an isolated rootfs copy but do not boot FVP. | Reuse the existing rootfs fsck/resize/mount/copy/unmount flow from `local_run_cca_test`, but first copy the shrinkwrap rootfs into `--test-root` so native KVM staging cannot pollute the shared `cca-tests` rootfs. Copy the OpenVMM binary, preflight binary, guest kernel, guest initrd, and any run scripts into `/cca` (or a native subdirectory under `/cca`) in that copy. |
+| `interactive-host` | Yes | Boot Plane0 Linux with artifacts staged and leave the environment available for manual commands. | Run `shrinkwrap run cca-3world.yaml --rtvar ROOTFS=<rootfs.ext2>` with the staged rootfs and do not try to parse a guest success marker. Prefer the most direct shrinkwrap/FVP interactive mode available; if none exists, document the manual serial-console interaction needed for the first version. |
+| `run-openvmm` | Yes | Non-interactive local smoke run of OpenVMM inside Plane0. | Stage artifacts and a script that runs the preflight first, then invokes OpenVMM with the actual CCA CLI/config supported by the code, direct arm64 Linux boot, device-tree boot mode, serial enabled, and only the first supported PCIe/virtio profile. For the MVP, use an explicit Plane0 boot-time init hook in the staged rootfs to run this script and write logs; do not rely on ad hoc serial typing for this mode. Stream/collect Plane0, OpenVMM, and Realm guest serial logs. |
+
+Do not implement these modes in the first MVP, but leave room for them:
+
+- `hold-on-failure`: a modifier for `run-openvmm` that leaves FVP/Plane0 alive
+  after failure for manual inspection.
+- `native-host`: run the same preflight and OpenVMM command directly on a real
+  CCA-capable Linux host or an already-running Plane0 shell, without launching
+  FVP.
+- `smoke-test`: CI-shaped mode that waits for a guest serial marker and returns
+  pass/fail; this should be the bridge toward a later VMM test.
+
+Concrete Flowey implementation outline for the MVP:
+
+- Add a new `kvm_cca_tests` pipeline under `flowey/flowey_hvlite/src/pipelines`
+  and register it in `pipelines/mod.rs` and the top-level clap pipeline enum.
+  Add any new Flowey jobs to `flowey_lib_hvlite/src/lib.rs` and `_jobs` module
+  registration.
+- Add CLI options for:
+  - `--test-root`, defaulting to `target/cca-test`;
+  - one mutually-exclusive mode selector: `--preflight`, `--stage-only`,
+    `--interactive-host`, or `--run-openvmm`;
+  - existing environment maintenance options equivalent to `cca-tests`
+    (`--install-emu`, `--update-emu`, `--rebuild-plane0-linux`,
+    `--rebuild-rootfs`) either by sharing the existing structs or by delegating
+    to the existing jobs;
+  - local guest kernel/initrd paths for the Realm guest, with later fallback to
+    `resolve_openvmm_test_linux_kernel` and `resolve_openvmm_test_initrd` once
+    the default artifacts are known to be CCA-enlightened enough;
+  - an optional extra OpenVMM command-line string for local debugging.
+- Reuse `flowey_lib_hvlite::build_openvmm::Node` to cross-build an aarch64
+  Linux `openvmm` binary (`CommonArch::Aarch64`,
+  `CommonPlatform::LinuxGnu`, debug profile for local MVP).
+- Add a tiny aarch64 Rust preflight binary. Prefer a small crate/binary that
+  depends on the existing `kvm` crate and performs the checks listed above.
+  Flowey should build it for aarch64 and stage it next to OpenVMM. Keep this
+  probe independent of FVP so it can also run on native CCA hosts later.
+- Validate the staged OpenVMM and preflight binaries against the Plane0 rootfs
+  before launching FVP. For dynamically linked aarch64 Linux GNU binaries, use
+  cross-safe ELF/interpreter/dependency inspection (for example `readelf` plus
+  sysroot lookup), not host `ldd`, and either stage required libraries or switch
+  to a static/musl-compatible build if that becomes available.
+- Add a new Flowey job (or refactor the reusable pieces from
+  `local_run_cca_test`) for rootfs staging:
+  - validate `shrinkwrap`, its venv, Plane0 Linux `Image`,
+    `rootfs.ext2`, `e2fsck`, and `resize2fs`;
+  - copy the shrinkwrap `rootfs.ext2` into a per-run isolated file under
+    `--test-root` before modification, and pass that copy to shrinkwrap. If a
+    stable path is needed for interactive reuse, guard it with a lock file under
+    `--test-root`;
+  - run the same fsck/resize/rootfs mount flow as `local_run_cca_test` against
+    the isolated copy;
+  - use a unique absolute mount directory under `--test-root` instead of the
+    current relative `mnt` directory, so concurrent or failed runs do not
+    collide;
+  - check free space before resizing/staging large artifacts;
+  - copy the OpenVMM binary, preflight binary, Realm guest kernel/initrd, and
+    scripts into `/cca`;
+  - always unmount/sync/cleanup on failure.
+- For `preflight` under FVP, stage only the preflight binary and a small script,
+  boot FVP, and run the script inside Plane0. If the current shrinkwrap setup
+  does not provide a reliable non-interactive Plane0 command transport, make the
+  first version an interactive run with clear instructions to execute
+  `/cca/kvm_cca_preflight` manually.
+- For `interactive-host`, stage artifacts and run FVP without enforcing a
+  success marker. The output should tell the developer where the artifacts are
+  inside Plane0 and the exact OpenVMM command to run manually.
+- For `run-openvmm`, stage a script such as `/cca/run-openvmm-kvm-cca.sh` that:
+  - runs `/cca/kvm_cca_preflight`;
+  - runs OpenVMM with the CCA isolation CLI/config currently implemented by
+    OpenVMM, direct arm64 Linux boot, device-tree boot mode, serial enabled, and
+    the supplied guest kernel/initrd;
+  - writes OpenVMM and guest logs under `/cca/logs`.
+  The Flowey job must install a boot-time init hook into the staged rootfs to run
+  this script inside Plane0, run shrinkwrap/FVP with an explicit timeout,
+  terminate or clean up FVP on timeout/failure, and collect those logs from the
+  isolated rootfs or serial output after shutdown. If the init-hook mechanism is
+  not reliable enough for non-interactive execution, keep `run-openvmm` behind
+  an explicit "not implemented" error rather than silently hanging.
+- Keep the existing `cargo xflowey cca-tests` behavior unchanged.
+
 ### 12. Kernel and userspace prerequisites for FVP
 
 The FVP environment needs both host-side CCA support in Plane0 Linux and an
@@ -386,6 +490,10 @@ Concrete work:
   OpenVMM for the target launch.
 - Add a preflight command that prints KVM RMI capability, supported Realm VM type
   and IPA size, and available SVE/debug features.
+- For the native OpenVMM MVP, use explicit local paths for the Realm guest
+  kernel and initrd until the default Flowey `openvmm-deps` artifacts are known
+  to contain the required CCA/RSI enlightenments. Document the exact kernel tree,
+  config, and smoke-test marker once selected.
 
 ### 13. Tests and validation
 
@@ -414,7 +522,16 @@ FVP validation:
 
 - `cargo xflowey cca-tests --install-emu` installs or validates the emulation
   environment from PR 3455.
-- A new/native mode builds or stages OpenVMM and launches it inside Plane0 Linux.
+- `cargo xflowey kvm-cca-tests --preflight` builds/stages the tiny KVM CCA
+  preflight probe and verifies the CCA KVM ABI inside Plane0 (or documents the
+  manual command when the first version is interactive-only).
+- `cargo xflowey kvm-cca-tests --stage-only` stages OpenVMM, the preflight
+  probe, guest kernel/initrd, and run scripts into the CCA rootfs without
+  launching FVP.
+- `cargo xflowey kvm-cca-tests --interactive-host` boots the CCA FVP/Plane0
+  environment with those artifacts staged for manual debugging.
+- `cargo xflowey kvm-cca-tests --run-openvmm` builds or stages OpenVMM and
+  launches it inside Plane0 Linux.
 - OpenVMM creates a KVM Realm VM, sets private memory, populates
   kernel/initrd/DTB, sets allowed initial registers, and runs the guest.
 - Guest serial output proves the enlightened Linux guest reaches userspace or the
@@ -440,8 +557,10 @@ FVP validation:
 7. **Minimal runtime/device profile:** run direct Linux with serial plus
    virtio/PCIe, GICv3, PSCI, MMIO, timer basics, and fatal handling for
    unsupported exits/RIPAS ranges. Do not expose VMBus.
-8. **FVP Flowey integration:** add the native OpenVMM KVM CCA mode to the PR 3455
-   FVP pipeline and collect logs/artifacts.
+8. **FVP Flowey integration:** add a native `kvm-cca-tests` Flowey pipeline with
+   the first four MVP modes: `preflight`, `stage-only`, `interactive-host`, and
+   `run-openvmm`. Reuse the PR 3455 FVP environment setup and collect
+   logs/artifacts.
 9. **Hardening:** expand tests, tighten device policy, remove temporary FVP-only
    assumptions, and document unsupported production features.
 
@@ -449,8 +568,27 @@ FVP validation:
 
 - Production attestation. Preserve useful measurement/configuration logs, but do
   not implement an attestation flow.
-- Final Flowey command shape. The native FVP mode can be added under
-  `cca-tests` or a separate `kvm-cca-tests` command during Flowey integration.
+- Non-MVP Flowey modes such as `hold-on-failure`, `native-host`, and automated
+  `smoke-test` pass/fail behavior. Keep the first Flowey implementation focused
+  on preflight, staging, interactive debugging, and a non-interactive local
+  OpenVMM run.
+
+## Review
+
+Plan review for the native KVM CCA Flowey modes found the overall direction
+acceptable with minor revisions. The plan was updated to require an explicit
+Plane0 command-transport strategy, isolate native KVM rootfs staging from the
+existing `cca-tests` rootfs, clarify that automated native-host mode is
+deferred, validate/stage OpenVMM runtime dependencies, define timeout and
+cleanup behavior, use safe mount directories under `--test-root`, and list the
+Flowey registration points needed for the new pipeline and jobs.
+
+A follow-up review asked for three clarifications before implementation: choose
+a concrete Plane0 command transport for `run-openvmm`, avoid host `ldd` for
+aarch64 dependency checks, and avoid concurrent rootfs staging collisions. The
+plan now specifies a Plane0 boot-time init hook for `run-openvmm`, cross-safe
+ELF/interpreter inspection for staged aarch64 binaries, and per-run rootfs
+copies or a `--test-root` lock for reusable staging paths.
 
 ## Files likely touched
 
