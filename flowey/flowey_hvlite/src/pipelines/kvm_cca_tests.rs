@@ -167,14 +167,18 @@ impl IntoPipeline for KvmCcaTestsCli {
             return Ok(pipeline);
         }
 
-        if stage_only {
+        if stage_only || preflight {
             let host_kernel = host_kernel.unwrap_or(default_cca_kernel_path()?);
             let guest_kernel = guest_kernel.unwrap_or_else(|| host_kernel.clone());
             let test_job = pipeline
                 .new_job(
                     FlowPlatform::host(backend_hint),
                     FlowArch::host(backend_hint),
-                    "kvm-cca-tests: stage native OpenVMM KVM CCA artifacts",
+                    if preflight {
+                        "kvm-cca-tests: run KVM CCA preflight in FVP"
+                    } else {
+                        "kvm-cca-tests: stage native OpenVMM KVM CCA artifacts"
+                    },
                 )
                 .dep_on(|_| flowey_lib_hvlite::_jobs::cfg_versions::Request::Init)
                 .dep_on(
@@ -199,8 +203,13 @@ impl IntoPipeline for KvmCcaTestsCli {
                 .dep_on(
                     move |ctx| flowey_lib_hvlite::_jobs::local_stage_kvm_cca::Params {
                         test_root: test_root.clone(),
+                        mode: if preflight {
+                            flowey_lib_hvlite::_jobs::local_stage_kvm_cca::StageMode::Preflight
+                        } else {
+                            flowey_lib_hvlite::_jobs::local_stage_kvm_cca::StageMode::StageOnly
+                        },
                         host_kernel,
-                        guest_kernel,
+                        guest_kernel: (!preflight).then_some(guest_kernel),
                         guest_initrd,
                         done: ctx.new_done_handle(),
                     },
@@ -210,7 +219,7 @@ impl IntoPipeline for KvmCcaTestsCli {
             return Ok(pipeline);
         }
 
-        if preflight || interactive_host || run_openvmm {
+        if interactive_host || run_openvmm {
             let _ = (host_kernel, guest_kernel, guest_initrd, openvmm_extra_args);
             anyhow::bail!("this kvm-cca-tests run mode is not implemented yet");
         }

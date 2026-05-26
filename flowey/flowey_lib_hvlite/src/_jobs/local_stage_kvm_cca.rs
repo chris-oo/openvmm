@@ -17,11 +17,18 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
+#[derive(Serialize, Deserialize, Copy, Clone, Debug)]
+pub enum StageMode {
+    StageOnly,
+    Preflight,
+}
+
 flowey_request! {
     pub struct Params {
         pub test_root: PathBuf,
+        pub mode: StageMode,
         pub host_kernel: PathBuf,
-        pub guest_kernel: PathBuf,
+        pub guest_kernel: Option<PathBuf>,
         pub guest_initrd: Option<PathBuf>,
         pub done: WriteVar<SideEffect>,
     }
@@ -41,6 +48,7 @@ impl SimpleFlowNode for Node {
     fn process_request(request: Self::Request, ctx: &mut NodeCtx<'_>) -> anyhow::Result<()> {
         let Params {
             test_root,
+            mode,
             host_kernel,
             guest_kernel,
             guest_initrd,
@@ -51,14 +59,16 @@ impl SimpleFlowNode for Node {
             arch: CommonArch::Aarch64,
             platform: CommonPlatform::LinuxGnu,
         };
-        let openvmm = ctx.reqv(|v| crate::build_openvmm::Request {
-            params: crate::build_openvmm::OpenvmmBuildParams {
-                profile: CommonProfile::Debug,
-                target: target.clone(),
-                features: [].into(),
-            },
-            version: None,
-            openvmm: v,
+        let openvmm = matches!(mode, StageMode::StageOnly).then(|| {
+            ctx.reqv(|v| crate::build_openvmm::Request {
+                params: crate::build_openvmm::OpenvmmBuildParams {
+                    profile: CommonProfile::Debug,
+                    target: target.clone(),
+                    features: [].into(),
+                },
+                version: None,
+                openvmm: v,
+            })
         });
         let preflight = ctx.reqv(|v| crate::build_kvm_cca_preflight::Request {
             params: crate::build_kvm_cca_preflight::KvmCcaPreflightBuildParams {
@@ -67,36 +77,49 @@ impl SimpleFlowNode for Node {
             },
             preflight: v,
         });
-        let guest_initrd = guest_initrd.map_or_else(
-            || {
-                ctx.reqv(|v| {
-                    crate::resolve_openvmm_test_initrd::Request::Get(CommonArch::Aarch64, v)
-                })
-            },
-            ReadVar::from_static,
-        );
+        let guest_initrd = matches!(mode, StageMode::StageOnly).then(|| {
+            guest_initrd.map_or_else(
+                || {
+                    ctx.reqv(|v| {
+                        crate::resolve_openvmm_test_initrd::Request::Get(CommonArch::Aarch64, v)
+                    })
+                },
+                ReadVar::from_static,
+            )
+        });
 
         ctx.emit_rust_step("stage native KVM CCA artifacts", |ctx| {
             done.claim(ctx);
-            let openvmm = openvmm.claim(ctx);
+            let openvmm = openvmm.map(|openvmm| openvmm.claim(ctx));
             let preflight = preflight.claim(ctx);
-            let guest_initrd = guest_initrd.claim(ctx);
+            let guest_initrd = guest_initrd.map(|guest_initrd| guest_initrd.claim(ctx));
             move |rt| {
-                let openvmm = rt.read(openvmm);
                 let openvmm = match openvmm {
-                    crate::build_openvmm::OpenvmmOutput::LinuxBin { bin, .. } => bin,
-                    crate::build_openvmm::OpenvmmOutput::WindowsBin { .. } => {
-                        anyhow::bail!("expected a Linux OpenVMM binary")
+                    Some(openvmm) => {
+                        let openvmm = rt.read(openvmm);
+                        Some(match openvmm {
+                            crate::build_openvmm::OpenvmmOutput::LinuxBin { bin, .. } => bin,
+                            crate::build_openvmm::OpenvmmOutput::WindowsBin { .. } => {
+                                anyhow::bail!("expected a Linux OpenVMM binary")
+                            }
+                        })
                     }
+                    None => None,
                 };
                 let preflight = rt.read(preflight).bin;
-                let guest_initrd = rt.read(guest_initrd);
+                let guest_initrd = guest_initrd.map(|guest_initrd| rt.read(guest_initrd));
 
-                validate_regular_file(&openvmm, "OpenVMM binary")?;
+                if let Some(openvmm) = &openvmm {
+                    validate_regular_file(openvmm, "OpenVMM binary")?;
+                }
                 validate_regular_file(&preflight, "KVM CCA preflight binary")?;
                 validate_regular_file(&host_kernel, "Plane0 host kernel")?;
-                validate_regular_file(&guest_kernel, "Realm guest kernel")?;
-                validate_regular_file(&guest_initrd, "Realm guest initrd")?;
+                if let Some(guest_kernel) = &guest_kernel {
+                    validate_regular_file(guest_kernel, "Realm guest kernel")?;
+                }
+                if let Some(guest_initrd) = &guest_initrd {
+                    validate_regular_file(guest_initrd, "Realm guest initrd")?;
+                }
 
                 let home_dir = env::var("HOME").map(PathBuf::from).expect("HOME not set");
                 let firmware_dir = home_dir.join(".shrinkwrap/package/cca-3world");
@@ -132,10 +155,11 @@ impl SimpleFlowNode for Node {
                 let generated_dir = stage_dir.join("generated");
                 fs::create_dir_all(&generated_dir)?;
                 let run_script = generated_dir.join("run-openvmm-kvm-cca.sh");
-                fs::write(
-                    &run_script,
-                    format!(
-                        r#"#!/bin/sh
+                if matches!(mode, StageMode::StageOnly) {
+                    fs::write(
+                        &run_script,
+                        format!(
+                            r#"#!/bin/sh
 set -eu
 
 mkdir -p /cca/logs
@@ -153,13 +177,17 @@ exec /cca/openvmm \
     {extra_args} \
     2>&1 | tee /cca/logs/openvmm.log
 "#,
-                        extra_args = ""
-                    ),
-                )?;
-                let init_hook = generated_dir.join("S99run-openvmm-kvm-cca");
-                fs::write(
-                    &init_hook,
-                    r#"#!/bin/sh
+                            extra_args = ""
+                        ),
+                    )?;
+                }
+                let init_hook = generated_dir.join(match mode {
+                    StageMode::StageOnly => "S99run-openvmm-kvm-cca",
+                    StageMode::Preflight => "S99kvm-cca-preflight",
+                });
+                let init_hook_contents = match mode {
+                    StageMode::StageOnly => {
+                        r#"#!/bin/sh
 
 case "$1" in
     start|"")
@@ -170,8 +198,30 @@ case "$1" in
 esac
 
 exit 0
-"#,
-                )?;
+"#
+                    }
+                    StageMode::Preflight => {
+                        r#"#!/bin/sh
+
+case "$1" in
+    start|"")
+        mkdir -p /cca/logs
+        if [ -x /cca/kvm_cca_preflight ]; then
+            /cca/kvm_cca_preflight >/cca/logs/kvm-cca-preflight.log 2>&1
+            rc=$?
+            echo "$rc" >/cca/logs/kvm-cca-preflight.status
+            cat /cca/logs/kvm-cca-preflight.log >/dev/console 2>&1 || true
+            sync
+            poweroff -f || poweroff || halt -f || halt || exit "$rc"
+        fi
+        ;;
+esac
+
+exit 0
+"#
+                    }
+                };
+                fs::write(&init_hook, init_hook_contents)?;
 
                 let mnt_dir = stage_dir.join("mnt");
                 let mut mounted = false;
@@ -212,14 +262,21 @@ exit 0
                         )?;
                     }
 
-                    for (src, dest_name) in [
-                        (&openvmm, "openvmm"),
-                        (&preflight, "kvm_cca_preflight"),
-                        (&host_kernel, "host-Image"),
-                        (&guest_kernel, "guest-Image"),
-                        (&guest_initrd, "initrd"),
-                        (&run_script, "run-openvmm-kvm-cca.sh"),
-                    ] {
+                    let mut files_to_copy = vec![(&preflight, "kvm_cca_preflight")];
+                    if let Some(openvmm) = &openvmm {
+                        files_to_copy.push((openvmm, "openvmm"));
+                    }
+                    files_to_copy.push((&host_kernel, "host-Image"));
+                    if let Some(guest_kernel) = &guest_kernel {
+                        files_to_copy.push((guest_kernel, "guest-Image"));
+                    }
+                    if let Some(guest_initrd) = &guest_initrd {
+                        files_to_copy.push((guest_initrd, "initrd"));
+                    }
+                    if matches!(mode, StageMode::StageOnly) {
+                        files_to_copy.push((&run_script, "run-openvmm-kvm-cca.sh"));
+                    }
+                    for (src, dest_name) in files_to_copy {
                         run_sudo(
                             &format!("copy {} into staged rootfs", src.display()),
                             &[
@@ -235,19 +292,22 @@ exit 0
                         &[
                             OsStr::new("cp"),
                             init_hook.as_os_str(),
-                            init_dir.join("S99run-openvmm-kvm-cca").as_os_str(),
+                            init_dir.join(init_hook.file_name().unwrap()).as_os_str(),
                         ],
                     )?;
+                    let mut chmod_paths = vec![
+                        cca_dir.join("kvm_cca_preflight"),
+                        init_dir.join(init_hook.file_name().unwrap()),
+                    ];
+                    if matches!(mode, StageMode::StageOnly) {
+                        chmod_paths.push(cca_dir.join("openvmm"));
+                        chmod_paths.push(cca_dir.join("run-openvmm-kvm-cca.sh"));
+                    }
+                    let mut chmod_args = vec![OsStr::new("chmod"), OsStr::new("0755")];
+                    chmod_args.extend(chmod_paths.iter().map(|path| path.as_os_str()));
                     run_sudo(
                         "make native KVM CCA staged files executable",
-                        &[
-                            OsStr::new("chmod"),
-                            OsStr::new("0755"),
-                            cca_dir.join("openvmm").as_os_str(),
-                            cca_dir.join("kvm_cca_preflight").as_os_str(),
-                            cca_dir.join("run-openvmm-kvm-cca.sh").as_os_str(),
-                            init_dir.join("S99run-openvmm-kvm-cca").as_os_str(),
-                        ],
+                        &chmod_args,
                     )?;
                     run_sudo("sync staged rootfs writes", &[OsStr::new("sync")])?;
                     Ok(())
@@ -284,6 +344,31 @@ exit 0
                 inject_result?;
 
                 log::info!("staged native KVM CCA rootfs at {}", rootfs_file.display());
+                if matches!(mode, StageMode::Preflight) {
+                    let shrinkwrap_dir = test_root.join("shrinkwrap");
+                    let venv_dir = shrinkwrap_dir.join("venv");
+                    let shrinkwrap_exe = shrinkwrap_dir.join("shrinkwrap/shrinkwrap");
+                    validate_regular_file(&shrinkwrap_exe, "shrinkwrap")?;
+                    anyhow::ensure!(
+                        venv_dir.is_dir(),
+                        "shrinkwrap venv is missing at {}",
+                        venv_dir.display()
+                    );
+                    let venv_bin_path = format!(
+                        "{}:{}",
+                        venv_dir.join("bin").display(),
+                        env::var("PATH").unwrap_or_default()
+                    );
+                    flowey::shell_cmd!(
+                        rt,
+                        "timeout --foreground 20m {shrinkwrap_exe} run cca-3world.yaml --rtvar ROOTFS={rootfs_file} --rtvar KERNEL={host_kernel}"
+                    )
+                        .env("VIRTUAL_ENV", &venv_dir)
+                        .env("PATH", &venv_bin_path)
+                        .run()
+                        .with_context(|| "failed to launch FVP for KVM CCA preflight")?;
+                    check_preflight_status(&rootfs_file, &stage_dir.join("preflight-status-mnt"))?;
+                }
                 Ok(())
             }
         });
@@ -363,5 +448,73 @@ fn run_sudo(description: &str, args: &[&OsStr]) -> anyhow::Result<()> {
         status.success(),
         "failed to {description}: exit status {status}"
     );
+    Ok(())
+}
+
+fn check_preflight_status(rootfs: &Path, mnt_dir: &Path) -> anyhow::Result<()> {
+    let mut mounted = false;
+    let result = (|| -> anyhow::Result<i32> {
+        run_sudo(
+            "create preflight status mount directory",
+            &[OsStr::new("mkdir"), OsStr::new("-p"), mnt_dir.as_os_str()],
+        )?;
+        run_sudo(
+            "mount staged rootfs for preflight status",
+            &[OsStr::new("mount"), rootfs.as_os_str(), mnt_dir.as_os_str()],
+        )?;
+        mounted = true;
+
+        let status_path = mnt_dir.join("cca/logs/kvm-cca-preflight.status");
+        anyhow::ensure!(
+            status_path.is_file(),
+            "KVM CCA preflight did not complete; missing {} (possible timeout or Plane0 crash)",
+            status_path.display()
+        );
+        let output = Command::new("sudo")
+            .arg("cat")
+            .arg(&status_path)
+            .output()
+            .with_context(|| format!("failed to read {}", status_path.display()))?;
+        anyhow::ensure!(
+            output.status.success(),
+            "failed to read {}: exit status {}",
+            status_path.display(),
+            output.status
+        );
+        let status = String::from_utf8(output.stdout)
+            .context("preflight status was not UTF-8")?
+            .trim()
+            .parse::<i32>()
+            .context("preflight status was not an integer")?;
+        Ok(status)
+    })();
+
+    let unmount_result = if mounted {
+        run_sudo(
+            "unmount preflight status rootfs",
+            &[OsStr::new("umount"), mnt_dir.as_os_str()],
+        )
+        .or_else(|_| {
+            run_sudo(
+                "lazy unmount preflight status rootfs",
+                &[OsStr::new("umount"), OsStr::new("-l"), mnt_dir.as_os_str()],
+            )
+        })
+        .context("failed to unmount preflight status rootfs; manual cleanup may be required")
+    } else {
+        Ok(())
+    };
+    if mnt_dir.is_dir() {
+        if let Err(err) = run_sudo(
+            "remove preflight status mount directory",
+            &[OsStr::new("rmdir"), mnt_dir.as_os_str()],
+        ) {
+            log::warn!("{err:#}");
+        }
+    }
+
+    unmount_result?;
+    let status = result?;
+    anyhow::ensure!(status == 0, "KVM CCA preflight failed with status {status}");
     Ok(())
 }
