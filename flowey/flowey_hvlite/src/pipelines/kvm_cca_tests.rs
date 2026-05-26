@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use flowey::node::prelude::ReadVar;
 use flowey::pipeline::prelude::*;
 use std::path::PathBuf;
 
@@ -117,10 +118,6 @@ impl IntoPipeline for KvmCcaTestsCli {
         if host_kernel_src.is_some() || host_kernel_rev.is_some() {
             anyhow::bail!("--host-kernel-src/--host-kernel-rev support is not implemented yet");
         }
-        if !install_emu && !update_emu {
-            let _ = (host_kernel, guest_kernel, guest_initrd, openvmm_extra_args);
-            anyhow::bail!("kvm-cca-tests run modes are not implemented yet");
-        }
 
         let mut pipeline = Pipeline::new();
         if install_emu {
@@ -170,6 +167,54 @@ impl IntoPipeline for KvmCcaTestsCli {
             return Ok(pipeline);
         }
 
+        if stage_only {
+            let host_kernel = host_kernel.unwrap_or(default_cca_kernel_path()?);
+            let guest_kernel = guest_kernel.unwrap_or_else(|| host_kernel.clone());
+            let test_job = pipeline
+                .new_job(
+                    FlowPlatform::host(backend_hint),
+                    FlowArch::host(backend_hint),
+                    "kvm-cca-tests: stage native OpenVMM KVM CCA artifacts",
+                )
+                .dep_on(|_| flowey_lib_hvlite::_jobs::cfg_versions::Request::Init)
+                .dep_on(
+                    |_| flowey_lib_hvlite::_jobs::cfg_hvlite_reposource::Params {
+                        hvlite_repo_source:
+                            flowey_lib_common::git_checkout::RepoSource::ExistingClone(
+                                ReadVar::from_static(crate::repo_root()),
+                            ),
+                    },
+                )
+                .dep_on(|_| flowey_lib_hvlite::_jobs::cfg_common::Params {
+                    local_only: Some(flowey_lib_hvlite::_jobs::cfg_common::LocalOnlyParams {
+                        interactive: true,
+                        auto_install: true,
+                        ignore_rust_version: true,
+                    }),
+                    verbose: ReadVar::from_static(false),
+                    locked: false,
+                    deny_warnings: false,
+                    no_incremental: false,
+                })
+                .dep_on(
+                    move |ctx| flowey_lib_hvlite::_jobs::local_stage_kvm_cca::Params {
+                        test_root: test_root.clone(),
+                        host_kernel,
+                        guest_kernel,
+                        guest_initrd,
+                        done: ctx.new_done_handle(),
+                    },
+                )
+                .finish();
+            let _ = test_job;
+            return Ok(pipeline);
+        }
+
+        if preflight || interactive_host || run_openvmm {
+            let _ = (host_kernel, guest_kernel, guest_initrd, openvmm_extra_args);
+            anyhow::bail!("this kvm-cca-tests run mode is not implemented yet");
+        }
+
         let update_job = pipeline
             .new_job(
                 FlowPlatform::host(backend_hint),
@@ -194,4 +239,11 @@ impl IntoPipeline for KvmCcaTestsCli {
 
         Ok(pipeline)
     }
+}
+
+fn default_cca_kernel_path() -> anyhow::Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
+    Ok(home.join("ai/eevee/linux/out/cca-fvp/kernel/arch/arm64/boot/Image"))
 }

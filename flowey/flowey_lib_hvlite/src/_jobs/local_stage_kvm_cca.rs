@@ -3,6 +3,10 @@
 
 //! Stage native OpenVMM KVM CCA artifacts into an isolated rootfs copy.
 
+use crate::common::CommonArch;
+use crate::common::CommonPlatform;
+use crate::common::CommonProfile;
+use crate::common::CommonTriple;
 use flowey::node::prelude::*;
 use std::env;
 use std::ffi::OsStr;
@@ -16,12 +20,9 @@ use std::time::Duration;
 flowey_request! {
     pub struct Params {
         pub test_root: PathBuf,
-        pub openvmm: ReadVar<crate::build_openvmm::OpenvmmOutput>,
-        pub preflight: ReadVar<crate::build_kvm_cca_preflight::KvmCcaPreflightOutput>,
         pub host_kernel: PathBuf,
         pub guest_kernel: PathBuf,
-        pub guest_initrd: PathBuf,
-        pub staged_rootfs: WriteVar<PathBuf>,
+        pub guest_initrd: Option<PathBuf>,
         pub done: WriteVar<SideEffect>,
     }
 }
@@ -31,25 +32,55 @@ new_simple_flow_node!(struct Node);
 impl SimpleFlowNode for Node {
     type Request = Params;
 
-    fn imports(_ctx: &mut ImportCtx<'_>) {}
+    fn imports(ctx: &mut ImportCtx<'_>) {
+        ctx.import::<crate::build_openvmm::Node>();
+        ctx.import::<crate::build_kvm_cca_preflight::Node>();
+        ctx.import::<crate::resolve_openvmm_test_initrd::Node>();
+    }
 
     fn process_request(request: Self::Request, ctx: &mut NodeCtx<'_>) -> anyhow::Result<()> {
         let Params {
             test_root,
-            openvmm,
-            preflight,
             host_kernel,
             guest_kernel,
             guest_initrd,
-            staged_rootfs,
             done,
         } = request;
+
+        let target = CommonTriple::Common {
+            arch: CommonArch::Aarch64,
+            platform: CommonPlatform::LinuxGnu,
+        };
+        let openvmm = ctx.reqv(|v| crate::build_openvmm::Request {
+            params: crate::build_openvmm::OpenvmmBuildParams {
+                profile: CommonProfile::Debug,
+                target: target.clone(),
+                features: [].into(),
+            },
+            version: None,
+            openvmm: v,
+        });
+        let preflight = ctx.reqv(|v| crate::build_kvm_cca_preflight::Request {
+            params: crate::build_kvm_cca_preflight::KvmCcaPreflightBuildParams {
+                profile: CommonProfile::Debug,
+                target,
+            },
+            preflight: v,
+        });
+        let guest_initrd = guest_initrd.map_or_else(
+            || {
+                ctx.reqv(|v| {
+                    crate::resolve_openvmm_test_initrd::Request::Get(CommonArch::Aarch64, v)
+                })
+            },
+            ReadVar::from_static,
+        );
 
         ctx.emit_rust_step("stage native KVM CCA artifacts", |ctx| {
             done.claim(ctx);
             let openvmm = openvmm.claim(ctx);
             let preflight = preflight.claim(ctx);
-            let staged_rootfs = staged_rootfs.claim(ctx);
+            let guest_initrd = guest_initrd.claim(ctx);
             move |rt| {
                 let openvmm = rt.read(openvmm);
                 let openvmm = match openvmm {
@@ -59,6 +90,7 @@ impl SimpleFlowNode for Node {
                     }
                 };
                 let preflight = rt.read(preflight).bin;
+                let guest_initrd = rt.read(guest_initrd);
 
                 validate_regular_file(&openvmm, "OpenVMM binary")?;
                 validate_regular_file(&preflight, "KVM CCA preflight binary")?;
@@ -241,7 +273,6 @@ exit 0
                 inject_result?;
 
                 log::info!("staged native KVM CCA rootfs at {}", rootfs_file.display());
-                rt.write(staged_rootfs, &rootfs_file);
                 Ok(())
             }
         });
