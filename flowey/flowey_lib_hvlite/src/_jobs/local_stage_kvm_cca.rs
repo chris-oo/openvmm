@@ -200,6 +200,17 @@ exit 0
                         "create init.d in staged rootfs",
                         &[OsStr::new("mkdir"), OsStr::new("-p"), init_dir.as_os_str()],
                     )?;
+                    let tmk_hook = init_dir.join("S99realm-launch");
+                    if tmk_hook.exists() {
+                        run_sudo(
+                            "disable TMK CCA auto-launch hook",
+                            &[
+                                OsStr::new("mv"),
+                                tmk_hook.as_os_str(),
+                                init_dir.join("S99realm-launch.disabled").as_os_str(),
+                            ],
+                        )?;
+                    }
 
                     for (src, dest_name) in [
                         (&openvmm, "openvmm"),
