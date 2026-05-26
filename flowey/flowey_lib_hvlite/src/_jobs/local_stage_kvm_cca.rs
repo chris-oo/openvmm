@@ -9,13 +9,10 @@ use crate::common::CommonProfile;
 use crate::common::CommonTriple;
 use flowey::node::prelude::*;
 use std::env;
-use std::ffi::OsStr;
 use std::fs;
 use std::fs::OpenOptions;
 use std::path::Path;
 use std::process::Command;
-use std::thread;
-use std::time::Duration;
 
 #[derive(Serialize, Deserialize, Copy, Clone, Debug)]
 pub enum StageMode {
@@ -130,6 +127,7 @@ impl SimpleFlowNode for Node {
                     home_dir.join(".shrinkwrap/build/build/cca-3world/buildroot/host/sbin/e2fsck");
                 let resize2fs_bin = home_dir
                     .join(".shrinkwrap/build/build/cca-3world/buildroot/host/sbin/resize2fs");
+                let debugfs_bin = find_debugfs()?;
                 validate_regular_file(&e2fsck_bin, "host e2fsck")?;
                 validate_regular_file(&resize2fs_bin, "host resize2fs")?;
 
@@ -154,6 +152,8 @@ impl SimpleFlowNode for Node {
 
                 let generated_dir = stage_dir.join("generated");
                 fs::create_dir_all(&generated_dir)?;
+                let debugfs_input_dir = generated_dir.join("debugfs-inputs");
+                fs::create_dir_all(&debugfs_input_dir)?;
                 let run_script = generated_dir.join("run-openvmm-kvm-cca.sh");
                 if matches!(mode, StageMode::StageOnly) {
                     fs::write(
@@ -180,6 +180,9 @@ exec /cca/openvmm \
                             extra_args = ""
                         ),
                     )?;
+                }
+                if matches!(mode, StageMode::StageOnly) {
+                    set_executable(&run_script)?;
                 }
                 let init_hook = generated_dir.join(match mode {
                     StageMode::StageOnly => "S99run-openvmm-kvm-cca",
@@ -222,45 +225,16 @@ exit 0
                     }
                 };
                 fs::write(&init_hook, init_hook_contents)?;
+                set_executable(&init_hook)?;
 
-                let mnt_dir = stage_dir.join("mnt");
-                let mut mounted = false;
                 let inject_result = (|| -> anyhow::Result<()> {
-                    run_sudo(
-                        "create staged rootfs mount directory",
-                        &[OsStr::new("mkdir"), OsStr::new("-p"), mnt_dir.as_os_str()],
-                    )?;
-                    run_sudo(
-                        "mount staged rootfs",
-                        &[
-                            OsStr::new("mount"),
-                            rootfs_file.as_os_str(),
-                            mnt_dir.as_os_str(),
-                        ],
-                    )?;
-                    mounted = true;
-
-                    let cca_dir = mnt_dir.join("cca");
-                    run_sudo(
-                        "create /cca in staged rootfs",
-                        &[OsStr::new("mkdir"), OsStr::new("-p"), cca_dir.as_os_str()],
-                    )?;
-                    let init_dir = mnt_dir.join("etc/init.d");
-                    run_sudo(
-                        "create init.d in staged rootfs",
-                        &[OsStr::new("mkdir"), OsStr::new("-p"), init_dir.as_os_str()],
-                    )?;
-                    let tmk_hook = init_dir.join("S99realm-launch");
-                    if tmk_hook.exists() {
-                        run_sudo(
-                            "disable TMK CCA auto-launch hook",
-                            &[
-                                OsStr::new("mv"),
-                                tmk_hook.as_os_str(),
-                                init_dir.join("S99realm-launch.disabled").as_os_str(),
-                            ],
-                        )?;
-                    }
+                    debugfs_run(&debugfs_bin, &rootfs_file, "mkdir /cca", None)?;
+                    debugfs_run(&debugfs_bin, &rootfs_file, "mkdir /cca/logs", None)?;
+                    debugfs_run_allow_failure(
+                        &debugfs_bin,
+                        &rootfs_file,
+                        "rm /etc/init.d/S99realm-launch",
+                    );
 
                     let mut files_to_copy = vec![(&preflight, "kvm_cca_preflight")];
                     if let Some(openvmm) = &openvmm {
@@ -277,69 +251,49 @@ exit 0
                         files_to_copy.push((&run_script, "run-openvmm-kvm-cca.sh"));
                     }
                     for (src, dest_name) in files_to_copy {
-                        run_sudo(
-                            &format!("copy {} into staged rootfs", src.display()),
-                            &[
-                                OsStr::new("cp"),
-                                src.as_os_str(),
-                                cca_dir.join(dest_name).as_os_str(),
-                            ],
+                        let safe_src = debugfs_input_dir.join(dest_name);
+                        fs::copy(src, &safe_src).with_context(|| {
+                            format!(
+                                "failed to copy {} to safe debugfs input {}",
+                                src.display(),
+                                safe_src.display()
+                            )
+                        })?;
+                        debugfs_run_allow_failure(
+                            &debugfs_bin,
+                            &rootfs_file,
+                            &format!("rm /cca/{dest_name}"),
+                        );
+                        debugfs_run(
+                            &debugfs_bin,
+                            &rootfs_file,
+                            &format!("write {dest_name} /cca/{dest_name}"),
+                            Some(&debugfs_input_dir),
                         )?;
                     }
 
-                    run_sudo(
-                        "install native KVM CCA init hook",
-                        &[
-                            OsStr::new("cp"),
-                            init_hook.as_os_str(),
-                            init_dir.join(init_hook.file_name().unwrap()).as_os_str(),
-                        ],
+                    let hook_name = init_hook.file_name().unwrap().to_string_lossy();
+                    let safe_hook = debugfs_input_dir.join(hook_name.as_ref());
+                    fs::copy(&init_hook, &safe_hook).with_context(|| {
+                        format!(
+                            "failed to copy {} to safe debugfs input {}",
+                            init_hook.display(),
+                            safe_hook.display()
+                        )
+                    })?;
+                    debugfs_run_allow_failure(
+                        &debugfs_bin,
+                        &rootfs_file,
+                        &format!("rm /etc/init.d/{hook_name}"),
+                    );
+                    debugfs_run(
+                        &debugfs_bin,
+                        &rootfs_file,
+                        &format!("write {hook_name} /etc/init.d/{hook_name}"),
+                        Some(&debugfs_input_dir),
                     )?;
-                    let mut chmod_paths = vec![
-                        cca_dir.join("kvm_cca_preflight"),
-                        init_dir.join(init_hook.file_name().unwrap()),
-                    ];
-                    if matches!(mode, StageMode::StageOnly) {
-                        chmod_paths.push(cca_dir.join("openvmm"));
-                        chmod_paths.push(cca_dir.join("run-openvmm-kvm-cca.sh"));
-                    }
-                    let mut chmod_args = vec![OsStr::new("chmod"), OsStr::new("0755")];
-                    chmod_args.extend(chmod_paths.iter().map(|path| path.as_os_str()));
-                    run_sudo(
-                        "make native KVM CCA staged files executable",
-                        &chmod_args,
-                    )?;
-                    run_sudo("sync staged rootfs writes", &[OsStr::new("sync")])?;
                     Ok(())
                 })();
-
-                if mounted {
-                    run_sudo(
-                        "unmount staged rootfs",
-                        &[OsStr::new("umount"), mnt_dir.as_os_str()],
-                    )
-                    .or_else(|_| {
-                        run_sudo(
-                            "lazy unmount staged rootfs",
-                            &[OsStr::new("umount"), OsStr::new("-l"), mnt_dir.as_os_str()],
-                        )
-                    })
-                    .context("failed to unmount staged rootfs; manual cleanup may be required")?;
-                }
-
-                if let Err(err) = run_sudo("sync host writes", &[OsStr::new("sync")]) {
-                    log::warn!("{err:#}");
-                }
-
-                thread::sleep(Duration::from_secs(1));
-                if mnt_dir.is_dir() {
-                    if let Err(err) = run_sudo(
-                        "remove staged rootfs mount directory",
-                        &[OsStr::new("rmdir"), mnt_dir.as_os_str()],
-                    ) {
-                        log::warn!("{err:#}");
-                    }
-                }
 
                 inject_result?;
 
@@ -347,8 +301,10 @@ exit 0
                 if matches!(mode, StageMode::Preflight) {
                     let shrinkwrap_dir = test_root.join("shrinkwrap");
                     let venv_dir = shrinkwrap_dir.join("venv");
-                    let shrinkwrap_exe = shrinkwrap_dir.join("shrinkwrap/shrinkwrap");
-                    validate_regular_file(&shrinkwrap_exe, "shrinkwrap")?;
+                    let shrinkwrap_py = shrinkwrap_dir.join("shrinkwrap/shrinkwrap.py");
+                    let venv_python = venv_dir.join("bin/python3");
+                    validate_regular_file(&shrinkwrap_py, "shrinkwrap.py")?;
+                    validate_regular_file(&venv_python, "shrinkwrap venv python")?;
                     anyhow::ensure!(
                         venv_dir.is_dir(),
                         "shrinkwrap venv is missing at {}",
@@ -361,13 +317,13 @@ exit 0
                     );
                     flowey::shell_cmd!(
                         rt,
-                        "timeout --foreground 20m {shrinkwrap_exe} run cca-3world.yaml --rtvar ROOTFS={rootfs_file} --rtvar KERNEL={host_kernel}"
+                        "timeout --foreground 20m {venv_python} {shrinkwrap_py} run cca-3world.yaml --rtvar ROOTFS={rootfs_file} --rtvar KERNEL={host_kernel}"
                     )
                         .env("VIRTUAL_ENV", &venv_dir)
                         .env("PATH", &venv_bin_path)
                         .run()
                         .with_context(|| "failed to launch FVP for KVM CCA preflight")?;
-                    check_preflight_status(&rootfs_file, &stage_dir.join("preflight-status-mnt"))?;
+                    check_preflight_status(&debugfs_bin, &rootfs_file)?;
                 }
                 Ok(())
             }
@@ -439,97 +395,92 @@ fn run_fsck(e2fsck: &Path, rootfs: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_sudo(description: &str, args: &[&OsStr]) -> anyhow::Result<()> {
-    check_sudo_auth()?;
-    let status = Command::new("sudo")
-        .args(args)
-        .status()
-        .with_context(|| format!("failed to execute sudo command to {description}"))?;
+fn debugfs_run(
+    debugfs: &Path,
+    rootfs: &Path,
+    command: &str,
+    current_dir: Option<&Path>,
+) -> anyhow::Result<()> {
+    let mut debugfs = Command::new(debugfs);
+    debugfs.arg("-w").arg("-R").arg(command).arg(rootfs);
+    if let Some(current_dir) = current_dir {
+        debugfs.current_dir(current_dir);
+    }
+    let output = debugfs
+        .output()
+        .with_context(|| format!("failed to execute debugfs command `{command}`"))?;
     anyhow::ensure!(
-        status.success(),
-        "failed to {description}: exit status {status}"
+        output.status.success(),
+        "debugfs command `{command}` failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
     Ok(())
 }
 
-fn check_preflight_status(rootfs: &Path, mnt_dir: &Path) -> anyhow::Result<()> {
-    let mut mounted = false;
-    let result = (|| -> anyhow::Result<i32> {
-        run_sudo(
-            "create preflight status mount directory",
-            &[OsStr::new("mkdir"), OsStr::new("-p"), mnt_dir.as_os_str()],
-        )?;
-        run_sudo(
-            "mount staged rootfs for preflight status",
-            &[OsStr::new("mount"), rootfs.as_os_str(), mnt_dir.as_os_str()],
-        )?;
-        mounted = true;
+fn debugfs_run_allow_failure(debugfs: &Path, rootfs: &Path, command: &str) {
+    if let Err(err) = debugfs_run(debugfs, rootfs, command, None) {
+        log::debug!("{err:#}");
+    }
+}
 
-        let status_path = mnt_dir.join("cca/logs/kvm-cca-preflight.status");
-        anyhow::ensure!(
-            status_path.is_file(),
-            "KVM CCA preflight did not complete; missing {} (possible timeout or Plane0 crash)",
-            status_path.display()
-        );
-        check_sudo_auth()?;
-        let output = Command::new("sudo")
-            .arg("cat")
-            .arg(&status_path)
-            .output()
-            .with_context(|| format!("failed to read {}", status_path.display()))?;
-        anyhow::ensure!(
-            output.status.success(),
-            "failed to read {}: exit status {}",
-            status_path.display(),
-            output.status
-        );
-        let status = String::from_utf8(output.stdout)
-            .context("preflight status was not UTF-8")?
-            .trim()
-            .parse::<i32>()
-            .context("preflight status was not an integer")?;
-        Ok(status)
-    })();
+fn debugfs_read(debugfs: &Path, rootfs: &Path, path: &str) -> anyhow::Result<Vec<u8>> {
+    let output = Command::new(debugfs)
+        .arg("-R")
+        .arg(format!("cat {path}"))
+        .arg(rootfs)
+        .output()
+        .with_context(|| format!("failed to execute debugfs cat for {path}"))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "failed to read {path} from {}: {}{}",
+        rootfs.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(output.stdout)
+}
 
-    let unmount_result = if mounted {
-        run_sudo(
-            "unmount preflight status rootfs",
-            &[OsStr::new("umount"), mnt_dir.as_os_str()],
-        )
-        .or_else(|_| {
-            run_sudo(
-                "lazy unmount preflight status rootfs",
-                &[OsStr::new("umount"), OsStr::new("-l"), mnt_dir.as_os_str()],
-            )
-        })
-        .context("failed to unmount preflight status rootfs; manual cleanup may be required")
-    } else {
-        Ok(())
-    };
-    if mnt_dir.is_dir() {
-        if let Err(err) = run_sudo(
-            "remove preflight status mount directory",
-            &[OsStr::new("rmdir"), mnt_dir.as_os_str()],
-        ) {
-            log::warn!("{err:#}");
+fn find_debugfs() -> anyhow::Result<PathBuf> {
+    for path in [
+        "/usr/sbin/debugfs",
+        "/sbin/debugfs",
+        "/usr/bin/debugfs",
+        "/bin/debugfs",
+    ] {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Ok(path);
         }
     }
+    anyhow::bail!("debugfs not found; install e2fsprogs to stage CCA rootfs without sudo")
+}
 
-    unmount_result?;
-    let status = result?;
-    anyhow::ensure!(status == 0, "KVM CCA preflight failed with status {status}");
+fn set_executable(path: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(path)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions)?;
+    }
     Ok(())
 }
 
-fn check_sudo_auth() -> anyhow::Result<()> {
-    let status = Command::new("sudo")
-        .arg("-n")
-        .arg("true")
-        .status()
-        .context("failed to check sudo authentication status")?;
-    anyhow::ensure!(
-        status.success(),
-        "sudo requires authentication; run `sudo -v` first or configure passwordless sudo for local CCA rootfs staging"
-    );
+fn check_preflight_status(debugfs: &Path, rootfs: &Path) -> anyhow::Result<()> {
+    let status_path = "/cca/logs/kvm-cca-preflight.status";
+    let status = debugfs_read(debugfs, rootfs, status_path)
+        .with_context(|| {
+            format!("KVM CCA preflight did not complete; missing {status_path} (possible timeout or Plane0 crash)")
+        })
+        .and_then(|status| {
+            String::from_utf8(status)
+                .context("preflight status was not UTF-8")?
+                .trim()
+                .parse::<i32>()
+                .context("preflight status was not an integer")
+        })?;
+
+    anyhow::ensure!(status == 0, "KVM CCA preflight failed with status {status}");
     Ok(())
 }
