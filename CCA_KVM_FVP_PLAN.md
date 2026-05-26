@@ -426,23 +426,40 @@ Concrete Flowey implementation outline for the MVP:
     (`--rebuild-plane0-linux`, `--rebuild-rootfs`) either by sharing the
     existing structs or by delegating to the existing jobs;
   - explicit Plane0 host kernel input for the FVP run, defaulting to the
-    existing `--test-root/plane0-linux/arch/arm64/boot/Image` only when that
-    image was built from the requested source/config. Also allow an explicit
-    host kernel source tree/revision for rebuilds, because native KVM CCA tests
-    need a different host kernel feature set than the existing TMK/OpenHCL
-    `cca-tests` path;
-  - explicit local guest kernel/initrd paths for the Realm guest, with later
-    fallback to `resolve_openvmm_test_linux_kernel` and
-    `resolve_openvmm_test_initrd` only once the default artifacts are known to be
-    CCA-enlightened enough;
+    shared local CCA FVP kernel image from
+    `~/ai/eevee/linux/out/cca-fvp/kernel/arch/arm64/boot/Image` when available.
+    Also allow an explicit host kernel source tree/revision for rebuilds,
+    because native KVM CCA tests need a different host kernel feature set than
+    the existing TMK/OpenHCL `cca-tests` path;
+  - explicit local guest kernel path for the Realm guest, defaulting to the same
+    shared local CCA FVP kernel image used for Plane0 host testing. The
+    `~/ai/eevee/linux/build-cca-fvp-kernels.sh` helper is intended to produce
+    one `Image` suitable for both the Plane0 host and the direct-boot Realm
+    guest for local MVP validation;
+  - guest initrd handling that defaults to the aarch64 `openvmm-deps` initrd via
+    `resolve_openvmm_test_initrd`, with `--guest-initrd <path>` as an override.
+    Keep an explicit future `--no-guest-initrd` option possible later, since
+    existing `cca-tests` kvmtool flow launches its Realm kernel without an
+    initrd. For the MVP, absence of `--guest-initrd` means "use the default
+    aarch64 openvmm-deps initrd", not "boot without an initrd";
   - an optional extra OpenVMM command-line string for local debugging.
 - Reuse `flowey_lib_hvlite::build_openvmm::Node` to cross-build an aarch64
   Linux `openvmm` binary (`CommonArch::Aarch64`,
   `CommonPlatform::LinuxGnu`, debug profile for local MVP).
+- Expand `~/ai/eevee/...` defaults through `$HOME`/home-directory logic before
+  converting them to `PathBuf`s; do not rely on shell expansion inside Flowey
+  Rust code. Validate before staging that host and guest kernel paths exist and
+  are regular files, with clear errors if the shared local `Image` has not been
+  built yet.
 - Add a tiny aarch64 Rust preflight binary. Prefer a small crate/binary that
   depends on the existing `kvm` crate and performs the checks listed above.
   Flowey should build it for aarch64 and stage it next to OpenVMM. Keep this
   probe independent of FVP so it can also run on native CCA hosts later.
+- Configure the aarch64 default initrd resolver before requesting it. The
+  pipeline must initialize `resolve_openvmm_test_initrd` through
+  `cfg_versions::Init` or an equivalent config path so
+  `resolve_openvmm_test_initrd::Request::Get(CommonArch::Aarch64, ...)` has a
+  release version or local path to resolve.
 - Validate the staged OpenVMM and preflight binaries against the Plane0 rootfs
   before launching FVP. For dynamically linked aarch64 Linux GNU binaries, use
   cross-safe ELF/interpreter/dependency inspection (for example `readelf` plus
@@ -485,7 +502,9 @@ Concrete Flowey implementation outline for the MVP:
   - runs `/cca/kvm_cca_preflight`;
   - runs OpenVMM with the CCA isolation CLI/config currently implemented by
     OpenVMM, direct arm64 Linux boot, device-tree boot mode, serial enabled, and
-    the supplied guest kernel/initrd;
+    the supplied guest kernel plus the default or overridden guest initrd;
+  - logs the resolved guest kernel path, initrd path/version, and host kernel
+    identity before launch;
   - writes OpenVMM and guest logs under `/cca/logs`.
   The Flowey job must install a boot-time init hook into the staged rootfs to run
   this script inside Plane0, run shrinkwrap/FVP with an explicit timeout,
@@ -506,35 +525,32 @@ cargo xflowey kvm-cca-tests --install-emu
 # The source tree/revision is explicit because this path tests a different KVM
 # feature set than the TMK/OpenHCL cca-tests payload.
 cargo xflowey kvm-cca-tests --update-emu \
-  --host-kernel-src ~/ai/eevee/NV-Kernels \
+  --host-kernel-src ~/ai/eevee/linux \
   --host-kernel-rev <rev-or-branch> \
   --rebuild-plane0-linux
 
 # Stage artifacts into an isolated rootfs copy, but do not launch FVP.
 cargo xflowey kvm-cca-tests --stage-only \
-  --host-kernel target/cca-test/plane0-linux/arch/arm64/boot/Image \
-  --guest-kernel /path/to/realm/Image \
-  --guest-initrd /path/to/realm/initrd
+  --host-kernel ~/ai/eevee/linux/out/cca-fvp/kernel/arch/arm64/boot/Image \
+  --guest-kernel ~/ai/eevee/linux/out/cca-fvp/kernel/arch/arm64/boot/Image
 
 # Boot FVP/Plane0 and run only the KVM CCA preflight probe. Guest kernel/initrd
 # are not needed for this mode.
 cargo xflowey kvm-cca-tests --preflight \
-  --host-kernel target/cca-test/plane0-linux/arch/arm64/boot/Image
+  --host-kernel ~/ai/eevee/linux/out/cca-fvp/kernel/arch/arm64/boot/Image
 
 # Boot FVP/Plane0 with the staged artifacts and leave it available for manual
 # debugging. The command output should print artifact locations under /cca and
 # the exact OpenVMM command/script to run manually inside Plane0.
 cargo xflowey kvm-cca-tests --interactive-host \
-  --host-kernel target/cca-test/plane0-linux/arch/arm64/boot/Image \
-  --guest-kernel /path/to/realm/Image \
-  --guest-initrd /path/to/realm/initrd
+  --host-kernel ~/ai/eevee/linux/out/cca-fvp/kernel/arch/arm64/boot/Image \
+  --guest-kernel ~/ai/eevee/linux/out/cca-fvp/kernel/arch/arm64/boot/Image
 
 # Stage artifacts, boot FVP/Plane0, run the preflight and OpenVMM via the
 # boot-time init hook, then collect logs and shut down/clean up.
 cargo xflowey kvm-cca-tests --run-openvmm \
-  --host-kernel target/cca-test/plane0-linux/arch/arm64/boot/Image \
-  --guest-kernel /path/to/realm/Image \
-  --guest-initrd /path/to/realm/initrd \
+  --host-kernel ~/ai/eevee/linux/out/cca-fvp/kernel/arch/arm64/boot/Image \
+  --guest-kernel ~/ai/eevee/linux/out/cca-fvp/kernel/arch/arm64/boot/Image \
   --openvmm-extra-args "<extra debug args if needed>"
 ```
 
@@ -545,18 +561,26 @@ Mode behavior:
 - `--update-emu --rebuild-plane0-linux` should build the requested host kernel
   and record enough metadata under `--test-root` to know which source/revision
   produced the default `--host-kernel` image, then exit without staging or
-  launching FVP.
+  launching FVP. For local MVP testing, this should be able to invoke
+  `~/ai/eevee/linux/build-cca-fvp-kernels.sh`, whose default output is
+  `~/ai/eevee/linux/out/cca-fvp/kernel/arch/arm64/boot/Image`.
 - `--stage-only` should produce the isolated rootfs path and logs path, then
-  exit. It should not run shrinkwrap.
+  exit. It should resolve and stage the default aarch64 `openvmm-deps` guest
+  initrd when `--guest-initrd` is not provided, and fail clearly if the host or
+  guest kernel path is missing or not a regular file. It should not run
+  shrinkwrap.
 - `--preflight` should stage the preflight binary and boot FVP with the explicit
   host kernel. It should not require `--guest-kernel` or `--guest-initrd`.
 - `--interactive-host` should launch shrinkwrap/FVP with the isolated rootfs and
   provided host kernel, then leave control/log output suitable for manual
-  debugging. It should not interpret guest success or failure.
-- `--run-openvmm` should fail fast if the boot-time init hook cannot be staged.
-  On success it should run `/cca/kvm_cca_preflight`, then
-  `/cca/run-openvmm-kvm-cca.sh`, enforce a timeout, collect logs, and clean up
-  FVP/rootfs mounts.
+  debugging. Like `--stage-only`, it should stage the default aarch64
+  `openvmm-deps` guest initrd unless overridden. It should not interpret guest
+  success or failure.
+- `--run-openvmm` should resolve the guest initrd from `openvmm-deps` for
+  aarch64 unless `--guest-initrd` is provided, then fail fast if the boot-time
+  init hook cannot be staged. On success it should run
+  `/cca/kvm_cca_preflight`, then `/cca/run-openvmm-kvm-cca.sh`, enforce a
+  timeout, collect logs, and clean up FVP/rootfs mounts.
 
 ### 12. Kernel and userspace prerequisites for FVP
 
@@ -567,28 +591,34 @@ Concrete work:
 
 - For native OpenVMM KVM CCA validation, treat the Plane0 host kernel as an
   explicit input to `kvm-cca-tests`, not an implicit artifact inherited from the
-  existing TMK/OpenHCL `cca-tests` flow. Use `~/ai/eevee/NV-Kernels` or another
-  specified source tree/revision for the host kernel under test. It must provide
-  `guest_memfd`, generic memory attributes, Realm VM creation,
-  `KVM_ARM_RMI_POPULATE`, RIPAS changes, Realm MMIO, VGIC/timer, and in-kernel
-  Realm PSCI completion support.
+  existing TMK/OpenHCL `cca-tests` flow. For local testing, use
+  `~/ai/eevee/linux/build-cca-fvp-kernels.sh`; it builds
+  `~/ai/eevee/linux/out/cca-fvp/kernel/arch/arm64/boot/Image`, and its
+  `kernel/configs/cca_fvp.config` enables the shared host/guest feature set:
+  KVM, Arm CCA guest support, initrd, PL011 console, virtio MMIO/PCI, 9P, Hyper-V
+  VTL mode, and common filesystems. The host kernel must provide `guest_memfd`,
+  generic memory attributes, Realm VM creation, `KVM_ARM_RMI_POPULATE`, RIPAS
+  changes, Realm MMIO, VGIC/timer, and in-kernel Realm PSCI completion support.
 - Keep sharing the emulator/shrinkwrap install and rootfs build infrastructure
   from `cca-tests`; only the staged payloads and host/guest kernel inputs differ
   for the native OpenVMM KVM CCA path.
 - Ensure the KVM userspace headers used by OpenVMM expose the v14 RMI/CCA ioctls
   and constants listed in section 2.
 - Build or provide the guest Linux kernel with Arm CCA/Realm awareness and the
-  enlightenments expected by the existing OpenVMM + KVM Linux path. The guest
-  kernel is also an explicit input for the MVP; do not assume the default
-  `openvmm-deps` aarch64 test kernel is suitable until verified.
+  enlightenments expected by the existing OpenVMM + KVM Linux path. For local
+  MVP testing, use the same `Image` produced by
+  `~/ai/eevee/linux/build-cca-fvp-kernels.sh` for the Realm guest. Use the
+  aarch64 `openvmm-deps` initrd by default via `resolve_openvmm_test_initrd`,
+  with an explicit `--guest-initrd` override when needed. Verify that this initrd
+  works with the CCA guest kernel, serial console, and the supported virtio/PCIe
+  profile.
 - Include kvmtool in the FVP environment as a reference/debug tool, but use
   OpenVMM for the target launch.
 - Add a preflight command that prints KVM RMI capability, supported Realm VM type
   and IPA size, and available SVE/debug features.
-- For the native OpenVMM MVP, use explicit local paths for the Realm guest
-  kernel and initrd until the default Flowey `openvmm-deps` artifacts are known
-  to contain the required CCA/RSI enlightenments. Document the exact kernel tree,
-  config, and smoke-test marker once selected.
+- Document the exact host/guest kernel source revision, the
+  `cca_fvp.config` contents used for the build, the resolved initrd artifact
+  version, and the smoke-test marker once selected.
 
 ### 13. Tests and validation
 
