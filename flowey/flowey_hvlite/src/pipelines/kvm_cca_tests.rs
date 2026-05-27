@@ -174,7 +174,7 @@ impl IntoPipeline for KvmCcaTestsCli {
             return Ok(pipeline);
         }
 
-        if stage_only || preflight {
+        if stage_only || preflight || interactive_host || run_openvmm {
             let host_kernel = host_kernel.unwrap_or(default_cca_kernel_path()?);
             let guest_kernel = guest_kernel.unwrap_or_else(|| host_kernel.clone());
             let logs_dir = logs_dir.map_or_else(
@@ -191,7 +191,11 @@ impl IntoPipeline for KvmCcaTestsCli {
                 .new_job(
                     FlowPlatform::host(backend_hint),
                     FlowArch::host(backend_hint),
-                    if preflight {
+                    if interactive_host {
+                        "kvm-cca-tests: boot interactive KVM CCA host in FVP"
+                    } else if run_openvmm {
+                        "kvm-cca-tests: run OpenVMM KVM CCA in FVP"
+                    } else if preflight {
                         "kvm-cca-tests: run KVM CCA preflight in FVP"
                     } else {
                         "kvm-cca-tests: stage native OpenVMM KVM CCA artifacts"
@@ -222,6 +226,10 @@ impl IntoPipeline for KvmCcaTestsCli {
                         test_root: test_root.clone(),
                         mode: if preflight {
                             flowey_lib_hvlite::_jobs::local_stage_kvm_cca::StageMode::Preflight
+                        } else if interactive_host {
+                            flowey_lib_hvlite::_jobs::local_stage_kvm_cca::StageMode::InteractiveHost
+                        } else if run_openvmm {
+                            flowey_lib_hvlite::_jobs::local_stage_kvm_cca::StageMode::RunOpenvmm
                         } else {
                             flowey_lib_hvlite::_jobs::local_stage_kvm_cca::StageMode::StageOnly
                         },
@@ -237,10 +245,7 @@ impl IntoPipeline for KvmCcaTestsCli {
             return Ok(pipeline);
         }
 
-        if interactive_host || run_openvmm {
-            let _ = (host_kernel, guest_kernel, guest_initrd, openvmm_extra_args);
-            anyhow::bail!("this kvm-cca-tests run mode is not implemented yet");
-        }
+        let _ = (interactive_host, openvmm_extra_args);
 
         let update_job = pipeline
             .new_job(

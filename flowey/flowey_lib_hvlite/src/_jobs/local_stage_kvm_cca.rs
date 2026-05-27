@@ -18,6 +18,8 @@ use std::process::Command;
 pub enum StageMode {
     StageOnly,
     Preflight,
+    InteractiveHost,
+    RunOpenvmm,
 }
 
 flowey_request! {
@@ -58,12 +60,16 @@ impl SimpleFlowNode for Node {
             arch: CommonArch::Aarch64,
             platform: CommonPlatform::LinuxGnu,
         };
-        let openvmm = matches!(mode, StageMode::StageOnly).then(|| {
+        let openvmm = matches!(
+            mode,
+            StageMode::StageOnly | StageMode::InteractiveHost | StageMode::RunOpenvmm
+        )
+        .then(|| {
             ctx.reqv(|v| crate::build_openvmm::Request {
                 params: crate::build_openvmm::OpenvmmBuildParams {
                     profile: CommonProfile::Debug,
                     target: target.clone(),
-                    features: [].into(),
+                    features: [crate::build_openvmm::OpenvmmFeature::VendoredCrypto].into(),
                 },
                 version: None,
                 openvmm: v,
@@ -76,7 +82,11 @@ impl SimpleFlowNode for Node {
             },
             preflight: v,
         });
-        let guest_initrd = matches!(mode, StageMode::StageOnly).then(|| {
+        let guest_initrd = matches!(
+            mode,
+            StageMode::StageOnly | StageMode::InteractiveHost | StageMode::RunOpenvmm
+        )
+        .then(|| {
             guest_initrd.map_or_else(
                 || {
                     ctx.reqv(|v| {
@@ -164,7 +174,10 @@ impl SimpleFlowNode for Node {
                 let debugfs_input_dir = generated_dir.join("debugfs-inputs");
                 fs::create_dir_all(&debugfs_input_dir)?;
                 let run_script = generated_dir.join("run-openvmm-kvm-cca.sh");
-                if matches!(mode, StageMode::StageOnly) {
+                if matches!(
+                    mode,
+                    StageMode::StageOnly | StageMode::InteractiveHost | StageMode::RunOpenvmm
+                ) {
                     fs::write(
                         &run_script,
                         format!(
@@ -177,28 +190,48 @@ echo "guest_kernel=/cca/guest-Image" | tee /cca/logs/kvm-cca-inputs.log
 echo "guest_initrd=/cca/initrd" | tee -a /cca/logs/kvm-cca-inputs.log
 
 /cca/kvm_cca_preflight 2>&1 | tee /cca/logs/kvm-cca-preflight.log
+preflight_rc=$?
+echo "$preflight_rc" >/cca/logs/kvm-cca-preflight.status
+if [ "$preflight_rc" -ne 0 ]; then
+    sync
+    poweroff -f || poweroff || halt -f || halt || exit "$preflight_rc"
+fi
 
-exec /cca/openvmm \
+set +e
+RUST_BACKTRACE=1 /cca/openvmm \
     --isolation cca \
     --kernel /cca/guest-Image \
     --initrd /cca/initrd \
     --device-tree \
+    --memory 512M \
+    --com1 stderr \
+    --cmdline console=ttyAMA0 \
     {extra_args} \
     2>&1 | tee /cca/logs/openvmm.log
+openvmm_rc=$?
+set -e
+echo "$openvmm_rc" >/cca/logs/openvmm.status
+sync
+poweroff -f || poweroff || halt -f || halt || exit "$openvmm_rc"
 "#,
                             extra_args = ""
                         ),
                     )?;
                 }
-                if matches!(mode, StageMode::StageOnly) {
+                if matches!(
+                    mode,
+                    StageMode::StageOnly | StageMode::InteractiveHost | StageMode::RunOpenvmm
+                ) {
                     set_executable(&run_script)?;
                 }
                 let init_hook = generated_dir.join(match mode {
                     StageMode::StageOnly => "S99run-openvmm-kvm-cca",
                     StageMode::Preflight => "S99kvm-cca-preflight",
+                    StageMode::InteractiveHost => "S99kvm-cca-interactive-host",
+                    StageMode::RunOpenvmm => "S99run-openvmm-kvm-cca",
                 });
                 let init_hook_contents = match mode {
-                    StageMode::StageOnly => {
+                    StageMode::StageOnly | StageMode::RunOpenvmm => {
                         r#"#!/bin/sh
 
 case "$1" in
@@ -206,6 +239,30 @@ case "$1" in
         if [ -x /cca/run-openvmm-kvm-cca.sh ]; then
             exec </dev/console >/dev/console 2>&1 /cca/run-openvmm-kvm-cca.sh
         fi
+        ;;
+esac
+
+exit 0
+"#
+                    }
+                    StageMode::InteractiveHost => {
+                        r#"#!/bin/sh
+
+case "$1" in
+    start|"")
+        mkdir -p /cca/logs
+        {
+            echo "KVM CCA interactive host is ready."
+            echo "Artifacts are staged under /cca:"
+            echo "  /cca/kvm_cca_preflight"
+            echo "  /cca/openvmm"
+            echo "  /cca/guest-Image"
+            echo "  /cca/initrd"
+            echo "  /cca/run-openvmm-kvm-cca.sh"
+            echo "Manual commands:"
+            echo "  /cca/kvm_cca_preflight"
+            echo "  /cca/run-openvmm-kvm-cca.sh"
+        } | tee /cca/logs/kvm-cca-interactive-host.log
         ;;
 esac
 
@@ -258,7 +315,12 @@ exit 0
                     if let Some(guest_initrd) = &guest_initrd {
                         files_to_copy.push((guest_initrd, "initrd"));
                     }
-                    if matches!(mode, StageMode::StageOnly) {
+                    if matches!(
+                        mode,
+                        StageMode::StageOnly
+                            | StageMode::InteractiveHost
+                            | StageMode::RunOpenvmm
+                    ) {
                         files_to_copy.push((&run_script, "run-openvmm-kvm-cca.sh"));
                     }
                     for (src, dest_name) in files_to_copy {
@@ -309,7 +371,10 @@ exit 0
                 inject_result?;
 
                 log::info!("staged native KVM CCA rootfs at {}", rootfs_file.display());
-                if matches!(mode, StageMode::Preflight) {
+                if matches!(
+                    mode,
+                    StageMode::Preflight | StageMode::InteractiveHost | StageMode::RunOpenvmm
+                ) {
                     let shrinkwrap_dir = test_root.join("shrinkwrap");
                     let venv_dir = shrinkwrap_dir.join("venv");
                     let shrinkwrap_py = shrinkwrap_dir.join("shrinkwrap/shrinkwrap.py");
@@ -326,21 +391,43 @@ exit 0
                         venv_dir.join("bin").display(),
                         env::var("PATH").unwrap_or_default()
                     );
-                    let fvp_result = flowey::shell_cmd!(
-                        rt,
-                        "timeout --foreground 20m {venv_python} {shrinkwrap_py} --runtime=docker --image=shrinkwraptool/base-slim:2026.3.0.dev0 run cca-3world.yaml --rtvar ROOTFS={rootfs_file} --rtvar KERNEL={host_kernel}"
-                    )
+                    if matches!(mode, StageMode::InteractiveHost) {
+                        print_interactive_host_instructions(&rootfs_file, &logs_dir);
+                    }
+                    let fvp_command = if matches!(mode, StageMode::InteractiveHost) {
+                        flowey::shell_cmd!(
+                            rt,
+                            "{venv_python} {shrinkwrap_py} --runtime=docker --image=shrinkwraptool/base-slim:2026.3.0.dev0 run cca-3world.yaml --rtvar ROOTFS={rootfs_file} --rtvar KERNEL={host_kernel}"
+                        )
+                    } else {
+                        flowey::shell_cmd!(
+                            rt,
+                            "timeout --foreground 20m {venv_python} {shrinkwrap_py} --runtime=docker --image=shrinkwraptool/base-slim:2026.3.0.dev0 run cca-3world.yaml --rtvar ROOTFS={rootfs_file} --rtvar KERNEL={host_kernel}"
+                        )
+                    };
+                    let fvp_result = fvp_command
                         .env("VIRTUAL_ENV", &venv_dir)
                         .env("PATH", &venv_bin_path)
                         .run();
                     extract_logs(&debugfs_bin, &rootfs_file, &logs_dir)?;
                     fvp_result.with_context(|| {
                         format!(
-                            "failed to launch FVP for KVM CCA preflight; logs extracted to {}",
+                            "failed to launch FVP for KVM CCA; logs extracted to {}",
                             logs_dir.display()
                         )
                     })?;
+                    if matches!(mode, StageMode::InteractiveHost) {
+                        return Ok(());
+                    }
                     check_preflight_status(&debugfs_bin, &rootfs_file)?;
+                    if matches!(mode, StageMode::RunOpenvmm) {
+                        check_status_file(
+                            &debugfs_bin,
+                            &rootfs_file,
+                            "/cca/logs/openvmm.status",
+                            "OpenVMM",
+                        )?;
+                    }
                 }
                 Ok(())
             }
@@ -493,6 +580,10 @@ fn extract_logs(debugfs: &Path, rootfs: &Path, logs_dir: &Path) -> anyhow::Resul
     let logs = [
         ("kvm-cca-host.log", "/cca/logs/kvm-cca-host.log"),
         ("kvm-cca-inputs.log", "/cca/logs/kvm-cca-inputs.log"),
+        (
+            "kvm-cca-interactive-host.log",
+            "/cca/logs/kvm-cca-interactive-host.log",
+        ),
         ("kvm-cca-preflight.log", "/cca/logs/kvm-cca-preflight.log"),
         (
             "kvm-cca-preflight.status",
@@ -523,6 +614,17 @@ fn extract_logs(debugfs: &Path, rootfs: &Path, logs_dir: &Path) -> anyhow::Resul
     Ok(())
 }
 
+fn print_interactive_host_instructions(rootfs: &Path, logs_dir: &Path) {
+    println!("KVM CCA interactive host is starting under FVP.");
+    println!("Staged rootfs: {}", rootfs.display());
+    println!("Logs will be extracted to: {}", logs_dir.display());
+    println!("After Plane0 boots, use the FVP/Plane0 console or SSH to run:");
+    println!("  /cca/kvm_cca_preflight");
+    println!("  /cca/run-openvmm-kvm-cca.sh");
+    println!("If SSH is available, try: ssh -p 8022 root@localhost");
+    println!("Stop FVP when finished; xflowey will then extract any /cca/logs files.");
+}
+
 fn find_debugfs() -> anyhow::Result<PathBuf> {
     for path in [
         "/usr/sbin/debugfs",
@@ -550,10 +652,25 @@ fn set_executable(path: &Path) -> anyhow::Result<()> {
 }
 
 fn check_preflight_status(debugfs: &Path, rootfs: &Path) -> anyhow::Result<()> {
-    let status_path = "/cca/logs/kvm-cca-preflight.status";
+    check_status_file(
+        debugfs,
+        rootfs,
+        "/cca/logs/kvm-cca-preflight.status",
+        "KVM CCA preflight",
+    )
+}
+
+fn check_status_file(
+    debugfs: &Path,
+    rootfs: &Path,
+    status_path: &str,
+    label: &'static str,
+) -> anyhow::Result<()> {
     let status = debugfs_read(debugfs, rootfs, status_path)
         .with_context(|| {
-            format!("KVM CCA preflight did not complete; missing {status_path} (possible timeout or Plane0 crash)")
+            format!(
+                "{label} did not complete; missing {status_path} (possible timeout or Plane0 crash)"
+            )
         })
         .and_then(|status| {
             String::from_utf8(status)
@@ -563,6 +680,6 @@ fn check_preflight_status(debugfs: &Path, rootfs: &Path) -> anyhow::Result<()> {
                 .context("preflight status was not an integer")
         })?;
 
-    anyhow::ensure!(status == 0, "KVM CCA preflight failed with status {status}");
+    anyhow::ensure!(status == 0, "{label} failed with status {status}");
     Ok(())
 }
