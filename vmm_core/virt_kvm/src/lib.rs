@@ -188,6 +188,8 @@ struct KvmPartitionInner {
     #[cfg(guest_arch = "aarch64")]
     #[inspect(skip)]
     cca_launch_state: Mutex<CcaLaunchState>,
+    #[cfg(guest_arch = "aarch64")]
+    cca_shared_gpa_bit: Option<u64>,
     memory: Mutex<KvmMemoryRangeState>,
     memory_backing_mode: KvmMemoryBackingMode,
     #[inspect(iter_by_index)]

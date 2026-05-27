@@ -530,10 +530,12 @@ impl virt::Processor for KvmProcessor<'_> {
                         pending_exit = false;
                     }
                     kvm::Exit::MmioWrite { address, data } => {
-                        dev.write_mmio(self.vpindex, address, data).await
+                        dev.write_mmio(self.vpindex, self.partition.mmio_address(address), data)
+                            .await
                     }
                     kvm::Exit::MmioRead { address, data } => {
-                        dev.read_mmio(self.vpindex, address, data).await
+                        dev.read_mmio(self.vpindex, self.partition.mmio_address(address), data)
+                            .await
                     }
                     kvm::Exit::Shutdown => {
                         return Err(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 });
@@ -884,6 +886,8 @@ impl virt::ProtoPartition for KvmProtoPartition<'_> {
             kvm: self.vm,
             memory: Default::default(),
             cca_launch_state: Mutex::new(crate::CcaLaunchState::NotStarted),
+            cca_shared_gpa_bit: (self.config.isolation == virt::IsolationType::Cca)
+                .then_some(1_u64 << (self.ipa_size - 1)),
             memory_backing_mode: match self.config.isolation {
                 virt::IsolationType::None => KvmMemoryBackingMode::Userspace,
                 virt::IsolationType::Cca => KvmMemoryBackingMode::GuestMemfd,
@@ -1046,6 +1050,16 @@ impl virt::irqcon::ControlGic for KvmPartitionInner {
                 err = &err as &dyn std::error::Error,
                 "failed to set SPI IRQ",
             );
+        }
+    }
+}
+
+impl KvmPartitionInner {
+    fn mmio_address(&self, address: u64) -> u64 {
+        if let Some(shared_bit) = self.cca_shared_gpa_bit {
+            address & (shared_bit - 1)
+        } else {
+            address
         }
     }
 }
