@@ -221,10 +221,15 @@ ARTIFACT_DIR=/cca
 if [ "$SCRIPT_DIR" = "/cca-share" ]; then
     ARTIFACT_DIR=/cca-share
 fi
+KERNEL_DIR="$ARTIFACT_DIR"
+if [ "$ARTIFACT_DIR" = "/cca-share" ]; then
+    KERNEL_DIR=/cca
+fi
 echo "host: $(uname -a)" | tee /cca/logs/kvm-cca-host.log
 echo "artifact_dir=$ARTIFACT_DIR" | tee /cca/logs/kvm-cca-inputs.log
-echo "guest_kernel=$ARTIFACT_DIR/guest-Image" | tee -a /cca/logs/kvm-cca-inputs.log
-echo "guest_initrd=$ARTIFACT_DIR/initrd" | tee -a /cca/logs/kvm-cca-inputs.log
+echo "kernel_dir=$KERNEL_DIR" | tee -a /cca/logs/kvm-cca-inputs.log
+echo "guest_kernel=$KERNEL_DIR/guest-Image" | tee -a /cca/logs/kvm-cca-inputs.log
+echo "guest_initrd=$KERNEL_DIR/initrd" | tee -a /cca/logs/kvm-cca-inputs.log
 echo "openvmm_memory={openvmm_memory}" | tee -a /cca/logs/kvm-cca-inputs.log
 echo "openvmm_extra_args={extra_args}" | tee -a /cca/logs/kvm-cca-inputs.log
 
@@ -240,8 +245,8 @@ dmesg >/cca/logs/host-dmesg-before-openvmm.log 2>&1 || true
 set +e
 RUST_BACKTRACE=1 "$ARTIFACT_DIR/openvmm" \
     --isolation cca \
-    --kernel "$ARTIFACT_DIR/guest-Image" \
-    --initrd "$ARTIFACT_DIR/initrd" \
+    --kernel "$KERNEL_DIR/guest-Image" \
+    --initrd "$KERNEL_DIR/initrd" \
     --device-tree \
     --memory {openvmm_memory} \
     --com1 stderr \
@@ -253,6 +258,9 @@ set -e
 echo "$openvmm_rc" >/cca/logs/openvmm.status
 dmesg >/cca/logs/host-dmesg-after-openvmm.log 2>&1 || true
 sync
+if [ "$ARTIFACT_DIR" = "/cca-share" ]; then
+    exit "$openvmm_rc"
+fi
 poweroff -f || poweroff || halt -f || halt || exit "$openvmm_rc"
 "#,
                             extra_args = openvmm_extra_args.as_deref().unwrap_or(""),
@@ -361,14 +369,10 @@ exit 0
                         files_to_copy.push((openvmm, "openvmm"));
                     }
                     files_to_copy.push((&host_kernel, "host-Image"));
-                    if !matches!(mode, StageMode::InteractiveHost)
-                        && let Some(guest_kernel) = &guest_kernel
-                    {
+                    if let Some(guest_kernel) = &guest_kernel {
                         files_to_copy.push((guest_kernel, "guest-Image"));
                     }
-                    if !matches!(mode, StageMode::InteractiveHost)
-                        && let Some(guest_initrd) = &guest_initrd
-                    {
+                    if let Some(guest_initrd) = &guest_initrd {
                         files_to_copy.push((guest_initrd, "initrd"));
                     }
                     if matches!(mode, StageMode::StageOnly | StageMode::RunOpenvmm) {
@@ -725,8 +729,12 @@ fn stage_share_dir(
 
     for (src, dest_name) in files_to_copy {
         let dest = share_dir.join(dest_name);
-        fs::copy(src, &dest)
-            .with_context(|| format!("failed to copy {} to {}", src.display(), dest.display()))?;
+        let same_file = src.canonicalize().ok() == dest.canonicalize().ok();
+        if !same_file {
+            fs::copy(src, &dest).with_context(|| {
+                format!("failed to copy {} to {}", src.display(), dest.display())
+            })?;
+        }
         set_executable(&dest)?;
     }
 
