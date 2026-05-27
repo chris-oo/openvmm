@@ -30,6 +30,7 @@ flowey_request! {
         pub guest_kernel: Option<PathBuf>,
         pub guest_initrd: Option<PathBuf>,
         pub logs_dir: PathBuf,
+        pub share_dir: PathBuf,
         pub openvmm_memory: String,
         pub openvmm_extra_args: Option<String>,
         pub done: WriteVar<SideEffect>,
@@ -55,6 +56,7 @@ impl SimpleFlowNode for Node {
             guest_kernel,
             guest_initrd,
             logs_dir,
+            share_dir,
             openvmm_memory,
             openvmm_extra_args,
             done,
@@ -140,6 +142,9 @@ impl SimpleFlowNode for Node {
                         "OpenVMM extra args must not contain newlines"
                     );
                 }
+                fs::create_dir_all(&share_dir).with_context(|| {
+                    format!("failed to create 9p share directory {}", share_dir.display())
+                })?;
 
                 let home_dir = env::var("HOME").map(PathBuf::from).expect("HOME not set");
                 let firmware_dir = home_dir.join(".shrinkwrap/package/cca-3world");
@@ -185,6 +190,18 @@ impl SimpleFlowNode for Node {
                 let debugfs_input_dir = generated_dir.join("debugfs-inputs");
                 fs::create_dir_all(&debugfs_input_dir)?;
                 let run_script = generated_dir.join("run-openvmm-kvm-cca.sh");
+                let mount_share_script = generated_dir.join("mount-kvm-cca-share.sh");
+                fs::write(
+                    &mount_share_script,
+                    r#"#!/bin/sh
+set -eu
+mkdir -p /cca-share
+if ! mountpoint -q /cca-share; then
+    mount -t 9p -o trans=virtio,version=9p2000.L FM /cca-share
+fi
+"#,
+                )?;
+                set_executable(&mount_share_script)?;
                 if matches!(
                     mode,
                     StageMode::StageOnly | StageMode::InteractiveHost | StageMode::RunOpenvmm
@@ -196,13 +213,22 @@ impl SimpleFlowNode for Node {
 set -eu
 
 mkdir -p /cca/logs
+if [ -x /cca/mount-kvm-cca-share.sh ]; then
+    /cca/mount-kvm-cca-share.sh 2>&1 | tee /cca/logs/kvm-cca-share-mount.log || true
+fi
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+ARTIFACT_DIR=/cca
+if [ "$SCRIPT_DIR" = "/cca-share" ]; then
+    ARTIFACT_DIR=/cca-share
+fi
 echo "host: $(uname -a)" | tee /cca/logs/kvm-cca-host.log
-echo "guest_kernel=/cca/guest-Image" | tee /cca/logs/kvm-cca-inputs.log
-echo "guest_initrd=/cca/initrd" | tee -a /cca/logs/kvm-cca-inputs.log
+echo "artifact_dir=$ARTIFACT_DIR" | tee /cca/logs/kvm-cca-inputs.log
+echo "guest_kernel=$ARTIFACT_DIR/guest-Image" | tee -a /cca/logs/kvm-cca-inputs.log
+echo "guest_initrd=$ARTIFACT_DIR/initrd" | tee -a /cca/logs/kvm-cca-inputs.log
 echo "openvmm_memory={openvmm_memory}" | tee -a /cca/logs/kvm-cca-inputs.log
 echo "openvmm_extra_args={extra_args}" | tee -a /cca/logs/kvm-cca-inputs.log
 
-/cca/kvm_cca_preflight 2>&1 | tee /cca/logs/kvm-cca-preflight.log
+"$ARTIFACT_DIR/kvm_cca_preflight" 2>&1 | tee /cca/logs/kvm-cca-preflight.log
 preflight_rc=$?
 echo "$preflight_rc" >/cca/logs/kvm-cca-preflight.status
 if [ "$preflight_rc" -ne 0 ]; then
@@ -210,20 +236,22 @@ if [ "$preflight_rc" -ne 0 ]; then
     poweroff -f || poweroff || halt -f || halt || exit "$preflight_rc"
 fi
 
+dmesg >/cca/logs/host-dmesg-before-openvmm.log 2>&1 || true
 set +e
-RUST_BACKTRACE=1 /cca/openvmm \
+RUST_BACKTRACE=1 "$ARTIFACT_DIR/openvmm" \
     --isolation cca \
-    --kernel /cca/guest-Image \
-    --initrd /cca/initrd \
+    --kernel "$ARTIFACT_DIR/guest-Image" \
+    --initrd "$ARTIFACT_DIR/initrd" \
     --device-tree \
     --memory {openvmm_memory} \
     --com1 stderr \
-    --cmdline "console=ttyAMA0,115200 earlycon=pl011,0xeffec000" \
+    --cmdline "console=ttyAMA0,115200 earlycon=pl011,mmio32,0x8000effec000" \
     {extra_args} \
     2>&1 | tee /cca/logs/openvmm.log
 openvmm_rc=$?
 set -e
 echo "$openvmm_rc" >/cca/logs/openvmm.status
+dmesg >/cca/logs/host-dmesg-after-openvmm.log 2>&1 || true
 sync
 poweroff -f || poweroff || halt -f || halt || exit "$openvmm_rc"
 "#,
@@ -265,6 +293,9 @@ exit 0
 case "$1" in
     start|"")
         mkdir -p /cca/logs
+        if [ -x /cca/mount-kvm-cca-share.sh ]; then
+            /cca/mount-kvm-cca-share.sh 2>&1 | tee /cca/logs/kvm-cca-share-mount.log || true
+        fi
         {
             echo "KVM CCA interactive host is ready."
             echo "Artifacts are staged under /cca:"
@@ -273,9 +304,11 @@ case "$1" in
             echo "  /cca/guest-Image"
             echo "  /cca/initrd"
             echo "  /cca/run-openvmm-kvm-cca.sh"
+            echo "Host 9p share is mounted at /cca-share when available."
             echo "Manual commands:"
             echo "  /cca/kvm_cca_preflight"
             echo "  /cca/run-openvmm-kvm-cca.sh"
+            echo "  /cca-share/run-openvmm-kvm-cca.sh"
         } | tee /cca/logs/kvm-cca-interactive-host.log
         ;;
 esac
@@ -318,23 +351,27 @@ exit 0
                         "rm /etc/init.d/S99realm-launch",
                     );
 
-                    let mut files_to_copy = vec![(&preflight, "kvm_cca_preflight")];
-                    if let Some(openvmm) = &openvmm {
+                    let mut files_to_copy = vec![(&mount_share_script, "mount-kvm-cca-share.sh")];
+                    if !matches!(mode, StageMode::InteractiveHost) {
+                        files_to_copy.push((&preflight, "kvm_cca_preflight"));
+                    }
+                    if !matches!(mode, StageMode::InteractiveHost)
+                        && let Some(openvmm) = &openvmm
+                    {
                         files_to_copy.push((openvmm, "openvmm"));
                     }
                     files_to_copy.push((&host_kernel, "host-Image"));
-                    if let Some(guest_kernel) = &guest_kernel {
+                    if !matches!(mode, StageMode::InteractiveHost)
+                        && let Some(guest_kernel) = &guest_kernel
+                    {
                         files_to_copy.push((guest_kernel, "guest-Image"));
                     }
-                    if let Some(guest_initrd) = &guest_initrd {
+                    if !matches!(mode, StageMode::InteractiveHost)
+                        && let Some(guest_initrd) = &guest_initrd
+                    {
                         files_to_copy.push((guest_initrd, "initrd"));
                     }
-                    if matches!(
-                        mode,
-                        StageMode::StageOnly
-                            | StageMode::InteractiveHost
-                            | StageMode::RunOpenvmm
-                    ) {
+                    if matches!(mode, StageMode::StageOnly | StageMode::RunOpenvmm) {
                         files_to_copy.push((&run_script, "run-openvmm-kvm-cca.sh"));
                     }
                     for (src, dest_name) in files_to_copy {
@@ -384,7 +421,17 @@ exit 0
 
                 inject_result?;
 
+                stage_share_dir(
+                    &share_dir,
+                    openvmm.as_deref(),
+                    &preflight,
+                    guest_kernel.as_deref(),
+                    guest_initrd.as_deref(),
+                    &run_script,
+                )?;
+
                 log::info!("staged native KVM CCA rootfs at {}", rootfs_file.display());
+                log::info!("staged native KVM CCA 9p share at {}", share_dir.display());
                 if matches!(
                     mode,
                     StageMode::Preflight | StageMode::InteractiveHost | StageMode::RunOpenvmm
@@ -411,12 +458,12 @@ exit 0
                     let fvp_command = if matches!(mode, StageMode::InteractiveHost) {
                         flowey::shell_cmd!(
                             rt,
-                            "{venv_python} {shrinkwrap_py} --runtime=docker --image=shrinkwraptool/base-slim:2026.3.0.dev0 run cca-3world.yaml --rtvar ROOTFS={rootfs_file} --rtvar KERNEL={host_kernel}"
+                            "{venv_python} {shrinkwrap_py} --runtime=docker --image=shrinkwraptool/base-slim:2026.3.0.dev0 run cca-3world.yaml --rtvar ROOTFS={rootfs_file} --rtvar KERNEL={host_kernel} --rtvar SHARE={share_dir}"
                         )
                     } else {
                         flowey::shell_cmd!(
                             rt,
-                            "timeout --foreground 20m {venv_python} {shrinkwrap_py} --runtime=docker --image=shrinkwraptool/base-slim:2026.3.0.dev0 run cca-3world.yaml --rtvar ROOTFS={rootfs_file} --rtvar KERNEL={host_kernel}"
+                            "timeout --foreground 20m {venv_python} {shrinkwrap_py} --runtime=docker --image=shrinkwraptool/base-slim:2026.3.0.dev0 run cca-3world.yaml --rtvar ROOTFS={rootfs_file} --rtvar KERNEL={host_kernel} --rtvar SHARE={share_dir}"
                         )
                     };
                     let fvp_result = fvp_command
@@ -607,10 +654,22 @@ fn extract_logs(debugfs: &Path, rootfs: &Path, logs_dir: &Path) -> anyhow::Resul
             "kvm-cca-interactive-host.log",
             "/cca/logs/kvm-cca-interactive-host.log",
         ),
+        (
+            "kvm-cca-share-mount.log",
+            "/cca/logs/kvm-cca-share-mount.log",
+        ),
         ("kvm-cca-preflight.log", "/cca/logs/kvm-cca-preflight.log"),
         (
             "kvm-cca-preflight.status",
             "/cca/logs/kvm-cca-preflight.status",
+        ),
+        (
+            "host-dmesg-before-openvmm.log",
+            "/cca/logs/host-dmesg-before-openvmm.log",
+        ),
+        (
+            "host-dmesg-after-openvmm.log",
+            "/cca/logs/host-dmesg-after-openvmm.log",
         ),
         ("openvmm.log", "/cca/logs/openvmm.log"),
         ("openvmm.status", "/cca/logs/openvmm.status"),
@@ -637,6 +696,43 @@ fn extract_logs(debugfs: &Path, rootfs: &Path, logs_dir: &Path) -> anyhow::Resul
     Ok(())
 }
 
+fn stage_share_dir(
+    share_dir: &Path,
+    openvmm: Option<&Path>,
+    preflight: &Path,
+    guest_kernel: Option<&Path>,
+    guest_initrd: Option<&Path>,
+    run_script: &Path,
+) -> anyhow::Result<()> {
+    fs::create_dir_all(share_dir).with_context(|| {
+        format!(
+            "failed to create 9p share directory {}",
+            share_dir.display()
+        )
+    })?;
+
+    let mut files_to_copy = vec![(preflight, "kvm_cca_preflight")];
+    if let Some(openvmm) = openvmm {
+        files_to_copy.push((openvmm, "openvmm"));
+    }
+    if let Some(guest_kernel) = guest_kernel {
+        files_to_copy.push((guest_kernel, "guest-Image"));
+    }
+    if let Some(guest_initrd) = guest_initrd {
+        files_to_copy.push((guest_initrd, "initrd"));
+    }
+    files_to_copy.push((run_script, "run-openvmm-kvm-cca.sh"));
+
+    for (src, dest_name) in files_to_copy {
+        let dest = share_dir.join(dest_name);
+        fs::copy(src, &dest)
+            .with_context(|| format!("failed to copy {} to {}", src.display(), dest.display()))?;
+        set_executable(&dest)?;
+    }
+
+    Ok(())
+}
+
 fn print_interactive_host_instructions(rootfs: &Path, logs_dir: &Path) {
     println!("KVM CCA interactive host is starting under FVP.");
     println!("Staged rootfs: {}", rootfs.display());
@@ -644,6 +740,7 @@ fn print_interactive_host_instructions(rootfs: &Path, logs_dir: &Path) {
     println!("After Plane0 boots, use the FVP/Plane0 console or SSH to run:");
     println!("  /cca/kvm_cca_preflight");
     println!("  /cca/run-openvmm-kvm-cca.sh");
+    println!("  /cca-share/run-openvmm-kvm-cca.sh");
     println!("If SSH is available, try: ssh -p 8022 root@localhost");
     println!("Stop FVP when finished; xflowey will then extract any /cca/logs files.");
 }

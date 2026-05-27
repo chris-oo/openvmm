@@ -52,6 +52,10 @@ pub struct KvmCcaTestsCli {
     #[clap(long)]
     pub logs_dir: Option<PathBuf>,
 
+    /// Host directory shared into Plane0 over virtio-9p.
+    #[clap(long)]
+    pub share_dir: Option<PathBuf>,
+
     /// Extra OpenVMM command-line arguments for local debugging.
     #[clap(long)]
     pub openvmm_extra_args: Option<String>,
@@ -91,6 +95,7 @@ impl IntoPipeline for KvmCcaTestsCli {
             guest_kernel,
             guest_initrd,
             logs_dir,
+            share_dir,
             openvmm_extra_args,
             openvmm_memory,
             preflight,
@@ -192,6 +197,16 @@ impl IntoPipeline for KvmCcaTestsCli {
                     }
                 },
             );
+            let share_dir = share_dir.map_or_else(
+                || test_root.join("kvm-cca/share"),
+                |share_dir| {
+                    if share_dir.is_absolute() {
+                        share_dir
+                    } else {
+                        crate::repo_root().join(share_dir)
+                    }
+                },
+            );
             let test_job = pipeline
                 .new_job(
                     FlowPlatform::host(backend_hint),
@@ -242,6 +257,7 @@ impl IntoPipeline for KvmCcaTestsCli {
                         guest_kernel: (!preflight).then_some(guest_kernel),
                         guest_initrd,
                         logs_dir,
+                        share_dir,
                         openvmm_memory,
                         openvmm_extra_args: openvmm_extra_args.clone(),
                         done: ctx.new_done_handle(),

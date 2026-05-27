@@ -554,6 +554,7 @@ cargo xflowey kvm-cca-tests --interactive-host \
   --host-kernel ~/ai/eevee/linux/out/cca-fvp/kernel/arch/arm64/boot/Image \
   --guest-kernel ~/ai/eevee/linux/out/cca-fvp/kernel/arch/arm64/boot/Image \
   --logs-dir target/cca-test/kvm-cca/logs/interactive \
+  --share-dir target/cca-test/kvm-cca/share \
   --openvmm-memory 128M
 
 # Stage artifacts, boot FVP/Plane0, run the preflight and OpenVMM via the
@@ -586,18 +587,25 @@ Mode behavior:
   should extract logs to `--logs-dir` or the default log directory.
 - `--interactive-host` should launch shrinkwrap/FVP with the isolated rootfs and
   provided host kernel, then leave control/log output suitable for manual
-  debugging. Like `--stage-only`, it should stage the default aarch64
-  `openvmm-deps` guest initrd unless overridden. It should not interpret guest
-  success or failure, but it should still extract logs to `--logs-dir` when FVP
-  exits.
+  debugging. It should keep the rootfs payload small and stable: inject only the
+  Plane0 host kernel, `/cca/mount-kvm-cca-share.sh`, and the init hook. Large or
+  frequently changing artifacts (`openvmm`, `kvm_cca_preflight`, guest kernel,
+  guest initrd, and `run-openvmm-kvm-cca.sh`) should be staged in the host 9p
+  `--share-dir` and mounted in Plane0 at `/cca-share`. It should not interpret
+  guest success or failure, but it should still extract logs to `--logs-dir`
+  when FVP exits.
 - Interactive debugging workflow:
   - launch:
     `cargo xflowey kvm-cca-tests --interactive-host --host-kernel ~/ai/eevee/linux/out/cca-fvp/kernel/arch/arm64/boot/Image --guest-kernel ~/ai/eevee/linux/out/cca-fvp/kernel/arch/arm64/boot/Image --logs-dir target/cca-test/kvm-cca/logs/interactive`;
   - the FVP Plane0 console is exposed on telnet port 5000. If the console is not
     already attached in the `xflowey` terminal, attach from another terminal with
     `telnet localhost 5000`, press Enter, and log in as `root`;
-  - staged artifacts live under `/cca`. Run `/cca/kvm_cca_preflight` first, then
-    `/cca/run-openvmm-kvm-cca.sh` to reproduce the OpenVMM CCA launch path;
+  - stable rootfs artifacts live under `/cca`; frequently changing artifacts
+    live in the host 9p share, mounted at `/cca-share` inside Plane0. If the
+    mount is not present, run `/cca/mount-kvm-cca-share.sh`;
+  - update host-side artifacts in `target/cca-test/kvm-cca/share/`, then rerun
+    `/cca-share/run-openvmm-kvm-cca.sh` from the still-running Plane0 shell to
+    avoid rebooting FVP;
   - if OpenVMM reaches `openvmm>`, use `help`, `resume`, `inspect`, `input`, and
     `quit` from the REPL. Stop FVP when finished so Flowey can extract
     `/cca/logs/*` to `--logs-dir`;
@@ -613,9 +621,10 @@ Mode behavior:
     128 MiB cut it to about 38s while still reaching the OpenVMM REPL;
   - use `--openvmm-extra-args "<args>"` to restage a modified OpenVMM command
     line without editing `/cca/run-openvmm-kvm-cca.sh` by hand;
-  - for code changes in OpenVMM/Flowey, rerun `--interactive-host` to restage the
-    rootfs, then reconnect with `telnet localhost 5000` and run the staged
-    script. For pure REPL experiments, keep the current FVP instance alive.
+  - for OpenVMM-only changes, rebuild/copy the new binary to
+    `target/cca-test/kvm-cca/share/openvmm` and rerun the `/cca-share` script
+    without rebooting FVP. Rerun `--interactive-host` only when changing the
+    Plane0 rootfs bootstrap, FVP inputs, or guest/host kernel images.
 - `--run-openvmm` should resolve the guest initrd from `openvmm-deps` for
   aarch64 unless `--guest-initrd` is provided, then fail fast if the boot-time
   init hook cannot be staged. On success it should run
