@@ -952,6 +952,12 @@ impl virt::Partition for KvmPartition {
         None
     }
 
+    fn supports_initial_accept_pages(
+        &self,
+    ) -> Option<&dyn virt::AcceptInitialPages<Error = <Self as virt::Hv1>::Error>> {
+        (self.inner.memory_backing_mode == KvmMemoryBackingMode::GuestMemfd).then_some(self)
+    }
+
     fn caps(&self) -> &PartitionCapabilities {
         &self.inner.caps
     }
