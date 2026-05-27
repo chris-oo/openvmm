@@ -1040,6 +1040,15 @@ impl InitializedVm {
                     "KVM {isolation_name} guest_memfd does not support the i440BX host PCI bridge"
                 );
             }
+            if cfg.hypervisor.with_isolation == Some(IsolationType::Cca) {
+                let only_supported_chipset_devices = cfg
+                    .chipset_devices
+                    .iter()
+                    .all(|device| matches!(device.resource.id(), "serial_pl011" | "missing-dev"));
+                if !only_supported_chipset_devices {
+                    anyhow::bail!("KVM CCA guest_memfd only supports PL011 serial chipset devices");
+                }
+            }
             if cfg.vmbus.is_some() || cfg.vtl2_vmbus.is_some() || !cfg.vmbus_devices.is_empty() {
                 anyhow::bail!("KVM {isolation_name} guest_memfd does not support VMBus");
             }

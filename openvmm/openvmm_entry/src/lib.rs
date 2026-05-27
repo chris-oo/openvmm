@@ -1845,6 +1845,7 @@ fn validate_isolation_config(cfg: &Config) -> anyhow::Result<()> {
         matches!(
             device.resource.id(),
             "serial_16550"
+                | "serial_pl011"
                 | "pic"
                 | "pit"
                 | "generic-ioapic"
