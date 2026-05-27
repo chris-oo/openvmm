@@ -48,6 +48,10 @@ pub struct KvmCcaTestsCli {
     #[clap(long)]
     pub guest_initrd: Option<PathBuf>,
 
+    /// Host directory for logs extracted from the staged FVP rootfs.
+    #[clap(long)]
+    pub logs_dir: Option<PathBuf>,
+
     /// Extra OpenVMM command-line arguments for local debugging.
     #[clap(long)]
     pub openvmm_extra_args: Option<String>,
@@ -82,6 +86,7 @@ impl IntoPipeline for KvmCcaTestsCli {
             host_kernel,
             guest_kernel,
             guest_initrd,
+            logs_dir,
             openvmm_extra_args,
             preflight,
             stage_only,
@@ -172,6 +177,16 @@ impl IntoPipeline for KvmCcaTestsCli {
         if stage_only || preflight {
             let host_kernel = host_kernel.unwrap_or(default_cca_kernel_path()?);
             let guest_kernel = guest_kernel.unwrap_or_else(|| host_kernel.clone());
+            let logs_dir = logs_dir.map_or_else(
+                || test_root.join("kvm-cca/logs/latest"),
+                |logs_dir| {
+                    if logs_dir.is_absolute() {
+                        logs_dir
+                    } else {
+                        crate::repo_root().join(logs_dir)
+                    }
+                },
+            );
             let test_job = pipeline
                 .new_job(
                     FlowPlatform::host(backend_hint),
@@ -213,6 +228,7 @@ impl IntoPipeline for KvmCcaTestsCli {
                         host_kernel,
                         guest_kernel: (!preflight).then_some(guest_kernel),
                         guest_initrd,
+                        logs_dir,
                         done: ctx.new_done_handle(),
                     },
                 )

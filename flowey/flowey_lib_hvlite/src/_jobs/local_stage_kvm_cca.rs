@@ -27,6 +27,7 @@ flowey_request! {
         pub host_kernel: PathBuf,
         pub guest_kernel: Option<PathBuf>,
         pub guest_initrd: Option<PathBuf>,
+        pub logs_dir: PathBuf,
         pub done: WriteVar<SideEffect>,
     }
 }
@@ -49,6 +50,7 @@ impl SimpleFlowNode for Node {
             host_kernel,
             guest_kernel,
             guest_initrd,
+            logs_dir,
             done,
         } = request;
 
@@ -322,14 +324,20 @@ exit 0
                         venv_dir.join("bin").display(),
                         env::var("PATH").unwrap_or_default()
                     );
-                    flowey::shell_cmd!(
+                    let fvp_result = flowey::shell_cmd!(
                         rt,
                         "timeout --foreground 20m {venv_python} {shrinkwrap_py} --runtime=docker --image=shrinkwraptool/base-slim:2026.3.0.dev0 run cca-3world.yaml --rtvar ROOTFS={rootfs_file} --rtvar KERNEL={host_kernel}"
                     )
                         .env("VIRTUAL_ENV", &venv_dir)
                         .env("PATH", &venv_bin_path)
-                        .run()
-                        .with_context(|| "failed to launch FVP for KVM CCA preflight")?;
+                        .run();
+                    extract_logs(&debugfs_bin, &rootfs_file, &logs_dir)?;
+                    fvp_result.with_context(|| {
+                        format!(
+                            "failed to launch FVP for KVM CCA preflight; logs extracted to {}",
+                            logs_dir.display()
+                        )
+                    })?;
                     check_preflight_status(&debugfs_bin, &rootfs_file)?;
                 }
                 Ok(())
@@ -446,6 +454,71 @@ fn debugfs_read(debugfs: &Path, rootfs: &Path, path: &str) -> anyhow::Result<Vec
         String::from_utf8_lossy(&output.stderr)
     );
     Ok(output.stdout)
+}
+
+fn debugfs_dump_optional(
+    debugfs: &Path,
+    rootfs: &Path,
+    guest_path: &str,
+    host_path: &Path,
+) -> anyhow::Result<bool> {
+    let _ = fs::remove_file(host_path);
+    let output = Command::new(debugfs)
+        .arg("-R")
+        .arg(format!("dump -p {guest_path} {}", host_path.display()))
+        .arg(rootfs)
+        .output()
+        .with_context(|| format!("failed to execute debugfs dump for {guest_path}"))?;
+
+    if output.status.success() {
+        return Ok(true);
+    }
+
+    log::debug!(
+        "did not extract {} from {}: {}{}",
+        guest_path,
+        rootfs.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(false)
+}
+
+fn extract_logs(debugfs: &Path, rootfs: &Path, logs_dir: &Path) -> anyhow::Result<()> {
+    fs::create_dir_all(logs_dir)
+        .with_context(|| format!("failed to create log directory {}", logs_dir.display()))?;
+
+    let logs = [
+        ("kvm-cca-host.log", "/cca/logs/kvm-cca-host.log"),
+        ("kvm-cca-inputs.log", "/cca/logs/kvm-cca-inputs.log"),
+        ("kvm-cca-preflight.log", "/cca/logs/kvm-cca-preflight.log"),
+        (
+            "kvm-cca-preflight.status",
+            "/cca/logs/kvm-cca-preflight.status",
+        ),
+        ("openvmm.log", "/cca/logs/openvmm.log"),
+        ("openvmm.status", "/cca/logs/openvmm.status"),
+    ];
+
+    let mut extracted = Vec::new();
+    for (host_name, guest_path) in logs {
+        let host_path = logs_dir.join(host_name);
+        if debugfs_dump_optional(debugfs, rootfs, guest_path, &host_path)? {
+            extracted.push(host_name);
+        }
+    }
+
+    if extracted.is_empty() {
+        log::warn!("no KVM CCA logs were extracted to {}", logs_dir.display());
+    } else {
+        log::info!(
+            "extracted KVM CCA logs to {}: {}",
+            logs_dir.display(),
+            extracted.join(", ")
+        );
+    }
+
+    Ok(())
 }
 
 fn find_debugfs() -> anyhow::Result<PathBuf> {
