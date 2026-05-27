@@ -219,10 +219,12 @@ case "$1" in
     start|"")
         mkdir -p /cca/logs
         if [ -x /cca/kvm_cca_preflight ]; then
-            /cca/kvm_cca_preflight >/cca/logs/kvm-cca-preflight.log 2>&1
-            rc=$?
+            {
+                /cca/kvm_cca_preflight 2>&1
+                echo "$?" >/cca/logs/kvm-cca-preflight.status
+            } | tee /cca/logs/kvm-cca-preflight.log
+            rc=$(cat /cca/logs/kvm-cca-preflight.status)
             echo "$rc" >/cca/logs/kvm-cca-preflight.status
-            cat /cca/logs/kvm-cca-preflight.log >/dev/console 2>&1 || true
             sync
             poweroff -f || poweroff || halt -f || halt || exit "$rc"
         fi
