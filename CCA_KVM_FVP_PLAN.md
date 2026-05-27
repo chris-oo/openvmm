@@ -610,9 +610,11 @@ Mode behavior:
     `quit` from the REPL. Stop FVP when finished so Flowey can extract
     `/cca/logs/*` to `--logs-dir`;
   - the Realm guest command line should include the PL011 console and early
-    console for OpenVMM's COM1 device:
-    `console=ttyAMA0,115200 earlycon=pl011,0xeffec000`. OpenVMM's generated DT
-    advertises `/hvlite/uart@effec000` as `/chosen/stdout-path`.
+    console for OpenVMM's COM1 device using the shared IPA half:
+    `console=ttyAMA0,115200 earlycon=pl011,mmio32,0x8000effec000`.
+    OpenVMM's generated DT should advertise `/openvmm/uart@8000effec000` as
+    `/chosen/stdout-path` for CCA and dispatch shared-IPA MMIO exits back to the
+    lower device address before chipset emulation.
 - Faster iteration defaults:
   - use `--openvmm-memory 128M` while debugging. The temporary CCA RAM-acceptance
     hack populates every private RAM page via `KVM_ARM_RMI_POPULATE`, so smaller
@@ -625,6 +627,30 @@ Mode behavior:
     `target/cca-test/kvm-cca/share/openvmm` and rerun the `/cca-share` script
     without rebooting FVP. Rerun `--interactive-host` only when changing the
     Plane0 rootfs bootstrap, FVP inputs, or guest/host kernel images.
+  - the fastest reliable loop currently runs OpenVMM from the 9p share while
+    keeping the guest kernel and initrd staged in the rootfs as `/cca/guest-Image`
+    and `/cca/initrd`. Directly reading large guest kernels from 9p, or copying
+    them from 9p to `/tmp`, was unreliable/truncated during local testing.
+    Avoid passing `--guest-kernel` as a path inside `--share-dir`, because that
+    can self-copy and truncate the share file.
+- Current proven FVP state:
+  - with the no-KASLR guest kernel, CCA direct Linux boot reaches early console,
+    reports `RME: Using RSI version 1.0`, enables `ttyAMA0`, runs `/init`, and
+    drops to an initrd shell because no root device is specified;
+  - the temporary full-RAM population hack is still required because the current
+    Linux guest expects all described RAM to be `RIPAS RAM` before entry;
+  - the kvmtool-style four-PPI timer DT/KVM PPI change was tested and is not
+    needed for this boot path, so it should remain dropped.
+- Remaining issues to investigate:
+  - Linux warns in `arm64_rsi_is_protected()` while probing the shared-IPA PL011
+    MMIO regions. The console still works, but the warning should be understood
+    before treating the device model as complete;
+  - `--run-openvmm` still needs a non-interactive success condition instead of
+    relying on the OpenVMM REPL;
+  - iteration is still slowed by CCA population time (about 38 seconds at
+    128 MiB with the full-RAM hack). Future improvements include a Realm boot
+    shim that accepts RAM itself, using smaller purpose-built test payloads, and
+    avoiding rootfs restaging for OpenVMM-only changes through the 9p share.
 - `--run-openvmm` should resolve the guest initrd from `openvmm-deps` for
   aarch64 unless `--guest-initrd` is provided, then fail fast if the boot-time
   init hook cannot be staged. On success it should run
