@@ -825,8 +825,12 @@ impl KvmPartitionInner {
             .check_private_memory_extensions()
             .map_err(map_cca_capability_error)?;
 
+        // HACK: Until the guest is launched through a boot shim that accepts RAM
+        // itself, populate the rest of RAM as accepted, unmeasured private pages.
+        let pages = cca_populate_pages_with_ram_hack(pages, &self.ram_ranges);
+
         let memory = self.memory.lock();
-        for page in pages {
+        for page in &pages {
             if page.visibility == virt::PageVisibility::Shared {
                 tracing::trace!(
                     gpa = page.range.start(),
@@ -1005,6 +1009,14 @@ fn snp_launch_pages_with_ram_hack(
     pages: &[virt::InitialAcceptedPage],
     ram_ranges: &[MemoryRange],
 ) -> Vec<virt::InitialAcceptedPage> {
+    initial_pages_with_ram_hack(pages, ram_ranges, snp_ram_hack_page)
+}
+
+fn initial_pages_with_ram_hack(
+    pages: &[virt::InitialAcceptedPage],
+    ram_ranges: &[MemoryRange],
+    hack_page: impl Fn(MemoryRange) -> virt::InitialAcceptedPage,
+) -> Vec<virt::InitialAcceptedPage> {
     let mut pages = pages.to_vec();
     let mut imported_ranges: Vec<_> = pages.iter().map(|page| page.range).collect();
     imported_ranges.sort_by_key(|range| (range.start(), range.end()));
@@ -1018,12 +1030,12 @@ fn snp_launch_pages_with_ram_hack(
                 continue;
             }
             if cursor < start {
-                pages.push(snp_ram_hack_page(MemoryRange::new(cursor..start)));
+                pages.push(hack_page(MemoryRange::new(cursor..start)));
             }
             cursor = cursor.max(end);
         }
         if cursor < ram_range.end() {
-            pages.push(snp_ram_hack_page(MemoryRange::new(cursor..ram_range.end())));
+            pages.push(hack_page(MemoryRange::new(cursor..ram_range.end())));
         }
     }
 
@@ -1037,6 +1049,24 @@ fn snp_ram_hack_page(range: MemoryRange) -> virt::InitialAcceptedPage {
         visibility: virt::PageVisibility::Exclusive,
         acceptance: BootPageAcceptance::Exclusive,
         tag: "kvm-snp-ram-hack".into(),
+    }
+}
+
+#[cfg(guest_arch = "aarch64")]
+fn cca_populate_pages_with_ram_hack(
+    pages: &[virt::InitialAcceptedPage],
+    ram_ranges: &[MemoryRange],
+) -> Vec<virt::InitialAcceptedPage> {
+    initial_pages_with_ram_hack(pages, ram_ranges, cca_ram_hack_page)
+}
+
+#[cfg(guest_arch = "aarch64")]
+fn cca_ram_hack_page(range: MemoryRange) -> virt::InitialAcceptedPage {
+    virt::InitialAcceptedPage {
+        range,
+        visibility: virt::PageVisibility::Exclusive,
+        acceptance: BootPageAcceptance::ExclusiveUnmeasured,
+        tag: "kvm-cca-ram-hack".into(),
     }
 }
 
