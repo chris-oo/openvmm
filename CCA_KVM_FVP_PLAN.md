@@ -616,11 +616,10 @@ Mode behavior:
     `/chosen/stdout-path` for CCA and dispatch shared-IPA MMIO exits back to the
     lower device address before chipset emulation.
 - Faster iteration defaults:
-  - use `--openvmm-memory 128M` while debugging. The temporary CCA RAM-acceptance
-    hack populates every private RAM page via `KVM_ARM_RMI_POPULATE`, so smaller
-    guest RAM directly reduces launch time. In local FVP runs, reducing from
-    512 MiB to 256 MiB cut CCA population from about 74s to about 50s, and
-    128 MiB cut it to about 38s while still reaching the OpenVMM REPL;
+  - use `--openvmm-memory 128M` while debugging. Smaller guest RAM directly
+    reduces launch time. In local FVP runs, reducing from 512 MiB to 256 MiB cut
+    launch time from about 74s to about 50s, and 128 MiB cut it to about 38s
+    while still reaching the OpenVMM REPL;
   - use `--openvmm-extra-args "<args>"` to restage a modified OpenVMM command
     line without editing `/cca/run-openvmm-kvm-cca.sh` by hand;
   - for OpenVMM-only changes, rebuild/copy the new binary to
@@ -637,8 +636,9 @@ Mode behavior:
   - with the no-KASLR guest kernel, CCA direct Linux boot reaches early console,
     reports `RME: Using RSI version 1.0`, enables `ttyAMA0`, runs `/init`, and
     drops to an initrd shell because no root device is specified;
-  - the temporary full-RAM population hack is still required because the current
-    Linux guest expects all described RAM to be `RIPAS RAM` before entry;
+  - the temporary full-RAM population hack was isolated and is not required for
+    this boot path. With only the kernel/initrd/DTB initial pages populated, the
+    no-KASLR guest still reaches `/init` and the initrd shell;
   - the kvmtool-style four-PPI timer DT/KVM PPI change was tested and is not
     needed for this boot path, so it should remain dropped.
 - Remaining issues to investigate:
@@ -647,10 +647,10 @@ Mode behavior:
     before treating the device model as complete;
   - `--run-openvmm` still needs a non-interactive success condition instead of
     relying on the OpenVMM REPL;
-  - iteration is still slowed by CCA population time (about 38 seconds at
-    128 MiB with the full-RAM hack). Future improvements include a Realm boot
-    shim that accepts RAM itself, using smaller purpose-built test payloads, and
-    avoiding rootfs restaging for OpenVMM-only changes through the 9p share.
+  - iteration is still slowed by FVP and Realm launch time (about 38 seconds at
+    128 MiB in local runs). Future improvements include using smaller
+    purpose-built test payloads and avoiding rootfs restaging for OpenVMM-only
+    changes through the 9p share.
 - `--run-openvmm` should resolve the guest initrd from `openvmm-deps` for
   aarch64 unless `--guest-initrd` is provided, then fail fast if the boot-time
   init hook cannot be staged. On success it should run

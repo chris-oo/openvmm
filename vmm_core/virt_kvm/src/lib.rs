@@ -827,9 +827,7 @@ impl KvmPartitionInner {
             .check_private_memory_extensions()
             .map_err(map_cca_capability_error)?;
 
-        // HACK: Until the guest is launched through a boot shim that accepts RAM
-        // itself, populate the rest of RAM as accepted, unmeasured private pages.
-        let pages = cca_populate_pages_with_ram_hack(pages, &self.ram_ranges);
+        let pages = pages.to_vec();
 
         let memory = self.memory.lock();
         for page in &pages {
@@ -1051,24 +1049,6 @@ fn snp_ram_hack_page(range: MemoryRange) -> virt::InitialAcceptedPage {
         visibility: virt::PageVisibility::Exclusive,
         acceptance: BootPageAcceptance::Exclusive,
         tag: "kvm-snp-ram-hack".into(),
-    }
-}
-
-#[cfg(guest_arch = "aarch64")]
-fn cca_populate_pages_with_ram_hack(
-    pages: &[virt::InitialAcceptedPage],
-    ram_ranges: &[MemoryRange],
-) -> Vec<virt::InitialAcceptedPage> {
-    initial_pages_with_ram_hack(pages, ram_ranges, cca_ram_hack_page)
-}
-
-#[cfg(guest_arch = "aarch64")]
-fn cca_ram_hack_page(range: MemoryRange) -> virt::InitialAcceptedPage {
-    virt::InitialAcceptedPage {
-        range,
-        visibility: virt::PageVisibility::Exclusive,
-        acceptance: BootPageAcceptance::ExclusiveUnmeasured,
-        tag: "kvm-cca-ram-hack".into(),
     }
 }
 
