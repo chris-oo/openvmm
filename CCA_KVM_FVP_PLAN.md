@@ -498,6 +498,13 @@ Concrete Flowey implementation outline for the MVP:
 - For `interactive-host`, stage artifacts and run FVP without enforcing a
   success marker. The output should tell the developer where the artifacts are
   inside Plane0 and the exact OpenVMM command to run manually.
+- Add `--logs-dir <path>` for FVP-backed modes. If omitted, use
+  `target/cca-test/kvm-cca/logs/latest`. The Flowey job should extract any
+  available `/cca/logs/*` files from the isolated rootfs after FVP exits or
+  times out, report the host log directory, and include at least:
+  `kvm-cca-host.log`, `kvm-cca-inputs.log`, `kvm-cca-preflight.log`,
+  `kvm-cca-preflight.status`, `openvmm.log`, and `openvmm.status` when those
+  files exist.
 - For `run-openvmm`, stage a script such as `/cca/run-openvmm-kvm-cca.sh` that:
   - runs `/cca/kvm_cca_preflight`;
   - runs OpenVMM with the CCA isolation CLI/config currently implemented by
@@ -537,20 +544,23 @@ cargo xflowey kvm-cca-tests --stage-only \
 # Boot FVP/Plane0 and run only the KVM CCA preflight probe. Guest kernel/initrd
 # are not needed for this mode.
 cargo xflowey kvm-cca-tests --preflight \
-  --host-kernel ~/ai/eevee/linux/out/cca-fvp/kernel/arch/arm64/boot/Image
+  --host-kernel ~/ai/eevee/linux/out/cca-fvp/kernel/arch/arm64/boot/Image \
+  --logs-dir target/cca-test/kvm-cca/logs/preflight
 
 # Boot FVP/Plane0 with the staged artifacts and leave it available for manual
 # debugging. The command output should print artifact locations under /cca and
 # the exact OpenVMM command/script to run manually inside Plane0.
 cargo xflowey kvm-cca-tests --interactive-host \
   --host-kernel ~/ai/eevee/linux/out/cca-fvp/kernel/arch/arm64/boot/Image \
-  --guest-kernel ~/ai/eevee/linux/out/cca-fvp/kernel/arch/arm64/boot/Image
+  --guest-kernel ~/ai/eevee/linux/out/cca-fvp/kernel/arch/arm64/boot/Image \
+  --logs-dir target/cca-test/kvm-cca/logs/interactive
 
 # Stage artifacts, boot FVP/Plane0, run the preflight and OpenVMM via the
 # boot-time init hook, then collect logs and shut down/clean up.
 cargo xflowey kvm-cca-tests --run-openvmm \
   --host-kernel ~/ai/eevee/linux/out/cca-fvp/kernel/arch/arm64/boot/Image \
   --guest-kernel ~/ai/eevee/linux/out/cca-fvp/kernel/arch/arm64/boot/Image \
+  --logs-dir target/cca-test/kvm-cca/logs/run-openvmm \
   --openvmm-extra-args "<extra debug args if needed>"
 ```
 
@@ -570,17 +580,20 @@ Mode behavior:
   guest kernel path is missing or not a regular file. It should not run
   shrinkwrap.
 - `--preflight` should stage the preflight binary and boot FVP with the explicit
-  host kernel. It should not require `--guest-kernel` or `--guest-initrd`.
+  host kernel. It should not require `--guest-kernel` or `--guest-initrd`. It
+  should extract logs to `--logs-dir` or the default log directory.
 - `--interactive-host` should launch shrinkwrap/FVP with the isolated rootfs and
   provided host kernel, then leave control/log output suitable for manual
   debugging. Like `--stage-only`, it should stage the default aarch64
   `openvmm-deps` guest initrd unless overridden. It should not interpret guest
-  success or failure.
+  success or failure, but it should still extract logs to `--logs-dir` when FVP
+  exits.
 - `--run-openvmm` should resolve the guest initrd from `openvmm-deps` for
   aarch64 unless `--guest-initrd` is provided, then fail fast if the boot-time
   init hook cannot be staged. On success it should run
   `/cca/kvm_cca_preflight`, then `/cca/run-openvmm-kvm-cca.sh`, enforce a
-  timeout, collect logs, and clean up FVP/rootfs mounts.
+  timeout, extract logs to `--logs-dir` or the default log directory, and clean
+  up FVP/rootfs mounts.
 
 ### 12. Kernel and userspace prerequisites for FVP
 
