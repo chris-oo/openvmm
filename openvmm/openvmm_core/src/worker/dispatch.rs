@@ -2862,6 +2862,7 @@ impl LoadedVmInner {
                     kernel_format,
                     mem_layout: &self.mem_layout,
                     snp_isolation: self.hypervisor_cfg.with_isolation == Some(IsolationType::Snp),
+                    cca_isolation: false,
                 };
                 if custom_dsdt.is_none() && self.mem_layout.mmio().len() < 2 {
                     anyhow::bail!("at least two mmio regions are required");
@@ -2911,6 +2912,7 @@ impl LoadedVmInner {
                     kernel_format,
                     mem_layout: &self.mem_layout,
                     snp_isolation: false,
+                    cca_isolation: self.hypervisor_cfg.with_isolation == Some(IsolationType::Cca),
                 };
 
                 if self.hypervisor_cfg.with_isolation == Some(IsolationType::Cca)

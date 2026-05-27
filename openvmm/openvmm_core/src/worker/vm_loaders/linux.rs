@@ -55,6 +55,7 @@ pub struct KernelConfig<'a> {
     pub kernel_format: LinuxKernelFormat,
     pub mem_layout: &'a MemoryLayout,
     pub snp_isolation: bool,
+    pub cca_isolation: bool,
 }
 
 pub struct AcpiTables {
@@ -177,6 +178,7 @@ fn build_dt(
     const PL011_SERIAL0_IRQ: u32 = 1;
     const PL011_SERIAL1_BASE: u64 = 0xEFFEB000;
     const PL011_SERIAL1_IRQ: u32 = 2;
+    const CCA_SHARED_IPA_BIT: u64 = 1 << 47;
 
     let num_cpus = processor_topology.vps().len();
 
@@ -306,7 +308,7 @@ fn build_dt(
     let psci = root_builder
         .start_node("psci")?
         .add_str(p_compatible, "arm,psci-0.2")?
-        .add_str(p_method, "hvc")?;
+        .add_str(p_method, if cfg.cca_isolation { "smc" } else { "hvc" })?;
     root_builder = psci.end_node()?;
 
     // Add a memory node for each RAM range.
@@ -494,14 +496,19 @@ fn build_dt(
             (PL011_SERIAL0_BASE, PL011_SERIAL0_IRQ),
             (PL011_SERIAL1_BASE, PL011_SERIAL1_IRQ),
         ] {
-            let name = format!("uart@{:x}", serial_base);
+            let guest_serial_base = if cfg.cca_isolation {
+                serial_base | CCA_SHARED_IPA_BIT
+            } else {
+                serial_base
+            };
+            let name = format!("uart@{:x}", guest_serial_base);
             soc = soc
                 .start_node(name.as_ref())?
                 .add_str_array(p_compatible, &["arm,sbsa-uart", "arm,primecell"])?
                 .add_str_array(p_clock_names, &["apb_pclk"])?
                 .add_u32(p_clocks, PHANDLE_APB_PCLK)?
                 .add_u32(p_interrupt_parent, PHANDLE_GIC)?
-                .add_u64_array(p_reg, &[serial_base, 0x1000])?
+                .add_u64_array(p_reg, &[guest_serial_base, 0x1000])?
                 .add_u32(p_current_speed, PL011_BAUD)?
                 .add_u32(p_arm_periph_id, PL011_PERIPH_ID)?
                 .add_u32_array(
@@ -554,7 +561,15 @@ fn build_dt(
     if enable_serial {
         chosen = chosen.add_str(
             p_stdout_path,
-            format!("/hvlite/uart@{PL011_SERIAL0_BASE:x}").as_str(),
+            format!(
+                "/openvmm/uart@{:x}",
+                if cfg.cca_isolation {
+                    PL011_SERIAL0_BASE | CCA_SHARED_IPA_BIT
+                } else {
+                    PL011_SERIAL0_BASE
+                }
+            )
+            .as_str(),
         )?;
     }
 
