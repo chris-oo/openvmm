@@ -30,6 +30,8 @@ flowey_request! {
         pub guest_kernel: Option<PathBuf>,
         pub guest_initrd: Option<PathBuf>,
         pub logs_dir: PathBuf,
+        pub openvmm_memory: String,
+        pub openvmm_extra_args: Option<String>,
         pub done: WriteVar<SideEffect>,
     }
 }
@@ -53,6 +55,8 @@ impl SimpleFlowNode for Node {
             guest_kernel,
             guest_initrd,
             logs_dir,
+            openvmm_memory,
+            openvmm_extra_args,
             done,
         } = request;
 
@@ -129,6 +133,13 @@ impl SimpleFlowNode for Node {
                 if let Some(guest_initrd) = &guest_initrd {
                     validate_regular_file(guest_initrd, "Realm guest initrd")?;
                 }
+                validate_shell_word(&openvmm_memory, "OpenVMM memory size")?;
+                if let Some(openvmm_extra_args) = &openvmm_extra_args {
+                    anyhow::ensure!(
+                        !openvmm_extra_args.contains('\n'),
+                        "OpenVMM extra args must not contain newlines"
+                    );
+                }
 
                 let home_dir = env::var("HOME").map(PathBuf::from).expect("HOME not set");
                 let firmware_dir = home_dir.join(".shrinkwrap/package/cca-3world");
@@ -188,6 +199,8 @@ mkdir -p /cca/logs
 echo "host: $(uname -a)" | tee /cca/logs/kvm-cca-host.log
 echo "guest_kernel=/cca/guest-Image" | tee /cca/logs/kvm-cca-inputs.log
 echo "guest_initrd=/cca/initrd" | tee -a /cca/logs/kvm-cca-inputs.log
+echo "openvmm_memory={openvmm_memory}" | tee -a /cca/logs/kvm-cca-inputs.log
+echo "openvmm_extra_args={extra_args}" | tee -a /cca/logs/kvm-cca-inputs.log
 
 /cca/kvm_cca_preflight 2>&1 | tee /cca/logs/kvm-cca-preflight.log
 preflight_rc=$?
@@ -203,9 +216,9 @@ RUST_BACKTRACE=1 /cca/openvmm \
     --kernel /cca/guest-Image \
     --initrd /cca/initrd \
     --device-tree \
-    --memory 512M \
+    --memory {openvmm_memory} \
     --com1 stderr \
-    --cmdline console=ttyAMA0 \
+    --cmdline "console=ttyAMA0,115200 earlycon=pl011,0xeffec000" \
     {extra_args} \
     2>&1 | tee /cca/logs/openvmm.log
 openvmm_rc=$?
@@ -214,7 +227,8 @@ echo "$openvmm_rc" >/cca/logs/openvmm.status
 sync
 poweroff -f || poweroff || halt -f || halt || exit "$openvmm_rc"
 "#,
-                            extra_args = ""
+                            extra_args = openvmm_extra_args.as_deref().unwrap_or(""),
+                            openvmm_memory = openvmm_memory,
                         ),
                     )?;
                 }
@@ -469,6 +483,15 @@ fn validate_regular_file(path: &Path, label: &str) -> anyhow::Result<()> {
         path.is_file(),
         "{label} is missing or is not a regular file: {}",
         path.display()
+    );
+    Ok(())
+}
+
+fn validate_shell_word(value: &str, label: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(!value.is_empty(), "{label} must not be empty");
+    anyhow::ensure!(
+        !value.chars().any(char::is_whitespace),
+        "{label} must not contain whitespace"
     );
     Ok(())
 }

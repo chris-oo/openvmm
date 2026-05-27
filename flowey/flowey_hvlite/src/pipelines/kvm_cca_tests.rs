@@ -56,6 +56,10 @@ pub struct KvmCcaTestsCli {
     #[clap(long)]
     pub openvmm_extra_args: Option<String>,
 
+    /// Guest memory size passed to OpenVMM for --run-openvmm and --interactive-host scripts.
+    #[clap(long, default_value = "128M")]
+    pub openvmm_memory: String,
+
     /// Boot FVP/Plane0 and run only the KVM CCA preflight probe.
     #[clap(long)]
     pub preflight: bool,
@@ -88,6 +92,7 @@ impl IntoPipeline for KvmCcaTestsCli {
             guest_initrd,
             logs_dir,
             openvmm_extra_args,
+            openvmm_memory,
             preflight,
             stage_only,
             interactive_host,
@@ -237,6 +242,8 @@ impl IntoPipeline for KvmCcaTestsCli {
                         guest_kernel: (!preflight).then_some(guest_kernel),
                         guest_initrd,
                         logs_dir,
+                        openvmm_memory,
+                        openvmm_extra_args: openvmm_extra_args.clone(),
                         done: ctx.new_done_handle(),
                     },
                 )
@@ -245,7 +252,7 @@ impl IntoPipeline for KvmCcaTestsCli {
             return Ok(pipeline);
         }
 
-        let _ = (interactive_host, openvmm_extra_args);
+        let _ = interactive_host;
 
         let update_job = pipeline
             .new_job(

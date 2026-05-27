@@ -553,7 +553,8 @@ cargo xflowey kvm-cca-tests --preflight \
 cargo xflowey kvm-cca-tests --interactive-host \
   --host-kernel ~/ai/eevee/linux/out/cca-fvp/kernel/arch/arm64/boot/Image \
   --guest-kernel ~/ai/eevee/linux/out/cca-fvp/kernel/arch/arm64/boot/Image \
-  --logs-dir target/cca-test/kvm-cca/logs/interactive
+  --logs-dir target/cca-test/kvm-cca/logs/interactive \
+  --openvmm-memory 128M
 
 # Stage artifacts, boot FVP/Plane0, run the preflight and OpenVMM via the
 # boot-time init hook, then collect logs and shut down/clean up.
@@ -561,6 +562,7 @@ cargo xflowey kvm-cca-tests --run-openvmm \
   --host-kernel ~/ai/eevee/linux/out/cca-fvp/kernel/arch/arm64/boot/Image \
   --guest-kernel ~/ai/eevee/linux/out/cca-fvp/kernel/arch/arm64/boot/Image \
   --logs-dir target/cca-test/kvm-cca/logs/run-openvmm \
+  --openvmm-memory 128M \
   --openvmm-extra-args "<extra debug args if needed>"
 ```
 
@@ -588,6 +590,32 @@ Mode behavior:
   `openvmm-deps` guest initrd unless overridden. It should not interpret guest
   success or failure, but it should still extract logs to `--logs-dir` when FVP
   exits.
+- Interactive debugging workflow:
+  - launch:
+    `cargo xflowey kvm-cca-tests --interactive-host --host-kernel ~/ai/eevee/linux/out/cca-fvp/kernel/arch/arm64/boot/Image --guest-kernel ~/ai/eevee/linux/out/cca-fvp/kernel/arch/arm64/boot/Image --logs-dir target/cca-test/kvm-cca/logs/interactive`;
+  - the FVP Plane0 console is exposed on telnet port 5000. If the console is not
+    already attached in the `xflowey` terminal, attach from another terminal with
+    `telnet localhost 5000`, press Enter, and log in as `root`;
+  - staged artifacts live under `/cca`. Run `/cca/kvm_cca_preflight` first, then
+    `/cca/run-openvmm-kvm-cca.sh` to reproduce the OpenVMM CCA launch path;
+  - if OpenVMM reaches `openvmm>`, use `help`, `resume`, `inspect`, `input`, and
+    `quit` from the REPL. Stop FVP when finished so Flowey can extract
+    `/cca/logs/*` to `--logs-dir`;
+  - the Realm guest command line should include the PL011 console and early
+    console for OpenVMM's COM1 device:
+    `console=ttyAMA0,115200 earlycon=pl011,0xeffec000`. OpenVMM's generated DT
+    advertises `/hvlite/uart@effec000` as `/chosen/stdout-path`.
+- Faster iteration defaults:
+  - use `--openvmm-memory 128M` while debugging. The temporary CCA RAM-acceptance
+    hack populates every private RAM page via `KVM_ARM_RMI_POPULATE`, so smaller
+    guest RAM directly reduces launch time. In local FVP runs, reducing from
+    512 MiB to 256 MiB cut CCA population from about 74s to about 50s, and
+    128 MiB cut it to about 38s while still reaching the OpenVMM REPL;
+  - use `--openvmm-extra-args "<args>"` to restage a modified OpenVMM command
+    line without editing `/cca/run-openvmm-kvm-cca.sh` by hand;
+  - for code changes in OpenVMM/Flowey, rerun `--interactive-host` to restage the
+    rootfs, then reconnect with `telnet localhost 5000` and run the staged
+    script. For pure REPL experiments, keep the current FVP instance alive.
 - `--run-openvmm` should resolve the guest initrd from `openvmm-deps` for
   aarch64 unless `--guest-initrd` is provided, then fail fast if the boot-time
   init hook cannot be staged. On success it should run
