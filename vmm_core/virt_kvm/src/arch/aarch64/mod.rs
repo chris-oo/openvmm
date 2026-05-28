@@ -228,6 +228,7 @@ pub struct Kvm {
     kvm: kvm::Kvm,
     supports_gic_v3: bool,
     supports_its: bool,
+    ipa_size: u8,
 }
 
 impl Kvm {
@@ -241,6 +242,13 @@ impl Kvm {
         // Probe GIC version by creating a throwaway VM and attempting to
         // create a GICv3 device. If that fails, try GICv2.
         let kvm = kvm::Kvm::from(file);
+        let ipa_size = match kvm
+            .check_extension(KVM_CAP_ARM_VM_IPA_SIZE)
+            .map_err(kvm::Error::CheckExtension)?
+        {
+            v if v > 0 => v as u8,
+            _ => 40,
+        };
         let probe_vm = kvm.new_vm()?;
         let supports_gic_v3 = if probe_vm
             .test_create_device(kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V3)
@@ -270,6 +278,7 @@ impl Kvm {
             kvm,
             supports_gic_v3,
             supports_its,
+            ipa_size,
         })
     }
 }
@@ -1233,6 +1242,9 @@ impl virt::Hypervisor for Kvm {
             platform_gsiv: None,
             supports_gic_v3: self.supports_gic_v3,
             supports_its: self.supports_its,
+            // TODO: Revisit whether CCA should share an abstraction with SNP's
+            // vtom/shared-GPA-boundary model instead of using a separate field.
+            cca_shared_gpa_bit: Some(1_u64 << (self.ipa_size - 1)),
         }
     }
 
@@ -1271,14 +1283,7 @@ impl virt::Hypervisor for Kvm {
             }
         }
 
-        let ipa_size = match self
-            .kvm
-            .check_extension(KVM_CAP_ARM_VM_IPA_SIZE)
-            .map_err(kvm::Error::CheckExtension)?
-        {
-            v if v > 0 => v as u8,
-            _ => 40,
-        };
+        let ipa_size = self.ipa_size;
 
         let vm = match config.isolation {
             virt::IsolationType::None => self.kvm.new_vm()?,

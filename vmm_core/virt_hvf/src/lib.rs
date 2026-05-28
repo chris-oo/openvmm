@@ -98,6 +98,7 @@ impl virt::Hypervisor for HvfHypervisor {
             platform_gsiv: None,
             supports_gic_v3: true,
             supports_its: false,
+            cca_shared_gpa_bit: None,
         }
     }
 

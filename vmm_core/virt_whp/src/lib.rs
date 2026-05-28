@@ -775,6 +775,7 @@ impl virt::Hypervisor for Whp {
                 platform_gsiv: Some(WHP_PMU_GSIV),
                 supports_gic_v3: true,
                 supports_its: false,
+                cca_shared_gpa_bit: None,
             }
         }
     }

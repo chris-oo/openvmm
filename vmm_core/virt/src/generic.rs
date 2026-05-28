@@ -62,6 +62,8 @@ pub struct PlatformInfo {
     /// MSI delivery via LPIs. When `true`, the topology can include
     /// a `GicItsInfo` and the backend will create/manage the ITS device.
     pub supports_its: bool,
+    /// The CCA shared IPA bit, if available.
+    pub cca_shared_gpa_bit: Option<u64>,
 }
 
 pub trait Hypervisor: 'static {
