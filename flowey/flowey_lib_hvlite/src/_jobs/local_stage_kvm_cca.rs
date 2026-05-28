@@ -249,8 +249,12 @@ RUST_BACKTRACE=1 "$ARTIFACT_DIR/openvmm" \
     --initrd "$KERNEL_DIR/initrd" \
     --device-tree \
     --memory {openvmm_memory} \
+    --pcie-root-complex rc0,segment=0,start_bus=0,end_bus=255,low_mmio=4M,high_mmio=1G \
+    --pcie-root-port rc0:console \
     --com1 stderr \
-    --cmdline "console=ttyAMA0,115200 earlycon=pl011,mmio32,0x8000effec000" \
+    --virtio-console console \
+    --virtio-console-pcie-port console \
+    --cmdline "console=hvc0 earlycon=pl011,mmio32,0x8000effec000" \
     {extra_args} \
     2>&1 | tee /cca/logs/openvmm.log
 openvmm_rc=$?

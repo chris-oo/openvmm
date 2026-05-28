@@ -61,7 +61,7 @@ pub struct KvmCcaTestsCli {
     pub openvmm_extra_args: Option<String>,
 
     /// Guest memory size passed to OpenVMM for --run-openvmm and --interactive-host scripts.
-    #[clap(long, default_value = "128M")]
+    #[clap(long, default_value = "256M")]
     pub openvmm_memory: String,
 
     /// Boot FVP/Plane0 and run only the KVM CCA preflight probe.
