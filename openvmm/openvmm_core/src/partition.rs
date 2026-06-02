@@ -22,7 +22,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 #[cfg(guest_arch = "aarch64")]
 use virt::Aarch64Partition as ArchPartition;
-use virt::InitialAcceptedPage;
+use virt::InitialPageImport;
 use virt::Partition;
 use virt::PartitionAccessState;
 use virt::PartitionCapabilities;
@@ -121,7 +121,7 @@ pub trait BasicPartitionStateAccess: 'static + Send + Sync + Inspect {
     fn restore(&self, state: VmSavedState) -> anyhow::Result<()>;
     fn reset(&self) -> anyhow::Result<()>;
     fn scrub_vtl(&self, vtl: Vtl) -> anyhow::Result<()>;
-    fn accept_initial_pages(&self, pages: Vec<InitialAcceptedPage>) -> anyhow::Result<()>;
+    fn finalize_initial_page_imports(&self, pages: Vec<InitialPageImport>) -> anyhow::Result<()>;
     fn guest_os_id(&self) -> u64;
 }
 
@@ -157,10 +157,10 @@ impl<T: Partition + PartitionAccessState> BasicPartitionStateAccess for T {
         Ok(())
     }
 
-    fn accept_initial_pages(&self, pages: Vec<InitialAcceptedPage>) -> anyhow::Result<()> {
-        self.supports_initial_accept_pages()
-            .context("accept pages not supported")?
-            .accept_initial_pages(&pages)?;
+    fn finalize_initial_page_imports(&self, pages: Vec<InitialPageImport>) -> anyhow::Result<()> {
+        self.supports_initial_page_import_finalization()
+            .context("initial page import finalization not supported")?
+            .finalize_initial_page_imports(&pages)?;
         Ok(())
     }
 
@@ -275,8 +275,11 @@ impl VmPartition for WrappedPartition {
         self.0.scrub_vtl(vtl)
     }
 
-    fn accept_initial_pages(&mut self, pages: Vec<InitialAcceptedPage>) -> anyhow::Result<()> {
-        self.0.accept_initial_pages(pages)
+    fn finalize_initial_page_imports(
+        &mut self,
+        pages: Vec<InitialPageImport>,
+    ) -> anyhow::Result<()> {
+        self.0.finalize_initial_page_imports(pages)
     }
 
     fn guest_os_id(&self) -> u64 {

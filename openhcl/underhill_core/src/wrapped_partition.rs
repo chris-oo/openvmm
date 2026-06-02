@@ -27,9 +27,9 @@ impl VmPartition for WrappedPartition {
         unreachable!()
     }
 
-    fn accept_initial_pages(
+    fn finalize_initial_page_imports(
         &mut self,
-        _pages: Vec<virt::InitialAcceptedPage>,
+        _pages: Vec<virt::InitialPageImport>,
     ) -> anyhow::Result<()> {
         unreachable!()
     }

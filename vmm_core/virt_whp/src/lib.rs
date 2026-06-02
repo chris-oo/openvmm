@@ -501,10 +501,13 @@ impl virt::ScrubVtl for WhpPartition {
     }
 }
 
-impl virt::AcceptInitialPages for WhpPartition {
+impl virt::FinalizeInitialPageImports for WhpPartition {
     type Error = Error;
 
-    fn accept_initial_pages(&self, pages: &[virt::InitialAcceptedPage]) -> Result<(), Error> {
+    fn finalize_initial_page_imports(
+        &self,
+        pages: &[virt::InitialPageImport],
+    ) -> Result<(), Error> {
         assert!(self.inner.isolation.is_isolated());
 
         for page in pages {
@@ -538,9 +541,9 @@ impl virt::Partition for WhpPartition {
         (!self.inner.isolation.is_isolated()).then_some(self)
     }
 
-    fn supports_initial_accept_pages(
+    fn supports_initial_page_import_finalization(
         &self,
-    ) -> Option<&dyn virt::AcceptInitialPages<Error = <Self as virt::Hv1>::Error>> {
+    ) -> Option<&dyn virt::FinalizeInitialPageImports<Error = <Self as virt::Hv1>::Error>> {
         self.inner.isolation.is_isolated().then_some(self)
     }
 

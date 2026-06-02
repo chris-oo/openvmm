@@ -246,19 +246,25 @@ pub(crate) enum CcaLaunchState {
 }
 
 #[cfg(guest_arch = "x86_64")]
-impl virt::AcceptInitialPages for KvmPartition {
+impl virt::FinalizeInitialPageImports for KvmPartition {
     type Error = KvmError;
 
-    fn accept_initial_pages(&self, pages: &[virt::InitialAcceptedPage]) -> Result<(), Self::Error> {
+    fn finalize_initial_page_imports(
+        &self,
+        pages: &[virt::InitialPageImport],
+    ) -> Result<(), Self::Error> {
         self.inner.snp_launch_initial_pages(pages)
     }
 }
 
 #[cfg(guest_arch = "aarch64")]
-impl virt::AcceptInitialPages for KvmPartition {
+impl virt::FinalizeInitialPageImports for KvmPartition {
     type Error = KvmError;
 
-    fn accept_initial_pages(&self, pages: &[virt::InitialAcceptedPage]) -> Result<(), Self::Error> {
+    fn finalize_initial_page_imports(
+        &self,
+        pages: &[virt::InitialPageImport],
+    ) -> Result<(), Self::Error> {
         self.inner.cca_populate_initial_pages(pages)
     }
 }
@@ -639,10 +645,7 @@ impl KvmPartitionInner {
     }
 
     #[cfg(guest_arch = "x86_64")]
-    fn snp_launch_initial_pages(
-        &self,
-        pages: &[virt::InitialAcceptedPage],
-    ) -> Result<(), KvmError> {
+    fn snp_launch_initial_pages(&self, pages: &[virt::InitialPageImport]) -> Result<(), KvmError> {
         {
             let mut state = self.snp_launch_state.lock();
             match *state {
@@ -671,7 +674,7 @@ impl KvmPartitionInner {
     #[cfg(guest_arch = "x86_64")]
     fn snp_launch_initial_pages_inner(
         &self,
-        pages: &[virt::InitialAcceptedPage],
+        pages: &[virt::InitialPageImport],
     ) -> Result<(), KvmError> {
         let sev = self.sev.as_ref().ok_or(KvmError::IsolationNotSupported)?;
         self.kvm.check_sev_snp_launch_extensions()?;
@@ -788,7 +791,7 @@ impl KvmPartitionInner {
     #[cfg(guest_arch = "aarch64")]
     fn cca_populate_initial_pages(
         &self,
-        pages: &[virt::InitialAcceptedPage],
+        pages: &[virt::InitialPageImport],
     ) -> Result<(), KvmError> {
         {
             let mut state = self.cca_launch_state.lock();
@@ -821,7 +824,7 @@ impl KvmPartitionInner {
     #[cfg(guest_arch = "aarch64")]
     fn cca_populate_initial_pages_inner(
         &self,
-        pages: &[virt::InitialAcceptedPage],
+        pages: &[virt::InitialPageImport],
     ) -> Result<(), KvmError> {
         self.kvm
             .check_private_memory_extensions()
@@ -1006,24 +1009,24 @@ struct SnpCpuidFn {
 
 #[cfg(guest_arch = "x86_64")]
 fn snp_launch_pages_with_ram_hack(
-    pages: &[virt::InitialAcceptedPage],
+    pages: &[virt::InitialPageImport],
     ram_ranges: &[MemoryRange],
-) -> Vec<virt::InitialAcceptedPage> {
+) -> Vec<virt::InitialPageImport> {
     initial_pages_with_ram_hack(pages, ram_ranges, snp_ram_hack_page)
 }
 
 fn initial_pages_with_ram_hack(
-    pages: &[virt::InitialAcceptedPage],
+    pages: &[virt::InitialPageImport],
     ram_ranges: &[MemoryRange],
-    hack_page: impl Fn(MemoryRange) -> virt::InitialAcceptedPage,
-) -> Vec<virt::InitialAcceptedPage> {
+    hack_page: impl Fn(MemoryRange) -> virt::InitialPageImport,
+) -> Vec<virt::InitialPageImport> {
     let mut pages = pages.to_vec();
-    let mut imported_ranges: Vec<_> = pages.iter().map(|page| page.range).collect();
-    imported_ranges.sort_by_key(|range| (range.start(), range.end()));
+    let mut page_imports: Vec<_> = pages.iter().map(|page| page.range).collect();
+    page_imports.sort_by_key(|range| (range.start(), range.end()));
 
     for ram_range in ram_ranges {
         let mut cursor = ram_range.start();
-        for imported_range in &imported_ranges {
+        for imported_range in &page_imports {
             let start = imported_range.start().max(ram_range.start());
             let end = imported_range.end().min(ram_range.end());
             if start >= end {
@@ -1043,8 +1046,8 @@ fn initial_pages_with_ram_hack(
 }
 
 #[cfg(guest_arch = "x86_64")]
-fn snp_ram_hack_page(range: MemoryRange) -> virt::InitialAcceptedPage {
-    virt::InitialAcceptedPage {
+fn snp_ram_hack_page(range: MemoryRange) -> virt::InitialPageImport {
+    virt::InitialPageImport {
         range,
         visibility: virt::PageVisibility::Exclusive,
         acceptance: BootPageAcceptance::Exclusive,
@@ -1530,7 +1533,7 @@ mod tests {
 
     #[test]
     fn snp_launch_pages_with_ram_hack_fills_unaccepted_ram_gaps() {
-        let pages = [virt::InitialAcceptedPage {
+        let pages = [virt::InitialPageImport {
             range: range(0x2000, 0x4000),
             visibility: virt::PageVisibility::Exclusive,
             acceptance: BootPageAcceptance::Exclusive,

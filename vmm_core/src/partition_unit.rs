@@ -34,7 +34,7 @@ use state_unit::UnitBuilder;
 use state_unit::UnitHandle;
 use std::sync::Arc;
 use thiserror::Error;
-use virt::InitialAcceptedPage;
+use virt::InitialPageImport;
 use virt::InitialRegs;
 #[cfg(feature = "dump")]
 use virt::VpIndex;
@@ -61,8 +61,11 @@ pub trait VmPartition: 'static + Send + Sync + InspectMut + ProtobufSaveRestore 
     /// Scrubs the VTL state for a partition.
     fn scrub_vtl(&mut self, vtl: Vtl) -> anyhow::Result<()>;
 
-    /// Accepts pages on behalf of the loader.
-    fn accept_initial_pages(&mut self, pages: Vec<InitialAcceptedPage>) -> anyhow::Result<()>;
+    /// Finalizes initial page imports on behalf of the loader.
+    fn finalize_initial_page_imports(
+        &mut self,
+        pages: Vec<InitialPageImport>,
+    ) -> anyhow::Result<()>;
 
     /// Returns the guest OS ID (from `HV_X64_MSR_GUEST_OS_ID`).
     ///
@@ -124,7 +127,7 @@ impl InspectMut for PartitionUnitRunner {
 enum PartitionRequest {
     ClearHalt(Rpc<(), bool>), // TODO: remove this, and use DebugRequest::Resume
     SetInitialRegs(Rpc<(Vtl, Arc<InitialRegs>), Result<(), InitialRegError>>),
-    SetInitialPageVisibility(Rpc<Vec<InitialAcceptedPage>, Result<(), InitialVisibilityError>>),
+    FinalizeInitialPageImports(Rpc<Vec<InitialPageImport>, Result<(), InitialPageImportError>>),
     StopVps(Rpc<(), ()>),
     StartVps,
     /// Build the partition state blob for a dump file.
@@ -173,11 +176,11 @@ pub enum InitialRegError {
     ScrubVtl(#[source] anyhow::Error),
 }
 
-/// Error returned by [`PartitionUnit::set_initial_page_visibility()`].
+/// Error returned by [`PartitionUnit::finalize_initial_page_imports()`].
 #[derive(Debug, Error)]
-pub enum InitialVisibilityError {
-    #[error("failed to set initial page acceptance")]
-    PageAcceptance(#[source] anyhow::Error),
+pub enum InitialPageImportError {
+    #[error("failed to finalize initial page imports")]
+    Finalize(#[source] anyhow::Error),
 }
 
 impl PartitionUnit {
@@ -285,12 +288,12 @@ impl PartitionUnit {
             .unwrap()
     }
 
-    pub async fn set_initial_page_visibility(
+    pub async fn finalize_initial_page_imports(
         &mut self,
-        vis: Vec<InitialAcceptedPage>,
-    ) -> Result<(), InitialVisibilityError> {
+        vis: Vec<InitialPageImport>,
+    ) -> Result<(), InitialPageImportError> {
         self.req_send
-            .call(PartitionRequest::SetInitialPageVisibility, vis)
+            .call(PartitionRequest::FinalizeInitialPageImports, vis)
             .await
             .unwrap()
     }
@@ -366,8 +369,8 @@ impl PartitionUnitRunner {
                         rpc.handle(async |(vtl, state)| self.set_initial_regs(vtl, state).await)
                             .await
                     }
-                    PartitionRequest::SetInitialPageVisibility(rpc) => {
-                        rpc.handle(async |vis| self.set_initial_page_visibility(vis).await)
+                    PartitionRequest::FinalizeInitialPageImports(rpc) => {
+                        rpc.handle(async |vis| self.finalize_initial_page_imports(vis).await)
                             .await
                     }
                     PartitionRequest::StopVps(rpc) => {
@@ -486,15 +489,15 @@ impl PartitionUnitRunner {
         Ok(())
     }
 
-    async fn set_initial_page_visibility(
+    async fn finalize_initial_page_imports(
         &mut self,
-        visibility: Vec<InitialAcceptedPage>,
-    ) -> Result<(), InitialVisibilityError> {
+        visibility: Vec<InitialPageImport>,
+    ) -> Result<(), InitialPageImportError> {
         assert!(!self.unit_started);
 
         self.partition
-            .accept_initial_pages(visibility)
-            .map_err(InitialVisibilityError::PageAcceptance)
+            .finalize_initial_page_imports(visibility)
+            .map_err(InitialPageImportError::Finalize)
     }
 
     fn try_start(&mut self) {

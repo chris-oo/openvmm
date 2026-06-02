@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::io::Seek;
 use thiserror::Error;
-use virt::InitialAcceptedPage;
+use virt::InitialPageImport;
 use vm_loader::Loader;
 use vm_topology::memory::MemoryLayout;
 use vm_topology::memory::MemoryRangeWithNode;
@@ -533,7 +533,7 @@ pub struct LoadIgvmParams<'a, T: ArchTopology> {
 
 pub fn load_igvm(
     params: LoadIgvmParams<'_, vm_topology::processor::TargetTopology>,
-) -> Result<(Vec<loader::importer::Register>, Vec<InitialAcceptedPage>), Error> {
+) -> Result<(Vec<loader::importer::Register>, Vec<InitialPageImport>), Error> {
     #[cfg(guest_arch = "x86_64")]
     {
         load_igvm_x86(params)
@@ -551,7 +551,7 @@ pub fn load_igvm(
 #[cfg_attr(not(guest_arch = "x86_64"), expect(dead_code))]
 fn load_igvm_x86(
     params: LoadIgvmParams<'_, X86Topology>,
-) -> Result<(Vec<X86Register>, Vec<InitialAcceptedPage>), Error> {
+) -> Result<(Vec<X86Register>, Vec<InitialPageImport>), Error> {
     let LoadIgvmParams {
         igvm_file,
         gm,
@@ -1219,7 +1219,7 @@ fn load_igvm_x86(
             .map_err(Error::Loader)?;
     }
 
-    Ok(loader.initial_regs_and_accepted_ranges())
+    Ok(loader.initial_regs_and_page_imports())
 }
 
 /// Build the IGVM memory map reported to the guest, with the specified memory
@@ -1265,7 +1265,7 @@ fn build_memory_map(
 #[cfg_attr(not(guest_arch = "aarch64"), expect(dead_code))]
 fn load_igvm_aarch64(
     _params: LoadIgvmParams<'_, Aarch64Topology>,
-) -> Result<(Vec<Aarch64Register>, Vec<InitialAcceptedPage>), Error> {
+) -> Result<(Vec<Aarch64Register>, Vec<InitialPageImport>), Error> {
     Err(Error::UnsupportedGuestArch)
 }
 

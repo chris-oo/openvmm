@@ -965,9 +965,9 @@ impl virt::Partition for KvmPartition {
         None
     }
 
-    fn supports_initial_accept_pages(
+    fn supports_initial_page_import_finalization(
         &self,
-    ) -> Option<&dyn virt::AcceptInitialPages<Error = <Self as virt::Hv1>::Error>> {
+    ) -> Option<&dyn virt::FinalizeInitialPageImports<Error = <Self as virt::Hv1>::Error>> {
         (self.inner.memory_backing_mode == KvmMemoryBackingMode::GuestMemfd).then_some(self)
     }
 

@@ -22,7 +22,7 @@ use range_map_vec::RangeMap;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::mem::Discriminant;
-use virt::InitialAcceptedPage;
+use virt::InitialPageImport;
 use virt::PageVisibility;
 use vm_topology::memory::MemoryLayout;
 
@@ -44,7 +44,7 @@ pub struct ImportedPageRange {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InitialLoadInfo<R> {
     pub initial_regs: Vec<R>,
-    pub imported_ranges: Vec<ImportedPageRange>,
+    pub page_imports: Vec<ImportedPageRange>,
 }
 
 impl<R> InitialLoadInfo<R> {
@@ -52,9 +52,9 @@ impl<R> InitialLoadInfo<R> {
         self.initial_regs
     }
 
-    pub fn into_initial_regs_and_accepted_ranges(self) -> (Vec<R>, Vec<InitialAcceptedPage>) {
+    pub fn into_initial_regs_and_page_imports(self) -> (Vec<R>, Vec<InitialPageImport>) {
         let pages = self
-            .imported_ranges
+            .page_imports
             .into_iter()
             .map(|range| {
                 let visibility = match range.acceptance {
@@ -67,7 +67,7 @@ impl<R> InitialLoadInfo<R> {
                     | BootPageAcceptance::CpuidPage
                     | BootPageAcceptance::CpuidExtendedStatePage => PageVisibility::Exclusive,
                 };
-                InitialAcceptedPage {
+                InitialPageImport {
                     range: range.range,
                     visibility,
                     acceptance: range.acceptance,
@@ -85,7 +85,7 @@ pub struct Loader<'a, R> {
     gm: GuestMemory,
     regs: HashMap<Discriminant<R>, R>,
     mem_layout: &'a MemoryLayout,
-    accepted_ranges: RangeMap<u64, RangeInfo>,
+    page_imports: RangeMap<u64, RangeInfo>,
     max_vtl: Vtl,
 }
 
@@ -95,7 +95,7 @@ impl<R> Loader<'_, R> {
             gm,
             regs: HashMap::new(),
             mem_layout,
-            accepted_ranges: RangeMap::new(),
+            page_imports: RangeMap::new(),
             max_vtl,
         }
     }
@@ -104,20 +104,21 @@ impl<R> Loader<'_, R> {
         self.initial_load_info().into_initial_regs()
     }
 
-    pub fn initial_regs_and_accepted_ranges(self) -> (Vec<R>, Vec<InitialAcceptedPage>) {
+    pub fn initial_regs_and_page_imports(self) -> (Vec<R>, Vec<InitialPageImport>) {
         self.initial_load_info()
-            .into_initial_regs_and_accepted_ranges()
+            .into_initial_regs_and_page_imports()
     }
 
     pub fn initial_load_info(mut self) -> InitialLoadInfo<R> {
         // Merge adjacent ranges first to help cut down on the number of entries
-        // in the initial acceptance list. Since we load from an IGVM file, most
-        // ranges are a single 4K page which can be merged for easier viewing.
-        self.accepted_ranges
+        // in the initial page import list. Since we load from an IGVM file,
+        // most ranges are a single 4K page which can be merged for easier
+        // viewing.
+        self.page_imports
             .merge_adjacent(range_map_vec::u64_is_adjacent);
 
-        let imported_ranges = self
-            .accepted_ranges
+        let page_imports = self
+            .page_imports
             .into_vec()
             .into_iter()
             .map(|(start, end, info)| ImportedPageRange {
@@ -129,7 +130,7 @@ impl<R> Loader<'_, R> {
 
         InitialLoadInfo {
             initial_regs: self.regs.into_values().collect(),
-            imported_ranges,
+            page_imports,
         }
     }
 
@@ -137,10 +138,10 @@ impl<R> Loader<'_, R> {
     where
         R: Clone,
     {
-        let mut accepted_ranges = self.accepted_ranges.clone();
-        accepted_ranges.merge_adjacent(range_map_vec::u64_is_adjacent);
+        let mut page_imports = self.page_imports.clone();
+        page_imports.merge_adjacent(range_map_vec::u64_is_adjacent);
 
-        let imported_ranges = accepted_ranges
+        let page_imports = page_imports
             .into_vec()
             .into_iter()
             .map(|(start, end, info)| ImportedPageRange {
@@ -152,11 +153,11 @@ impl<R> Loader<'_, R> {
 
         InitialLoadInfo {
             initial_regs: self.regs.values().cloned().collect(),
-            imported_ranges,
+            page_imports,
         }
     }
 
-    /// Accept a new page range with a given acceptance into the map of accepted ranges.
+    /// Track a new imported page range with a given acceptance.
     pub fn accept_new_range(
         &mut self,
         page_base: u64,
@@ -165,7 +166,7 @@ impl<R> Loader<'_, R> {
         acceptance: BootPageAcceptance,
     ) -> anyhow::Result<()> {
         let page_end = page_base + page_count - 1;
-        match self.accepted_ranges.entry(page_base..=page_end) {
+        match self.page_imports.entry(page_base..=page_end) {
             Entry::Overlapping(entry) => {
                 let (overlap_start, overlap_end, ref overlap_info) = *entry.get();
                 Err(anyhow::anyhow!(
@@ -215,7 +216,7 @@ impl<R: Debug + GuestArch> ImageLoad<R> for Loader<'_, R> {
             "importing pages"
         );
 
-        // Track accepted ranges for duplicate imports.
+        // Track imported ranges for duplicate imports.
         self.accept_new_range(page_base, page_count, debug_tag, acceptance)?;
 
         // Page count must be larger or equal to data.
@@ -422,7 +423,7 @@ mod tests {
 
         assert_eq!(load_info.initial_regs, vec![X86Register::Rip(0x100000)]);
         assert_eq!(
-            load_info.imported_ranges,
+            load_info.page_imports,
             vec![ImportedPageRange {
                 range: MemoryRange::from_4k_gpn_range(1..3),
                 acceptance: BootPageAcceptance::ExclusiveUnmeasured,
@@ -432,10 +433,10 @@ mod tests {
     }
 
     #[test]
-    fn initial_acceptance_preserves_loader_acceptance_for_private_pages() {
+    fn initial_page_imports_preserve_loader_acceptance_for_private_pages() {
         let load_info = InitialLoadInfo::<X86Register> {
             initial_regs: Vec::new(),
-            imported_ranges: vec![
+            page_imports: vec![
                 ImportedPageRange {
                     range: MemoryRange::from_4k_gpn_range(1..2),
                     acceptance: BootPageAcceptance::SecretsPage,
@@ -449,18 +450,18 @@ mod tests {
             ],
         };
 
-        let (_, pages) = load_info.into_initial_regs_and_accepted_ranges();
+        let (_, pages) = load_info.into_initial_regs_and_page_imports();
 
         assert_eq!(
             pages,
             vec![
-                InitialAcceptedPage {
+                InitialPageImport {
                     range: MemoryRange::from_4k_gpn_range(1..2),
                     visibility: PageVisibility::Exclusive,
                     acceptance: BootPageAcceptance::SecretsPage,
                     tag: "secrets".to_string(),
                 },
-                InitialAcceptedPage {
+                InitialPageImport {
                     range: MemoryRange::from_4k_gpn_range(2..3),
                     visibility: PageVisibility::Exclusive,
                     acceptance: BootPageAcceptance::CpuidPage,

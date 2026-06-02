@@ -2928,7 +2928,7 @@ impl LoadedVmInner {
                         }
                     })?;
 
-                load_info.into_initial_regs_and_accepted_ranges()
+                load_info.into_initial_regs_and_page_imports()
             }
             #[cfg(guest_arch = "aarch64")]
             &LoadMode::Linux {
@@ -2980,7 +2980,7 @@ impl LoadedVmInner {
                     build_acpi,
                 )?;
 
-                load_info.into_initial_regs_and_accepted_ranges()
+                load_info.into_initial_regs_and_page_imports()
             }
             &LoadMode::Uefi {
                 ref firmware,
@@ -3107,14 +3107,14 @@ impl LoadedVmInner {
             .await
             .context("failed to set initial register state")?;
 
-        // Only set initial page visibility on isolated partitions. Keep this
+        // Only finalize initial page imports on isolated partitions. Keep this
         // after register setup so backends can finalize protected CPU state.
         if self.hypervisor_cfg.with_isolation.is_some() {
-            tracing::debug!(?initial_page_vis, "initial_page_vis");
+            tracing::debug!(?initial_page_vis, "initial_page_imports");
             self.partition_unit
-                .set_initial_page_visibility(initial_page_vis)
+                .finalize_initial_page_imports(initial_page_vis)
                 .await
-                .context("failed to set initial page visibility")?;
+                .context("failed to finalize initial page imports")?;
         }
 
         Ok(())

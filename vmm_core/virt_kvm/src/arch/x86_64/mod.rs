@@ -643,9 +643,9 @@ impl Partition for KvmPartition {
         Some(self)
     }
 
-    fn supports_initial_accept_pages(
+    fn supports_initial_page_import_finalization(
         &self,
-    ) -> Option<&dyn virt::AcceptInitialPages<Error = <Self as Hv1>::Error>> {
+    ) -> Option<&dyn virt::FinalizeInitialPageImports<Error = <Self as Hv1>::Error>> {
         self.inner.sev.is_some().then_some(self)
     }
 

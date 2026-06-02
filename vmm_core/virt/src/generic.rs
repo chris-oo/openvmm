@@ -155,7 +155,7 @@ pub enum PageVisibility {
 
 /// Initial page import metadata for isolated partitions.
 #[derive(Eq, PartialEq, Debug, Clone)]
-pub struct InitialAcceptedPage {
+pub struct InitialPageImport {
     /// The guest physical range being imported.
     pub range: MemoryRange,
     /// The generic visibility requested for the page range.
@@ -287,11 +287,11 @@ pub struct HvConfig {
 
 /// Methods for manipulating a VM partition.
 pub trait Partition: 'static + Hv1 + Inspect + Send + Sync {
-    /// Returns a trait object to accept pages on behalf of the guest during the
-    /// initial start import flow.
-    fn supports_initial_accept_pages(
+    /// Returns a trait object to finalize initial page imports during the
+    /// initial start flow.
+    fn supports_initial_page_import_finalization(
         &self,
-    ) -> Option<&dyn AcceptInitialPages<Error = <Self as Hv1>::Error>> {
+    ) -> Option<&dyn FinalizeInitialPageImports<Error = <Self as Hv1>::Error>> {
         None
     }
 
@@ -366,17 +366,18 @@ pub trait Aarch64Partition: Partition {
     fn control_gic(&self, vtl: Vtl) -> Arc<dyn ControlGic>;
 }
 
-/// Extension trait for accepting initial pages.
-pub trait AcceptInitialPages {
+/// Extension trait for finalizing initial page imports.
+pub trait FinalizeInitialPageImports {
     type Error: std::error::Error;
 
-    /// Accepts initial pages on behalf of the guest.
+    /// Finalizes initial page imports on behalf of the loader.
     ///
     /// This can only be used during the load path during partition start to
-    /// accept pages on behalf of the guest that were set as part of the load
-    /// process. The host virtstack cannot accept pages on behalf of the guest
-    /// once it has started running.
-    fn accept_initial_pages(&self, pages: &[InitialAcceptedPage]) -> Result<(), Self::Error>;
+    /// complete any backend-specific initialization for pages that were imported
+    /// as part of the load process. The host virtstack cannot finalize these
+    /// imports once the guest has started running.
+    fn finalize_initial_page_imports(&self, pages: &[InitialPageImport])
+    -> Result<(), Self::Error>;
 }
 
 /// Extension trait for resetting the partition.
