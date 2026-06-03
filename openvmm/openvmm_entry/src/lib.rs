@@ -1397,18 +1397,21 @@ async fn vm_config_from_command_line(
         });
 
     let with_isolation = if let Some(isolation) = &opt.isolation {
-        // TODO: For now, isolation is only supported with VTL2.
-        if !opt.vtl2 {
-            anyhow::bail!("isolation is only currently supported with vtl2");
-        }
-
-        // TODO: Alias map support is not yet implement with isolation.
-        if !opt.no_alias_map {
-            anyhow::bail!("alias map not supported with isolation");
-        }
-
         match isolation {
-            cli_args::IsolationCli::Vbs => Some(openvmm_defs::config::IsolationType::Vbs),
+            cli_args::IsolationCli::Vbs => {
+                // TODO: For now, VBS isolation is only supported with VTL2.
+                if !opt.vtl2 {
+                    anyhow::bail!("VBS isolation is only currently supported with vtl2");
+                }
+
+                // TODO: Alias map support is not yet implemented with isolation.
+                if !opt.no_alias_map {
+                    anyhow::bail!("alias map not supported with isolation");
+                }
+
+                Some(openvmm_defs::config::IsolationType::Vbs)
+            }
+            cli_args::IsolationCli::Snp => Some(openvmm_defs::config::IsolationType::Snp),
         }
     } else {
         None
