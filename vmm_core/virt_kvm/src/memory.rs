@@ -7,6 +7,7 @@ use crate::KvmPartitionInner;
 use inspect::Inspect;
 use memory_range::MemoryRange;
 use std::fs::File;
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
 #[derive(Debug, Inspect)]
@@ -24,6 +25,12 @@ unsafe impl Send for KvmMemoryRange {}
 pub(crate) struct KvmMemoryRangeState {
     #[inspect(flatten, iter_by_index)]
     pub(crate) ranges: Vec<Option<KvmMemoryRange>>,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) struct KvmPrivateMemoryRange {
+    pub(crate) gpa: MemoryRange,
+    pub(crate) hva: *mut u8,
 }
 
 #[derive(Debug, Inspect)]
@@ -59,7 +66,6 @@ enum KvmMemoryBacking<'a> {
 }
 
 impl KvmMemoryBackingMode {
-    #[expect(dead_code)]
     pub(crate) fn guest_memfd(
         kvm: &kvm::Partition,
         ram_ranges: impl IntoIterator<Item = MemoryRange>,
@@ -161,9 +167,8 @@ impl KvmPartitionInner {
             } => {
                 // SAFETY: `map_region` requires its caller to keep
                 // `data..data+size` valid until this guest-physical range is
-                // unmapped or the partition is destroyed. `memory_backing`
-                // The partition owns the backing guestmemfd for at least as long
-                // as KVM references it.
+                // unmapped or the partition is destroyed. The partition owns the
+                // backing guestmemfd for at least as long as KVM references it.
                 unsafe {
                     self.kvm.set_user_memory_region2(
                         slot_to_use as u32,
@@ -238,6 +243,142 @@ impl KvmPartitionInner {
             }
         }
     }
+
+    #[cfg(guest_arch = "x86_64")]
+    pub(crate) fn set_map_gpa_range_attributes(
+        &self,
+        gpa: u64,
+        page_count: u64,
+        map_attributes: u64,
+    ) -> Result<(), KvmError> {
+        const KVM_MAP_GPA_RANGE_PAGE_SIZE_MASK: u64 = 0x3;
+        const KVM_MAP_GPA_RANGE_ENC_STATUS_MASK: u64 = 0xf << 4;
+
+        let size = page_count
+            .checked_mul(hvdef::HV_PAGE_SIZE)
+            .ok_or(KvmError::InvalidMapGpaRange)?;
+        let end = gpa.checked_add(size).ok_or(KvmError::InvalidMapGpaRange)?;
+        if !gpa.is_multiple_of(hvdef::HV_PAGE_SIZE) || size == 0 {
+            return Err(KvmError::InvalidMapGpaRange);
+        }
+        let unsupported_attributes = map_attributes
+            & !(KVM_MAP_GPA_RANGE_PAGE_SIZE_MASK | KVM_MAP_GPA_RANGE_ENC_STATUS_MASK);
+        if unsupported_attributes != 0 {
+            return Err(KvmError::UnsupportedMapGpaRangeAttributes(map_attributes));
+        }
+        let private = match map_attributes & KVM_MAP_GPA_RANGE_ENC_STATUS_MASK {
+            kvm::KVM_MAP_GPA_RANGE_DECRYPTED_UAPI => false,
+            kvm::KVM_MAP_GPA_RANGE_ENCRYPTED_UAPI => true,
+            _ => return Err(KvmError::UnsupportedMapGpaRangeAttributes(map_attributes)),
+        };
+
+        let range = MemoryRange::new(gpa..end);
+        if !self.ram_ranges.iter().any(|ram| ram.contains(&range)) {
+            return Err(KvmError::InvalidMapGpaRange);
+        }
+
+        let attributes = if private {
+            kvm::KVM_MEMORY_ATTRIBUTE_PRIVATE as u64
+        } else {
+            0
+        };
+        tracing::debug!(
+            gpa,
+            size,
+            page_count,
+            map_attributes,
+            private,
+            "KVM_HC_MAP_GPA_RANGE set memory attributes"
+        );
+        self.kvm.set_memory_attributes(gpa, size, attributes)?;
+        self.discard_stale_private_memory_backing(range, private, "SNP")?;
+        Ok(())
+    }
+
+    #[cfg_attr(guest_arch = "aarch64", expect(dead_code))]
+    fn discard_stale_private_memory_backing(
+        &self,
+        range: MemoryRange,
+        private: bool,
+        isolation_name: &'static str,
+    ) -> Result<(), KvmError> {
+        let state = self.memory.lock();
+        let slot = state
+            .ranges
+            .iter()
+            .flatten()
+            .find(|slot| slot.range.contains(&range))
+            .ok_or(KvmError::InvalidMapGpaRange)?;
+        let offset = range.start() - slot.range.start();
+        if private {
+            let addr = slot.host_addr.wrapping_add(offset as usize);
+            tracing::debug!(
+                gpa = range.start(),
+                size = range.len(),
+                hva = addr as usize,
+                isolation_name,
+                "discarding shared backing after private conversion"
+            );
+            let ret =
+                unsafe { libc::madvise(addr.cast(), range.len() as usize, libc::MADV_DONTNEED) };
+            if ret != 0 {
+                return Err(KvmError::DiscardSharedBacking(
+                    std::io::Error::last_os_error(),
+                ));
+            }
+        } else {
+            let (guest_memfd, guest_memfd_offset) =
+                match (&self.memory_backing_mode, slot.guest_memfd_offset) {
+                    (KvmMemoryBackingMode::GuestMemfd(backing), Some(slot_offset)) => {
+                        (&backing.file, slot_offset + offset)
+                    }
+                    _ => return Err(KvmError::InvalidMapGpaRange),
+                };
+            tracing::debug!(
+                gpa = range.start(),
+                size = range.len(),
+                guest_memfd_offset,
+                isolation_name,
+                "discarding private backing after shared conversion"
+            );
+            let ret = unsafe {
+                libc::fallocate(
+                    guest_memfd.as_raw_fd(),
+                    libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                    guest_memfd_offset as libc::off_t,
+                    range.len() as libc::off_t,
+                )
+            };
+            if ret != 0 {
+                return Err(KvmError::DiscardPrivateBacking(
+                    std::io::Error::last_os_error(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg_attr(guest_arch = "aarch64", expect(dead_code))]
+pub(crate) fn private_memory_range_from_slots(
+    range: MemoryRange,
+    slots: &[Option<KvmMemoryRange>],
+) -> Result<KvmPrivateMemoryRange, KvmError> {
+    let slot = slots
+        .iter()
+        .flatten()
+        .find(|slot| slot.range.contains(&range))
+        .ok_or(KvmError::InvalidPrivateMemoryRange)?;
+
+    if slot.guest_memfd_offset.is_none() || !slot.private_attributes_set {
+        return Err(KvmError::InvalidPrivateMemoryRange);
+    }
+
+    let offset = range.start() - slot.range.start();
+    Ok(KvmPrivateMemoryRange {
+        gpa: range,
+        hva: slot.host_addr.wrapping_add(offset as usize),
+    })
 }
 
 fn check_private_memory_extensions(kvm: &kvm::Partition) -> Result<(), KvmError> {
