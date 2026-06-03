@@ -11,7 +11,6 @@ mod vm_state;
 mod vp_state;
 
 use crate::KvmError;
-use crate::KvmMemoryBackingMode;
 use crate::KvmPartition;
 use crate::KvmPartitionInner;
 use crate::KvmProcessorBinder;
@@ -20,6 +19,7 @@ use crate::SnpLaunchState;
 use crate::gsi::GsiRouting;
 use crate::gsi::KvmIrqFdState;
 use crate::gsi::MsiRouteBuilder;
+use crate::memory::KvmMemoryBackingMode;
 use guestmem::DoorbellRegistration;
 use guestmem::GuestMemory;
 use guestmem::GuestMemoryError;

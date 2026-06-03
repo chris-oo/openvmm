@@ -11,13 +11,13 @@
 #![cfg(all(target_os = "linux", guest_arch = "aarch64"))]
 
 use crate::KvmError;
-use crate::KvmMemoryBackingMode;
 use crate::KvmPartition;
 use crate::KvmPartitionInner;
 use crate::KvmRunVpError;
 use crate::gsi::GsiRouting;
 use crate::gsi::KvmIrqFdState;
 use crate::gsi::MsiRouteBuilder;
+use crate::memory::KvmMemoryBackingMode;
 use aarch64defs::SystemReg;
 use aarch64defs::Vendor;
 use aarch64defs::gic::GicV2mRegister;
