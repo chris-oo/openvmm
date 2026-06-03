@@ -4,6 +4,8 @@
 use crate::KvmError;
 use crate::KvmPartition;
 use crate::KvmPartitionInner;
+#[cfg(guest_arch = "aarch64")]
+use crate::cca::map_cca_conversion_error;
 use inspect::Inspect;
 use memory_range::MemoryRange;
 use std::fs::File;
@@ -277,7 +279,7 @@ impl KvmPartitionInner {
         tracing::debug!(gpa, size, flags, private, "KVM CCA set memory attributes");
         self.kvm.set_memory_attributes(gpa, size, attributes)?;
         self.discard_stale_private_memory_backing(range, private, "CCA")
-            .map_err(crate::map_cca_conversion_error)?;
+            .map_err(map_cca_conversion_error)?;
         Ok(())
     }
 
