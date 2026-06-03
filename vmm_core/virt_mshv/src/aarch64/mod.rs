@@ -59,6 +59,7 @@ impl virt::Hypervisor for LinuxMshv {
             // TODO: query from hypervisor
             supports_gic_v3: true,
             supports_its: false,
+            shared_gpa_bit: None,
         }
     }
 
