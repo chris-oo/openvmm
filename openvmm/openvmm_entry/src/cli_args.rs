@@ -3038,6 +3038,8 @@ pub enum GicMsiCli {
 pub enum IsolationCli {
     Vbs,
     Snp,
+    #[cfg(guest_arch = "aarch64")]
+    Cca,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]

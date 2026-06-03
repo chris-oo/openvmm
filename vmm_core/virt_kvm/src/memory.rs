@@ -11,11 +11,11 @@
 use crate::KvmError;
 use crate::KvmPartition;
 use crate::KvmPartitionInner;
+#[cfg(guest_arch = "aarch64")]
+use crate::cca::map_cca_conversion_error;
 use inspect::Inspect;
 use memory_range::MemoryRange;
-#[cfg(guest_arch = "x86_64")]
 use std::fs::File;
-#[cfg(guest_arch = "x86_64")]
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
@@ -47,7 +47,6 @@ pub(crate) struct KvmPrivateMemoryRange {
     pub(crate) hva: *mut u8,
 }
 
-#[cfg(guest_arch = "x86_64")]
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 struct KvmMemoryRangeSegment {
     range: MemoryRange,
@@ -61,12 +60,10 @@ struct KvmMemoryRangeSegment {
 pub(crate) enum KvmMemoryBackingMode {
     /// Register only the caller-provided userspace mapping.
     Userspace,
-    #[cfg(guest_arch = "x86_64")]
     /// Register shared userspace and private guestmemfd backing for RAM.
     GuestMemfd(KvmGuestMemfdBacking),
 }
 
-#[cfg(guest_arch = "x86_64")]
 #[derive(Debug, Inspect)]
 /// Partition-owned guestmemfd and its packed mapping of guest RAM ranges.
 pub(crate) struct KvmGuestMemfdBacking {
@@ -77,14 +74,12 @@ pub(crate) struct KvmGuestMemfdBacking {
     initial_private: bool,
 }
 
-#[cfg(guest_arch = "x86_64")]
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Inspect)]
 struct KvmGuestMemfdRange {
     range: MemoryRange,
     file_offset: u64,
 }
 
-#[cfg(guest_arch = "x86_64")]
 #[derive(Debug)]
 enum KvmMemoryBacking<'a> {
     Userspace,
@@ -95,14 +90,7 @@ enum KvmMemoryBacking<'a> {
     },
 }
 
-#[cfg(guest_arch = "aarch64")]
-#[derive(Debug)]
-enum KvmMemoryBacking {
-    Userspace,
-}
-
 impl KvmMemoryBackingMode {
-    #[cfg(guest_arch = "x86_64")]
     /// Creates one guestmemfd spanning the supplied RAM ranges.
     ///
     /// Guest ranges are packed contiguously into the file in iteration order.
@@ -202,7 +190,6 @@ impl KvmPartitionInner {
                 };
                 (None, false)
             }
-            #[cfg(guest_arch = "x86_64")]
             KvmMemoryBacking::GuestMemfd {
                 file,
                 file_offset,
@@ -246,7 +233,6 @@ impl KvmPartitionInner {
         Ok(())
     }
 
-    #[cfg(guest_arch = "x86_64")]
     fn memory_backing(&self, range: MemoryRange) -> Result<KvmMemoryBacking<'_>, KvmError> {
         match &self.memory_backing_mode {
             KvmMemoryBackingMode::Userspace => Ok(KvmMemoryBacking::Userspace),
@@ -261,11 +247,6 @@ impl KvmPartitionInner {
                 }
             }
         }
-    }
-
-    #[cfg(guest_arch = "aarch64")]
-    fn memory_backing(&self, _range: MemoryRange) -> Result<KvmMemoryBacking, KvmError> {
-        Ok(KvmMemoryBacking::Userspace)
     }
 
     /// # Safety
@@ -355,7 +336,6 @@ impl KvmPartitionInner {
         Ok(())
     }
 
-    #[cfg(guest_arch = "x86_64")]
     /// Discards data from the backing that is no longer selected by KVM.
     ///
     /// Guestmemfd memory slots have separate shared userspace and private
@@ -420,9 +400,48 @@ impl KvmPartitionInner {
         }
         Ok(())
     }
+
+    #[cfg(guest_arch = "aarch64")]
+    pub(crate) fn set_cca_memory_attributes(
+        &self,
+        gpa: u64,
+        size: u64,
+        flags: u64,
+    ) -> Result<(), KvmError> {
+        let end = gpa
+            .checked_add(size)
+            .ok_or(KvmError::InvalidCcaMemoryFault)?;
+        if !gpa.is_multiple_of(hvdef::HV_PAGE_SIZE)
+            || !size.is_multiple_of(hvdef::HV_PAGE_SIZE)
+            || size == 0
+        {
+            return Err(KvmError::InvalidCcaMemoryFault);
+        }
+
+        let unsupported_flags = flags & !kvm::KVM_MEMORY_EXIT_FLAG_PRIVATE_UAPI;
+        if unsupported_flags != 0 {
+            return Err(KvmError::UnsupportedCcaMemoryFaultFlags(flags));
+        }
+
+        let private = flags & kvm::KVM_MEMORY_EXIT_FLAG_PRIVATE_UAPI != 0;
+        let range = MemoryRange::new(gpa..end);
+        let state = self.memory.lock();
+        let segments =
+            guest_memfd_range_segments(range, &state.ranges).map_err(map_cca_conversion_error)?;
+
+        let attributes = if private {
+            kvm::KVM_MEMORY_ATTRIBUTE_PRIVATE as u64
+        } else {
+            0
+        };
+        tracing::debug!(gpa, size, flags, private, "KVM CCA set memory attributes");
+        self.kvm.set_memory_attributes(gpa, size, attributes)?;
+        self.discard_stale_private_memory_backing(&segments, private, "CCA")
+            .map_err(map_cca_conversion_error)?;
+        Ok(())
+    }
 }
 
-#[cfg(guest_arch = "x86_64")]
 fn guest_memfd_range_segments(
     range: MemoryRange,
     slots: &[Option<KvmMemoryRange>],
@@ -460,7 +479,6 @@ fn guest_memfd_range_segments(
     Ok(segments)
 }
 
-#[cfg_attr(guest_arch = "aarch64", expect(dead_code))]
 /// Resolves an imported range to a private guestmemfd slot and source HVA.
 ///
 /// The entire range must be contained in one slot whose private attribute is
@@ -486,9 +504,8 @@ pub(crate) fn private_memory_range_from_slots(
     })
 }
 
-#[cfg(guest_arch = "x86_64")]
 /// Verifies the KVM capabilities required for guestmemfd private memory.
-fn check_private_memory_extensions(kvm: &kvm::Partition) -> Result<(), KvmError> {
+pub(crate) fn check_private_memory_extensions(kvm: &kvm::Partition) -> Result<(), kvm::Error> {
     require_kvm_extension(kvm, kvm::KVM_CAP_USER_MEMORY2, "KVM_CAP_USER_MEMORY2")?;
     require_kvm_extension(kvm, kvm::KVM_CAP_GUEST_MEMFD, "KVM_CAP_GUEST_MEMFD")?;
     let memory_attributes = require_kvm_extension(
@@ -499,28 +516,25 @@ fn check_private_memory_extensions(kvm: &kvm::Partition) -> Result<(), KvmError>
     if memory_attributes as u64 & kvm::KVM_MEMORY_ATTRIBUTE_PRIVATE as u64 == 0 {
         return Err(kvm::Error::MissingCapability(
             "KVM_CAP_MEMORY_ATTRIBUTES(KVM_MEMORY_ATTRIBUTE_PRIVATE)",
-        )
-        .into());
+        ));
     }
     Ok(())
 }
 
-#[cfg(guest_arch = "x86_64")]
 fn require_kvm_extension(
     kvm: &kvm::Partition,
     extension: u32,
     capability: &'static str,
-) -> Result<i32, KvmError> {
+) -> Result<i32, kvm::Error> {
     let value = kvm
         .check_extension(extension)
         .map_err(kvm::Error::CheckExtension)?;
     if value == 0 {
-        return Err(kvm::Error::MissingCapability(capability).into());
+        return Err(kvm::Error::MissingCapability(capability));
     }
     Ok(value)
 }
 
-#[cfg(guest_arch = "x86_64")]
 fn classify_guest_memfd_backing(
     range: MemoryRange,
     ram_ranges: &[KvmGuestMemfdRange],
@@ -612,7 +626,6 @@ mod tests {
         MemoryRange::new(start..end)
     }
 
-    #[cfg(guest_arch = "x86_64")]
     fn guest_memfd_ranges(ranges: &[MemoryRange]) -> Vec<KvmGuestMemfdRange> {
         let mut file_offset = 0;
         ranges
@@ -652,7 +665,6 @@ mod tests {
         })
     }
 
-    #[cfg(guest_arch = "x86_64")]
     #[test]
     fn guest_memfd_classifier_selects_contained_ram() {
         let ram_ranges = guest_memfd_ranges(&[range(0x1000, 0x9000), range(0x1_0000, 0x2_0000)]);
@@ -667,7 +679,6 @@ mod tests {
         );
     }
 
-    #[cfg(guest_arch = "x86_64")]
     #[test]
     fn guest_memfd_classifier_keeps_non_ram_userspace() {
         let ram_ranges = guest_memfd_ranges(&[range(0x1000, 0x9000), range(0x1_0000, 0x2_0000)]);
@@ -678,7 +689,6 @@ mod tests {
         );
     }
 
-    #[cfg(guest_arch = "x86_64")]
     #[test]
     fn guest_memfd_classifier_rejects_partial_ram_overlap() {
         let ram_ranges = guest_memfd_ranges(&[range(0x1000, 0x9000), range(0x1_0000, 0x2_0000)]);
@@ -689,7 +699,6 @@ mod tests {
         ));
     }
 
-    #[cfg(guest_arch = "x86_64")]
     #[test]
     fn guest_memfd_classifier_does_not_merge_adjacent_ram_ranges() {
         let ram_ranges = guest_memfd_ranges(&[range(0x1000, 0x3000), range(0x3000, 0x5000)]);
@@ -700,7 +709,6 @@ mod tests {
         ));
     }
 
-    #[cfg(guest_arch = "x86_64")]
     #[test]
     fn guest_memfd_classifier_rejects_ambiguous_ram_containment() {
         let ram_ranges = guest_memfd_ranges(&[range(0x1000, 0x5000), range(0x2000, 0x4000)]);
@@ -756,7 +764,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(guest_arch = "x86_64")]
     fn guest_memfd_segments_cover_adjacent_unordered_slots() {
         let mut first_backing = vec![0u8; 0x2000];
         let mut second_backing = vec![0u8; 0x2000];
@@ -797,7 +804,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(guest_arch = "x86_64")]
     fn guest_memfd_segments_reject_incomplete_coverage() {
         let mut backing = vec![0u8; 0x4000];
         let host_addr = backing.as_mut_ptr();
@@ -833,7 +839,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(guest_arch = "x86_64")]
     fn guest_memfd_segments_reject_overlapping_slots() {
         let mut backing = vec![0u8; 0x4000];
         let host_addr = backing.as_mut_ptr();
