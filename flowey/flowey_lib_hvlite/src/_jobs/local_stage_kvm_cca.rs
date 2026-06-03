@@ -212,6 +212,8 @@ fi
                             r#"#!/bin/sh
 set -eu
 
+VIRTIO_BLK_SIZE="${{SNP_VIRTIO_BLK_SIZE:-64M}}"
+
 mkdir -p /cca/logs
 if [ -x /cca/mount-kvm-cca-share.sh ]; then
     /cca/mount-kvm-cca-share.sh 2>&1 | tee /cca/logs/kvm-cca-share-mount.log || true
@@ -254,7 +256,9 @@ RUST_BACKTRACE=1 "$ARTIFACT_DIR/openvmm" \
     --com1 stderr \
     --virtio-console console \
     --virtio-console-pcie-port console \
-    --cmdline "console=hvc0 earlycon=pl011,mmio32,0x8000effec000" \
+    --pcie-root-port rc0:blk \
+    --virtio-blk "mem:$VIRTIO_BLK_SIZE,pcie_port=blk" \
+    --cmdline "console=hvc0" \
     {extra_args} \
     2>&1 | tee /cca/logs/openvmm.log
 openvmm_rc=$?
