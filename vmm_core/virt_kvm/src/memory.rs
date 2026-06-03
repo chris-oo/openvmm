@@ -341,9 +341,9 @@ impl KvmPartitionInner {
     }
 }
 
-pub(crate) fn validate_snp_launch_range(range: MemoryRange) -> Result<(), KvmError> {
+pub(crate) fn validate_private_memory_range(range: MemoryRange) -> Result<(), KvmError> {
     if !is_page_aligned(std::ptr::null_mut(), range.start(), range.len()) {
-        return Err(KvmError::UnalignedSnpLaunchRange);
+        return Err(KvmError::UnalignedPrivateMemoryRange);
     }
     Ok(())
 }
@@ -352,15 +352,15 @@ pub(crate) fn private_memory_range_from_slots(
     range: MemoryRange,
     slots: &[Option<KvmMemoryRange>],
 ) -> Result<KvmPrivateMemoryRange, KvmError> {
-    validate_snp_launch_range(range)?;
+    validate_private_memory_range(range)?;
     let slot = slots
         .iter()
         .flatten()
         .find(|slot| slot.range.contains(&range))
-        .ok_or(KvmError::InvalidSnpLaunchRange)?;
+        .ok_or(KvmError::InvalidPrivateMemoryRange)?;
 
     if slot.guest_memfd.is_none() || !slot.private_attributes_set {
-        return Err(KvmError::InvalidSnpLaunchRange);
+        return Err(KvmError::InvalidPrivateMemoryRange);
     }
 
     let offset = range.start() - slot.range.start();
@@ -563,7 +563,7 @@ mod tests {
         })];
         assert!(matches!(
             private_memory_range_from_slots(range(0x1000, 0x2000), &userspace_slots),
-            Err(KvmError::InvalidSnpLaunchRange)
+            Err(KvmError::InvalidPrivateMemoryRange)
         ));
 
         let shared_slots = [Some(KvmMemoryRange {
@@ -574,7 +574,7 @@ mod tests {
         })];
         assert!(matches!(
             private_memory_range_from_slots(range(0x1000, 0x2000), &shared_slots),
-            Err(KvmError::InvalidSnpLaunchRange)
+            Err(KvmError::InvalidPrivateMemoryRange)
         ));
     }
 }

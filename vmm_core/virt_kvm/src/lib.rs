@@ -82,6 +82,10 @@ pub enum KvmError {
     MisalignedMemoryRange,
     #[error("cannot resize KVM guest_memfd memory slot")]
     CannotResizeGuestMemfdSlot,
+    #[error("private memory range is not page aligned")]
+    UnalignedPrivateMemoryRange,
+    #[error("private memory range is not contained in guest_memfd private memory")]
+    InvalidPrivateMemoryRange,
     #[error("SNP launch range is not page aligned")]
     UnalignedSnpLaunchRange,
     #[error("SNP launch range is not contained in guest_memfd private memory")]
@@ -376,7 +380,8 @@ impl KvmPartitionInner {
                 return Err(KvmError::UnsupportedSnpPageAcceptance(page.acceptance));
             };
 
-            let private_range = private_memory_range_from_slots(page.range, &memory.ranges)?;
+            let private_range = private_memory_range_from_slots(page.range, &memory.ranges)
+                .map_err(map_snp_private_range_error)?;
             if page.acceptance == BootPageAcceptance::CpuidPage {
                 tracing::debug!(
                     gpa = page.range.start(),
@@ -906,8 +911,17 @@ fn cca_populate_flags(acceptance: BootPageAcceptance) -> Result<u32, KvmError> {
 #[cfg(guest_arch = "aarch64")]
 fn map_cca_private_range_error(err: KvmError) -> KvmError {
     match err {
-        KvmError::UnalignedSnpLaunchRange => KvmError::UnalignedCcaPopulateRange,
-        KvmError::InvalidSnpLaunchRange => KvmError::InvalidCcaPopulateRange,
+        KvmError::UnalignedPrivateMemoryRange => KvmError::UnalignedCcaPopulateRange,
+        KvmError::InvalidPrivateMemoryRange => KvmError::InvalidCcaPopulateRange,
+        err => err,
+    }
+}
+
+#[cfg(guest_arch = "x86_64")]
+fn map_snp_private_range_error(err: KvmError) -> KvmError {
+    match err {
+        KvmError::UnalignedPrivateMemoryRange => KvmError::UnalignedSnpLaunchRange,
+        KvmError::InvalidPrivateMemoryRange => KvmError::InvalidSnpLaunchRange,
         err => err,
     }
 }
