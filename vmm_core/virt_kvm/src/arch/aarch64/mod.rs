@@ -26,6 +26,8 @@ use core::panic;
 use hvdef::Vtl;
 use inspect::Inspect;
 use inspect::InspectMut;
+use kvm::Aarch64VmType;
+use kvm::KVM_CAP_ARM_RMI_UAPI;
 use kvm::KVM_CAP_ARM_VM_IPA_SIZE;
 use kvm::KVM_DEV_ARM_VGIC_CTRL_INIT;
 use kvm::KVM_DEV_ARM_VGIC_GRP_ADDR;
@@ -480,10 +482,42 @@ impl virt::Processor for KvmProcessor<'_> {
                     self.runner.complete_exit()
                 } else {
                     // Run the VP.
+                    if self.partition.caps.isolation == virt::IsolationType::Cca {
+                        match *self.partition.cca_launch_state.lock() {
+                            crate::CcaLaunchState::Populated => {}
+                            crate::CcaLaunchState::Failed => {
+                                return Err(
+                                    dev.fatal_error(KvmRunVpError::CcaPopulationFailed.into())
+                                );
+                            }
+                            crate::CcaLaunchState::NotStarted
+                            | crate::CcaLaunchState::Populating => {
+                                return Err(dev.fatal_error(KvmRunVpError::CcaNotPopulated.into()));
+                            }
+                        }
+                    }
                     self.runner.run()
                 };
 
-                let exit = exit.map_err(|err| dev.fatal_error(KvmRunVpError::Run(err).into()))?;
+                let exit = match exit {
+                    Ok(exit) => exit,
+                    Err(kvm::Error::RunMemoryFault {
+                        flags, gpa, size, ..
+                    }) if self.partition.caps.isolation == virt::IsolationType::Cca => {
+                        match self.partition.set_cca_memory_attributes(gpa, size, flags) {
+                            Ok(()) => {
+                                pending_exit = false;
+                                continue;
+                            }
+                            Err(err) => {
+                                return Err(dev.fatal_error(err.into()));
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        return Err(dev.fatal_error(KvmRunVpError::from_kvm_run_error(err).into()));
+                    }
+                };
                 pending_exit = true;
                 match exit {
                     kvm::Exit::Interrupted => {
@@ -796,6 +830,9 @@ impl virt::ProtoPartition for KvmProtoPartition<'_> {
             GicVersion::V3 {
                 redistributors_base,
             } => self.add_gicv3(redistributors_base)?,
+            GicVersion::V2 { .. } if self.config.isolation == virt::IsolationType::Cca => {
+                return Err(KvmError::CcaRequiresGicV3);
+            }
             GicVersion::V2 { cpu_interface_base } => self.add_gicv2(cpu_interface_base)?,
         };
 
@@ -826,7 +863,7 @@ impl virt::ProtoPartition for KvmProtoPartition<'_> {
                 pfr0 & 0xf == 2
             };
             PartitionCapabilities {
-                isolation: virt::IsolationType::None,
+                isolation: self.config.isolation,
                 vendor: Vendor::ARM,
                 supports_aarch32_el0,
             }
@@ -834,8 +871,15 @@ impl virt::ProtoPartition for KvmProtoPartition<'_> {
 
         let partition = Arc::new(KvmPartitionInner {
             kvm: self.vm,
+            cca_launch_state: Mutex::new(crate::CcaLaunchState::NotStarted),
             memory: Default::default(),
-            memory_backing_mode: KvmMemoryBackingMode::Userspace,
+            memory_backing_mode: match self.config.isolation {
+                virt::IsolationType::None => KvmMemoryBackingMode::Userspace,
+                virt::IsolationType::Cca => KvmMemoryBackingMode::GuestMemfd,
+                virt::IsolationType::Vbs | virt::IsolationType::Snp | virt::IsolationType::Tdx => {
+                    unreachable!()
+                }
+            },
             ram_ranges: config
                 .mem_layout
                 .ram()
@@ -895,6 +939,12 @@ impl virt::Partition for KvmPartition {
         &self,
     ) -> Option<&dyn virt::ResetPartition<Error = <Self as virt::Hv1>::Error>> {
         None
+    }
+
+    fn supports_initial_page_acceptance(
+        &self,
+    ) -> Option<&dyn virt::AcceptInitialPages<Error = <Self as virt::Hv1>::Error>> {
+        (self.inner.memory_backing_mode == KvmMemoryBackingMode::GuestMemfd).then_some(self)
     }
 
     fn caps(&self) -> &PartitionCapabilities {
@@ -1165,16 +1215,6 @@ impl virt::Hypervisor for Kvm {
         &'a mut self,
         config: ProtoPartitionConfig<'a>,
     ) -> Result<Self::ProtoPartition<'a>, Self::Error> {
-        if config.isolation.is_isolated() {
-            return Err(KvmError::IsolationNotSupported);
-        }
-
-        if let Some(hv_config) = &config.hv_config {
-            if hv_config.vtl2.is_some() {
-                return Err(KvmError::Vtl2NotSupported);
-            }
-        }
-
         let ipa_size = match self
             .kvm
             .check_extension(KVM_CAP_ARM_VM_IPA_SIZE)
@@ -1184,7 +1224,46 @@ impl virt::Hypervisor for Kvm {
             _ => 40,
         };
 
-        let vm = self.kvm.new_vm()?;
+        match config.isolation {
+            virt::IsolationType::None => {}
+            virt::IsolationType::Cca => {
+                if config.hv_config.is_some() {
+                    return Err(KvmError::UnsupportedIsolationConfiguration(
+                        "CCA does not support Hyper-V enlightenments or VTL2",
+                    ));
+                }
+                if !self.supports_gic_v3 {
+                    return Err(KvmError::CcaRequiresGicV3);
+                }
+                if self
+                    .kvm
+                    .check_extension(KVM_CAP_ARM_RMI_UAPI)
+                    .map_err(kvm::Error::CheckExtension)?
+                    == 0
+                {
+                    return Err(KvmError::MissingCcaCapability("KVM_CAP_ARM_RMI"));
+                }
+            }
+            virt::IsolationType::Vbs | virt::IsolationType::Snp | virt::IsolationType::Tdx => {
+                return Err(KvmError::IsolationNotSupported);
+            }
+        }
+
+        if let Some(hv_config) = &config.hv_config {
+            if hv_config.vtl2.is_some() {
+                return Err(KvmError::Vtl2NotSupported);
+            }
+        }
+
+        let vm = match config.isolation {
+            virt::IsolationType::None => self.kvm.new_vm()?,
+            virt::IsolationType::Cca => self
+                .kvm
+                .new_aarch64_vm(Aarch64VmType::Realm { ipa_bits: ipa_size })?,
+            virt::IsolationType::Vbs | virt::IsolationType::Snp | virt::IsolationType::Tdx => {
+                unreachable!()
+            }
+        };
 
         Ok(KvmProtoPartition {
             vm,

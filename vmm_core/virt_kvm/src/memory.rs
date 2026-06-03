@@ -4,6 +4,8 @@
 use crate::KvmError;
 use crate::KvmPartition;
 use crate::KvmPartitionInner;
+#[cfg(guest_arch = "aarch64")]
+use crate::cca::map_cca_conversion_error;
 use inspect::Inspect;
 use memory_range::MemoryRange;
 use std::fs::File;
@@ -37,7 +39,6 @@ pub(crate) struct KvmPrivateMemoryRange {
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Inspect)]
 pub(crate) enum KvmMemoryBackingMode {
     Userspace,
-    #[cfg_attr(guest_arch = "aarch64", expect(dead_code))]
     GuestMemfd,
 }
 
@@ -248,7 +249,6 @@ impl KvmPartitionInner {
         Ok(())
     }
 
-    #[cfg_attr(guest_arch = "aarch64", expect(dead_code))]
     fn discard_stale_private_memory_backing(
         &self,
         range: MemoryRange,
@@ -307,6 +307,46 @@ impl KvmPartitionInner {
         }
         Ok(())
     }
+
+    #[cfg(guest_arch = "aarch64")]
+    pub(crate) fn set_cca_memory_attributes(
+        &self,
+        gpa: u64,
+        size: u64,
+        flags: u64,
+    ) -> Result<(), KvmError> {
+        let end = gpa
+            .checked_add(size)
+            .ok_or(KvmError::InvalidCcaMemoryFault)?;
+        if !gpa.is_multiple_of(hvdef::HV_PAGE_SIZE)
+            || !size.is_multiple_of(hvdef::HV_PAGE_SIZE)
+            || size == 0
+        {
+            return Err(KvmError::InvalidCcaMemoryFault);
+        }
+
+        let unsupported_flags = flags & !kvm::KVM_MEMORY_EXIT_FLAG_PRIVATE_UAPI;
+        if unsupported_flags != 0 {
+            return Err(KvmError::UnsupportedCcaMemoryFaultFlags(flags));
+        }
+
+        let private = flags & kvm::KVM_MEMORY_EXIT_FLAG_PRIVATE_UAPI != 0;
+        let range = MemoryRange::new(gpa..end);
+        if !self.ram_ranges.iter().any(|ram| ram.contains(&range)) {
+            return Err(KvmError::InvalidCcaMemoryFault);
+        }
+
+        let attributes = if private {
+            kvm::KVM_MEMORY_ATTRIBUTE_PRIVATE as u64
+        } else {
+            0
+        };
+        tracing::debug!(gpa, size, flags, private, "KVM CCA set memory attributes");
+        self.kvm.set_memory_attributes(gpa, size, attributes)?;
+        self.discard_stale_private_memory_backing(range, private, "CCA")
+            .map_err(map_cca_conversion_error)?;
+        Ok(())
+    }
 }
 
 pub(crate) fn validate_private_memory_range(range: MemoryRange) -> Result<(), KvmError> {
@@ -316,7 +356,6 @@ pub(crate) fn validate_private_memory_range(range: MemoryRange) -> Result<(), Kv
     Ok(())
 }
 
-#[cfg_attr(guest_arch = "aarch64", expect(dead_code))]
 pub(crate) fn private_memory_range_from_slots(
     range: MemoryRange,
     slots: &[Option<KvmMemoryRange>],

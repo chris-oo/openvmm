@@ -1412,6 +1412,8 @@ async fn vm_config_from_command_line(
                 Some(openvmm_defs::config::IsolationType::Vbs)
             }
             cli_args::IsolationCli::Snp => Some(openvmm_defs::config::IsolationType::Snp),
+            #[cfg(guest_arch = "aarch64")]
+            cli_args::IsolationCli::Cca => Some(openvmm_defs::config::IsolationType::Cca),
         }
     } else {
         None
