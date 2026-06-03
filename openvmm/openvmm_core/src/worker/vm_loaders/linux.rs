@@ -50,6 +50,7 @@ pub struct KernelConfig<'a> {
     pub initrd: &'a Option<std::fs::File>,
     pub cmdline: &'a str,
     pub mem_layout: &'a MemoryLayout,
+    pub snp_isolation: bool,
 }
 
 pub struct AcpiTables {
@@ -64,12 +65,16 @@ pub fn load_linux_x86(
     cfg: &KernelConfig<'_>,
     gm: &GuestMemory,
     acpi_at_gpa: impl FnOnce(u64) -> AcpiTables,
-) -> Result<Vec<X86Register>, Error> {
+) -> Result<(Vec<X86Register>, Vec<virt::InitialPageImport>), Error> {
     const GDT_BASE: u64 = 0x1000;
     const CR3_BASE: u64 = 0x4000;
     const ZERO_PAGE_BASE: u64 = 0x2000;
     const CMDLINE_BASE: u64 = 0x3000;
     const ACPI_BASE: u64 = 0xe0000;
+    const SNP_SECRETS_BASE: u64 = 0x10000;
+    const SNP_CPUID_BASE: u64 = 0x11000;
+    const SNP_CC_BLOB_BASE: u64 = 0x12000;
+    const SNP_CC_SETUP_DATA_BASE: u64 = 0x13000;
 
     let kaddr: u64 = 0x100000;
     let mut kernel_file = cfg.kernel;
@@ -99,6 +104,12 @@ pub fn load_linux_x86(
         gdt_address: GDT_BASE,
         page_table_address: CR3_BASE,
     };
+    let snp_boot = cfg.snp_isolation.then_some(loader::linux::SnpBootConfig {
+        secrets_address: SNP_SECRETS_BASE,
+        cpuid_address: SNP_CPUID_BASE,
+        cc_blob_address: SNP_CC_BLOB_BASE,
+        cc_setup_data_address: SNP_CC_SETUP_DATA_BASE,
+    });
 
     let acpi_tables = acpi_at_gpa(ACPI_BASE);
 
@@ -129,10 +140,11 @@ pub fn load_linux_x86(
         zero_page_config,
         acpi_config,
         register_config,
+        snp_boot,
     )
     .map_err(Error::Loader)?;
 
-    Ok(loader.initial_regs())
+    Ok(loader.initial_regs_and_page_imports())
 }
 
 /// Returns the device tree blob.
@@ -788,7 +800,7 @@ pub fn load_linux_arm64(
     processor_topology: &ProcessorTopology<Aarch64Topology>,
     pcie_host_bridges: &[PcieHostBridge],
     build_acpi: Option<impl FnOnce(u64) -> vmm_core::acpi_builder::BuiltAcpiTables>,
-) -> Result<Vec<Aarch64Register>, Error> {
+) -> Result<(Vec<Aarch64Register>, Vec<virt::InitialPageImport>), Error> {
     let mut loader = Loader::new(gm.clone(), cfg.mem_layout, hvdef::Vtl::Vtl0);
     let mut kernel_file = cfg.kernel;
 
@@ -873,5 +885,5 @@ pub fn load_linux_arm64(
     loader::linux::set_direct_boot_registers_arm64(&mut loader, &load_info)
         .map_err(Error::Loader)?;
 
-    Ok(loader.initial_regs())
+    Ok(loader.initial_regs_and_page_imports())
 }
