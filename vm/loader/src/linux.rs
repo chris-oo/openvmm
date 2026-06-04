@@ -361,6 +361,9 @@ fn import_snp_boot_pages(
             &[],
         )
         .map_err(Error::Importer)?;
+    // The backend finalization path owns the CPUID page contents because they
+    // must match the configured vCPU CPUID. The loader only reserves and tags
+    // the page for that backend-specific initialization.
     importer
         .import_pages(
             cpuid_address / HV_PAGE_SIZE,

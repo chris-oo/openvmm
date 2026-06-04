@@ -71,8 +71,17 @@ impl SimpleFlowNode for Node {
                 if rebuild_rootfs {
                     let shrinkwrap_dir = test_root.join("shrinkwrap");
                     let venv_dir = shrinkwrap_dir.join("venv");
-                    sync_shrinkwrap_overlay_assets(&openvmm_root, &shrinkwrap_dir)?;
-                    build_cca_rootfs(rt, &test_root, &shrinkwrap_dir, &venv_dir)?;
+                    sync_shrinkwrap_overlay_assets(&openvmm_root, &shrinkwrap_dir, false)?;
+                    build_cca_rootfs(
+                        rt,
+                        &test_root,
+                        &shrinkwrap_dir,
+                        &venv_dir,
+                        "cca_planes.yaml",
+                        "${artifact:BUILDROOT}",
+                        true,
+                        false,
+                    )?;
                 }
 
                 Ok(())

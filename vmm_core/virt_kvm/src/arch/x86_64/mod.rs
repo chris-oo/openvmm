@@ -1770,17 +1770,6 @@ impl<'p> Processor for KvmProcessor<'p> {
                             kvm::KVM_SYSTEM_EVENT_CRASH => {
                                 return Err(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 });
                             }
-                            kvm::KVM_SYSTEM_EVENT_SEV_TERM => {
-                                let ghcb_msr = event_flags;
-                                return Err(dev.fatal_error(
-                                    KvmRunVpError::SevTermination {
-                                        ghcb_msr,
-                                        reason_set: (ghcb_msr >> 12) & 0xf,
-                                        reason: (ghcb_msr >> 16) & 0xff,
-                                    }
-                                    .into(),
-                                ));
-                            }
                             _ => {
                                 return Err(dev.fatal_error(
                                     KvmRunVpError::UnhandledSystemEvent(event_type).into(),
