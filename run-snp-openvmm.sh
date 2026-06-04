@@ -7,7 +7,6 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 OPENVMM_BIN="${OPENVMM_BIN:-$SCRIPT_DIR/openvmm}"
 KERNEL="${SNP_KERNEL:-$SCRIPT_DIR/vmlinuz-6.17.0-23-generic}"
-KERNEL_FORMAT="${SNP_KERNEL_FORMAT:-bzimage}"
 INITRD="${SNP_INITRD:-$SCRIPT_DIR/initrd}"
 # need 160 mb with compressed kernel and initrd
 MEMORY="${SNP_MEMORY:-160MB}"
@@ -37,7 +36,6 @@ cmd=(
     --pcie-root-port rc0:blk
     --virtio-blk "mem:$VIRTIO_BLK_SIZE,pcie_port=blk"
     --kernel "$KERNEL"
-    --linux-kernel-format "$KERNEL_FORMAT"
     --initrd "$INITRD"
     -m "$MEMORY"
     -p "$PROCESSORS"

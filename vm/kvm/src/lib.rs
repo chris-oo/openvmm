@@ -1932,6 +1932,7 @@ impl<'a> VpRunner<'a> {
                     nr: hypercall.nr,
                     args: hypercall.args,
                     result: &mut hypercall.ret,
+                    // SAFETY: this is the active field for KVM_EXIT_HYPERCALL.
                     flags: unsafe { hypercall.__bindgen_anon_1.flags },
                 }
             }
