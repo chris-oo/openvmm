@@ -3,6 +3,7 @@
 
 use cca_tests::CcaTestsCli;
 use flowey::pipeline::prelude::*;
+use kvm_cca_tests::KvmCcaTestsCli;
 use restore_packages::RestorePackagesCli;
 use vmm_tests_run::VmmTestsRunCli;
 
@@ -13,6 +14,7 @@ pub mod build_reproducible;
 pub mod cca_tests;
 pub mod checkin_gates;
 pub mod custom_vmfirmwareigvm_dll;
+pub mod kvm_cca_tests;
 pub mod openvmm_source_release;
 pub mod restore_packages;
 pub mod vmm_tests_run;
@@ -45,6 +47,9 @@ pub enum OpenvmmPipelines {
 
     /// Build and run CCA tests with installation of emulation environment supported
     CcaTests(CcaTestsCli),
+
+    /// Build and run native OpenVMM KVM CCA tests
+    KvmCcaTests(KvmCcaTestsCli),
 }
 
 #[derive(clap::Subcommand)]
@@ -86,6 +91,7 @@ impl IntoPipeline for OpenvmmPipelines {
             OpenvmmPipelines::RestorePackages(cmd) => cmd.into_pipeline(pipeline_hint),
             OpenvmmPipelines::VmmTestsRun(cmd) => cmd.into_pipeline(pipeline_hint),
             OpenvmmPipelines::CcaTests(cmd) => cmd.into_pipeline(pipeline_hint),
+            OpenvmmPipelines::KvmCcaTests(cmd) => cmd.into_pipeline(pipeline_hint),
         }
     }
 }
