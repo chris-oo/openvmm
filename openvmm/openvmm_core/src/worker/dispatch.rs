@@ -1016,6 +1016,100 @@ impl InitializedVm {
             anyhow::bail!("hugepage_size={size} requires hugepages=on");
         }
 
+        if matches!(
+            cfg.hypervisor.with_isolation,
+            Some(IsolationType::Snp | IsolationType::Cca)
+        ) {
+            let isolation_name = match cfg.hypervisor.with_isolation {
+                Some(IsolationType::Snp) => "SNP",
+                Some(IsolationType::Cca) => "CCA",
+                _ => unreachable!(),
+            };
+            if !matches!(cfg.load_mode, LoadMode::Linux { .. }) {
+                anyhow::bail!(
+                    "KVM {isolation_name} guest_memfd currently only supports direct Linux load mode"
+                );
+            }
+            if cfg.hypervisor.with_hv {
+                anyhow::bail!(
+                    "KVM {isolation_name} guest_memfd does not support Hyper-V enlightenments"
+                );
+            }
+            if cfg.hypervisor.with_vtl2.is_some() {
+                anyhow::bail!("KVM {isolation_name} guest_memfd does not support VTL2");
+            }
+            if cfg.chipset.with_hyperv_vga {
+                anyhow::bail!("KVM {isolation_name} guest_memfd does not support Hyper-V VGA");
+            }
+            if cfg.chipset.with_i440bx_host_pci_bridge {
+                anyhow::bail!(
+                    "KVM {isolation_name} guest_memfd does not support the i440BX host PCI bridge"
+                );
+            }
+            if cfg.hypervisor.with_isolation == Some(IsolationType::Cca) {
+                let only_supported_chipset_devices = cfg
+                    .chipset_devices
+                    .iter()
+                    .all(|device| matches!(device.resource.id(), "serial_pl011" | "missing-dev"));
+                if !only_supported_chipset_devices {
+                    anyhow::bail!("KVM CCA guest_memfd only supports PL011 serial chipset devices");
+                }
+            }
+            if cfg.vmbus.is_some() || cfg.vtl2_vmbus.is_some() || !cfg.vmbus_devices.is_empty() {
+                anyhow::bail!("KVM {isolation_name} guest_memfd does not support VMBus");
+            }
+            if cfg.hypervisor.with_isolation == Some(IsolationType::Cca) {
+                if !matches!(
+                    cfg.load_mode,
+                    LoadMode::Linux {
+                        boot_mode: openvmm_defs::config::LinuxDirectBootMode::DeviceTree,
+                        ..
+                    }
+                ) {
+                    anyhow::bail!(
+                        "KVM CCA guest_memfd only supports device tree Linux direct boot"
+                    );
+                }
+                if !cfg.virtio_devices.is_empty() {
+                    anyhow::bail!(
+                        "KVM CCA guest_memfd only supports virtio devices on PCIe root ports"
+                    );
+                }
+                if !cfg.pcie_switches.is_empty() {
+                    anyhow::bail!("KVM CCA guest_memfd does not support PCIe switches");
+                }
+                let unsupported_pcie_root_complex =
+                    cfg.pcie_root_complexes.iter().any(|root_complex| {
+                        root_complex.cxl.is_some()
+                            || root_complex
+                                .ports
+                                .iter()
+                                .any(|port| port.hotplug || port.cxl)
+                    });
+                if unsupported_pcie_root_complex {
+                    anyhow::bail!(
+                        "KVM CCA guest_memfd does not support PCIe hotplug or CXL root ports"
+                    );
+                }
+            }
+            if !cfg.floppy_disks.is_empty()
+                || !cfg.ide_disks.is_empty()
+                || !cfg.virtio_devices.is_empty()
+            {
+                anyhow::bail!("KVM {isolation_name} guest_memfd does not support disks");
+            }
+            if matches!(
+                cfg.vmgs,
+                Some(
+                    VmgsResource::Disk(_)
+                        | VmgsResource::ReprovisionOnFailure(_)
+                        | VmgsResource::Reprovision(_)
+                )
+            ) {
+                anyhow::bail!("KVM {isolation_name} guest_memfd does not support VMGS disks");
+            }
+        }
+
         // Collect RAM ranges for the backing request. All ranges go into a
         // single backing for now; NUMA will split them across multiple.
         let ram_ranges: Vec<MemoryRange> = mem_layout

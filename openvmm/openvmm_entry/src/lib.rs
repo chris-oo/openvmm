@@ -932,7 +932,9 @@ async fn vm_config_from_command_line(
     let has_com3 = serial2_cfg.is_some();
 
     let mut chipset = VmManifestBuilder::new(
-        if opt.igvm.is_some() {
+        if matches!(opt.isolation, Some(cli_args::IsolationCli::Snp)) {
+            BaseChipsetType::EnlightenedLinuxDirect
+        } else if opt.igvm.is_some() {
             BaseChipsetType::HclHost
         } else if opt.pcat {
             BaseChipsetType::HypervGen1
@@ -1758,7 +1760,125 @@ async fn vm_config_from_command_line(
     };
 
     storage.build_config(&mut cfg, &mut resources, opt.scsi_sub_channels)?;
+    validate_isolation_config(&cfg)?;
     Ok((cfg, resources))
+}
+
+fn validate_isolation_config(cfg: &Config) -> anyhow::Result<()> {
+    let Some(isolation) = cfg.hypervisor.with_isolation else {
+        return Ok(());
+    };
+
+    #[cfg(not(guest_arch = "aarch64"))]
+    if isolation == openvmm_defs::config::IsolationType::Cca {
+        anyhow::bail!("CCA isolation currently only supports aarch64 guests");
+    }
+
+    if !matches!(
+        isolation,
+        openvmm_defs::config::IsolationType::Snp | openvmm_defs::config::IsolationType::Cca
+    ) {
+        return Ok(());
+    }
+
+    let isolation_name = match isolation {
+        openvmm_defs::config::IsolationType::Snp => "SNP",
+        openvmm_defs::config::IsolationType::Cca => "CCA",
+        openvmm_defs::config::IsolationType::Vbs => unreachable!(),
+    };
+
+    if !matches!(cfg.load_mode, LoadMode::Linux { .. }) {
+        anyhow::bail!("{isolation_name} isolation currently only supports Linux direct boot");
+    }
+
+    if cfg.hypervisor.with_hv {
+        anyhow::bail!(
+            "{isolation_name} isolation currently does not support Hyper-V enlightenments"
+        );
+    }
+
+    if cfg.hypervisor.with_vtl2.is_some() {
+        anyhow::bail!("{isolation_name} isolation currently does not support VTL2");
+    }
+
+    if cfg.vmbus.is_some() || cfg.vtl2_vmbus.is_some() || !cfg.vmbus_devices.is_empty() {
+        anyhow::bail!("{isolation_name} isolation currently does not support VMBus devices");
+    }
+
+    if isolation == openvmm_defs::config::IsolationType::Cca {
+        if !matches!(
+            cfg.load_mode,
+            LoadMode::Linux {
+                boot_mode: openvmm_defs::config::LinuxDirectBootMode::DeviceTree,
+                ..
+            }
+        ) {
+            anyhow::bail!("CCA isolation currently only supports device tree Linux direct boot");
+        }
+
+        if !cfg.virtio_devices.is_empty() {
+            anyhow::bail!(
+                "CCA isolation currently only supports virtio devices on PCIe root ports"
+            );
+        }
+
+        if !cfg.pcie_switches.is_empty() {
+            anyhow::bail!("CCA isolation currently does not support PCIe switches");
+        }
+
+        let unsupported_pcie_root_complex = cfg.pcie_root_complexes.iter().any(|root_complex| {
+            root_complex.cxl.is_some()
+                || root_complex
+                    .ports
+                    .iter()
+                    .any(|port| port.hotplug || port.cxl)
+        });
+        if unsupported_pcie_root_complex {
+            anyhow::bail!(
+                "CCA isolation currently does not support PCIe hotplug or CXL root ports"
+            );
+        }
+    }
+
+    let only_supported_chipset_devices = cfg.chipset_devices.iter().all(|device| {
+        matches!(
+            device.resource.id(),
+            "serial_16550"
+                | "serial_pl011"
+                | "pic"
+                | "pit"
+                | "generic-ioapic"
+                | "hyperv_power_management"
+                | "missing-dev"
+        )
+    });
+    let only_virtio_pcie_devices = cfg
+        .pcie_devices
+        .iter()
+        .all(|device| device.resource.id() == "virtio");
+
+    if !cfg.floppy_disks.is_empty()
+        || !cfg.ide_disks.is_empty()
+        || !cfg.virtio_devices.is_empty()
+        || !only_virtio_pcie_devices
+        || !cfg.vpci_devices.is_empty()
+        || !only_supported_chipset_devices
+        || !cfg.pci_chipset_devices.is_empty()
+    {
+        anyhow::bail!("{isolation_name} isolation currently only supports virtio devices");
+    }
+
+    if cfg.framebuffer.is_some()
+        || cfg.vga_firmware.is_some()
+        || cfg.debugger_rpc.is_some()
+        || cfg.generation_id_recv.is_some()
+    {
+        anyhow::bail!(
+            "{isolation_name} isolation currently does not support this VM configuration"
+        );
+    }
+
+    Ok(())
 }
 
 /// Gets the terminal to use for externally launched console windows.
