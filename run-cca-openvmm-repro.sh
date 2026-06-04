@@ -10,6 +10,7 @@ OPENVMM_MEMORY="${CCA_REPRO_OPENVMM_MEMORY:-256M}"
 LOGS_DIR="${CCA_REPRO_LOGS_DIR:-target/cca-test/kvm-cca/logs/interactive}"
 TIMEOUT_SECONDS="${CCA_REPRO_TIMEOUT_SECONDS:-300}"
 XFLOWEY_EXIT_TIMEOUT_SECONDS="${CCA_REPRO_XFLOWEY_EXIT_TIMEOUT_SECONDS:-120}"
+OPENVMM_EXIT_TIMEOUT_SECONDS="${CCA_REPRO_OPENVMM_EXIT_TIMEOUT_SECONDS:-15}"
 LOGIN="${CCA_REPRO_LOGIN:-root}"
 REMOTE_SCRIPT="${CCA_REPRO_REMOTE_SCRIPT:-/cca-share/run-openvmm-kvm-cca.sh}"
 ERROR_PATTERN="${CCA_REPRO_ERROR_PATTERN:-fatal error|failed to run VP|[Gg]uest crash(?:ed)?|guest halted|triple fault|panicked at|assertion failed|abnormal exit|SIGABRT|core dumped|Internal error|Unhandled|VCPU panic|Kernel panic}"
@@ -22,6 +23,7 @@ python3 - \
     "$LOGS_DIR" \
     "$TIMEOUT_SECONDS" \
     "$XFLOWEY_EXIT_TIMEOUT_SECONDS" \
+    "$OPENVMM_EXIT_TIMEOUT_SECONDS" \
     "$LOGIN" \
     "$REMOTE_SCRIPT" \
     "$ERROR_PATTERN" \
@@ -34,6 +36,7 @@ import select
 import signal
 import subprocess
 import sys
+import termios
 import time
 
 (
@@ -43,6 +46,7 @@ import time
     logs_dir,
     timeout_seconds,
     xflowey_exit_timeout_seconds,
+    openvmm_exit_timeout_seconds,
     login,
     remote_script,
     error_pattern,
@@ -51,9 +55,10 @@ import time
 ) = sys.argv[1:]
 timeout_seconds = int(timeout_seconds)
 xflowey_exit_timeout_seconds = int(xflowey_exit_timeout_seconds)
+openvmm_exit_timeout_seconds = int(openvmm_exit_timeout_seconds)
 error = re.compile(error_pattern)
 success = re.compile(success_pattern)
-shell_prompt = re.compile(r"(?:^|[\r\n])[^#\r\n]*# $")
+shell_prompt = re.compile(r"(?:^|[\r\n])[^#\r\n]*#\s*$")
 
 argv = [
     "cargo",
@@ -86,7 +91,8 @@ def fvp_pids():
         if not pid_text.isdigit():
             continue
         argv0 = args.split(" ", 1)[0]
-        if argv0 == "FVP_Base_RevC" or argv0.endswith("/FVP_Base_RevC"):
+        basename = os.path.basename(argv0)
+        if basename.startswith("FVP_Base_RevC"):
             pids.append(int(pid_text))
     return pids
 
@@ -135,9 +141,23 @@ def send_remote_script():
     os.write(fd, f"{remote_script}\r".encode())
 
 
+def send_openvmm_escape():
+    print("\nCCA repro: guest reached success; entering OpenVMM control prompt with Ctrl-Q", file=sys.stderr, flush=True)
+    os.write(fd, b"\x11")
+
+
+def send_openvmm_quit():
+    print("\nCCA repro: quitting OpenVMM", file=sys.stderr, flush=True)
+    os.write(fd, b"q\r")
+
+
 pid, fd = pty.fork()
 if pid == 0:
     os.execvp(argv[0], argv)
+
+attrs = termios.tcgetattr(fd)
+attrs[0] &= ~(termios.IXON | termios.IXOFF | termios.IXANY)
+termios.tcsetattr(fd, termios.TCSANOW, attrs)
 
 deadline = time.monotonic() + timeout_seconds
 buffer = ""
@@ -149,6 +169,9 @@ timed_out = False
 child_status = None
 done_since = None
 last_login_sent = 0.0
+openvmm_quit_sent = False
+openvmm_quit_command_sent = False
+openvmm_quit_deadline = None
 
 try:
     while True:
@@ -166,6 +189,9 @@ try:
         readable, _, _ = select.select([fd], [], [], min(0.5, remaining))
         if not readable:
             if done_since is not None and time.monotonic() - done_since > 1:
+                stop_fvp()
+                break
+            if openvmm_quit_deadline is not None and time.monotonic() >= openvmm_quit_deadline:
                 stop_fvp()
                 break
             if logged_in and not command_sent and shell_prompt.search(buffer):
@@ -207,14 +233,27 @@ try:
         repro_started = command_sent or "Run /init as init process" in buffer or success.search(buffer)
         if repro_started and error.search(buffer):
             matched_error = True
-            if done_since is None:
-                done_since = now
+            stop_fvp()
+            break
         if repro_started and success.search(buffer):
             matched_success = True
-            if done_since is None:
-                done_since = now
+            if not openvmm_quit_sent:
+                send_openvmm_escape()
+                openvmm_quit_sent = True
+                openvmm_quit_deadline = now + openvmm_exit_timeout_seconds
+                buffer = ""
+            continue
 
-        if done_since is not None and now - done_since > 1:
+        if openvmm_quit_sent and not openvmm_quit_command_sent and "openvmm>" in buffer:
+            send_openvmm_quit()
+            openvmm_quit_command_sent = True
+            buffer = ""
+            continue
+
+        if openvmm_quit_sent and shell_prompt.search(buffer):
+            stop_fvp()
+            break
+        if openvmm_quit_deadline is not None and now >= openvmm_quit_deadline:
             stop_fvp()
             break
 
@@ -227,7 +266,28 @@ try:
             except OSError:
                 data = b""
             if data:
-                print(data.decode(errors="replace"), end="", flush=True)
+                text = data.decode(errors="replace")
+                print(text, end="", flush=True)
+                buffer = (buffer + text)[-8192:]
+                repro_started = command_sent or "Run /init as init process" in buffer or success.search(buffer)
+                if repro_started and error.search(buffer):
+                    matched_error = True
+                    stop_fvp()
+                if repro_started and success.search(buffer):
+                    matched_success = True
+                    if not openvmm_quit_sent:
+                        send_openvmm_escape()
+                        openvmm_quit_sent = True
+                        openvmm_quit_deadline = time.monotonic() + openvmm_exit_timeout_seconds
+                        buffer = ""
+                if openvmm_quit_sent and not openvmm_quit_command_sent and "openvmm>" in buffer:
+                    send_openvmm_quit()
+                    openvmm_quit_command_sent = True
+                    buffer = ""
+                if openvmm_quit_sent and shell_prompt.search(buffer):
+                    stop_fvp()
+                if openvmm_quit_deadline is not None and time.monotonic() >= openvmm_quit_deadline:
+                    stop_fvp()
         finished, status = os.waitpid(pid, os.WNOHANG)
         if finished:
             child_status = status
