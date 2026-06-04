@@ -14,6 +14,7 @@ use std::collections::BTreeSet;
 pub enum OpenvmmFeature {
     Gdb,
     Tpm,
+    VendoredCrypto,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -116,6 +117,7 @@ impl FlowNode for Node {
                             match f {
                                 OpenvmmFeature::Gdb => "gdb",
                                 OpenvmmFeature::Tpm => "tpm",
+                                OpenvmmFeature::VendoredCrypto => "vendored_crypto",
                             }
                             .into()
                         })

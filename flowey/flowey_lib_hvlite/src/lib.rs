@@ -14,6 +14,7 @@ pub mod build_guide;
 pub mod build_hypestv;
 pub mod build_igvmfilegen;
 pub mod build_incubator;
+pub mod build_kvm_cca_preflight;
 pub mod build_nextest_unit_tests;
 pub mod build_nextest_vmm_tests;
 pub mod build_ohcldiag_dev;
