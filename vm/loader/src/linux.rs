@@ -332,6 +332,9 @@ fn import_snp_boot_pages(
             &[],
         )
         .map_err(Error::Importer)?;
+    // The backend finalization path owns the CPUID page contents because they
+    // must match the configured vCPU CPUID. The loader only reserves and tags
+    // the page for that backend-specific initialization.
     importer
         .import_pages(
             snp_boot.cpuid_address / HV_PAGE_SIZE,
@@ -436,15 +439,12 @@ fn import_initrd<R: GuestArch>(
 /// Load only a Linux kernel and optional initrd to VTL0.
 /// This does not setup register state or any other config information.
 ///
-/// The kernel image may be either an uncompressed ELF (`vmlinux`) or a
-/// compressed bzImage. If a bzImage is detected, the bzImage payload is
-/// loaded directly into guest memory and the kernel's own decompressor
-/// runs at boot time.
+/// The kernel image must be an uncompressed ELF (`vmlinux`).
 ///
 /// # Arguments
 ///
 /// * `importer` - The importer to use.
-/// * `kernel_image` - Kernel image (uncompressed ELF or bzImage).
+/// * `kernel_image` - Uncompressed ELF kernel image.
 /// * `kernel_minimum_start_address` - The minimum address the kernel can load at.
 ///   It cannot contain an entrypoint or program headers that refer to memory below this address.
 /// * `initrd` - The initrd config, optional.
@@ -1032,8 +1032,10 @@ mod tests {
     use crate::importer::IsolationConfig;
     use crate::importer::ParameterAreaIndex;
     use crate::importer::StartupMemoryType;
+    use memory_range::MemoryRange;
     use std::io::Cursor;
     use test_with_tracing::test;
+    use vm_topology::memory::MemoryRangeWithNode;
     use zerocopy::FromBytes;
 
     #[derive(Debug)]
@@ -1184,6 +1186,52 @@ mod tests {
         assert_eq!(importer.imports[0].tag, "linux-kernel");
         assert_eq!(importer.imports[0].page_base, 0x1000);
         assert_eq!(importer.imports[0].data[0x200], 0xcc);
+    }
+
+    #[test]
+    fn elf_format_does_not_autodetect_bzimage() {
+        let mut importer = TestImporter::default();
+        let mut image = Cursor::new(test_bzimage());
+        let cmdline = CString::new("").unwrap();
+        let mem_layout = MemoryLayout::new_from_ranges(
+            &[MemoryRangeWithNode {
+                range: MemoryRange::new(0..0x4000000),
+                vnode: 0,
+            }],
+            &[],
+        )
+        .unwrap();
+
+        let err = load_x86(
+            &mut importer,
+            &mut image,
+            0x100000,
+            None,
+            CommandLineConfig {
+                address: 0x3000,
+                cmdline: &cmdline,
+            },
+            ZeroPageConfig {
+                address: 0x2000,
+                mem_layout: &mem_layout,
+                acpi_base_address: 0xe0000,
+                acpi_len: 0x1000,
+            },
+            AcpiConfig {
+                rdsp_address: 0xe0000,
+                rdsp: &[0; 0x10],
+                tables_address: 0xe1000,
+                tables: &[0; 0x10],
+            },
+            RegisterConfig {
+                gdt_address: 0x1000,
+                page_table_address: 0x4000,
+            },
+            None,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, Error::ElfLoader(_)));
     }
 
     #[test]
