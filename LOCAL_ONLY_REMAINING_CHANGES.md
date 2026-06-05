@@ -57,3 +57,30 @@ Any change to runtime behavior in core crates should be treated with suspicion.
 It either belongs in one of the upstream PR bookmarks or should be removed from
 the local-only endpoint unless it is explicitly required for local CCA
 validation.
+
+## Validation results
+
+The suspicious runtime changes were tested by first reverting them to the
+`snp-cca-upstream-stack` contents, then restoring only the groups required for
+the repros.
+
+| Commit | Files | Result |
+| --- | --- | --- |
+| `local: drop stale runtime bring-up changes` | Reverts the suspicious runtime files to the upstream stack as a baseline. | Builds with the Underhill API compatibility fix retained, but SNP hangs during early TSC calibration. |
+| `local: keep SNP loader direct-boot fix` | `vm/loader/src/linux.rs` | Split from the SNP runtime group; part of the required local SNP validation set. |
+| `local: keep SNP launch policy fix` | `vmm_core/virt_kvm/src/snp.rs` | Split from the SNP runtime group; part of the required local SNP validation set. |
+| `local: keep SEV termination handling` | `vmm_core/virt_kvm/src/arch/x86_64/mod.rs`, `vmm_core/virt_kvm/src/lib.rs` | Split from the SNP runtime group; keeps only SEV termination system-event handling and the matching error. |
+| `local: keep CCA Linux direct-boot address fallback` | `openvmm/openvmm_core/src/worker/vm_loaders/linux.rs` | Split from the OpenVMM runtime group; part of the remaining local CCA/SNP validation set. |
+| `local: keep OpenVMM guestmemfd validation and device wiring` | `openvmm/openvmm_core/src/worker/dispatch.rs` | Split from the OpenVMM runtime group; part of the remaining local CCA/SNP validation set. |
+| `local: keep manifest builder direct-boot shape` | `vmm_core/vm_manifest_builder/src/lib.rs` | Required for the current SNP repro. Removing this file's local delta causes the same early TSC calibration hang. |
+
+The following suspicious files were tested and found not to be required for the
+current SNP/CCA repros, so their local-only deltas were dropped:
+
+- `vmm_core/virt_kvm/src/memory.rs`
+- `vm/loader/src/paravisor.rs`
+- `vmm_core/virt_kvm/Cargo.toml`
+- `vmm_core/virt_kvm/src/cca.rs`
+
+Both `run-snp-openvmm-repro.sh` and `run-cca-openvmm-repro.sh` pass with the
+remaining split local-runtime commits.
