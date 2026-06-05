@@ -42,7 +42,7 @@ view passed to devices.
 3. Expose the CCA shared IPA bit to `openvmm_core`:
    - KVM already computes it from Realm IPA size as `1u64 << (ipa_size - 1)`;
    - plumb it through an aarch64 platform/capability field such as
-     `virt::PlatformInfo::cca_shared_gpa_bit: Option<u64>` rather than
+     `virt::PlatformInfo::shared_gpa_bit: Option<u64>` rather than
      duplicating the KVM IPA-size query in OpenVMM core.
    - add an in-code TODO at the new shared-bit plumbing to revisit whether this
      should be unified with SNP's existing `vtom`/shared-GPA-boundary model
