@@ -82,7 +82,6 @@ impl<R> Loader<'_, R> {
                     // support for that doesn't exist in any virt backend yet.
                     // Handling these will require more virt::generic types.
                     BootPageAcceptance::VpContext => todo!(),
-                    BootPageAcceptance::ErrorPage => todo!(),
                     BootPageAcceptance::SecretsPage => todo!(),
                     BootPageAcceptance::CpuidPage => todo!(),
                     BootPageAcceptance::CpuidExtendedStatePage => todo!(),

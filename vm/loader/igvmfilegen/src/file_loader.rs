@@ -878,7 +878,6 @@ impl<R: IgvmLoaderRegister + GuestArch + 'static> IgvmLoader<R> {
                         IgvmPageDataType::NORMAL,
                         IgvmPageDataFlags::new().with_unmeasured(true),
                     ),
-                    BootPageAcceptance::ErrorPage => todo!(),
                     BootPageAcceptance::SecretsPage => {
                         (IgvmPageDataType::SECRETS, IgvmPageDataFlags::new())
                     }
