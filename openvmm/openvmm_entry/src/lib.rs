@@ -1119,7 +1119,9 @@ async fn vm_config_from_command_line(
     let has_com3 = serial2_cfg.is_some();
 
     let mut chipset = VmManifestBuilder::new(
-        if opt.igvm.is_some() {
+        if matches!(opt.isolation, Some(cli_args::IsolationCli::Snp)) {
+            BaseChipsetType::EnlightenedLinuxDirect
+        } else if opt.igvm.is_some() {
             BaseChipsetType::HclHost
         } else if opt.pcat {
             BaseChipsetType::HypervGen1
@@ -2030,7 +2032,58 @@ async fn vm_config_from_command_line(
     };
 
     storage.build_config(&mut cfg, &mut resources, opt.scsi_sub_channels)?;
+    validate_snp_config(&cfg)?;
     Ok((cfg, resources))
+}
+
+fn validate_snp_config(cfg: &Config) -> anyhow::Result<()> {
+    if cfg.hypervisor.with_isolation != Some(openvmm_defs::config::IsolationType::Snp) {
+        return Ok(());
+    }
+
+    if !matches!(cfg.load_mode, LoadMode::Linux { .. }) {
+        anyhow::bail!("SNP isolation currently only supports Linux direct boot");
+    }
+    if cfg.hypervisor.with_hv {
+        anyhow::bail!("SNP isolation currently does not support Hyper-V enlightenments");
+    }
+    if cfg.hypervisor.with_vtl2.is_some() {
+        anyhow::bail!("SNP isolation currently does not support VTL2");
+    }
+    if cfg.vmbus.is_some() || cfg.vtl2_vmbus.is_some() || !cfg.vmbus_devices.is_empty() {
+        anyhow::bail!("SNP isolation currently does not support VMBus devices");
+    }
+
+    let only_supported_chipset_devices = cfg.chipset_devices.iter().all(|device| {
+        matches!(
+            device.resource.id(),
+            "serial_16550"
+                | "pic"
+                | "pit"
+                | "generic-ioapic"
+                | "hyperv_power_management"
+                | "missing-dev"
+        )
+    });
+    let only_virtio_pcie_devices = cfg
+        .pcie_devices
+        .iter()
+        .all(|device| device.resource.id() == "virtio");
+    if !cfg.floppy_disks.is_empty()
+        || !cfg.ide_disks.is_empty()
+        || !cfg.virtio_devices.is_empty()
+        || !only_virtio_pcie_devices
+        || !cfg.vpci_devices.is_empty()
+        || !only_supported_chipset_devices
+        || !cfg.pci_chipset_devices.is_empty()
+    {
+        anyhow::bail!("SNP isolation currently only supports virtio devices");
+    }
+    if cfg.framebuffer.is_some() || cfg.vga_firmware.is_some() || cfg.debugger_rpc.is_some() {
+        anyhow::bail!("SNP isolation currently does not support this VM configuration");
+    }
+
+    Ok(())
 }
 
 /// Gets the terminal to use for externally launched console windows.
