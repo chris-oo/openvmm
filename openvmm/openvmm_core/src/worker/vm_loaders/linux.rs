@@ -56,6 +56,45 @@ pub struct KernelConfig<'a> {
     pub snp_c_bit: Option<u8>,
 }
 
+// Bring-up hack for SNP Linux direct boot. Without a bootshim or firmware to
+// accept memory after launch, every RAM page must be added to the initial SNP
+// launch context. This makes launch extremely slow and should be removed once
+// SNP boots exclusively through IGVM, or direct boot can accept the remaining
+// RAM after launch instead of pre-accepting it here.
+fn complete_snp_direct_ram_imports(
+    page_imports: &mut Vec<virt::InitialPageImport>,
+    ram_ranges: impl IntoIterator<Item = MemoryRange>,
+) {
+    let mut imported_ranges: Vec<_> = page_imports.iter().map(|page| page.range).collect();
+    imported_ranges.sort_by_key(|range| (range.start(), range.end()));
+
+    for ram_range in ram_ranges {
+        let mut cursor = ram_range.start();
+        for imported_range in &imported_ranges {
+            let start = imported_range.start().max(ram_range.start());
+            let end = imported_range.end().min(ram_range.end());
+            if start >= end {
+                continue;
+            }
+            if cursor < start {
+                page_imports.push(virt::InitialPageImport {
+                    range: MemoryRange::new(cursor..start),
+                    import_type: virt::InitialPageImportType::Normal,
+                    tag: "linux-snp-direct-ram",
+                });
+            }
+            cursor = cursor.max(end);
+        }
+        if cursor < ram_range.end() {
+            page_imports.push(virt::InitialPageImport {
+                range: MemoryRange::new(cursor..ram_range.end()),
+                import_type: virt::InitialPageImportType::Normal,
+                tag: "linux-snp-direct-ram",
+            });
+        }
+    }
+}
+
 /// The default SMBIOS identity for firmware-less Linux direct boot.
 ///
 /// There is no configuration surface yet, so every direct-boot VM gets this
@@ -131,7 +170,18 @@ pub fn load_linux_x86(
     )
     .map_err(Error::Loader)?;
 
-    Ok(loader.initial_regs_and_page_imports())
+    let InitialLoad {
+        regs,
+        mut page_imports,
+    } = loader.initial_regs_and_page_imports();
+    if cfg.isolation == Some(IsolationType::Snp) {
+        complete_snp_direct_ram_imports(
+            &mut page_imports,
+            cfg.mem_layout.ram().iter().map(|range| range.range),
+        );
+    }
+
+    Ok(InitialLoad { regs, page_imports })
 }
 
 /// Returns the device tree blob.
@@ -951,4 +1001,45 @@ pub fn load_linux_arm64(
         .map_err(Error::Loader)?;
 
     Ok(loader.initial_regs_and_page_imports())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    #[test]
+    fn completes_snp_direct_ram_imports() {
+        let mut page_imports = vec![virt::InitialPageImport {
+            range: MemoryRange::new(0x2000..0x4000),
+            import_type: virt::InitialPageImportType::Secrets,
+            tag: "loader",
+        }];
+
+        complete_snp_direct_ram_imports(
+            &mut page_imports,
+            [
+                MemoryRange::new(0x1000..0x5000),
+                MemoryRange::new(0x8000..0xa000),
+            ],
+        );
+
+        let completed_ranges: Vec<_> = page_imports
+            .iter()
+            .filter(|page| page.tag == "linux-snp-direct-ram")
+            .map(|page| page.range)
+            .collect();
+        assert_eq!(
+            completed_ranges,
+            [
+                MemoryRange::new(0x1000..0x2000),
+                MemoryRange::new(0x4000..0x5000),
+                MemoryRange::new(0x8000..0xa000),
+            ]
+        );
+        assert_eq!(
+            page_imports[0].import_type,
+            virt::InitialPageImportType::Secrets
+        );
+    }
 }

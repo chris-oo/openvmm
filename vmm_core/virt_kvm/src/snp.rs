@@ -5,7 +5,6 @@ use crate::KvmError;
 use crate::KvmPartition;
 use crate::KvmPartitionInner;
 use crate::memory::private_memory_range_from_slots;
-use memory_range::MemoryRange;
 use std::os::fd::AsFd;
 use virt::InitialPageImportType;
 
@@ -67,13 +66,8 @@ impl KvmPartitionInner {
         self.kvm
             .sev_snp_launch_start(sev.as_fd(), &mut launch_start)?;
 
-        // TODO: This is for bring-up, because we do not support a bootshim or boot
-        // modes that can accept memory itself. Accept all RAM such that we can directly
-        // boot a Linux kernel.
-        let pages = snp_launch_pages_with_ram_hack(pages, &self.ram_ranges);
-
         let memory = self.memory.lock();
-        for page in &pages {
+        for page in pages {
             let launch_page_type = crate::arch::snp::snp_launch_page_type(page.import_type)?;
             let Some(kvm_page_type) = launch_page_type.kvm_page_type() else {
                 return Err(KvmError::UnsupportedSnpPageImportType(page.import_type));
@@ -289,51 +283,6 @@ struct SnpCpuidFn {
     edx: u32,
 }
 
-fn snp_launch_pages_with_ram_hack(
-    pages: &[virt::InitialPageImport],
-    ram_ranges: &[MemoryRange],
-) -> Vec<virt::InitialPageImport> {
-    initial_pages_with_ram_hack(pages, ram_ranges, snp_ram_hack_page)
-}
-
-fn initial_pages_with_ram_hack(
-    pages: &[virt::InitialPageImport],
-    ram_ranges: &[MemoryRange],
-    hack_page: impl Fn(MemoryRange) -> virt::InitialPageImport,
-) -> Vec<virt::InitialPageImport> {
-    let mut pages = pages.to_vec();
-    let mut page_imports: Vec<_> = pages.iter().map(|page| page.range).collect();
-    page_imports.sort_by_key(|range| (range.start(), range.end()));
-
-    for ram_range in ram_ranges {
-        let mut cursor = ram_range.start();
-        for imported_range in &page_imports {
-            let start = imported_range.start().max(ram_range.start());
-            let end = imported_range.end().min(ram_range.end());
-            if start >= end {
-                continue;
-            }
-            if cursor < start {
-                pages.push(hack_page(MemoryRange::new(cursor..start)));
-            }
-            cursor = cursor.max(end);
-        }
-        if cursor < ram_range.end() {
-            pages.push(hack_page(MemoryRange::new(cursor..ram_range.end())));
-        }
-    }
-
-    pages
-}
-
-fn snp_ram_hack_page(range: MemoryRange) -> virt::InitialPageImport {
-    virt::InitialPageImport {
-        range,
-        import_type: InitialPageImportType::Normal,
-        tag: "kvm-snp-ram-hack".into(),
-    }
-}
-
 fn validate_snp_bsp_register_state(
     regs: &kvm::kvm_regs,
     sregs: &kvm::kvm_sregs,
@@ -499,36 +448,6 @@ pub(crate) fn split_zero_page_runs(bytes: &[u8]) -> Result<Vec<SnpPageRun>, KvmE
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn range(start: u64, end: u64) -> MemoryRange {
-        MemoryRange::new(start..end)
-    }
-
-    #[test]
-    fn snp_launch_pages_with_ram_hack_fills_unaccepted_ram_gaps() {
-        let pages = [virt::InitialPageImport {
-            range: range(0x2000, 0x4000),
-            import_type: InitialPageImportType::Normal,
-            tag: "loader".into(),
-        }];
-        let ram_ranges = [range(0x1000, 0x5000), range(0x8000, 0xa000)];
-
-        let launch_pages = snp_launch_pages_with_ram_hack(&pages, &ram_ranges);
-        let hack_ranges: Vec<_> = launch_pages
-            .iter()
-            .filter(|page| page.tag == "kvm-snp-ram-hack")
-            .map(|page| page.range)
-            .collect();
-
-        assert_eq!(
-            hack_ranges,
-            vec![
-                range(0x1000, 0x2000),
-                range(0x4000, 0x5000),
-                range(0x8000, 0xa000)
-            ]
-        );
-    }
 
     #[test]
     fn split_zero_page_runs_coalesces_adjacent_pages_by_zero_state() {
