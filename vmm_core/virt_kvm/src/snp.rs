@@ -375,20 +375,29 @@ fn set_snp_c_bit_in_page_tables(
     Ok(())
 }
 
+const SNP_CPUID_COUNT_MAX: usize = 64;
+const SNP_CPUID_TABLE_HEADER_SIZE: usize = 16;
+const SNP_CPUID_FN_SIZE: usize = 48;
+
 fn write_snp_cpuid_page(
     page: *mut u8,
     page_len: u64,
     cpuid: &[kvm::kvm_cpuid_entry2],
 ) -> Result<(), KvmError> {
-    const SNP_CPUID_COUNT_MAX: usize = 64;
-    const SNP_CPUID_TABLE_HEADER_SIZE: usize = 16;
-    const SNP_CPUID_FN_SIZE: usize = 48;
-
-    if cpuid.len() > SNP_CPUID_COUNT_MAX {
-        return Err(KvmError::TooManySnpCpuidEntries(cpuid.len()));
-    }
     if page_len < (SNP_CPUID_TABLE_HEADER_SIZE + SNP_CPUID_COUNT_MAX * SNP_CPUID_FN_SIZE) as u64 {
         return Err(KvmError::InvalidSnpLaunchRange);
+    }
+
+    let cpuid = cpuid
+        .iter()
+        .copied()
+        .filter_map(|mut entry| {
+            sanitize_snp_cpuid_entry(&mut entry);
+            (entry.eax != 0 || entry.ebx != 0 || entry.ecx != 0 || entry.edx != 0).then_some(entry)
+        })
+        .collect::<Vec<_>>();
+    if cpuid.len() > SNP_CPUID_COUNT_MAX {
+        return Err(KvmError::TooManySnpCpuidEntries(cpuid.len()));
     }
 
     let page = unsafe { std::slice::from_raw_parts_mut(page, page_len as usize) };
@@ -396,8 +405,6 @@ fn write_snp_cpuid_page(
     page[..4].copy_from_slice(&(cpuid.len() as u32).to_le_bytes());
 
     for (index, cpuid) in cpuid.iter().copied().enumerate() {
-        let mut cpuid = cpuid;
-        sanitize_snp_cpuid_entry(&mut cpuid);
         let entry = &mut page[SNP_CPUID_TABLE_HEADER_SIZE + index * SNP_CPUID_FN_SIZE..]
             [..SNP_CPUID_FN_SIZE];
         entry[0..4].copy_from_slice(&cpuid.function.to_le_bytes());
@@ -609,5 +616,62 @@ mod tests {
             u32::from_le_bytes(page[xsave + 28..xsave + 32].try_into().unwrap()),
             0x240
         );
+    }
+
+    #[test]
+    fn write_snp_cpuid_page_sparsifies_after_sanitizing() {
+        let mut page = vec![0xff; hvdef::HV_PAGE_SIZE as usize];
+        let cpuid = [
+            kvm::kvm_cpuid_entry2 {
+                function: 1,
+                ecx: 0x0100_0000,
+                ..Default::default()
+            },
+            kvm::kvm_cpuid_entry2 {
+                function: 2,
+                ..Default::default()
+            },
+            kvm::kvm_cpuid_entry2 {
+                function: 0x4000_0000,
+                eax: 0x4000_0001,
+                ..Default::default()
+            },
+        ];
+
+        write_snp_cpuid_page(page.as_mut_ptr(), page.len() as u64, &cpuid).unwrap();
+
+        assert_eq!(u32::from_le_bytes(page[0..4].try_into().unwrap()), 1);
+        assert_eq!(
+            u32::from_le_bytes(page[16..20].try_into().unwrap()),
+            0x4000_0000
+        );
+    }
+
+    #[test]
+    fn write_snp_cpuid_page_enforces_limit_after_sparsifying() {
+        let mut page = vec![0xff; hvdef::HV_PAGE_SIZE as usize];
+        let mut cpuid = (0..SNP_CPUID_COUNT_MAX as u32)
+            .map(|function| kvm::kvm_cpuid_entry2 {
+                function,
+                eax: 1,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        cpuid.push(kvm::kvm_cpuid_entry2 {
+            function: 0xffff,
+            ..Default::default()
+        });
+
+        write_snp_cpuid_page(page.as_mut_ptr(), page.len() as u64, &cpuid).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(page[0..4].try_into().unwrap()),
+            SNP_CPUID_COUNT_MAX as u32
+        );
+
+        cpuid.last_mut().unwrap().eax = 1;
+        assert!(matches!(
+            write_snp_cpuid_page(page.as_mut_ptr(), page.len() as u64, &cpuid),
+            Err(KvmError::TooManySnpCpuidEntries(count)) if count == SNP_CPUID_COUNT_MAX + 1
+        ));
     }
 }
