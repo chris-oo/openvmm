@@ -1302,8 +1302,18 @@ impl Options {
 
     /// Validates isolation-specific command-line option combinations.
     pub fn validate_isolation_options(&self) -> anyhow::Result<()> {
-        if matches!(self.isolation, Some(IsolationCli::Snp)) && self.uefi {
-            anyhow::bail!("SNP isolation currently only supports Linux direct boot");
+        if matches!(self.isolation, Some(IsolationCli::Snp)) {
+            if self.uefi {
+                anyhow::bail!("SNP isolation currently only supports Linux direct boot");
+            }
+            if self.memory.hugepages
+                || self
+                    .numa
+                    .as_ref()
+                    .is_some_and(|nodes| nodes.iter().any(|node| node.memory.hugepages))
+            {
+                anyhow::bail!("SNP isolation currently does not support hugetlb memory");
+            }
         }
         Ok(())
     }
@@ -5350,8 +5360,48 @@ mod tests {
     }
 
     #[test]
+    fn test_isolation_options_reject_snp_hugepages() {
+        for args in [
+            vec![
+                "openvmm",
+                "--isolation",
+                "snp",
+                "--memory",
+                "size=1G,hugepages=on",
+            ],
+            vec![
+                "openvmm",
+                "--isolation",
+                "snp",
+                "--numa",
+                "size=1G,hugepages=on",
+            ],
+        ] {
+            let opt = Options::try_parse_from(args).unwrap();
+            assert_eq!(
+                opt.validate_isolation_options().unwrap_err().to_string(),
+                "SNP isolation currently does not support hugetlb memory"
+            );
+        }
+    }
+
+    #[test]
     fn test_isolation_options_allow_vbs_uefi() {
         let opt = Options::try_parse_from(["openvmm", "--isolation", "vbs", "--uefi"]).unwrap();
+
+        opt.validate_isolation_options().unwrap();
+    }
+
+    #[test]
+    fn test_isolation_options_allow_vbs_hugepages() {
+        let opt = Options::try_parse_from([
+            "openvmm",
+            "--isolation",
+            "vbs",
+            "--memory",
+            "size=1G,hugepages=on",
+        ])
+        .unwrap();
 
         opt.validate_isolation_options().unwrap();
     }
