@@ -130,6 +130,10 @@ fn gb_pages_supported() -> bool {
         && safe_intrinsics::cpuid(GB_PAGE_LEAF, 0).edx & GB_PAGE_FLAG != 0
 }
 
+fn include_supported_cpuid_leaf(isolation: virt::IsolationType, function: u32) -> bool {
+    matches!(isolation, virt::IsolationType::Snp) || function & 0xf0000000 != 0x40000000
+}
+
 impl virt::Hypervisor for Kvm {
     type ProtoPartition<'a> = KvmProtoPartition<'a>;
     type Partition = KvmPartition;
@@ -184,8 +188,9 @@ impl virt::Hypervisor for Kvm {
         let mut cpuid_entries = supported_cpuid
             .into_iter()
             .filter_map(|entry| {
-                // Filter out KVM CPUID entries.
-                if entry.function & 0xf0000000 == 0x40000000 {
+                // SNP guests consume the enforced CPUID page instead of
+                // falling back to KVM for missing hypervisor leaves.
+                if !include_supported_cpuid_leaf(config.isolation, entry.function) {
                     return None;
                 }
                 let mut leaf =
@@ -1920,5 +1925,27 @@ impl GuestEventPort for KvmGuestEventPort {
 impl SignalMsi for KvmPartitionInner {
     fn signal_msi(&self, _devid: Option<u32>, address: u64, data: u32) {
         self.request_msi(MsiRequest { address, data });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    #[test]
+    fn snp_includes_kvm_cpuid_leaves() {
+        assert!(include_supported_cpuid_leaf(
+            virt::IsolationType::Snp,
+            0x4000_0000
+        ));
+        assert!(!include_supported_cpuid_leaf(
+            virt::IsolationType::None,
+            0x4000_0000
+        ));
+        assert!(include_supported_cpuid_leaf(
+            virt::IsolationType::None,
+            0x8000_0000
+        ));
     }
 }
