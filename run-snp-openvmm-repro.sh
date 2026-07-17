@@ -8,9 +8,9 @@ HOST="${SNP_REPRO_HOST:-cho-snp-ubuntu}"
 REMOTE_SCRIPT="${SNP_REPRO_REMOTE_SCRIPT:-~/snp-openvmm/run-snp-openvmm.sh}"
 TIMEOUT_SECONDS="${SNP_REPRO_TIMEOUT_SECONDS:-180}"
 ERROR_PATTERN="${SNP_REPRO_ERROR_PATTERN:-fatal error|failed to run VP|Bad address|guest halted|triple fault|panicked at|assertion failed|abnormal exit|SIGABRT|core dumped|node failure|Connection reset by peer}"
-SUCCESS_PATTERN="${SNP_REPRO_SUCCESS_PATTERN:-Run /init as init process|Dropping to a shell|~ #}"
+SHELL_PATTERN="${SNP_REPRO_SHELL_PATTERN:-~ #}"
 
-python3 - "$HOST" "$REMOTE_SCRIPT" "$TIMEOUT_SECONDS" "$ERROR_PATTERN" "$SUCCESS_PATTERN" <<'PY'
+python3 - "$HOST" "$REMOTE_SCRIPT" "$TIMEOUT_SECONDS" "$ERROR_PATTERN" "$SHELL_PATTERN" <<'PY'
 import os
 import pty
 import re
@@ -20,10 +20,30 @@ import subprocess
 import sys
 import time
 
-host, remote_script, timeout_seconds, error_pattern, success_pattern = sys.argv[1:]
+host, remote_script, timeout_seconds, error_pattern, shell_pattern = sys.argv[1:]
 timeout_seconds = int(timeout_seconds)
 pattern = re.compile(error_pattern)
-success = re.compile(success_pattern)
+shell_ready = re.compile(shell_pattern)
+smoke_success = re.compile(r"(?:^|[\r\n])OVMM_SMOKE_ALL_PASS(?:[\r\n]|$)")
+smoke_failure = re.compile(r"(?:^|[\r\n])OVMM_SMOKE_[A-Z_]+_FAIL(?:[\r\n]|$)")
+smoke_command = (
+    "ok=1; echo OVMM_SMOKE_BEGIN; "
+    "d=; for p in /sys/class/block/vd*; do [ -e \"$p\" ] || continue; "
+    "[ \"$(cat \"$p/size\")\" = 131072 ] && d=${p##*/} && break; done; "
+    "m=OPENVMM-VIRTIO-BLK-SMOKE; "
+    "if [ -n \"$d\" ] && printf %s \"$m\" | dd of=/dev/$d bs=1 count=${#m} conv=fsync 2>/dev/null "
+    "&& [ \"$(dd if=/dev/$d bs=1 count=${#m} 2>/dev/null)\" = \"$m\" ]; "
+    "then echo OVMM_SMOKE_BLK_PASS; else echo OVMM_SMOKE_BLK_FAIL; ok=0; fi; "
+    "n=; for p in /sys/class/net/*; do [ -e \"$p\" ] || continue; "
+    "[ \"${p##*/}\" != lo ] && n=${p##*/} && break; done; "
+    "if [ -n \"$n\" ]; then echo OVMM_SMOKE_NET_ENUM_PASS; "
+    "else echo OVMM_SMOKE_NET_ENUM_FAIL; ok=0; fi; "
+    "if [ -n \"$n\" ] && ifconfig \"$n\" 10.0.0.2 netmask 255.255.255.0 up; "
+    "then echo OVMM_SMOKE_NET_LINK_PASS; else echo OVMM_SMOKE_NET_LINK_FAIL; ok=0; fi; "
+    "if [ -n \"$n\" ] && ping -c 1 -W 2 10.0.0.1 >/dev/null 2>&1; "
+    "then echo OVMM_SMOKE_NET_PING_PASS; else echo OVMM_SMOKE_NET_PING_FAIL; ok=0; fi; "
+    "if [ \"$ok\" = 1 ]; then echo OVMM_SMOKE_ALL_PASS; else echo OVMM_SMOKE_ALL_FAIL; fi"
+)
 
 argv = ["ssh", "-t", host, remote_script]
 pid, fd = pty.fork()
@@ -38,9 +58,17 @@ timed_out = False
 child_status = None
 pending_quit = False
 pending_quit_since = None
+smoke_sent = False
 
 def send_quit():
     os.write(fd, b"\x11q\r")
+
+def send_smoke_test():
+    print("\nSNP repro: running virtio block/network smoke tests", file=sys.stderr, flush=True)
+    payload = f"{smoke_command}\r".encode()
+    for offset in range(0, len(payload), 32):
+        os.write(fd, payload[offset : offset + 32])
+        time.sleep(0.01)
 
 try:
     while True:
@@ -78,7 +106,17 @@ try:
             if not pending_quit:
                 pending_quit = True
                 pending_quit_since = time.monotonic()
-        if success.search(buffer):
+        if shell_ready.search(buffer) and not smoke_sent:
+            send_smoke_test()
+            smoke_sent = True
+            buffer = ""
+            continue
+        if smoke_failure.search(buffer):
+            matched_error = True
+            if not pending_quit:
+                pending_quit = True
+                pending_quit_since = time.monotonic()
+        if smoke_success.search(buffer):
             matched_success = True
             if not pending_quit:
                 pending_quit = True
@@ -117,7 +155,9 @@ try:
             sys.exit(124)
         if child_exit != 0:
             print(f"\nSNP repro command exited unexpectedly with status {child_exit}", file=sys.stderr)
-        sys.exit(child_exit)
+            sys.exit(child_exit)
+        print("\nSNP repro exited before virtio smoke tests passed", file=sys.stderr)
+        sys.exit(1)
 
     try:
         os.kill(pid, signal.SIGTERM)
@@ -130,7 +170,11 @@ try:
         sys.exit(0)
     if timed_out:
         sys.exit(124)
-    sys.exit(os.waitstatus_to_exitcode(status))
+    child_exit = os.waitstatus_to_exitcode(status)
+    if child_exit != 0:
+        sys.exit(child_exit)
+    print("\nSNP repro exited before virtio smoke tests passed", file=sys.stderr)
+    sys.exit(1)
 except KeyboardInterrupt:
     try:
         os.kill(pid, signal.SIGTERM)
