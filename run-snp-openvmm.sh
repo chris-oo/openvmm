@@ -35,6 +35,8 @@ cmd=(
     --pcie-root-complex rc0,segment=0,start_bus=0,end_bus=255,low_mmio=4M,high_mmio=1G
     --pcie-root-port rc0:blk
     --virtio-blk "mem:$VIRTIO_BLK_SIZE,pcie_port=blk"
+    --pcie-root-port rc0:net
+    --virtio-net pcie_port=net:consomme
     --kernel "$KERNEL"
     --initrd "$INITRD"
     -m "$MEMORY"

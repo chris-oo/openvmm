@@ -14,7 +14,7 @@ OPENVMM_EXIT_TIMEOUT_SECONDS="${CCA_REPRO_OPENVMM_EXIT_TIMEOUT_SECONDS:-15}"
 LOGIN="${CCA_REPRO_LOGIN:-root}"
 REMOTE_SCRIPT="${CCA_REPRO_REMOTE_SCRIPT:-/cca-share/run-openvmm-kvm-cca.sh}"
 ERROR_PATTERN="${CCA_REPRO_ERROR_PATTERN:-fatal error|failed to run VP|[Gg]uest crash(?:ed)?|guest halted|triple fault|panicked at|assertion failed|abnormal exit|SIGABRT|core dumped|Internal error|Unhandled|VCPU panic|Kernel panic}"
-SUCCESS_PATTERN="${CCA_REPRO_SUCCESS_PATTERN:-No root device specified\\. Dropping to a shell\\.|can.t access tty; job control turned off}"
+SHELL_PATTERN="${CCA_REPRO_SHELL_PATTERN:-No root device specified\\. Dropping to a shell\\.|can.t access tty; job control turned off}"
 
 python3 - \
     "$HOST_KERNEL" \
@@ -27,7 +27,7 @@ python3 - \
     "$LOGIN" \
     "$REMOTE_SCRIPT" \
     "$ERROR_PATTERN" \
-    "$SUCCESS_PATTERN" \
+    "$SHELL_PATTERN" \
     "$@" <<'PY'
 import os
 import pty
@@ -50,15 +50,35 @@ import time
     login,
     remote_script,
     error_pattern,
-    success_pattern,
+    shell_pattern,
     *extra_args,
 ) = sys.argv[1:]
 timeout_seconds = int(timeout_seconds)
 xflowey_exit_timeout_seconds = int(xflowey_exit_timeout_seconds)
 openvmm_exit_timeout_seconds = int(openvmm_exit_timeout_seconds)
 error = re.compile(error_pattern)
-success = re.compile(success_pattern)
+shell_ready = re.compile(shell_pattern)
+smoke_success = re.compile(r"(?:^|[\r\n])OVMM_SMOKE_ALL_PASS(?:[\r\n]|$)")
+smoke_failure = re.compile(r"(?:^|[\r\n])OVMM_SMOKE_[A-Z_]+_FAIL(?:[\r\n]|$)")
 shell_prompt = re.compile(r"(?:^|[\r\n])[^#\r\n]*#\s*$")
+smoke_command = (
+    "ok=1; echo OVMM_SMOKE_BEGIN; "
+    "d=; for p in /sys/class/block/vd*; do [ -e \"$p\" ] || continue; "
+    "[ \"$(cat \"$p/size\")\" = 131072 ] && d=${p##*/} && break; done; "
+    "m=OPENVMM-VIRTIO-BLK-SMOKE; "
+    "if [ -n \"$d\" ] && printf %s \"$m\" | dd of=/dev/$d bs=1 count=${#m} conv=fsync 2>/dev/null "
+    "&& [ \"$(dd if=/dev/$d bs=1 count=${#m} 2>/dev/null)\" = \"$m\" ]; "
+    "then echo OVMM_SMOKE_BLK_PASS; else echo OVMM_SMOKE_BLK_FAIL; ok=0; fi; "
+    "n=; for p in /sys/class/net/*; do [ -e \"$p\" ] || continue; "
+    "[ \"${p##*/}\" != lo ] && n=${p##*/} && break; done; "
+    "if [ -n \"$n\" ]; then echo OVMM_SMOKE_NET_ENUM_PASS; "
+    "else echo OVMM_SMOKE_NET_ENUM_FAIL; ok=0; fi; "
+    "if [ -n \"$n\" ] && ifconfig \"$n\" 10.0.0.2 netmask 255.255.255.0 up; "
+    "then echo OVMM_SMOKE_NET_LINK_PASS; else echo OVMM_SMOKE_NET_LINK_FAIL; ok=0; fi; "
+    "if [ -n \"$n\" ] && ping -c 1 -W 2 10.0.0.1 >/dev/null 2>&1; "
+    "then echo OVMM_SMOKE_NET_PING_PASS; else echo OVMM_SMOKE_NET_PING_FAIL; ok=0; fi; "
+    "if [ \"$ok\" = 1 ]; then echo OVMM_SMOKE_ALL_PASS; else echo OVMM_SMOKE_ALL_FAIL; fi"
+)
 
 argv = [
     "cargo",
@@ -150,6 +170,13 @@ def send_openvmm_quit():
     print("\nCCA repro: quitting OpenVMM", file=sys.stderr, flush=True)
     os.write(fd, b"q\r")
 
+def send_smoke_test():
+    print("\nCCA repro: running virtio block/network smoke tests", file=sys.stderr, flush=True)
+    payload = f"{smoke_command}\r".encode()
+    for offset in range(0, len(payload), 8):
+        os.write(fd, payload[offset : offset + 8])
+        time.sleep(0.05)
+
 
 pid, fd = pty.fork()
 if pid == 0:
@@ -172,6 +199,8 @@ last_login_sent = 0.0
 openvmm_quit_sent = False
 openvmm_quit_command_sent = False
 openvmm_quit_deadline = None
+guest_shell_ready = False
+smoke_sent = False
 
 try:
     while True:
@@ -230,12 +259,23 @@ try:
             buffer = ""
             continue
 
-        repro_started = command_sent or "Run /init as init process" in buffer or success.search(buffer)
+        repro_started = command_sent or "Run /init as init process" in buffer or shell_ready.search(buffer)
         if repro_started and error.search(buffer):
             matched_error = True
             stop_fvp()
             break
-        if repro_started and success.search(buffer):
+        if repro_started and shell_ready.search(buffer):
+            guest_shell_ready = True
+        if guest_shell_ready and shell_prompt.search(buffer) and not smoke_sent:
+            send_smoke_test()
+            smoke_sent = True
+            buffer = ""
+            continue
+        if smoke_failure.search(buffer):
+            matched_error = True
+            stop_fvp()
+            break
+        if smoke_success.search(buffer):
             matched_success = True
             if not openvmm_quit_sent:
                 send_openvmm_escape()
@@ -269,11 +309,24 @@ try:
                 text = data.decode(errors="replace")
                 print(text, end="", flush=True)
                 buffer = (buffer + text)[-8192:]
-                repro_started = command_sent or "Run /init as init process" in buffer or success.search(buffer)
+                repro_started = (
+                    command_sent
+                    or "Run /init as init process" in buffer
+                    or shell_ready.search(buffer)
+                )
                 if repro_started and error.search(buffer):
                     matched_error = True
                     stop_fvp()
-                if repro_started and success.search(buffer):
+                if repro_started and shell_ready.search(buffer):
+                    guest_shell_ready = True
+                if guest_shell_ready and shell_prompt.search(buffer) and not smoke_sent:
+                    send_smoke_test()
+                    smoke_sent = True
+                    buffer = ""
+                if smoke_failure.search(buffer):
+                    matched_error = True
+                    stop_fvp()
+                if smoke_success.search(buffer):
                     matched_success = True
                     if not openvmm_quit_sent:
                         send_openvmm_escape()
@@ -309,14 +362,14 @@ try:
     if matched_error:
         finish("FAILURE", "matched an error/crash pattern", 1)
     if matched_success:
-        finish("SUCCESS", "guest reached the expected dropped-shell pattern", 0)
+        finish("SUCCESS", "virtio block and network smoke tests passed", 0)
     if timed_out:
         finish("FAILURE", f"timed out after {timeout_seconds} seconds", 124)
 
     exit_code = child_exit_code(child_status)
     if exit_code not in (None, 0):
         finish("FAILURE", f"command exited unexpectedly with status {exit_code}", exit_code)
-    finish("SUCCESS", "command exited cleanly before a known outcome pattern was observed", 0)
+    finish("FAILURE", "command exited before virtio smoke tests passed", 1)
 except KeyboardInterrupt:
     stop_fvp()
     try:

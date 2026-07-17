@@ -244,6 +244,9 @@ if [ "$preflight_rc" -ne 0 ]; then
 fi
 
 dmesg >/cca/logs/host-dmesg-before-openvmm.log 2>&1 || true
+if [ ! -e /etc/resolv.conf ]; then
+    printf 'nameserver 10.0.0.1\n' >/etc/resolv.conf
+fi
 set +e
 RUST_BACKTRACE=1 "$ARTIFACT_DIR/openvmm" \
     --isolation cca \
@@ -258,6 +261,8 @@ RUST_BACKTRACE=1 "$ARTIFACT_DIR/openvmm" \
     --virtio-console-pcie-port console \
     --pcie-root-port rc0:blk \
     --virtio-blk "mem:$VIRTIO_BLK_SIZE,pcie_port=blk" \
+    --pcie-root-port rc0:net \
+    --virtio-net pcie_port=net:consomme \
     --cmdline "console=hvc0" \
     {extra_args} \
     2>&1 | tee /cca/logs/openvmm.log

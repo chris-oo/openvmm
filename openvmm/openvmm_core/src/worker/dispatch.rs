@@ -1146,6 +1146,8 @@ impl InitializedVm {
             layout: cfg.layout.clone(),
             pcie_root_complexes: &cfg.pcie_root_complexes,
             virtio_mmio_count,
+            pcie_ecam_below_4gb: cfg.hypervisor.with_isolation
+                == Some(openvmm_defs::config::IsolationType::Snp),
             vtl2_layout,
             ram_start_address,
             vtl2_framebuffer_size,
