@@ -1299,6 +1299,14 @@ impl Options {
         }
         Ok(())
     }
+
+    /// Validates isolation-specific command-line option combinations.
+    pub fn validate_isolation_options(&self) -> anyhow::Result<()> {
+        if matches!(self.isolation, Some(IsolationCli::Snp)) && self.uefi {
+            anyhow::bail!("SNP isolation currently only supports Linux direct boot");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -5329,6 +5337,23 @@ mod tests {
         let opt = Options::try_parse_from(["openvmm", "--memory", "shared=on", "--private-memory"])
             .unwrap();
         assert!(opt.validate_memory_options().is_err());
+    }
+
+    #[test]
+    fn test_isolation_options_reject_snp_uefi() {
+        let opt = Options::try_parse_from(["openvmm", "--isolation", "snp", "--uefi"]).unwrap();
+
+        assert_eq!(
+            opt.validate_isolation_options().unwrap_err().to_string(),
+            "SNP isolation currently only supports Linux direct boot"
+        );
+    }
+
+    #[test]
+    fn test_isolation_options_allow_vbs_uefi() {
+        let opt = Options::try_parse_from(["openvmm", "--isolation", "vbs", "--uefi"]).unwrap();
+
+        opt.validate_isolation_options().unwrap();
     }
 
     #[test]
