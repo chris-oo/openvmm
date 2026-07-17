@@ -1315,6 +1315,16 @@ impl Options {
                 anyhow::bail!("SNP isolation currently does not support hugetlb memory");
             }
         }
+        #[cfg(guest_arch = "aarch64")]
+        if matches!(self.isolation, Some(IsolationCli::Cca))
+            && (self.memory.hugepages
+                || self
+                    .numa
+                    .as_ref()
+                    .is_some_and(|nodes| nodes.iter().any(|node| node.memory.hugepages)))
+        {
+            anyhow::bail!("CCA isolation currently does not support hugetlb memory");
+        }
         Ok(())
     }
 }
@@ -5406,6 +5416,33 @@ mod tests {
         .unwrap();
 
         opt.validate_isolation_options().unwrap();
+    }
+
+    #[cfg(guest_arch = "aarch64")]
+    #[test]
+    fn test_isolation_options_reject_cca_hugepages() {
+        for args in [
+            vec![
+                "openvmm",
+                "--isolation",
+                "cca",
+                "--memory",
+                "size=1G,hugepages=on",
+            ],
+            vec![
+                "openvmm",
+                "--isolation",
+                "cca",
+                "--numa",
+                "size=1G,hugepages=on",
+            ],
+        ] {
+            let opt = Options::try_parse_from(args).unwrap();
+            assert_eq!(
+                opt.validate_isolation_options().unwrap_err().to_string(),
+                "CCA isolation currently does not support hugetlb memory"
+            );
+        }
     }
 
     #[test]
