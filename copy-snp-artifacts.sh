@@ -11,7 +11,7 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 OPENVMM_BIN="${OPENVMM_BIN:-$REPO_ROOT/target/x86_64-unknown-linux-gnu/debug/openvmm}"
 LINUX_KERNEL="${SNP_KERNEL:-$REPO_ROOT/vmlinuz-6.17.0-23-generic}"
-LINUX_INITRD="${SNP_INITRD:-$REPO_ROOT/target/vmm-tests/x64/initrd}"
+LINUX_INITRD="${SNP_INITRD:-$REPO_ROOT/target/vmm_tests/x64/initrd}"
 RUN_SCRIPT="$REPO_ROOT/run-snp-openvmm.sh"
 
 echo "Building OpenVMM..."
