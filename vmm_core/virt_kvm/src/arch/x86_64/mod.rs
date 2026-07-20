@@ -1679,32 +1679,37 @@ impl<'p> Processor for KvmProcessor<'p> {
                         flags,
                     } => {
                         if nr == kvm::KVM_HC_MAP_GPA_RANGE_UAPI {
+                            let gpa = args[0];
+                            let page_count = args[1];
+                            let map_attributes = args[2];
+
                             tracing::debug!(
-                                gpa = args[0],
-                                page_count = args[1],
-                                map_attributes = args[2],
+                                gpa,
+                                page_count,
+                                map_attributes,
                                 flags,
                                 "handling KVM_HC_MAP_GPA_RANGE"
                             );
-                            match self
-                                .partition
-                                .set_map_gpa_range_attributes(args[0], args[1], args[2])
-                            {
+                            match self.partition.set_map_gpa_range_attributes(
+                                gpa,
+                                page_count,
+                                map_attributes,
+                            ) {
                                 Ok(()) => {
                                     *result = 0;
                                     tracing::debug!(
-                                        gpa = args[0],
-                                        page_count = args[1],
-                                        map_attributes = args[2],
+                                        gpa,
+                                        page_count,
+                                        map_attributes,
                                         "handled KVM_HC_MAP_GPA_RANGE"
                                     );
                                 }
                                 Err(err) => {
                                     tracelimit::error_ratelimited!(
                                         error = &err as &dyn std::error::Error,
-                                        gpa = args[0],
-                                        page_count = args[1],
-                                        map_attributes = args[2],
+                                        gpa,
+                                        page_count,
+                                        map_attributes,
                                         "failed KVM_HC_MAP_GPA_RANGE"
                                     );
                                     *result = 1;

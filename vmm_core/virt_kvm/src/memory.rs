@@ -264,6 +264,17 @@ impl KvmPartitionInner {
         }
     }
 
+    /// Applies a guest-requested SNP shared/private state change.
+    ///
+    /// `page_count` is always expressed in 4-KiB pages by
+    /// `KVM_HC_MAP_GPA_RANGE`. The page-size bits in `map_attributes` describe
+    /// the guest's preferred processing granularity, but do not change the
+    /// units of `page_count`.
+    ///
+    /// The range must be non-empty, page-aligned, fully contained in RAM, and
+    /// request either the encrypted or decrypted state. After updating KVM's
+    /// private-memory attributes, the backing for the old state is discarded
+    /// so stale data cannot be reused if the page later transitions back.
     #[cfg(guest_arch = "x86_64")]
     pub(crate) fn set_map_gpa_range_attributes(
         &self,
@@ -316,6 +327,13 @@ impl KvmPartitionInner {
     }
 
     #[cfg(guest_arch = "x86_64")]
+    /// Discards data from the backing that is no longer selected by KVM.
+    ///
+    /// Guestmemfd memory slots have separate shared userspace and private
+    /// guestmemfd backings. For a shared-to-private conversion, discard the
+    /// shared mapping with `MADV_DONTNEED`. For a private-to-shared conversion,
+    /// punch a hole in guestmemfd so private data cannot become visible after a
+    /// later conversion back to private.
     fn discard_stale_private_memory_backing(
         &self,
         range: MemoryRange,
