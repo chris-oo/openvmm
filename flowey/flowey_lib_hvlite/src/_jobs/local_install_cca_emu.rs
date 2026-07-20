@@ -196,22 +196,16 @@ pub(crate) fn build_cca_rootfs(
     buildroot_overlay: bool,
     use_docker_runtime: bool,
 ) -> anyhow::Result<()> {
-    let shrinkwrap_py = shrinkwrap_dir.join("shrinkwrap/shrinkwrap.py");
-    let venv_python = venv_dir.join("bin/python3");
+    let shrinkwrap_bin = venv_dir.join("bin/shrinkwrap");
     anyhow::ensure!(
-        shrinkwrap_py.exists(),
-        "shrinkwrap installation is missing or broken at {}, try --install-emu first",
-        shrinkwrap_py.display()
+        shrinkwrap_bin.exists(),
+        "shrinkwrap executable is missing at {}, try --install-emu first",
+        shrinkwrap_bin.display()
     );
     anyhow::ensure!(
         venv_dir.exists(),
         "shrinkwrap venv is missing at {}, try --install-emu first",
         venv_dir.display()
-    );
-    anyhow::ensure!(
-        venv_python.exists(),
-        "shrinkwrap venv python is missing at {}, try --install-emu first",
-        venv_python.display()
     );
 
     let log_dir = test_root.join("logs");
@@ -226,8 +220,7 @@ pub(crate) fn build_cca_rootfs(
 
     let tfa_revision = "8dae0862c502e08568a61a1050091fa9357f1240";
     log::info!("shrinkwrap build log: {}", log_file.display());
-    let mut cmd = Command::new(&venv_python);
-    cmd.arg(&shrinkwrap_py);
+    let mut cmd = Command::new(&shrinkwrap_bin);
     if use_docker_runtime {
         cmd.arg("--runtime=docker")
             .arg("--image=shrinkwraptool/base-slim:2026.3.0.dev0");
@@ -383,6 +376,8 @@ impl SimpleFlowNode for Node {
                     flowey::shell_cmd!(rt, "{pip} install --upgrade pip").run()?;
                     flowey::shell_cmd!(rt, "{pip} install pyyaml termcolor tuxmake").run()?;
                 }
+                let pip = venv_dir.join("bin/pip");
+                flowey::shell_cmd!(rt, "{pip} install --editable {shrinkwrap_dir}").run()?;
 
                 sync_shrinkwrap_overlay_assets(
                     &openvmm_root,
