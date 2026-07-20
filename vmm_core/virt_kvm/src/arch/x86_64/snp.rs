@@ -1,14 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-#![allow(dead_code)]
-
 use crate::KvmError;
 use virt::InitialPageImportType;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum SnpLaunchPageType {
     Normal,
+    #[cfg_attr(not(test), expect(dead_code))]
     Zero,
     Unmeasured,
     Secrets,

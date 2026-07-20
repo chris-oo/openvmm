@@ -165,7 +165,7 @@ pub enum BaseChipsetType {
     HclHost,
     /// Unenlightened Linux VM, with basic architectural devices.
     UnenlightenedLinuxDirect,
-    /// Enlightened Linux VM with no emulated chipset devices.
+    /// Enlightened Linux VM with a minimal emulated chipset for direct boot.
     EnlightenedLinuxDirect,
 }
 
