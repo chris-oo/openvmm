@@ -34,6 +34,8 @@ pub enum Error {
     Dt(#[source] DtError),
     #[error("failed to write EFI/ACPI tables to guest memory")]
     Efi(#[source] guestmem::GuestMemoryError),
+    #[error("missing SNP C-bit CPUID information")]
+    MissingSnpCBit,
 }
 
 struct Aarch64EfiInfo {
@@ -51,6 +53,7 @@ pub struct KernelConfig<'a> {
     pub cmdline: &'a str,
     pub mem_layout: &'a MemoryLayout,
     pub isolation: Option<IsolationType>,
+    pub snp_c_bit: Option<u8>,
 }
 
 /// The default SMBIOS identity for firmware-less Linux direct boot.
@@ -104,8 +107,13 @@ pub fn load_linux_x86(
     });
 
     let cmdline = CString::new(cfg.cmdline).unwrap();
-    let snp_boot =
-        (cfg.isolation == Some(IsolationType::Snp)).then_some(loader::linux::SnpBootConfig);
+    let snp_boot = if cfg.isolation == Some(IsolationType::Snp) {
+        Some(loader::linux::SnpBootConfig {
+            c_bit: cfg.snp_c_bit.ok_or(Error::MissingSnpCBit)?,
+        })
+    } else {
+        None
+    };
 
     let mut loader = Loader::new(gm.clone(), cfg.mem_layout, hvdef::Vtl::Vtl0);
 

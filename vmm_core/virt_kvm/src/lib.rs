@@ -76,10 +76,6 @@ pub enum KvmError {
     InvalidSnpLaunchRange,
     #[error("too many CPUID entries for SNP launch page: {0}")]
     TooManySnpCpuidEntries(usize),
-    #[error("missing SNP C-bit CPUID information")]
-    MissingSnpCBit,
-    #[error("invalid SNP direct-boot page table length: {0:#x}")]
-    InvalidSnpPageTableLength(u64),
     #[error("invalid KVM_HC_MAP_GPA_RANGE request")]
     InvalidMapGpaRange,
     #[error("unsupported KVM_HC_MAP_GPA_RANGE attributes: {0:#x}")]

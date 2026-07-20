@@ -3133,6 +3133,7 @@ impl LoadedVmInner {
                     cmdline,
                     mem_layout: &self.mem_layout,
                     isolation: self.hypervisor_cfg.with_isolation,
+                    snp_c_bit: self.partition.caps().snp_c_bit,
                 };
                 super::vm_loaders::linux::load_linux_x86(&kernel_config, &self.gm, |gpa| {
                     let tables = acpi_builder.build_acpi_tables(gpa, |dsdt| {
@@ -3171,6 +3172,7 @@ impl LoadedVmInner {
                     cmdline,
                     mem_layout: &self.mem_layout,
                     isolation: self.hypervisor_cfg.with_isolation,
+                    snp_c_bit: None,
                 };
 
                 let build_acpi = if boot_mode == LinuxDirectBootMode::Acpi {
