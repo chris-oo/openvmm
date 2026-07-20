@@ -6,7 +6,9 @@ use crate::KvmPartition;
 use crate::KvmPartitionInner;
 use inspect::Inspect;
 use memory_range::MemoryRange;
+#[cfg(guest_arch = "x86_64")]
 use std::fs::File;
+#[cfg(guest_arch = "x86_64")]
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
@@ -37,9 +39,11 @@ pub(crate) struct KvmPrivateMemoryRange {
 #[inspect(external_tag)]
 pub(crate) enum KvmMemoryBackingMode {
     Userspace,
+    #[cfg(guest_arch = "x86_64")]
     GuestMemfd(KvmGuestMemfdBacking),
 }
 
+#[cfg(guest_arch = "x86_64")]
 #[derive(Debug, Inspect)]
 pub(crate) struct KvmGuestMemfdBacking {
     #[inspect(skip)]
@@ -49,12 +53,14 @@ pub(crate) struct KvmGuestMemfdBacking {
     initial_private: bool,
 }
 
+#[cfg(guest_arch = "x86_64")]
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Inspect)]
 struct KvmGuestMemfdRange {
     range: MemoryRange,
     file_offset: u64,
 }
 
+#[cfg(guest_arch = "x86_64")]
 #[derive(Debug)]
 enum KvmMemoryBacking<'a> {
     Userspace,
@@ -65,7 +71,14 @@ enum KvmMemoryBacking<'a> {
     },
 }
 
+#[cfg(guest_arch = "aarch64")]
+#[derive(Debug)]
+enum KvmMemoryBacking {
+    Userspace,
+}
+
 impl KvmMemoryBackingMode {
+    #[cfg(guest_arch = "x86_64")]
     pub(crate) fn guest_memfd(
         kvm: &kvm::Partition,
         ram_ranges: impl IntoIterator<Item = MemoryRange>,
@@ -160,6 +173,7 @@ impl KvmPartitionInner {
                 };
                 (None, false)
             }
+            #[cfg(guest_arch = "x86_64")]
             KvmMemoryBacking::GuestMemfd {
                 file,
                 file_offset,
@@ -203,6 +217,7 @@ impl KvmPartitionInner {
         Ok(())
     }
 
+    #[cfg(guest_arch = "x86_64")]
     fn memory_backing(&self, range: MemoryRange) -> Result<KvmMemoryBacking<'_>, KvmError> {
         match &self.memory_backing_mode {
             KvmMemoryBackingMode::Userspace => Ok(KvmMemoryBacking::Userspace),
@@ -217,6 +232,11 @@ impl KvmPartitionInner {
                 }
             }
         }
+    }
+
+    #[cfg(guest_arch = "aarch64")]
+    fn memory_backing(&self, _range: MemoryRange) -> Result<KvmMemoryBacking, KvmError> {
+        Ok(KvmMemoryBacking::Userspace)
     }
 
     /// # Safety
@@ -295,7 +315,7 @@ impl KvmPartitionInner {
         Ok(())
     }
 
-    #[cfg_attr(guest_arch = "aarch64", expect(dead_code))]
+    #[cfg(guest_arch = "x86_64")]
     fn discard_stale_private_memory_backing(
         &self,
         range: MemoryRange,
@@ -381,6 +401,7 @@ pub(crate) fn private_memory_range_from_slots(
     })
 }
 
+#[cfg(guest_arch = "x86_64")]
 fn check_private_memory_extensions(kvm: &kvm::Partition) -> Result<(), KvmError> {
     require_kvm_extension(kvm, kvm::KVM_CAP_USER_MEMORY2, "KVM_CAP_USER_MEMORY2")?;
     require_kvm_extension(kvm, kvm::KVM_CAP_GUEST_MEMFD, "KVM_CAP_GUEST_MEMFD")?;
@@ -398,6 +419,7 @@ fn check_private_memory_extensions(kvm: &kvm::Partition) -> Result<(), KvmError>
     Ok(())
 }
 
+#[cfg(guest_arch = "x86_64")]
 fn require_kvm_extension(
     kvm: &kvm::Partition,
     extension: u32,
@@ -412,6 +434,7 @@ fn require_kvm_extension(
     Ok(value)
 }
 
+#[cfg(guest_arch = "x86_64")]
 fn classify_guest_memfd_backing(
     range: MemoryRange,
     ram_ranges: &[KvmGuestMemfdRange],
@@ -503,6 +526,7 @@ mod tests {
         MemoryRange::new(start..end)
     }
 
+    #[cfg(guest_arch = "x86_64")]
     fn guest_memfd_ranges(ranges: &[MemoryRange]) -> Vec<KvmGuestMemfdRange> {
         let mut file_offset = 0;
         ranges
@@ -542,6 +566,7 @@ mod tests {
         })
     }
 
+    #[cfg(guest_arch = "x86_64")]
     #[test]
     fn guest_memfd_classifier_selects_contained_ram() {
         let ram_ranges = guest_memfd_ranges(&[range(0x1000, 0x9000), range(0x1_0000, 0x2_0000)]);
@@ -556,6 +581,7 @@ mod tests {
         );
     }
 
+    #[cfg(guest_arch = "x86_64")]
     #[test]
     fn guest_memfd_classifier_keeps_non_ram_userspace() {
         let ram_ranges = guest_memfd_ranges(&[range(0x1000, 0x9000), range(0x1_0000, 0x2_0000)]);
@@ -566,6 +592,7 @@ mod tests {
         );
     }
 
+    #[cfg(guest_arch = "x86_64")]
     #[test]
     fn guest_memfd_classifier_rejects_partial_ram_overlap() {
         let ram_ranges = guest_memfd_ranges(&[range(0x1000, 0x9000), range(0x1_0000, 0x2_0000)]);
@@ -576,6 +603,7 @@ mod tests {
         ));
     }
 
+    #[cfg(guest_arch = "x86_64")]
     #[test]
     fn guest_memfd_classifier_does_not_merge_adjacent_ram_ranges() {
         let ram_ranges = guest_memfd_ranges(&[range(0x1000, 0x3000), range(0x3000, 0x5000)]);
@@ -586,6 +614,7 @@ mod tests {
         ));
     }
 
+    #[cfg(guest_arch = "x86_64")]
     #[test]
     fn guest_memfd_classifier_rejects_ambiguous_ram_containment() {
         let ram_ranges = guest_memfd_ranges(&[range(0x1000, 0x5000), range(0x2000, 0x4000)]);
