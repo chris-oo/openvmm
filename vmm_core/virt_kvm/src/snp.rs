@@ -68,10 +68,7 @@ impl KvmPartitionInner {
 
         let memory = self.memory.lock();
         for page in pages {
-            let launch_page_type = crate::arch::snp::snp_launch_page_type(page.import_type)?;
-            let Some(kvm_page_type) = launch_page_type.kvm_page_type() else {
-                return Err(KvmError::UnsupportedSnpPageImportType(page.import_type));
-            };
+            let kvm_page_type = crate::arch::snp::snp_launch_page_type(page.import_type)?;
 
             let private_range = private_memory_range_from_slots(page.range, &memory.ranges)
                 .map_err(map_snp_private_range_error)?;
@@ -89,62 +86,46 @@ impl KvmPartitionInner {
                     page.range.len(),
                 );
             }
-            let bytes = unsafe {
-                std::slice::from_raw_parts(
-                    private_range.hva.cast_const(),
-                    page.range.len() as usize,
-                )
-            };
-            for run in split_zero_page_runs(bytes)? {
-                let page_type = if run.kind == SnpPageRunKind::Zero
-                    && kvm_page_type == kvm::SevSnpPageType::Normal
-                {
-                    kvm::SevSnpPageType::Zero
-                } else {
-                    kvm_page_type
-                };
-                let gpa = page.range.start() + run.byte_offset as u64;
-                let uaddr = if page_type == kvm::SevSnpPageType::Zero {
-                    0
-                } else {
-                    private_range.hva.wrapping_add(run.byte_offset) as u64
-                };
-                tracing::trace!(
-                    gpa,
-                    len = run.byte_len,
-                    ?page_type,
-                    import_type = ?page.import_type,
-                    tag = page.tag,
-                    "KVM_SEV_SNP_LAUNCH_UPDATE"
-                );
-                let cpuid_page_before =
-                    (page.import_type == InitialPageImportType::Cpuid).then(|| unsafe {
-                        std::slice::from_raw_parts(private_range.hva, page.range.len() as usize)
-                            .to_vec()
-                    });
-                if let Err(err) = self.kvm.sev_snp_launch_update(
-                    sev.as_fd(),
-                    gpa / hvdef::HV_PAGE_SIZE,
-                    uaddr,
-                    run.byte_len as u64,
-                    page_type,
-                ) {
-                    if let Some(cpuid_page_before) = cpuid_page_before {
-                        Self::trace_snp_cpuid_page_diff(
-                            &cpuid_page_before,
-                            private_range.hva,
-                            page.range.len(),
-                        );
-                    }
-                    return Err(err.into());
-                }
-                if page.import_type == InitialPageImportType::Cpuid {
-                    Self::trace_snp_cpuid_page(
-                        "SNP CPUID page after launch update",
+            // IGVM page data with no file payload represents a normal private
+            // page containing zeroes, not an SNP hardware ZERO page. Do not
+            // infer the page type from contents; add an explicit import type if
+            // IGVM gains native hardware-zero-page semantics.
+            let gpa = page.range.start();
+            tracing::trace!(
+                gpa,
+                len = page.range.len(),
+                ?kvm_page_type,
+                import_type = ?page.import_type,
+                tag = page.tag,
+                "KVM_SEV_SNP_LAUNCH_UPDATE"
+            );
+            let cpuid_page_before =
+                (page.import_type == InitialPageImportType::Cpuid).then(|| unsafe {
+                    std::slice::from_raw_parts(private_range.hva, page.range.len() as usize)
+                        .to_vec()
+                });
+            if let Err(err) = self.kvm.sev_snp_launch_update(
+                sev.as_fd(),
+                gpa / hvdef::HV_PAGE_SIZE,
+                private_range.hva as u64,
+                page.range.len(),
+                kvm_page_type,
+            ) {
+                if let Some(cpuid_page_before) = cpuid_page_before {
+                    Self::trace_snp_cpuid_page_diff(
+                        &cpuid_page_before,
                         private_range.hva,
                         page.range.len(),
                     );
                 }
+                return Err(err.into());
+            }
+            if page.import_type == InitialPageImportType::Cpuid {
+                Self::trace_snp_cpuid_page(
+                    "SNP CPUID page after launch update",
+                    private_range.hva,
+                    page.range.len(),
+                );
             }
         }
         self.prepare_snp_vmsa_register_state()?;
@@ -411,94 +392,9 @@ fn map_snp_private_range_error(err: KvmError) -> KvmError {
     }
 }
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub(crate) enum SnpPageRunKind {
-    Zero,
-    NonZero,
-}
-
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub(crate) struct SnpPageRun {
-    byte_offset: usize,
-    byte_len: usize,
-    kind: SnpPageRunKind,
-}
-
-pub(crate) fn split_zero_page_runs(bytes: &[u8]) -> Result<Vec<SnpPageRun>, KvmError> {
-    const PAGE_SIZE: usize = hvdef::HV_PAGE_SIZE as usize;
-    if !bytes.len().is_multiple_of(PAGE_SIZE) {
-        return Err(KvmError::UnalignedSnpLaunchRange);
-    }
-
-    let mut runs: Vec<SnpPageRun> = Vec::new();
-    for (page_index, page) in bytes.chunks_exact(PAGE_SIZE).enumerate() {
-        let kind = if page.iter().all(|&byte| byte == 0) {
-            SnpPageRunKind::Zero
-        } else {
-            SnpPageRunKind::NonZero
-        };
-        if let Some(run) = runs.last_mut()
-            && run.kind == kind
-        {
-            run.byte_len += PAGE_SIZE;
-            continue;
-        }
-        runs.push(SnpPageRun {
-            byte_offset: page_index * PAGE_SIZE,
-            byte_len: PAGE_SIZE,
-            kind,
-        });
-    }
-    Ok(runs)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn split_zero_page_runs_coalesces_adjacent_pages_by_zero_state() {
-        let mut bytes = vec![0u8; 5 * hvdef::HV_PAGE_SIZE as usize];
-        bytes[hvdef::HV_PAGE_SIZE as usize] = 1;
-        bytes[2 * hvdef::HV_PAGE_SIZE as usize] = 2;
-        bytes[4 * hvdef::HV_PAGE_SIZE as usize] = 3;
-
-        let runs = split_zero_page_runs(&bytes).unwrap();
-
-        assert_eq!(
-            runs,
-            vec![
-                SnpPageRun {
-                    byte_offset: 0,
-                    byte_len: hvdef::HV_PAGE_SIZE as usize,
-                    kind: SnpPageRunKind::Zero,
-                },
-                SnpPageRun {
-                    byte_offset: hvdef::HV_PAGE_SIZE as usize,
-                    byte_len: 2 * hvdef::HV_PAGE_SIZE as usize,
-                    kind: SnpPageRunKind::NonZero,
-                },
-                SnpPageRun {
-                    byte_offset: 3 * hvdef::HV_PAGE_SIZE as usize,
-                    byte_len: hvdef::HV_PAGE_SIZE as usize,
-                    kind: SnpPageRunKind::Zero,
-                },
-                SnpPageRun {
-                    byte_offset: 4 * hvdef::HV_PAGE_SIZE as usize,
-                    byte_len: hvdef::HV_PAGE_SIZE as usize,
-                    kind: SnpPageRunKind::NonZero,
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn split_zero_page_runs_rejects_partial_pages() {
-        assert!(matches!(
-            split_zero_page_runs(&[0; 17]),
-            Err(KvmError::UnalignedSnpLaunchRange)
-        ));
-    }
 
     #[test]
     fn write_snp_cpuid_page_writes_linux_table_and_xsave_inputs() {
