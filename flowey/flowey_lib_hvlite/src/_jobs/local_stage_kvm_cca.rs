@@ -3,6 +3,7 @@
 
 //! Stage native OpenVMM KVM CCA artifacts into an isolated rootfs copy.
 
+use crate::_jobs::local_install_cca_emu::SHRINKWRAP_IMAGE;
 use crate::common::CommonArch;
 use crate::common::CommonPlatform;
 use crate::common::CommonProfile;
@@ -473,17 +474,18 @@ exit 0
                     let fvp_command = if matches!(mode, StageMode::InteractiveHost) {
                         flowey::shell_cmd!(
                             rt,
-                            "{shrinkwrap_bin} --runtime=docker --image=shrinkwraptool/base-slim:2026.3.0.dev0 run cca-3world.yaml --rtvar ROOTFS={rootfs_file} --rtvar KERNEL={host_kernel} --rtvar SHARE={share_dir}"
+                            "{shrinkwrap_bin} --runtime=docker --image={SHRINKWRAP_IMAGE} run cca-3world.yaml --rtvar ROOTFS={rootfs_file} --rtvar KERNEL={host_kernel} --rtvar SHARE={share_dir}"
                         )
                     } else {
                         flowey::shell_cmd!(
                             rt,
-                            "timeout --foreground 20m {shrinkwrap_bin} --runtime=docker --image=shrinkwraptool/base-slim:2026.3.0.dev0 run cca-3world.yaml --rtvar ROOTFS={rootfs_file} --rtvar KERNEL={host_kernel} --rtvar SHARE={share_dir}"
+                            "timeout --foreground 20m {shrinkwrap_bin} --runtime=docker --image={SHRINKWRAP_IMAGE} run cca-3world.yaml --rtvar ROOTFS={rootfs_file} --rtvar KERNEL={host_kernel} --rtvar SHARE={share_dir}"
                         )
                     };
                     let fvp_result = fvp_command
                         .env("VIRTUAL_ENV", &venv_dir)
                         .env("PATH", &venv_bin_path)
+                        .env("SHRINKWRAP_CONFIG", shrinkwrap_dir.join("config"))
                         .run();
                     extract_logs(&debugfs_bin, &rootfs_file, &logs_dir)?;
                     fvp_result.with_context(|| {

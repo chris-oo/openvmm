@@ -37,8 +37,8 @@ build:
       -DPLAT_CMN_CTX_MAX_XLAT_TABLES: 13
     repo:
       remote: https://git.trustedfirmware.org/TF-RMM/tf-rmm.git
-      # topics/rmm-v2.0-poc_2, tested by the v14 KVM CCA series.
-      revision: topics/rmm-v2.0-poc_2
+      # RMM v2.0-bet1 commit tested by the v14 KVM CCA series.
+      revision: 3340667a291acd5722cb45d05135d7aa15174b25
   tfa:
     params:
       GIC_ENABLE_V4_EXTN: 1
@@ -48,7 +48,10 @@ build:
   linux:
     repo:
       remote: https://gitlab.arm.com/linux-arm/linux-cca.git
-      revision: cca/planes/rfc-v1
+      # cca-host/v14, tested with this local KVM CCA stack.
+      revision: f4e94cc01f1bc874ab35a47d308530cb58231d74
+    artifacts:
+      LINUX_SOURCE: ${param:sourcedir}
     prebuild:
       # Use source dir modification time as timestamp (for locally reproducible build).
       - export KBUILD_BUILD_TIMESTAMP="@$$(stat -c '%Y' ${param:sourcedir})"
@@ -60,7 +63,17 @@ build:
     repo:
       kvmtool:
         remote: https://gitlab.arm.com/linux-arm/kvmtool-cca.git
-        revision: cca/planes/rfc-v1
+        # cca/v12 from the KVM CCA v14 cover letter.
+        revision: cb8a0f831ef0e7eec17893ee767b8db7c4234d63
+    prebuild:
+      - make -C kvmtool clean
+      - find kvmtool -name '.*.d' -delete
+      - (cd kvmtool && ./util/update_headers.sh ${artifact:LINUX_SOURCE})
+  kvm-unit-tests:
+    repo:
+      remote: https://gitlab.arm.com/linux-arm/kvm-unit-tests-cca.git
+      # cca/v4 from the KVM CCA v14 cover letter.
+      revision: 6810c578fff399b33528335c7eae3c90e33847ff
 
 run:
   params:

@@ -15,6 +15,8 @@ use std::process::Command;
 use std::thread;
 
 const SHRINKWRAP_REPO: &str = "https://git.gitlab.arm.com/tooling/shrinkwrap.git";
+const SHRINKWRAP_REVISION: &str = "1c6b7a5278b47be11cad3bcd3a20416fc43fd388";
+pub(crate) const SHRINKWRAP_IMAGE: &str = "shrinkwraptool/base-slim:2026.9.0.dev0";
 // The guest Linux kernel (with cca/plane driver) hasn't been upstreamed yet, fetch it from our private repo
 const PLANE0_LINUX_REPO: &str = "https://github.com/jiong-microsoft/OHCL-Linux-Kernel.git";
 const PLANE0_LINUX_BRANCH: &str = "cca-dev";
@@ -217,13 +219,15 @@ pub(crate) fn build_cca_rootfs(
         venv_dir.join("bin").display(),
         env::var("PATH").unwrap_or_default()
     );
+    let shrinkwrap_config = shrinkwrap_dir.join("config");
 
-    let tfa_revision = "8dae0862c502e08568a61a1050091fa9357f1240";
+    // TF-A master as of the KVM CCA v14 posting date.
+    let tfa_revision = "d1d16b07efd0181b319a4a61b2e539ddff739878";
     log::info!("shrinkwrap build log: {}", log_file.display());
     let mut cmd = Command::new(&shrinkwrap_bin);
     if use_docker_runtime {
         cmd.arg("--runtime=docker")
-            .arg("--image=shrinkwraptool/base-slim:2026.3.0.dev0");
+            .arg(format!("--image={SHRINKWRAP_IMAGE}"));
     }
     cmd.arg("build").arg("cca-3world.yaml");
     if buildroot_overlay {
@@ -239,6 +243,7 @@ pub(crate) fn build_cca_rootfs(
         .arg(format!("TFA_REVISION={tfa_revision}"))
         .env("VIRTUAL_ENV", venv_dir)
         .env("PATH", path)
+        .env("SHRINKWRAP_CONFIG", shrinkwrap_config)
         .current_dir(shrinkwrap_dir.join("config"));
     let output = cmd.output().context("failed to execute shrinkwrap build")?;
     let mut log = Vec::new();
@@ -360,6 +365,16 @@ impl SimpleFlowNode for Node {
                 // using 'shrinkwrap', which leverages YAML to define all required
                 // components. This significantly reduces manual effort and the risk of errors.
                 let shrinkwrap_dir = rt.read(shrinkwrap_dir);
+                flowey::shell_cmd!(
+                    rt,
+                    "git -C {shrinkwrap_dir} fetch origin {SHRINKWRAP_REVISION}"
+                )
+                .run()?;
+                flowey::shell_cmd!(
+                    rt,
+                    "git -C {shrinkwrap_dir} checkout --detach {SHRINKWRAP_REVISION}"
+                )
+                .run()?;
                 let venv_dir = shrinkwrap_dir.join("venv");
                 if !venv_dir.exists() {
                     log::info!(
