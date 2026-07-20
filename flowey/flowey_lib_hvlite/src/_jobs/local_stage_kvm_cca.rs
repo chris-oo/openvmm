@@ -455,10 +455,8 @@ exit 0
                 ) {
                     let shrinkwrap_dir = test_root.join("shrinkwrap");
                     let venv_dir = shrinkwrap_dir.join("venv");
-                    let shrinkwrap_py = shrinkwrap_dir.join("shrinkwrap/shrinkwrap.py");
-                    let venv_python = venv_dir.join("bin/python3");
-                    validate_regular_file(&shrinkwrap_py, "shrinkwrap.py")?;
-                    validate_regular_file(&venv_python, "shrinkwrap venv python")?;
+                    let shrinkwrap_bin = venv_dir.join("bin/shrinkwrap");
+                    validate_regular_file(&shrinkwrap_bin, "shrinkwrap executable")?;
                     anyhow::ensure!(
                         venv_dir.is_dir(),
                         "shrinkwrap venv is missing at {}",
@@ -475,12 +473,12 @@ exit 0
                     let fvp_command = if matches!(mode, StageMode::InteractiveHost) {
                         flowey::shell_cmd!(
                             rt,
-                            "{venv_python} {shrinkwrap_py} --runtime=docker --image=shrinkwraptool/base-slim:2026.3.0.dev0 run cca-3world.yaml --rtvar ROOTFS={rootfs_file} --rtvar KERNEL={host_kernel} --rtvar SHARE={share_dir}"
+                            "{shrinkwrap_bin} --runtime=docker --image=shrinkwraptool/base-slim:2026.3.0.dev0 run cca-3world.yaml --rtvar ROOTFS={rootfs_file} --rtvar KERNEL={host_kernel} --rtvar SHARE={share_dir}"
                         )
                     } else {
                         flowey::shell_cmd!(
                             rt,
-                            "timeout --foreground 20m {venv_python} {shrinkwrap_py} --runtime=docker --image=shrinkwraptool/base-slim:2026.3.0.dev0 run cca-3world.yaml --rtvar ROOTFS={rootfs_file} --rtvar KERNEL={host_kernel} --rtvar SHARE={share_dir}"
+                            "timeout --foreground 20m {shrinkwrap_bin} --runtime=docker --image=shrinkwraptool/base-slim:2026.3.0.dev0 run cca-3world.yaml --rtvar ROOTFS={rootfs_file} --rtvar KERNEL={host_kernel} --rtvar SHARE={share_dir}"
                         )
                     };
                     let fvp_result = fvp_command

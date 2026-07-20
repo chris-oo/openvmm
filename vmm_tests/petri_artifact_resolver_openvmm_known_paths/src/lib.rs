@@ -489,7 +489,7 @@ fn cca_home_dir() -> anyhow::Result<PathBuf> {
 fn cca_shrinkwrap_path() -> anyhow::Result<PathBuf> {
     get_path(
         cca_test_root().join("shrinkwrap"),
-        "shrinkwrap/shrinkwrap",
+        "venv/bin/shrinkwrap",
         cca_missing_command("CCA shrinkwrap executable"),
     )
 }
