@@ -4,10 +4,16 @@
 
 set -euo pipefail
 
-HOST_KERNEL="${CCA_REPRO_HOST_KERNEL:-$HOME/ai/eevee/linux/out/cca-fvp/kernel/arch/arm64/boot/Image}"
-GUEST_KERNEL="${CCA_REPRO_GUEST_KERNEL:-$HOME/ai/eevee/linux/out/cca-fvp/kernel/arch/arm64/boot/Image}"
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+TEST_ROOT="${CCA_REPRO_TEST_ROOT:-$REPO_ROOT/target/cca-test}"
+if [[ "$TEST_ROOT" != /* ]]; then
+    TEST_ROOT="$REPO_ROOT/$TEST_ROOT"
+fi
+TEST_ROOT="$(realpath -m "$TEST_ROOT")"
+HOST_KERNEL="${CCA_REPRO_HOST_KERNEL:-$TEST_ROOT/cca-kernels-v15/host-Image}"
+GUEST_KERNEL="${CCA_REPRO_GUEST_KERNEL:-$TEST_ROOT/cca-kernels-v15/guest-Image}"
 OPENVMM_MEMORY="${CCA_REPRO_OPENVMM_MEMORY:-256M}"
-LOGS_DIR="${CCA_REPRO_LOGS_DIR:-target/cca-test/kvm-cca/logs/interactive}"
+LOGS_DIR="${CCA_REPRO_LOGS_DIR:-$TEST_ROOT/kvm-cca/logs/interactive}"
 TIMEOUT_SECONDS="${CCA_REPRO_TIMEOUT_SECONDS:-300}"
 XFLOWEY_EXIT_TIMEOUT_SECONDS="${CCA_REPRO_XFLOWEY_EXIT_TIMEOUT_SECONDS:-120}"
 OPENVMM_EXIT_TIMEOUT_SECONDS="${CCA_REPRO_OPENVMM_EXIT_TIMEOUT_SECONDS:-15}"
@@ -17,6 +23,8 @@ ERROR_PATTERN="${CCA_REPRO_ERROR_PATTERN:-fatal error|failed to run VP|[Gg]uest 
 SHELL_PATTERN="${CCA_REPRO_SHELL_PATTERN:-No root device specified\\. Dropping to a shell\\.|can.t access tty; job control turned off}"
 
 python3 - \
+    "$REPO_ROOT" \
+    "$TEST_ROOT" \
     "$HOST_KERNEL" \
     "$GUEST_KERNEL" \
     "$OPENVMM_MEMORY" \
@@ -40,6 +48,8 @@ import termios
 import time
 
 (
+    repo_root,
+    test_root,
     host_kernel,
     guest_kernel,
     openvmm_memory,
@@ -84,6 +94,8 @@ argv = [
     "cargo",
     "xflowey",
     "kvm-cca-tests",
+    "--test-root",
+    test_root,
     "--interactive-host",
     "--host-kernel",
     host_kernel,
@@ -96,53 +108,75 @@ argv = [
     *extra_args,
 ]
 
+shrinkwrap_image = "shrinkwraptool/base-slim:2026.9.0.dev0"
+rootfs_path = os.path.realpath(os.path.join(test_root, "kvm-cca/rootfs.ext2"))
 
-def fvp_pids():
+
+def shrinkwrap_container_ids():
+    output = subprocess.check_output(
+        [
+            "docker",
+            "ps",
+            "--filter",
+            f"ancestor={shrinkwrap_image}",
+            "--format",
+            "{{.ID}}",
+        ],
+        text=True,
+    )
+    matches = set()
+    for container_id in output.split():
+        try:
+            mounts = subprocess.check_output(
+                [
+                    "docker",
+                    "inspect",
+                    "--format",
+                    "{{range .Mounts}}{{println .Source}}{{end}}",
+                    container_id,
+                ],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+        except subprocess.CalledProcessError:
+            continue
+        if rootfs_path in {os.path.realpath(path) for path in mounts.splitlines()}:
+            matches.add(container_id)
+    return matches
+
+
+baseline_shrinkwrap_containers = shrinkwrap_container_ids()
+
+
+def cleanup_shrinkwrap_containers():
     try:
-        output = subprocess.check_output(["ps", "-eo", "pid=,args="], text=True)
-    except subprocess.SubprocessError:
-        return []
-    pids = []
-    for line in output.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        pid_text, _, args = stripped.partition(" ")
-        if not pid_text.isdigit():
-            continue
-        argv0 = args.split(" ", 1)[0]
-        basename = os.path.basename(argv0)
-        if basename.startswith("FVP_Base_RevC"):
-            pids.append(int(pid_text))
-    return pids
+        new_containers = shrinkwrap_container_ids() - baseline_shrinkwrap_containers
+    except (OSError, subprocess.SubprocessError) as err:
+        print(f"\nWarning: failed to inspect repro Shrinkwrap containers: {err}", flush=True)
+        return
+    if not new_containers:
+        return
+    print(
+        "\nRemoving repro Shrinkwrap containers: "
+        + " ".join(sorted(new_containers)),
+        flush=True,
+    )
+    subprocess.run(
+        ["docker", "rm", "--force", *sorted(new_containers)],
+        check=False,
+    )
 
 
 def stop_fvp():
-    pids = fvp_pids()
-    if not pids:
+    global shrinkwrap_stop_requested
+    if shrinkwrap_stop_requested:
         return
-    print(f"\nStopping FVP_Base_RevC processes: {' '.join(str(pid) for pid in pids)}", flush=True)
-    for pid in pids:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        if not fvp_pids():
-            return
-        time.sleep(0.25)
-    remaining = fvp_pids()
-    if remaining:
-        print(
-            f"Force stopping remaining FVP_Base_RevC processes: {' '.join(str(pid) for pid in remaining)}",
-            flush=True,
-        )
-        for pid in remaining:
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+    print("\nStopping repro FVP through Shrinkwrap Ctrl-]", flush=True)
+    try:
+        os.write(fd, b"\x1d")
+    except OSError:
+        pass
+    shrinkwrap_stop_requested = True
 
 
 def child_exit_code(status):
@@ -180,6 +214,7 @@ def send_smoke_test():
 
 pid, fd = pty.fork()
 if pid == 0:
+    os.chdir(repo_root)
     os.execvp(argv[0], argv)
 
 attrs = termios.tcgetattr(fd)
@@ -201,6 +236,7 @@ openvmm_quit_command_sent = False
 openvmm_quit_deadline = None
 guest_shell_ready = False
 smoke_sent = False
+shrinkwrap_stop_requested = False
 
 try:
     while True:
@@ -353,7 +389,7 @@ try:
             flush=True,
         )
         try:
-            os.kill(pid, signal.SIGTERM)
+            os.killpg(pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
         _, child_status = os.waitpid(pid, 0)
@@ -377,4 +413,6 @@ except KeyboardInterrupt:
     except ProcessLookupError:
         pass
     raise
+finally:
+    cleanup_shrinkwrap_containers()
 PY
