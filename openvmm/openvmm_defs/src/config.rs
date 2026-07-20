@@ -371,9 +371,25 @@ pub enum PcieIommuConfig {
     /// AMD IOMMU (AMD-Vi) for x86_64 guests.
     AmdVi,
     /// Arm SMMUv3 for aarch64 guests.
-    Smmu,
+    Smmu {
+        /// Enable HW-accelerated nested translation (iommufd). Requires VFIO
+        /// devices with `iommu=` behind this SMMU.
+        accel: bool,
+        /// Output address size (OAS) resolution policy.
+        oas: SmmuOas,
+    },
     /// Intel VT-d for x86_64 guests.
     IntelVtd,
+}
+
+/// Output address size (OAS) policy for an emulated SMMUv3.
+#[derive(Debug, MeshPayload, Clone, Copy)]
+pub enum SmmuOas {
+    /// Advertise a fixed default OAS. See `DEFAULT_AUTO_OAS_BITS` for the
+    /// sizing policy and its limits.
+    Auto,
+    /// Use a fixed OAS in bits (one of 32, 36, 40, 42, 44, 48, 52).
+    Fixed(u8),
 }
 
 #[derive(Debug, Protobuf, Default, Clone)]

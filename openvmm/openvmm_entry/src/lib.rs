@@ -855,15 +855,29 @@ async fn vm_config_from_command_line(
         "--amd-iommu and --intel-vtd cannot both be used in the same VM"
     );
 
-    #[cfg(guest_arch = "aarch64")]
-    let mut smmu_names: std::collections::HashSet<&str> =
-        opt.smmu.iter().map(|s| s.as_str()).collect();
     #[cfg(guest_arch = "x86_64")]
     let mut amd_iommu_names: std::collections::HashSet<&str> =
         opt.amd_iommu.iter().map(|s| s.as_str()).collect();
     #[cfg(guest_arch = "x86_64")]
     let mut vtd_names: std::collections::HashSet<&str> =
         opt.intel_vtd.iter().map(|s| s.as_str()).collect();
+
+    // Map each `--smmu` entry to its root complex, rejecting duplicate `rc=`
+    // entries up front. Entries are removed as they are matched to a root
+    // complex below; any left over refer to unknown root complexes.
+    #[cfg(guest_arch = "aarch64")]
+    let mut smmu_names: std::collections::HashMap<&str, &cli_args::SmmuCli> = {
+        let mut map = std::collections::HashMap::new();
+        for s in &opt.smmu {
+            if map.insert(s.rc_name.as_str(), s).is_some() {
+                anyhow::bail!(
+                    "--smmu specified multiple times for root complex '{}'",
+                    s.rc_name
+                );
+            }
+        }
+        map
+    };
 
     let mut pcie_root_complexes = Vec::new();
     for (i, rc_cli) in opt.pcie_root_complex.iter().enumerate() {
@@ -928,9 +942,17 @@ async fn vm_config_from_command_line(
             cxl,
             ports,
             #[cfg(guest_arch = "aarch64")]
-            iommu: smmu_names
-                .remove(rc_cli.name.as_str())
-                .then_some(openvmm_defs::config::PcieIommuConfig::Smmu),
+            iommu: smmu_names.remove(rc_cli.name.as_str()).map(|s| {
+                openvmm_defs::config::PcieIommuConfig::Smmu {
+                    accel: s.accel,
+                    oas: match s.oas {
+                        cli_args::SmmuOasCli::Auto => openvmm_defs::config::SmmuOas::Auto,
+                        cli_args::SmmuOasCli::Fixed(bits) => {
+                            openvmm_defs::config::SmmuOas::Fixed(bits)
+                        }
+                    },
+                }
+            }),
             #[cfg(guest_arch = "x86_64")]
             iommu: if amd_iommu_names.remove(rc_cli.name.as_str()) {
                 Some(openvmm_defs::config::PcieIommuConfig::AmdVi)
@@ -945,7 +967,7 @@ async fn vm_config_from_command_line(
     }
 
     #[cfg(guest_arch = "aarch64")]
-    if let Some(name) = smmu_names.into_iter().next() {
+    if let Some(name) = smmu_names.into_keys().next() {
         anyhow::bail!("--smmu refers to unknown root complex '{name}'");
     }
     #[cfg(guest_arch = "x86_64")]
