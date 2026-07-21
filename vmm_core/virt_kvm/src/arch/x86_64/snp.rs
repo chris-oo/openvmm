@@ -1,9 +1,15 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+//! x86-specific translation of loader imports to KVM SNP page types.
+
 use crate::KvmError;
 use virt::InitialPageImportType;
 
+/// Returns the KVM SNP launch page type for a loader import.
+///
+/// Imports without a direct SNP launch representation are rejected rather
+/// than being measured with an unintended page type.
 pub fn snp_launch_page_type(
     import_type: InitialPageImportType,
 ) -> Result<kvm::SevSnpPageType, KvmError> {

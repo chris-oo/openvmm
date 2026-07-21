@@ -1,6 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+//! KVM memory-slot and confidential guest backing management.
+//!
+//! Confidential RAM slots use userspace memory for shared access and a
+//! guestmemfd for private access. This module records both sides of each slot,
+//! selects the appropriate backing when a range is mapped, validates private
+//! launch ranges, and discards stale contents when ownership changes.
+
 use crate::KvmError;
 use crate::KvmPartition;
 use crate::KvmPartitionInner;
@@ -13,6 +20,7 @@ use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
 #[derive(Debug, Inspect)]
+/// A registered KVM memory slot and its confidential-memory metadata.
 pub(crate) struct KvmMemoryRange {
     host_addr: *mut u8,
     range: MemoryRange,
@@ -24,14 +32,18 @@ unsafe impl Sync for KvmMemoryRange {}
 unsafe impl Send for KvmMemoryRange {}
 
 #[derive(Debug, Default, Inspect)]
+/// Slot-indexed memory mappings currently registered with KVM.
 pub(crate) struct KvmMemoryRangeState {
     #[inspect(flatten, iter_by_index)]
     pub(crate) ranges: Vec<Option<KvmMemoryRange>>,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
+/// A private guest range paired with the userspace source used for launch.
 pub(crate) struct KvmPrivateMemoryRange {
+    /// Guest-physical range covered by the private slot.
     pub(crate) gpa: MemoryRange,
+    /// Userspace source address corresponding to the start of `gpa`.
     pub(crate) hva: *mut u8,
 }
 
@@ -45,14 +57,18 @@ struct KvmMemoryRangeSegment {
 
 #[derive(Debug, Inspect)]
 #[inspect(external_tag)]
+/// Backing strategy for partition memory slots.
 pub(crate) enum KvmMemoryBackingMode {
+    /// Register only the caller-provided userspace mapping.
     Userspace,
     #[cfg(guest_arch = "x86_64")]
+    /// Register shared userspace and private guestmemfd backing for RAM.
     GuestMemfd(KvmGuestMemfdBacking),
 }
 
 #[cfg(guest_arch = "x86_64")]
 #[derive(Debug, Inspect)]
+/// Partition-owned guestmemfd and its packed mapping of guest RAM ranges.
 pub(crate) struct KvmGuestMemfdBacking {
     #[inspect(skip)]
     file: File,
@@ -87,6 +103,11 @@ enum KvmMemoryBacking {
 
 impl KvmMemoryBackingMode {
     #[cfg(guest_arch = "x86_64")]
+    /// Creates one guestmemfd spanning the supplied RAM ranges.
+    ///
+    /// Guest ranges are packed contiguously into the file in iteration order.
+    /// `initial_private` controls both the initial memory attributes and which
+    /// backing KVM selects when each slot is first registered.
     pub(crate) fn guest_memfd(
         kvm: &kvm::Partition,
         ram_ranges: impl IntoIterator<Item = MemoryRange>,
@@ -440,6 +461,10 @@ fn guest_memfd_range_segments(
 }
 
 #[cfg_attr(guest_arch = "aarch64", expect(dead_code))]
+/// Resolves an imported range to a private guestmemfd slot and source HVA.
+///
+/// The entire range must be contained in one slot whose private attribute is
+/// already active.
 pub(crate) fn private_memory_range_from_slots(
     range: MemoryRange,
     slots: &[Option<KvmMemoryRange>],
@@ -462,6 +487,7 @@ pub(crate) fn private_memory_range_from_slots(
 }
 
 #[cfg(guest_arch = "x86_64")]
+/// Verifies the KVM capabilities required for guestmemfd private memory.
 fn check_private_memory_extensions(kvm: &kvm::Partition) -> Result<(), KvmError> {
     require_kvm_extension(kvm, kvm::KVM_CAP_USER_MEMORY2, "KVM_CAP_USER_MEMORY2")?;
     require_kvm_extension(kvm, kvm::KVM_CAP_GUEST_MEMFD, "KVM_CAP_GUEST_MEMFD")?;

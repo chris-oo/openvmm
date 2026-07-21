@@ -1,6 +1,15 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+//! SEV-SNP launch support for KVM partitions.
+//!
+//! The loader writes initial private page contents into the userspace side of
+//! guestmemfd-backed slots. This module translates the loader's import types
+//! into SNP launch updates, constructs the firmware CPUID page from the BSP's
+//! effective KVM CPUID table, validates the initial BSP state, and finalizes
+//! the launch context. Runtime shared/private transitions are handled by the
+//! memory module rather than the launch path.
+
 use crate::KvmError;
 use crate::KvmPartition;
 use crate::KvmPartitionInner;
@@ -9,10 +18,15 @@ use std::os::fd::AsFd;
 use virt::InitialPageImportType;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
+/// Progress of the one-shot SNP launch sequence.
 pub(crate) enum SnpLaunchState {
+    /// No launch command has been issued.
     NotStarted,
+    /// Launch is in progress.
     Started,
+    /// Launch completed successfully.
     Finished,
+    /// Launch failed and cannot be retried on this partition.
     Failed,
 }
 
@@ -25,6 +39,7 @@ impl virt::AcceptInitialPages for KvmPartition {
 }
 
 impl KvmPartitionInner {
+    /// Runs the SNP launch sequence once and records its terminal state.
     fn snp_launch_initial_pages(&self, pages: &[virt::InitialPageImport]) -> Result<(), KvmError> {
         {
             let mut state = self.snp_launch_state.lock();
@@ -51,6 +66,7 @@ impl KvmPartitionInner {
         }
     }
 
+    /// Adds every loader-provided range to the SNP launch context and finalizes it.
     fn snp_launch_initial_pages_inner(
         &self,
         pages: &[virt::InitialPageImport],
@@ -135,6 +151,7 @@ impl KvmPartitionInner {
         Ok(())
     }
 
+    /// Normalizes the vCPU state that KVM will encode into each SNP VMSA.
     fn prepare_snp_vmsa_register_state(&self) -> Result<(), KvmError> {
         for vp in &self.vps {
             let vp_info = vp.vp_info();
@@ -264,6 +281,7 @@ struct SnpCpuidFn {
     edx: u32,
 }
 
+/// Validates the BSP register state required by the direct Linux boot path.
 fn validate_snp_bsp_register_state(
     regs: &kvm::kvm_regs,
     sregs: &kvm::kvm_sregs,
@@ -317,6 +335,11 @@ const SNP_CPUID_COUNT_MAX: usize = 64;
 const SNP_CPUID_TABLE_HEADER_SIZE: usize = 16;
 const SNP_CPUID_FN_SIZE: usize = 48;
 
+/// Serializes the effective BSP CPUID table in the SNP firmware page format.
+///
+/// Entries that become all-zero after firmware-required sanitization are
+/// omitted so the fixed 64-entry firmware limit is applied to the serialized
+/// table rather than the unsanitized KVM table.
 fn write_snp_cpuid_page(
     page: *mut u8,
     page_len: u64,
@@ -367,6 +390,7 @@ fn write_snp_cpuid_page(
     Ok(())
 }
 
+/// Removes KVM-synthetic CPUID bits that SNP firmware validates against hardware.
 fn sanitize_snp_cpuid_entry(entry: &mut kvm::kvm_cpuid_entry2) {
     match (entry.function, entry.index) {
         // SNP firmware validates the CPUID page against hardware-supported
@@ -385,6 +409,7 @@ fn sanitize_snp_cpuid_entry(entry: &mut kvm::kvm_cpuid_entry2) {
     }
 }
 
+/// Converts a generic private-slot lookup failure into the SNP launch error.
 fn map_snp_private_range_error(err: KvmError) -> KvmError {
     match err {
         KvmError::InvalidPrivateMemoryRange => KvmError::InvalidSnpLaunchRange,
