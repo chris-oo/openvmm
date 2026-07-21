@@ -401,6 +401,12 @@ impl KvmPartitionInner {
         Ok(())
     }
 
+    /// Applies a KVM CCA memory-fault/RIPAS state transition.
+    ///
+    /// The kernel supplies a page-aligned range and indicates whether it must
+    /// become private. The range must remain within configured RAM. As with SNP
+    /// conversions, the old backing is discarded after KVM accepts the new
+    /// memory attribute so stale contents cannot reappear on a later transition.
     #[cfg(guest_arch = "aarch64")]
     pub(crate) fn set_cca_memory_attributes(
         &self,

@@ -1,6 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+//! Arm CCA Realm population support for KVM partitions.
+//!
+//! Loader-provided private pages are copied from their userspace mappings into
+//! Realm memory with `KVM_ARM_RMI_POPULATE`. KVM may report partial progress by
+//! updating the ioctl argument, so population continues until each range is
+//! complete. Runtime RIPAS changes are handled by the memory module.
+
 use crate::KvmError;
 use crate::KvmPartition;
 use crate::KvmPartitionInner;
@@ -8,10 +15,15 @@ use crate::memory::private_memory_range_from_slots;
 use virt::InitialPageImportType;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
+/// Progress of the one-shot Realm initial population sequence.
 pub(crate) enum CcaLaunchState {
+    /// No population request has been issued.
     NotStarted,
+    /// Population is in progress.
     Populating,
+    /// Every initial private range was populated successfully.
     Populated,
+    /// Population failed and cannot be retried on this partition.
     Failed,
 }
 
@@ -24,6 +36,7 @@ impl virt::AcceptInitialPages for KvmPartition {
 }
 
 impl KvmPartitionInner {
+    /// Populates initial Realm pages once and records the terminal state.
     fn cca_populate_initial_pages(
         &self,
         pages: &[virt::InitialPageImport],
@@ -56,6 +69,7 @@ impl KvmPartitionInner {
         }
     }
 
+    /// Populates all supported initial imports, honoring partial ioctl progress.
     fn cca_populate_initial_pages_inner(
         &self,
         pages: &[virt::InitialPageImport],
@@ -96,6 +110,7 @@ impl KvmPartitionInner {
     }
 }
 
+/// Returns the RMI populate flags for a loader import type.
 fn cca_populate_flags(import_type: InitialPageImportType) -> Result<u32, KvmError> {
     match import_type {
         InitialPageImportType::Normal => Ok(kvm::KVM_ARM_RMI_POPULATE_FLAGS_MEASURE_UAPI),
@@ -110,6 +125,7 @@ fn cca_populate_flags(import_type: InitialPageImportType) -> Result<u32, KvmErro
     }
 }
 
+/// Converts a generic private-slot lookup failure into a CCA population error.
 fn map_cca_private_range_error(err: KvmError) -> KvmError {
     match err {
         KvmError::InvalidPrivateMemoryRange => KvmError::InvalidCcaPopulateRange,
@@ -117,6 +133,7 @@ fn map_cca_private_range_error(err: KvmError) -> KvmError {
     }
 }
 
+/// Converts generic memory-conversion validation errors into CCA exit errors.
 pub(crate) fn map_cca_conversion_error(err: KvmError) -> KvmError {
     match err {
         KvmError::InvalidMapGpaRange => KvmError::InvalidCcaMemoryFault,
@@ -124,6 +141,7 @@ pub(crate) fn map_cca_conversion_error(err: KvmError) -> KvmError {
     }
 }
 
+/// Converts private-memory capability errors into CCA-specific errors.
 fn map_cca_capability_error(err: kvm::Error) -> KvmError {
     match err {
         kvm::Error::MissingCapability(capability) => KvmError::MissingCcaCapability(capability),

@@ -244,6 +244,7 @@ enum KvmRunVpError {
 }
 
 impl KvmRunVpError {
+    /// Preserves CCA memory-fault details when converting a KVM run error.
     #[cfg(guest_arch = "aarch64")]
     fn from_kvm_run_error(err: kvm::Error) -> Self {
         match err {
