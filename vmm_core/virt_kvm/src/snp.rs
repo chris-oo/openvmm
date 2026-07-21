@@ -96,11 +96,6 @@ impl KvmPartitionInner {
                     "writing SNP CPUID page"
                 );
                 write_snp_cpuid_page(private_range.hva, page.range.len(), &self.bsp_cpuid)?;
-                Self::trace_snp_cpuid_page(
-                    "SNP CPUID page before launch update",
-                    private_range.hva,
-                    page.range.len(),
-                );
             }
             // IGVM page data with no file payload represents a normal private
             // page containing zeroes, not an SNP hardware ZERO page. Do not
@@ -115,34 +110,13 @@ impl KvmPartitionInner {
                 tag = page.tag,
                 "KVM_SEV_SNP_LAUNCH_UPDATE"
             );
-            let cpuid_page_before =
-                (page.import_type == InitialPageImportType::Cpuid).then(|| unsafe {
-                    std::slice::from_raw_parts(private_range.hva, page.range.len() as usize)
-                        .to_vec()
-                });
-            if let Err(err) = self.kvm.sev_snp_launch_update(
+            self.kvm.sev_snp_launch_update(
                 sev.as_fd(),
                 gpa / hvdef::HV_PAGE_SIZE,
                 private_range.hva as u64,
                 page.range.len(),
                 kvm_page_type,
-            ) {
-                if let Some(cpuid_page_before) = cpuid_page_before {
-                    Self::trace_snp_cpuid_page_diff(
-                        &cpuid_page_before,
-                        private_range.hva,
-                        page.range.len(),
-                    );
-                }
-                return Err(err.into());
-            }
-            if page.import_type == InitialPageImportType::Cpuid {
-                Self::trace_snp_cpuid_page(
-                    "SNP CPUID page after launch update",
-                    private_range.hva,
-                    page.range.len(),
-                );
-            }
+            )?;
         }
         self.prepare_snp_vmsa_register_state()?;
         tracing::debug!("KVM_SEV_SNP_LAUNCH_FINISH");
@@ -151,7 +125,16 @@ impl KvmPartitionInner {
         Ok(())
     }
 
-    /// Normalizes the vCPU state that KVM will encode into each SNP VMSA.
+    /// Prepares the vCPU state that KVM will encode into each SNP VMSA.
+    ///
+    /// KVM owns the VMSA pages and does not expose them as launch imports.
+    /// During `KVM_SEV_SNP_LAUNCH_FINISH`, KVM copies each vCPU's current
+    /// register, VMCB, and FPU state into its VMSA before measuring and
+    /// encrypting it. Normalize the required XCR0 state for every vCPU and
+    /// validate the direct-boot BSP before that state becomes protected.
+    ///
+    /// AP register state is not validated here because SNP APs are started
+    /// later through GHCB AP creation with guest-provided VMSAs.
     fn prepare_snp_vmsa_register_state(&self) -> Result<(), KvmError> {
         for vp in &self.vps {
             let vp_info = vp.vp_info();
@@ -170,118 +153,13 @@ impl KvmPartitionInner {
 
         Ok(())
     }
-
-    fn trace_snp_cpuid_page(message: &'static str, page: *const u8, page_len: u64) {
-        const SNP_CPUID_COUNT_MAX: usize = 64;
-        const SNP_CPUID_TABLE_HEADER_SIZE: usize = 16;
-        const SNP_CPUID_FN_SIZE: usize = 48;
-
-        if page_len < (SNP_CPUID_TABLE_HEADER_SIZE + SNP_CPUID_COUNT_MAX * SNP_CPUID_FN_SIZE) as u64
-        {
-            tracing::warn!(page_len, message);
-            return;
-        }
-
-        let page = unsafe { std::slice::from_raw_parts(page, page_len as usize) };
-        let count = u32::from_le_bytes(page[0..4].try_into().unwrap()) as usize;
-        let mut standard_range = None;
-        let mut hypervisor_range = None;
-        let mut extended_range = None;
-        let mut snp_leaf = None;
-        for index in 0..count.min(SNP_CPUID_COUNT_MAX) {
-            let offset = SNP_CPUID_TABLE_HEADER_SIZE + index * SNP_CPUID_FN_SIZE;
-            let entry = Self::read_snp_cpuid_fn(&page[offset..][..SNP_CPUID_FN_SIZE]);
-            match (entry.eax_in, entry.ecx_in) {
-                (0, 0) => standard_range = Some(entry.eax),
-                (0x4000_0000, 0) => hypervisor_range = Some(entry.eax),
-                (0x8000_0000, 0) => extended_range = Some(entry.eax),
-                (0x8000_001f, 0) => snp_leaf = Some((entry.eax, entry.ebx, entry.ecx, entry.edx)),
-                _ => {}
-            }
-        }
-
-        tracing::debug!(
-            count,
-            ?standard_range,
-            ?hypervisor_range,
-            ?extended_range,
-            ?snp_leaf,
-            message
-        );
-    }
-
-    fn trace_snp_cpuid_page_diff(before: &[u8], after: *const u8, page_len: u64) {
-        const SNP_CPUID_COUNT_MAX: usize = 64;
-        const SNP_CPUID_TABLE_HEADER_SIZE: usize = 16;
-        const SNP_CPUID_FN_SIZE: usize = 48;
-
-        if page_len < (SNP_CPUID_TABLE_HEADER_SIZE + SNP_CPUID_COUNT_MAX * SNP_CPUID_FN_SIZE) as u64
-        {
-            tracing::warn!(page_len, "SNP CPUID debug page is too small");
-            return;
-        }
-
-        let after = unsafe { std::slice::from_raw_parts(after, page_len as usize) };
-        let count = u32::from_le_bytes(after[0..4].try_into().unwrap()) as usize;
-        tracing::warn!(count, "SNP CPUID page after firmware rejection");
-        for index in 0..count.min(SNP_CPUID_COUNT_MAX) {
-            let offset = SNP_CPUID_TABLE_HEADER_SIZE + index * SNP_CPUID_FN_SIZE;
-            let before_entry = &before[offset..][..SNP_CPUID_FN_SIZE];
-            let after_entry = &after[offset..][..SNP_CPUID_FN_SIZE];
-            if before_entry == after_entry {
-                continue;
-            }
-            let before = Self::read_snp_cpuid_fn(before_entry);
-            let after = Self::read_snp_cpuid_fn(after_entry);
-            tracing::warn!(
-                index,
-                before.eax_in,
-                before.ecx_in,
-                before.xcr0_in,
-                before.xss_in,
-                before.eax,
-                before.ebx,
-                before.ecx,
-                before.edx,
-                after.eax_in,
-                after.ecx_in,
-                after.xcr0_in,
-                after.xss_in,
-                after.eax,
-                after.ebx,
-                after.ecx,
-                after.edx,
-                "SNP CPUID entry changed by firmware"
-            );
-        }
-    }
-
-    fn read_snp_cpuid_fn(entry: &[u8]) -> SnpCpuidFn {
-        SnpCpuidFn {
-            eax_in: u32::from_le_bytes(entry[0..4].try_into().unwrap()),
-            ecx_in: u32::from_le_bytes(entry[4..8].try_into().unwrap()),
-            xcr0_in: u64::from_le_bytes(entry[8..16].try_into().unwrap()),
-            xss_in: u64::from_le_bytes(entry[16..24].try_into().unwrap()),
-            eax: u32::from_le_bytes(entry[24..28].try_into().unwrap()),
-            ebx: u32::from_le_bytes(entry[28..32].try_into().unwrap()),
-            ecx: u32::from_le_bytes(entry[32..36].try_into().unwrap()),
-            edx: u32::from_le_bytes(entry[36..40].try_into().unwrap()),
-        }
-    }
 }
 
-struct SnpCpuidFn {
-    eax_in: u32,
-    ecx_in: u32,
-    xcr0_in: u64,
-    xss_in: u64,
-    eax: u32,
-    ebx: u32,
-    ecx: u32,
-    edx: u32,
-}
-
-/// Validates the BSP register state required by the direct Linux boot path.
+/// Validates the BSP state that KVM will seal into the initial VMSA.
+///
+/// This catches loader or register-plumbing errors before launch finish, where
+/// they would otherwise surface as a firmware error or a guest that cannot
+/// execute the direct Linux entry point.
 fn validate_snp_bsp_register_state(
     regs: &kvm::kvm_regs,
     sregs: &kvm::kvm_sregs,
