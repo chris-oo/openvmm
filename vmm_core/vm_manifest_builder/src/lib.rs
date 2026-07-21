@@ -444,9 +444,10 @@ impl VmManifestBuilder {
                 with_i440bx_host_pci_bridge: false,
             },
         };
+        let is_x86 = matches!(self.arch, MachineArch::X86_64);
 
         if let Some((backend, port)) = self.debugcon {
-            if matches!(self.arch, MachineArch::X86_64) {
+            if is_x86 {
                 result.attach_debugcon(port, backend);
             } else {
                 return Err(ErrorInner::UnsupportedDebugconArch.into());
@@ -494,7 +495,6 @@ impl VmManifestBuilder {
                 }
             }
             BaseChipsetType::UnenlightenedLinuxDirect => {
-                let is_x86 = matches!(self.arch, MachineArch::X86_64);
                 result.chipset = BaseChipsetManifest {
                     with_generic_cmos_rtc: is_x86,
                     with_generic_isa_floppy: false,
@@ -536,7 +536,6 @@ impl VmManifestBuilder {
                 }
             }
             BaseChipsetType::EnlightenedLinuxDirect => {
-                let is_x86 = matches!(self.arch, MachineArch::X86_64);
                 result.chipset = BaseChipsetManifest::empty();
                 result.capabilities.with_ioapic = is_x86;
                 result.capabilities.with_psp = self.psp;
@@ -578,7 +577,6 @@ impl VmManifestBuilder {
                 }
             }
             BaseChipsetType::HypervGen2Uefi | BaseChipsetType::HyperVGen2LinuxDirect => {
-                let is_x86 = matches!(self.arch, MachineArch::X86_64);
                 result.chipset = BaseChipsetManifest {
                     with_generic_cmos_rtc: is_x86,
                     with_generic_isa_floppy: false,
