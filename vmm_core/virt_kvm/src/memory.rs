@@ -35,6 +35,14 @@ pub(crate) struct KvmPrivateMemoryRange {
     pub(crate) hva: *mut u8,
 }
 
+#[cfg(guest_arch = "x86_64")]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+struct KvmMemoryRangeSegment {
+    range: MemoryRange,
+    host_addr: *mut u8,
+    guest_memfd_offset: u64,
+}
+
 #[derive(Debug, Inspect)]
 #[inspect(external_tag)]
 pub(crate) enum KvmMemoryBackingMode {
@@ -271,10 +279,11 @@ impl KvmPartitionInner {
     /// the guest's preferred processing granularity, but do not change the
     /// units of `page_count`.
     ///
-    /// The range must be non-empty, page-aligned, fully contained in RAM, and
-    /// request either the encrypted or decrypted state. After updating KVM's
-    /// private-memory attributes, the backing for the old state is discarded
-    /// so stale data cannot be reused if the page later transitions back.
+    /// The range must be non-empty, page-aligned, continuously covered by
+    /// guestmemfd-backed slots, and request either the encrypted or decrypted
+    /// state. After updating KVM's private-memory attributes, the backing for
+    /// the old state is discarded so stale data cannot be reused if the page
+    /// later transitions back.
     #[cfg(guest_arch = "x86_64")]
     pub(crate) fn set_map_gpa_range_attributes(
         &self,
@@ -304,9 +313,8 @@ impl KvmPartitionInner {
         };
 
         let range = MemoryRange::new(gpa..end);
-        if !self.ram_ranges.iter().any(|ram| ram.contains(&range)) {
-            return Err(KvmError::InvalidMapGpaRange);
-        }
+        let state = self.memory.lock();
+        let segments = guest_memfd_range_segments(range, &state.ranges)?;
 
         let attributes = if private {
             kvm::KVM_MEMORY_ATTRIBUTE_PRIVATE as u64
@@ -322,7 +330,7 @@ impl KvmPartitionInner {
             "KVM_HC_MAP_GPA_RANGE set memory attributes"
         );
         self.kvm.set_memory_attributes(gpa, size, attributes)?;
-        self.discard_stale_private_memory_backing(range, private, "SNP")?;
+        self.discard_stale_private_memory_backing(&segments, private, "SNP")?;
         Ok(())
     }
 
@@ -336,65 +344,99 @@ impl KvmPartitionInner {
     /// later conversion back to private.
     fn discard_stale_private_memory_backing(
         &self,
-        range: MemoryRange,
+        segments: &[KvmMemoryRangeSegment],
         private: bool,
         isolation_name: &'static str,
     ) -> Result<(), KvmError> {
-        let state = self.memory.lock();
-        let slot = state
-            .ranges
-            .iter()
-            .flatten()
-            .find(|slot| slot.range.contains(&range))
-            .ok_or(KvmError::InvalidMapGpaRange)?;
-        let offset = range.start() - slot.range.start();
         if private {
-            let addr = slot.host_addr.wrapping_add(offset as usize);
-            tracing::debug!(
-                gpa = range.start(),
-                size = range.len(),
-                hva = addr as usize,
-                isolation_name,
-                "discarding shared backing after private conversion"
-            );
-            let ret =
-                unsafe { libc::madvise(addr.cast(), range.len() as usize, libc::MADV_DONTNEED) };
-            if ret != 0 {
-                return Err(KvmError::DiscardSharedBacking(
-                    std::io::Error::last_os_error(),
-                ));
+            for segment in segments {
+                tracing::debug!(
+                    gpa = segment.range.start(),
+                    size = segment.range.len(),
+                    hva = segment.host_addr as usize,
+                    isolation_name,
+                    "discarding shared backing after private conversion"
+                );
+                let ret = unsafe {
+                    libc::madvise(
+                        segment.host_addr.cast(),
+                        segment.range.len() as usize,
+                        libc::MADV_DONTNEED,
+                    )
+                };
+                if ret != 0 {
+                    return Err(KvmError::DiscardSharedBacking(
+                        std::io::Error::last_os_error(),
+                    ));
+                }
             }
         } else {
-            let (guest_memfd, guest_memfd_offset) =
-                match (&self.memory_backing_mode, slot.guest_memfd_offset) {
-                    (KvmMemoryBackingMode::GuestMemfd(backing), Some(slot_offset)) => {
-                        (&backing.file, slot_offset + offset)
-                    }
-                    _ => return Err(KvmError::InvalidMapGpaRange),
-                };
-            tracing::debug!(
-                gpa = range.start(),
-                size = range.len(),
-                guest_memfd_offset,
-                isolation_name,
-                "discarding private backing after shared conversion"
-            );
-            let ret = unsafe {
-                libc::fallocate(
-                    guest_memfd.as_raw_fd(),
-                    libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-                    guest_memfd_offset as libc::off_t,
-                    range.len() as libc::off_t,
-                )
+            let KvmMemoryBackingMode::GuestMemfd(backing) = &self.memory_backing_mode else {
+                return Err(KvmError::InvalidMapGpaRange);
             };
-            if ret != 0 {
-                return Err(KvmError::DiscardPrivateBacking(
-                    std::io::Error::last_os_error(),
-                ));
+            for segment in segments {
+                tracing::debug!(
+                    gpa = segment.range.start(),
+                    size = segment.range.len(),
+                    guest_memfd_offset = segment.guest_memfd_offset,
+                    isolation_name,
+                    "discarding private backing after shared conversion"
+                );
+                let ret = unsafe {
+                    libc::fallocate(
+                        backing.file.as_raw_fd(),
+                        libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                        segment.guest_memfd_offset as libc::off_t,
+                        segment.range.len() as libc::off_t,
+                    )
+                };
+                if ret != 0 {
+                    return Err(KvmError::DiscardPrivateBacking(
+                        std::io::Error::last_os_error(),
+                    ));
+                }
             }
         }
         Ok(())
     }
+}
+
+#[cfg(guest_arch = "x86_64")]
+fn guest_memfd_range_segments(
+    range: MemoryRange,
+    slots: &[Option<KvmMemoryRange>],
+) -> Result<Vec<KvmMemoryRangeSegment>, KvmError> {
+    let mut segments = slots
+        .iter()
+        .flatten()
+        .filter_map(|slot| {
+            let guest_memfd_offset = slot.guest_memfd_offset?;
+            let start = range.start().max(slot.range.start());
+            let end = range.end().min(slot.range.end());
+            (start < end).then(|| {
+                let slot_offset = start - slot.range.start();
+                KvmMemoryRangeSegment {
+                    range: MemoryRange::new(start..end),
+                    host_addr: slot.host_addr.wrapping_add(slot_offset as usize),
+                    guest_memfd_offset: guest_memfd_offset + slot_offset,
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    segments.sort_by_key(|segment| segment.range.start());
+
+    let mut cursor = range.start();
+    for segment in &segments {
+        if segment.range.start() != cursor {
+            return Err(KvmError::InvalidMapGpaRange);
+        }
+        cursor = segment.range.end();
+    }
+    if cursor != range.end() {
+        return Err(KvmError::InvalidMapGpaRange);
+    }
+
+    Ok(segments)
 }
 
 #[cfg_attr(guest_arch = "aarch64", expect(dead_code))]
@@ -684,6 +726,109 @@ mod tests {
         assert!(matches!(
             private_memory_range_from_slots(range(0x1000, 0x2000), &shared_slots),
             Err(KvmError::InvalidPrivateMemoryRange)
+        ));
+    }
+
+    #[test]
+    #[cfg(guest_arch = "x86_64")]
+    fn guest_memfd_segments_cover_adjacent_unordered_slots() {
+        let mut first_backing = vec![0u8; 0x2000];
+        let mut second_backing = vec![0u8; 0x2000];
+        let first_host_addr = first_backing.as_mut_ptr();
+        let second_host_addr = second_backing.as_mut_ptr();
+        let slots = [
+            Some(KvmMemoryRange {
+                host_addr: second_host_addr,
+                range: range(0x3000, 0x5000),
+                guest_memfd_offset: Some(0x8000),
+                private_attributes_set: false,
+            }),
+            Some(KvmMemoryRange {
+                host_addr: first_host_addr,
+                range: range(0x1000, 0x3000),
+                guest_memfd_offset: Some(0x4000),
+                private_attributes_set: true,
+            }),
+        ];
+
+        let segments = guest_memfd_range_segments(range(0x2000, 0x4000), &slots).unwrap();
+
+        assert_eq!(
+            segments,
+            [
+                KvmMemoryRangeSegment {
+                    range: range(0x2000, 0x3000),
+                    host_addr: first_host_addr.wrapping_add(0x1000),
+                    guest_memfd_offset: 0x5000,
+                },
+                KvmMemoryRangeSegment {
+                    range: range(0x3000, 0x4000),
+                    host_addr: second_host_addr,
+                    guest_memfd_offset: 0x8000,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(guest_arch = "x86_64")]
+    fn guest_memfd_segments_reject_incomplete_coverage() {
+        let mut backing = vec![0u8; 0x4000];
+        let host_addr = backing.as_mut_ptr();
+        let gapped_slots = [
+            Some(KvmMemoryRange {
+                host_addr,
+                range: range(0x1000, 0x2000),
+                guest_memfd_offset: Some(0),
+                private_attributes_set: true,
+            }),
+            Some(KvmMemoryRange {
+                host_addr: host_addr.wrapping_add(0x2000),
+                range: range(0x3000, 0x4000),
+                guest_memfd_offset: Some(0x2000),
+                private_attributes_set: true,
+            }),
+        ];
+        assert!(matches!(
+            guest_memfd_range_segments(range(0x1000, 0x4000), &gapped_slots),
+            Err(KvmError::InvalidMapGpaRange)
+        ));
+
+        let userspace_slot = [Some(KvmMemoryRange {
+            host_addr,
+            range: range(0x1000, 0x4000),
+            guest_memfd_offset: None,
+            private_attributes_set: false,
+        })];
+        assert!(matches!(
+            guest_memfd_range_segments(range(0x1000, 0x4000), &userspace_slot),
+            Err(KvmError::InvalidMapGpaRange)
+        ));
+    }
+
+    #[test]
+    #[cfg(guest_arch = "x86_64")]
+    fn guest_memfd_segments_reject_overlapping_slots() {
+        let mut backing = vec![0u8; 0x4000];
+        let host_addr = backing.as_mut_ptr();
+        let slots = [
+            Some(KvmMemoryRange {
+                host_addr,
+                range: range(0x1000, 0x3000),
+                guest_memfd_offset: Some(0),
+                private_attributes_set: true,
+            }),
+            Some(KvmMemoryRange {
+                host_addr: host_addr.wrapping_add(0x1000),
+                range: range(0x2000, 0x4000),
+                guest_memfd_offset: Some(0x1000),
+                private_attributes_set: true,
+            }),
+        ];
+
+        assert!(matches!(
+            guest_memfd_range_segments(range(0x1000, 0x4000), &slots),
+            Err(KvmError::InvalidMapGpaRange)
         ));
     }
 }
