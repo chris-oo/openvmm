@@ -5,6 +5,8 @@ use flowey::node::prelude::ReadVar;
 use flowey::pipeline::prelude::*;
 use std::path::PathBuf;
 
+const CCA_V15_KERNEL_REVISION: &str = "d6d40e6a310388f58def167f8b57e31d6c6057a2";
+
 /// Native OpenVMM KVM CCA debug and test flows.
 #[derive(clap::Args)]
 pub struct KvmCcaTestsCli {
@@ -28,15 +30,15 @@ pub struct KvmCcaTestsCli {
     #[clap(long)]
     pub rebuild_rootfs: bool,
 
-    /// Host kernel source tree for future Plane0 rebuild support.
+    /// Pinned linux-cca source tree used to build both host and guest kernels.
     #[clap(long)]
-    pub host_kernel_src: Option<PathBuf>,
+    pub cca_kernel_src: Option<PathBuf>,
 
-    /// Host kernel revision for future Plane0 rebuild support.
+    /// Exact linux-cca revision used to build both host and guest kernels.
     #[clap(long)]
-    pub host_kernel_rev: Option<String>,
+    pub cca_kernel_rev: Option<String>,
 
-    /// Plane0 host kernel Image to boot under FVP.
+    /// FVP normal-world host kernel Image.
     #[clap(long)]
     pub host_kernel: Option<PathBuf>,
 
@@ -89,8 +91,8 @@ impl IntoPipeline for KvmCcaTestsCli {
             update_emu,
             rebuild_plane0_linux,
             rebuild_rootfs,
-            host_kernel_src,
-            host_kernel_rev,
+            cca_kernel_src,
+            cca_kernel_rev,
             host_kernel,
             guest_kernel,
             guest_initrd,
@@ -130,10 +132,6 @@ impl IntoPipeline for KvmCcaTestsCli {
                 "select exactly one run mode: --preflight, --stage-only, --interactive-host, or --run-openvmm"
             );
         }
-        if host_kernel_src.is_some() || host_kernel_rev.is_some() {
-            anyhow::bail!("--host-kernel-src/--host-kernel-rev support is not implemented yet");
-        }
-
         let mut pipeline = Pipeline::new();
         if install_emu {
             let check_job = pipeline
@@ -185,8 +183,37 @@ impl IntoPipeline for KvmCcaTestsCli {
         }
 
         if stage_only || preflight || interactive_host || run_openvmm {
-            let host_kernel = host_kernel.unwrap_or(default_cca_kernel_path()?);
-            let guest_kernel = guest_kernel.unwrap_or_else(|| host_kernel.clone());
+            let kernels = match (host_kernel, guest_kernel) {
+                (Some(host), guest) => {
+                    anyhow::ensure!(
+                        cca_kernel_src.is_none() && cca_kernel_rev.is_none(),
+                        "explicit --host-kernel/--guest-kernel paths cannot be combined with --cca-kernel-src/--cca-kernel-rev"
+                    );
+                    anyhow::ensure!(
+                        preflight || guest.is_some(),
+                        "--guest-kernel is required whenever --host-kernel is supplied"
+                    );
+                    flowey_lib_hvlite::_jobs::local_stage_kvm_cca::CcaKernelSource::Paths {
+                        host,
+                        guest,
+                    }
+                }
+                (None, Some(_)) => {
+                    anyhow::bail!("--guest-kernel requires --host-kernel");
+                }
+                (None, None) => {
+                    let source = cca_kernel_src.unwrap_or(default_cca_kernel_source()?);
+                    let revision = cca_kernel_rev.unwrap_or_else(|| CCA_V15_KERNEL_REVISION.into());
+                    flowey_lib_hvlite::_jobs::local_stage_kvm_cca::CcaKernelSource::Build(
+                        flowey_lib_hvlite::build_cca_linux_kernels::CcaLinuxKernelBuildParams {
+                            openvmm_root: crate::repo_root(),
+                            source,
+                            revision,
+                            output_root: test_root.join("cca-kernels-v15"),
+                        },
+                    )
+                }
+            };
             let logs_dir = logs_dir.map_or_else(
                 || test_root.join("kvm-cca/logs/latest"),
                 |logs_dir| {
@@ -253,8 +280,7 @@ impl IntoPipeline for KvmCcaTestsCli {
                         } else {
                             flowey_lib_hvlite::_jobs::local_stage_kvm_cca::StageMode::StageOnly
                         },
-                        host_kernel,
-                        guest_kernel: (!preflight).then_some(guest_kernel),
+                        kernels,
                         guest_initrd,
                         logs_dir,
                         share_dir,
@@ -297,9 +323,9 @@ impl IntoPipeline for KvmCcaTestsCli {
     }
 }
 
-fn default_cca_kernel_path() -> anyhow::Result<PathBuf> {
+fn default_cca_kernel_source() -> anyhow::Result<PathBuf> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
-    Ok(home.join("ai/eevee/linux/out/cca-fvp/kernel/arch/arm64/boot/Image"))
+    Ok(home.join("ai/jolteon/linux-cca"))
 }

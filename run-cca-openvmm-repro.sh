@@ -4,8 +4,8 @@
 
 set -euo pipefail
 
-HOST_KERNEL="${CCA_REPRO_HOST_KERNEL:-$HOME/ai/eevee/linux/out/cca-fvp/kernel/arch/arm64/boot/Image}"
-GUEST_KERNEL="${CCA_REPRO_GUEST_KERNEL:-$HOME/ai/eevee/linux/out/cca-fvp/kernel/arch/arm64/boot/Image}"
+HOST_KERNEL="${CCA_REPRO_HOST_KERNEL:-target/cca-test/cca-kernels-v15/host-Image}"
+GUEST_KERNEL="${CCA_REPRO_GUEST_KERNEL:-target/cca-test/cca-kernels-v15/guest-Image}"
 OPENVMM_MEMORY="${CCA_REPRO_OPENVMM_MEMORY:-256M}"
 LOGS_DIR="${CCA_REPRO_LOGS_DIR:-target/cca-test/kvm-cca/logs/interactive}"
 TIMEOUT_SECONDS="${CCA_REPRO_TIMEOUT_SECONDS:-300}"

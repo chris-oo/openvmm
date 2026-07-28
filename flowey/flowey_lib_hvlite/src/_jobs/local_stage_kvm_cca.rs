@@ -23,12 +23,20 @@ pub enum StageMode {
     RunOpenvmm,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum CcaKernelSource {
+    Paths {
+        host: PathBuf,
+        guest: Option<PathBuf>,
+    },
+    Build(crate::build_cca_linux_kernels::CcaLinuxKernelBuildParams),
+}
+
 flowey_request! {
     pub struct Params {
         pub test_root: PathBuf,
         pub mode: StageMode,
-        pub host_kernel: PathBuf,
-        pub guest_kernel: Option<PathBuf>,
+        pub kernels: CcaKernelSource,
         pub guest_initrd: Option<PathBuf>,
         pub logs_dir: PathBuf,
         pub share_dir: PathBuf,
@@ -44,6 +52,7 @@ impl SimpleFlowNode for Node {
     type Request = Params;
 
     fn imports(ctx: &mut ImportCtx<'_>) {
+        ctx.import::<crate::build_cca_linux_kernels::Node>();
         ctx.import::<crate::build_openvmm::Node>();
         ctx.import::<crate::build_kvm_cca_preflight::Node>();
         ctx.import::<crate::resolve_openvmm_test_initrd::Node>();
@@ -53,8 +62,7 @@ impl SimpleFlowNode for Node {
         let Params {
             test_root,
             mode,
-            host_kernel,
-            guest_kernel,
+            kernels,
             guest_initrd,
             logs_dir,
             share_dir,
@@ -103,13 +111,31 @@ impl SimpleFlowNode for Node {
                 ReadVar::from_static,
             )
         });
+        let (kernel_paths, built_kernels) = match kernels {
+            CcaKernelSource::Paths { host, guest } => (Some((host, guest)), None),
+            CcaKernelSource::Build(params) => {
+                let output =
+                    ctx.reqv(|v| crate::build_cca_linux_kernels::Request { params, output: v });
+                (None, Some(output))
+            }
+        };
 
         ctx.emit_rust_step("stage native KVM CCA artifacts", |ctx| {
             done.claim(ctx);
             let openvmm = openvmm.map(|openvmm| openvmm.claim(ctx));
             let preflight = preflight.claim(ctx);
             let guest_initrd = guest_initrd.map(|guest_initrd| guest_initrd.claim(ctx));
+            let built_kernels =
+                built_kernels.map(|built_kernels| built_kernels.claim(ctx));
             move |rt| {
+                let (host_kernel, guest_kernel) = match (&kernel_paths, built_kernels) {
+                    (Some((host, guest)), None) => (host.clone(), guest.clone()),
+                    (None, Some(built_kernels)) => {
+                        let kernels = rt.read(built_kernels);
+                        (kernels.host_image, Some(kernels.guest_image))
+                    }
+                    _ => unreachable!(),
+                };
                 let openvmm = match openvmm {
                     Some(openvmm) => {
                         let openvmm = rt.read(openvmm);
@@ -129,7 +155,7 @@ impl SimpleFlowNode for Node {
                     validate_regular_file(openvmm, "OpenVMM binary")?;
                 }
                 validate_regular_file(&preflight, "KVM CCA preflight binary")?;
-                validate_regular_file(&host_kernel, "Plane0 host kernel")?;
+                validate_regular_file(&host_kernel, "FVP normal-world host kernel")?;
                 if let Some(guest_kernel) = &guest_kernel {
                     validate_regular_file(guest_kernel, "Realm guest kernel")?;
                 }
