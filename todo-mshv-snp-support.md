@@ -17,10 +17,12 @@ kernel workarounds, panic paths, and intentionally incomplete attestation
 handling.
 
 The recommended first milestone is **feature parity with the current KVM SNP
-Linux direct-boot path on MSHV**. General SNP IGVM boot should be a separate
-milestone because the current IGVM loader still rejects `SnpVpContext` and
-`SnpIdBlock`, while the prototype's SNP IGVM loader silently discarded
-important directives.
+Linux direct-boot path on MSHV**. SNP IGVM boot is explicitly out of scope for
+this workstream and belongs to a future milestone. The current work may add
+backend-neutral launch metadata and VMSA interfaces that the future IGVM loader
+will consume, but it must not add SNP IGVM parsing, dispatch, or boot support.
+The current IGVM loader still rejects `SnpVpContext` and `SnpIdBlock`, while
+the prototype's SNP IGVM loader silently discarded important directives.
 
 All SNP load paths should nevertheless use one VP-context contract from the
 start: the loader supplies a VMSA page at a loader-owned GPA regardless of
@@ -29,7 +31,7 @@ and validates it, translates its state into KVM vCPU state, and then lets KVM
 create its internal VMSA at launch finish.
 
 Three launch details must be resolved experimentally against the target kernel
-before implementation begins:
+before implementing the dependent MSHV secure-launch and VMGEXIT phases:
 
 - whether an explicit `IsolationState = SECURE` property transition is required
   before encrypted guest-memory mappings, or whether mapping is the only
@@ -378,9 +380,17 @@ context:
   implements that currently-unimplemented hook, records the chosen GPA, and
   finalizes the VMSA after all BSP register imports have been collected
   (`vmm_core/vm_loader/src/lib.rs:44-89, 178-188, 265-267`);
-- the VMSA page is excluded automatically from
-  `complete_snp_direct_ram_imports` because it is already present in the import
-  list;
+- the x86 loader writes the synthesized VMSA bytes into `GuestMemory` at the
+  selected GPA and records that range as `BootPageAcceptance::VpContext`;
+- `initial_regs_and_page_imports` converts that record into an
+  `InitialPageImportType::VpContext` entry. The worker passes the complete
+  import list to `PartitionUnit::accept_initial_pages`, so the virt backend
+  receives the VMSA GPA and type, then reads the bytes from its existing
+  `GuestMemory` mapping;
+- `complete_snp_direct_ram_imports` sees that range in the import list and
+  therefore does not add a duplicate `Normal` import. This exclusion is not the
+  transport mechanism; the `VpContext` entry plus the bytes already written to
+  guest memory are;
 - no backend injects an extra VMSA page after loader completion.
 
 This matches existing image-loader ownership:
@@ -501,10 +511,25 @@ for encrypted VPs.
 
 ### 4. CPUID page
 
-Extract the backend-independent parts of KVM's tested SNP CPUID serializer so
-both backends produce the same firmware page format and enforce the same
-capacity and reserved-field rules. The backend-specific input should be an
-iterator/collection of effective CPUID leaves.
+Do not create a new crate for this. Split the existing code along dependency
+boundaries:
+
+- move the SNP CPUID firmware-page wire definitions currently in
+  `loader::cpuid` (`HV_PSP_CPUID_PAGE`, leaf layout, and the 64-entry capacity)
+  into `x86defs::snp`, which is already shared by `loader`, `virt_kvm`, and
+  `virt_mshv`;
+- add a backend-neutral runtime serializer under `virt::x86` that accepts
+  neutral `virt::CpuidLeaf`-style entries, validates the page size/count and
+  reserved fields, and produces the firmware-page bytes;
+- keep loader-specific required-leaf lists and placeholder-page construction
+  in `loader::cpuid`;
+- keep acquisition of effective CPUID values and sanitization in each
+  hypervisor backend.
+
+This avoids adding a `loader` dependency to either virt backend and avoids a
+new one-function crate. Extract the backend-independent parts of KVM's tested
+serializer into the `virt::x86` helper so both backends produce the same
+firmware page format and enforce the same capacity and reserved-field rules.
 
 Do not make KVM's CPUID sanitization masks backend-independent. Several masks
 remove KVM-synthetic feature bits; MSHV effective CPUID values need a separately
@@ -627,31 +652,59 @@ Do not conflate "guest request ioctl works" with complete attestation support.
 The prototype omitted certificate data for extended guest requests and disabled
 ID-block verification.
 
-For the direct-boot milestone, make the launch policy explicit:
+Support two explicit launch modes:
 
-- either define a documented bring-up mode without an ID block;
-- or require a configured ID block and reject launch when it is absent.
+- `NoIdBlock`: complete the SNP launch without ID-block verification. Linux
+  direct boot uses this mode for now.
+- `IdBlock`: validate and pass a supplied SNP ID block and authentication data
+  to launch completion.
 
-The production direction should support a caller-supplied, validated ID block
-and expose the resulting policy/measurement expectations to configuration.
+Represent this as typed launch metadata, for example
+`SnpIdBlockMode::None | Provided { id_block, id_auth }`, rather than a boolean
+plus independently optional buffers. Extend the loader-to-backend launch
+contract beyond the current page-only `AcceptInitialPages` argument so an
+`InitialLoad` can carry:
+
+- the initial page imports;
+- optional SNP ID-block/authentication data;
+- the SNP policy associated with that data where required.
+
+Linux direct boot always produces `None`. The SNP IGVM loader preserves the
+file semantics: `SnpIdBlock` present produces `Provided`, and absence produces
+`None`. It must reject duplicate, malformed, incompatible-mask, or
+policy-inconsistent ID-block directives rather than silently ignoring them.
+
+The current direct-boot workstream should define the typed optional metadata
+and implement/test both backend completion modes, but its only loader producer
+is Linux direct boot with `None`. Producing `Provided` from an IGVM file belongs
+to the future IGVM milestone.
+
+MSHV must support both modes when calling `complete_isolated_import`: set
+`id_block_enabled` and populate the completion data only for `Provided`.
+Absence of an ID block is a supported launch mode, not an error or hidden
+bring-up switch.
+
 Extended guest request certificate retrieval should be reported unsupported
 until a real certificate source and size negotiation are implemented.
 
 KVM loading of an SNP IGVM may use the supplied VMSA to reproduce boot state,
 but it cannot reproduce an IGVM measurement that assumes direct import of that
-VMSA page with the current KVM UAPI. This mode must reject or explicitly
-disclaim measurement/ID-block verification rather than presenting successful
-boot as measurement equivalence.
+VMSA page with the current KVM UAPI. KVM can launch `NoIdBlock`; if an IGVM
+contains `Provided` ID-block data whose expected measurement cannot match KVM's
+internally generated VMSA, KVM must reject that launch with a clear unsupported
+error rather than drop the ID block or claim verification.
 
-### 8. IGVM follow-up
+### 8. Future IGVM milestone (out of current scope)
 
-Do not add the prototype's permissive `snp_igvm.rs` unchanged. A later IGVM
-milestone should extend the current loader so it:
+Do not implement SNP IGVM boot in this workstream, and do not add the
+prototype's permissive `snp_igvm.rs` unchanged. A later, separately planned
+IGVM milestone should extend the current loader so it:
 
 - selects the SNP compatibility mask explicitly;
 - imports all applicable page-data directives;
 - handles or rejects every `SnpVpContext` deterministically;
-- passes `SnpIdBlock` into launch completion;
+- preserves optional `SnpIdBlock`/authentication data as typed launch metadata
+  and passes it into launch completion when present;
 - gives KVM the same parsed VMSA used by MSHV, with KVM translating it to vCPU
   state and explicitly not claiming VMSA measurement equivalence;
 - rejects unsupported directives instead of debug-logging and ignoring them;
@@ -733,10 +786,197 @@ state machine, VMSA/CPUID builders, import batching, and GHCB parser. Hardware
 tests should run in a documented capable environment or gated pipeline and
 must not be presented as the only regression protection.
 
+#### Remote build/deploy/run harness
+
+Add one user-facing repository-root script, tentatively
+`run-mshv-snp-remote.sh`, that performs the complete developer loop:
+
+1. restore or locate the direct-Linux test artifacts;
+2. build OpenVMM locally;
+3. validate that the remote host can receive and execute the test;
+4. copy all artifacts atomically;
+5. run the requested MSHV SNP scenarios;
+6. execute guest smoke tests;
+7. collect logs and return a reliable exit status;
+8. clean up the exact remote process/run directory according to policy.
+
+The default target is the SSH alias `wedson-mshv`, overridable with
+`MSHV_SNP_HOST`. At the time of this report, that host is Azure Linux 3.0 with
+kernel `6.6.135.mshv2-1.azl3`; `/dev/mshv` exists but is root-only, and
+non-interactive `sudo` is available. The script should deploy as the SSH user
+and run OpenVMM with `sudo -n`, failing clearly rather than prompting for a
+password.
+
+Use the current SNP scripts as behavioral source material:
+
+- `copy-snp-artifacts.sh` for artifact checks and atomic `.new` replacement;
+- `run-snp-openvmm.sh` for the direct-Linux OpenVMM command line;
+- `run-snp-openvmm-repro.sh` for PTY handling, timeout/error recognition,
+  guest-shell detection, virtio smoke tests, OpenVMM control-channel shutdown,
+  and exit-code behavior;
+- `run-cca-openvmm-repro.sh` for structured local log collection and robust
+  process cleanup.
+
+Do not require the developer to invoke those scripts in sequence. The new
+script is the single supported entrypoint and may reuse shared helpers or
+upload an internal remote runner, but it must not depend on manually prepared
+remote state.
+
+##### Local artifact and build stages
+
+The script should resolve defaults relative to the repository root:
+
+- OpenVMM:
+  `target/x86_64-unknown-linux-musl/debug/openvmm`, produced by
+  `cargo build --target x86_64-unknown-linux-musl -p openvmm`;
+- direct-Linux kernel:
+  the same known-working Ubuntu SNP guest kernel used by the KVM SNP repro,
+  currently `vmlinuz-6.17.0-23-generic` at the repository root;
+- direct-Linux initrd:
+  `.packages/underhill-deps-private/x64/initrd`.
+
+Run `cargo xflowey restore-packages` before the musl build when the restored
+sysroot or packaged initrd is absent. The restored x86_64 sysroot supplies the
+static libraries required by the repository's musl configuration. Do not rely
+on the stale `target/vmm_tests/x64/initrd` path.
+
+Require the known-working Ubuntu kernel to exist locally or be supplied through
+`MSHV_SNP_KERNEL`; do not silently fall back to the generic packaged test
+kernel until that kernel has independently demonstrated SNP guest boot.
+Permit explicit overrides (`MSHV_SNP_OPENVMM`, `MSHV_SNP_KERNEL`, and
+`MSHV_SNP_INITRD`) for iteration.
+
+The musl artifact is intentional: a locally built GNU binary currently requires
+GLIBC 2.39 while `wedson-mshv` provides GLIBC 2.38. The static-pie musl build
+has been verified to execute on the target host.
+
+Before copying, print the resolved artifacts, sizes, local revision/change ID,
+build profile, and hashes. Fail if any artifact is missing, empty, not readable,
+or if the OpenVMM binary is not executable.
+
+##### Remote staging and minimal environment checks
+
+Use a unique remote directory such as
+`~/mshv-snp-openvmm/runs/<run-id>` so concurrent developers/runs cannot replace
+each other's binary. The run ID should include a timestamp and local jj change
+ID when available. Upload each artifact to a temporary name, verify its hash,
+then rename it within the run directory.
+
+Keep Bash-side checks minimal. They exist only to distinguish deployment
+failures from an OpenVMM test result:
+
+- SSH batch-mode connectivity;
+- `sudo -n true`;
+- `timeout` availability;
+- successful creation of the unique remote run directory;
+- successful artifact copy, hash verification, and execution of the copied
+  binary.
+
+Do not duplicate MSHV/SNP capability detection in Bash. OpenVMM is authoritative
+for opening `/dev/mshv`, selecting the MSHV backend, creating an SNP partition,
+and reporting unsupported kernel/hypervisor capabilities. Capture those errors
+as the scenario result. The script may record `uname` and `/dev/mshv`
+permissions in the manifest for diagnostics, but those observations must not
+replace an actual OpenVMM launch.
+
+Do not use `pkill`/`killall`. Record the exact remote OpenVMM PID and terminate
+only that process tree on timeout or interruption. Because OpenVMM runs as
+root, the remote runner should create a separate process group/session, record
+its PGID, and clean it with `sudo -n kill -TERM -- -<pgid>`, followed by
+`SIGKILL` after a bounded grace period. A local `trap` must attempt that exact
+remote cleanup on normal exit, failure, Ctrl-C, and SSH loss. Preserve the
+remote run directory on failure by default; remove successful runs unless
+`MSHV_SNP_KEEP_REMOTE=1`.
+
+##### Remote launch command
+
+The uploaded runner should derive paths only from its run directory and launch
+approximately:
+
+```text
+sudo -n env OPENVMM_LOG=<configured filters> timeout --foreground <seconds> \
+  ./openvmm --hypervisor mshv --isolation snp --com1 console \
+  --kernel ./vmlinux --initrd ./initrd -m <memory> -p <processors> \
+  -c "console=ttyS0 earlyprintk=serial earlycon panic=-1" \
+  <virtio block/network arguments>
+```
+
+Keep the full command line in the captured log. Defaults should match the
+working KVM SNP repro where backend-independent, but use
+`virt_mshv=trace,mshv=trace` filters rather than KVM filters. All memory,
+processor, timeout, logging, and kernel-command-line values should be
+overridable without editing the script.
+
+##### Default scenarios and success criteria
+
+A default invocation should run two fresh VMs sequentially:
+
+1. one vCPU, validating partition creation, BSP VMSA import/binding, launch
+   completion, and basic execution;
+2. two vCPUs, validating the SNP AP-creation path in addition to the BSP path.
+
+Support selecting a single scenario for fast iteration, for example
+`--scenario bsp` or `--scenario smp`, but make `--scenario all` the documented
+default. Invoke the PTY/console driver separately for each scenario; do not try
+to reuse one OpenVMM or SSH PTY session for both VMs.
+
+For each VM, require:
+
+- no known fatal/panic/triple-fault/error marker;
+- arrival at the expected initrd shell marker within the boot timeout;
+- a deterministic guest marker protocol (`OVMM_SMOKE_*`);
+- virtio block enumeration plus write/read verification;
+- virtio network enumeration, link setup, and connectivity to the consomme
+  user-mode network gateway;
+- clean OpenVMM shutdown through the control prompt after success.
+
+The script returns zero only if every selected scenario reports
+`OVMM_SMOKE_ALL_PASS` and OpenVMM exits cleanly. Use distinct nonzero statuses
+for preflight failure, build/deploy failure, boot timeout, matched crash marker,
+smoke-test failure, and cleanup failure.
+
+Determine pass/fail primarily from anchored `OVMM_SMOKE_*` markers and process
+exit status. Free-text error matching is secondary diagnostic classification:
+scope patterns to explicit fatal/panic lines, do not let incidental trace text
+override `OVMM_SMOKE_ALL_PASS`, and preserve marker matching across read
+boundaries. Capture full trace output regardless of the decision logic.
+
+##### Logs and reproducibility
+
+Write local logs under `target/mshv-snp/<run-id>/`:
+
+- `manifest.txt`: local change ID, artifact paths/hashes, remote kernel,
+  command-line options, and scenario list;
+- `deploy.log`: preflight and copy operations;
+- `bsp.console.log` and `smp.console.log`: complete SSH/OpenVMM/guest serial;
+- `result.json` or another machine-readable summary with per-scenario result,
+  duration, failure category, and remote run directory.
+
+Never filter or truncate the captured console stream. Error matching controls
+the outcome but the complete output remains available for debugging.
+
+##### Future automated VMM-test milestone (out of current scope)
+
+Petri/VMM-test integration is explicitly future work and is not part of this
+MSHV SNP implementation workstream. The current deliverable is the SSH-based
+hardware bring-up and developer-iteration harness.
+
+After the MSHV SNP direct-boot path and remote harness are stable, a separately
+planned milestone may:
+
+- add a capability-gated MSHV SNP VMM test;
+- run it through `cargo xflowey vmm-tests-run`, never raw nextest;
+- reuse the same guest success markers and scenario definitions where
+  practical;
+- keep remote deployment as the fallback for hardware/kernel combinations not
+  available in presubmit.
+
 ### G. IGVM support
 
-- Implement strict SNP IGVM parsing and ID-block flow as a separate change.
-- Do not make direct-boot completion depend on this milestone.
+- **Future milestone; not part of the current implementation workstream.**
+- Implement strict SNP IGVM parsing and ID-block flow only in that later work.
+- Do not make direct-boot completion or the current MSHV SNP series depend on
+  this milestone.
 
 ## Test plan
 
@@ -770,16 +1010,26 @@ must not be presented as the only regression protection.
 ### Kernel-backed tests
 
 - Successful KVM SNP direct boot using the loader-supplied VMSA contract.
-- SNP capability unavailable.
-- Partition creation and clean drop before launch.
-- Failure before secure transition.
-- Failure after secure transition but before import completion.
-- Successful one-vCPU direct boot.
-- Successful multi-vCPU boot using SNP AP creation.
-- Port I/O and MMIO device access.
-- Guest-request attestation response.
-- Repeated unsupported VMGEXIT input without panic or unbounded logging.
-- Drop after successful launch and after each injected failure point.
+- On `wedson-mshv`, run the single-command remote harness for both the BSP and
+  SMP scenarios and archive its manifest/result logs.
+- Verify Linux direct boot completes in `NoIdBlock` mode.
+- Verify SNP capability unavailable or `/dev/mshv` inaccessible produces a
+  preflight/creation error rather than a panic.
+- Verify partition creation and clean drop before launch.
+- Inject failure before the first host-access-revoking transition.
+- Inject failure after host access is revoked but before import completion.
+- Verify successful one-vCPU direct boot.
+- Verify successful two-vCPU boot using SNP AP creation.
+- Verify port I/O and MMIO through the guest console and virtio devices.
+- Verify guest-request attestation response separately from ID-block launch
+  mode.
+- Send repeated unsupported/malformed VMGEXIT input without panic or unbounded
+  logging.
+- Verify drop after successful launch and after each injected failure point.
+- Verify timeout/Ctrl-C cleanup leaves no running OpenVMM process and preserves
+  failure logs.
+- Verify two unique remote run directories can be staged without artifact
+  collision.
 
 ### Regression tests
 
@@ -826,32 +1076,29 @@ must not be presented as the only regression protection.
 10. Add minimal, non-panicking GHCB handling needed for direct boot.
 11. Add unit, kernel-backed direct-boot, and failure-path tests.
 12. Harden attestation policy and extended guest request behavior.
-13. Add strict SNP IGVM support separately.
 
 Each step should be independently reviewable. The memory deferral and VMSA
-changes should not be combined with broad IGVM loader changes.
+changes should not be combined with broad IGVM loader changes. SNP IGVM boot
+starts only after this workstream is complete.
 
 ## Decisions needed before implementation
 
-1. Is the first supported boot contract Linux direct boot only, or must the
-   initial series also boot an SNP IGVM?
-2. Is a no-ID-block mode acceptable as an explicitly gated bring-up feature,
-   or must the first merge require verified ID-block input?
-3. Which VMGEXIT operations are required by the target guest, especially
+1. Which VMGEXIT operations are required by the target direct-Linux guest,
+   especially
    restricted injection and doorbell-page support?
-4. What exact MSHV kernel revision is the compatibility floor?
-5. Should the backend-neutral SNP CPUID/VMSA helpers live in `virt`, `x86defs`,
+2. What exact MSHV kernel revision is the compatibility floor?
+3. Should the backend-neutral SNP CPUID/VMSA helpers live in `virt`, `x86defs`,
    or a new narrowly scoped shared module?
-6. Which VMSA fields must the first KVM implementation reproduce, which
+4. Which VMSA fields must the first KVM implementation reproduce, which
    nonzero unsupported fields should make launch fail, and which direct-boot
    values remain explicit sideband state?
-7. Does the target ABI require a distinct `IsolationState = SECURE` property
+5. Does the target ABI require a distinct `IsolationState = SECURE` property
    transition before mapping/import?
-8. Is the VP GHCB state-page mapping guaranteed on the target kernel, or is
+6. Is the VP GHCB state-page mapping guaranteed on the target kernel, or is
    shared guest-memory access the authoritative path?
-9. Which concrete `vp_state` setters comprise the complete initial BSP state,
+7. Which concrete `vp_state` setters comprise the complete initial BSP state,
    and when does the backend reject further state changes?
-10. Does `complete_isolated_import` make isolation control runnable
+8. Does `complete_isolated_import` make isolation control runnable
     automatically, or must OpenVMM set
     `HV_PARTITION_PROPERTY_ISOLATION_CONTROL` before first VP run?
 
@@ -967,6 +1214,28 @@ translation and normal-page acceptance, MSHV import, atomic landing, and
 measurement disclaimer. The final clarification broadens KVM sideband state
 from MTRRs alone to every reset value not represented in `SevVmsa`, including
 relevant LAPIC/MSR and FPU/XSAVE defaults.
+
+### Adversarial review 8: remote harness
+
+Initial verdict: **Needs rework**.
+
+The review verified the artifact-resolution and single-script approach, but
+identified deployment blockers and reliability gaps. The plan now incorporates
+the findings:
+
+- build a static-pie musl OpenVMM after `restore-packages`; this build was
+  verified to execute on `wedson-mshv`, while the GNU build requires GLIBC 2.39
+  and the host provides 2.38;
+- use the known-working Ubuntu SNP guest kernel
+  `vmlinuz-6.17.0-23-generic`, now present at the repository root;
+- clean the root-owned OpenVMM process through a recorded process group and
+  `sudo -n kill`, never name-based process killing;
+- run BSP and SMP as independent PTY sessions;
+- determine success primarily from anchored smoke markers, retaining full trace
+  logs without allowing incidental trace text to override success;
+- describe the network check accurately as consomme gateway connectivity.
+
+Petri/VMM-test integration remains an explicit future milestone.
 
 ## Source index
 
