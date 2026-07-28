@@ -1,6 +1,3 @@
-# Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
-
 # QEMU CCA support for OpenVMM VMM tests
 
 > This file is Markdown despite the requested `.toml` filename. TOML snippets
