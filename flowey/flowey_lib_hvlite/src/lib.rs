@@ -10,6 +10,7 @@ pub mod _jobs;
 pub mod artifact_openvmm_hcl_sizecheck;
 pub mod assemble_openvmm_vendor_release;
 pub mod build_and_test_vmgs_lib;
+pub mod build_cca_linux_kernels;
 pub mod build_guest_test_uefi;
 pub mod build_guide;
 pub mod build_hypestv;
