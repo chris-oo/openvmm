@@ -3,13 +3,13 @@
 # SPDX-FileCopyrightText: Copyright TF-RMM Contributors.
 #
 # This overlay is consumed by Arm software emulator FVP when running native
-# OpenVMM KVM CCA tests. Unlike cca_planes.yaml, this targets the v14 KVM CCA
-# userspace ABI, which requires TF-RMM RMM v2.0-bet1 support.
+# OpenVMM KVM CCA tests. Unlike cca_planes.yaml, this targets the v15 KVM CCA
+# userspace ABI and RMM v2.0-bet2.
 %YAML 1.2
 ---
 description: >-
-  Overlay to build TF-RMM with RMM v2.0-bet1 support for native OpenVMM KVM
-  CCA testing.
+  Overlay to build the RMM v2.0-bet2 firmware stack for native OpenVMM KVM CCA
+  v15 testing.
 
 buildex:
   btvars:
@@ -27,7 +27,7 @@ buildex:
     # current RMM.
     TFA_REVISION:
       type: string
-      value: master
+      value: da738d5eae93af342fdc4995dd3c05acb4c9d757
 
 build:
   rmm:
@@ -37,8 +37,8 @@ build:
       -DPLAT_CMN_CTX_MAX_XLAT_TABLES: 13
     repo:
       remote: https://git.trustedfirmware.org/TF-RMM/tf-rmm.git
-      # RMM v2.0-bet1 commit tested by the v14 KVM CCA series.
-      revision: 3340667a291acd5722cb45d05135d7aa15174b25
+      # topics/rmm-v2.0-poc_3, used with the v15 KVM CCA series.
+      revision: f00eac344b6f7c18abc6dad1948b07e9a82ff9f0
   tfa:
     params:
       GIC_ENABLE_V4_EXTN: 1
@@ -48,8 +48,8 @@ build:
   linux:
     repo:
       remote: https://gitlab.arm.com/linux-arm/linux-cca.git
-      # cca-host/v14, tested with this local KVM CCA stack.
-      revision: f4e94cc01f1bc874ab35a47d308530cb58231d74
+      # cca-host/v15.
+      revision: d6d40e6a310388f58def167f8b57e31d6c6057a2
     artifacts:
       LINUX_SOURCE: ${param:sourcedir}
     prebuild:
@@ -63,7 +63,8 @@ build:
     repo:
       kvmtool:
         remote: https://gitlab.arm.com/linux-arm/kvmtool-cca.git
-        # cca/v12 from the KVM CCA v14 cover letter.
+        # Retain the buildable v12 pin. Native OpenVMM KVM CCA tests do not use
+        # kvmtool, but the Shrinkwrap base config requires building it.
         revision: cb8a0f831ef0e7eec17893ee767b8db7c4234d63
     prebuild:
       - make -C kvmtool clean
@@ -72,7 +73,7 @@ build:
   kvm-unit-tests:
     repo:
       remote: https://gitlab.arm.com/linux-arm/kvm-unit-tests-cca.git
-      # cca/v4 from the KVM CCA v14 cover letter.
+      # cca/v4 from the KVM CCA v15 cover letter.
       revision: 6810c578fff399b33528335c7eae3c90e33847ff
 
 run:

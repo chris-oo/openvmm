@@ -221,8 +221,13 @@ pub(crate) fn build_cca_rootfs(
     );
     let shrinkwrap_config = shrinkwrap_dir.join("config");
 
-    // TF-A master as of the KVM CCA v14 posting date.
-    let tfa_revision = "d1d16b07efd0181b319a4a61b2e539ddff739878";
+    let tfa_revision = if planes_overlay == "kvm_cca_planes.yaml" {
+        // TF-A v2.15, tested by topics/rmm-v2.0-poc_3.
+        "da738d5eae93af342fdc4995dd3c05acb4c9d757"
+    } else {
+        // TF-A master as of the KVM CCA v14 posting date.
+        "d1d16b07efd0181b319a4a61b2e539ddff739878"
+    };
     log::info!("shrinkwrap build log: {}", log_file.display());
     let mut cmd = Command::new(&shrinkwrap_bin);
     if use_docker_runtime {

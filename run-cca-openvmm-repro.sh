@@ -5,10 +5,15 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-HOST_KERNEL="${CCA_REPRO_HOST_KERNEL:-$REPO_ROOT/target/cca-test/cca-kernels-v15/host-Image}"
-GUEST_KERNEL="${CCA_REPRO_GUEST_KERNEL:-$REPO_ROOT/target/cca-test/cca-kernels-v15/guest-Image}"
+TEST_ROOT="${CCA_REPRO_TEST_ROOT:-$REPO_ROOT/target/cca-test}"
+if [[ "$TEST_ROOT" != /* ]]; then
+    TEST_ROOT="$REPO_ROOT/$TEST_ROOT"
+fi
+TEST_ROOT="$(realpath -m "$TEST_ROOT")"
+HOST_KERNEL="${CCA_REPRO_HOST_KERNEL:-$TEST_ROOT/cca-kernels-v15/host-Image}"
+GUEST_KERNEL="${CCA_REPRO_GUEST_KERNEL:-$TEST_ROOT/cca-kernels-v15/guest-Image}"
 OPENVMM_MEMORY="${CCA_REPRO_OPENVMM_MEMORY:-256M}"
-LOGS_DIR="${CCA_REPRO_LOGS_DIR:-target/cca-test/kvm-cca/logs/interactive}"
+LOGS_DIR="${CCA_REPRO_LOGS_DIR:-$TEST_ROOT/kvm-cca/logs/interactive}"
 TIMEOUT_SECONDS="${CCA_REPRO_TIMEOUT_SECONDS:-300}"
 XFLOWEY_EXIT_TIMEOUT_SECONDS="${CCA_REPRO_XFLOWEY_EXIT_TIMEOUT_SECONDS:-120}"
 OPENVMM_EXIT_TIMEOUT_SECONDS="${CCA_REPRO_OPENVMM_EXIT_TIMEOUT_SECONDS:-15}"
@@ -19,6 +24,7 @@ SHELL_PATTERN="${CCA_REPRO_SHELL_PATTERN:-No root device specified\\. Dropping t
 
 python3 - \
     "$REPO_ROOT" \
+    "$TEST_ROOT" \
     "$HOST_KERNEL" \
     "$GUEST_KERNEL" \
     "$OPENVMM_MEMORY" \
@@ -36,12 +42,14 @@ import pty
 import re
 import select
 import signal
+import subprocess
 import sys
 import termios
 import time
 
 (
     repo_root,
+    test_root,
     host_kernel,
     guest_kernel,
     openvmm_memory,
@@ -86,6 +94,8 @@ argv = [
     "cargo",
     "xflowey",
     "kvm-cca-tests",
+    "--test-root",
+    test_root,
     "--interactive-host",
     "--host-kernel",
     host_kernel,
@@ -97,6 +107,65 @@ argv = [
     logs_dir,
     *extra_args,
 ]
+
+shrinkwrap_image = "shrinkwraptool/base-slim:2026.9.0.dev0"
+rootfs_path = os.path.realpath(os.path.join(test_root, "kvm-cca/rootfs.ext2"))
+
+
+def shrinkwrap_container_ids():
+    output = subprocess.check_output(
+        [
+            "docker",
+            "ps",
+            "--filter",
+            f"ancestor={shrinkwrap_image}",
+            "--format",
+            "{{.ID}}",
+        ],
+        text=True,
+    )
+    matches = set()
+    for container_id in output.split():
+        try:
+            mounts = subprocess.check_output(
+                [
+                    "docker",
+                    "inspect",
+                    "--format",
+                    "{{range .Mounts}}{{println .Source}}{{end}}",
+                    container_id,
+                ],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+        except subprocess.CalledProcessError:
+            continue
+        if rootfs_path in {os.path.realpath(path) for path in mounts.splitlines()}:
+            matches.add(container_id)
+    return matches
+
+
+baseline_shrinkwrap_containers = shrinkwrap_container_ids()
+
+
+def cleanup_shrinkwrap_containers():
+    try:
+        new_containers = shrinkwrap_container_ids() - baseline_shrinkwrap_containers
+    except (OSError, subprocess.SubprocessError) as err:
+        print(f"\nWarning: failed to inspect repro Shrinkwrap containers: {err}", flush=True)
+        return
+    if not new_containers:
+        return
+    print(
+        "\nRemoving repro Shrinkwrap containers: "
+        + " ".join(sorted(new_containers)),
+        flush=True,
+    )
+    subprocess.run(
+        ["docker", "rm", "--force", *sorted(new_containers)],
+        check=False,
+    )
+
 
 def stop_fvp():
     global shrinkwrap_stop_requested
@@ -344,4 +413,6 @@ except KeyboardInterrupt:
     except ProcessLookupError:
         pass
     raise
+finally:
+    cleanup_shrinkwrap_containers()
 PY
