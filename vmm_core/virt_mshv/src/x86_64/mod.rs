@@ -88,6 +88,12 @@ const GHCB_SW_EXIT_CODE_VALID_BIT: u64 =
     1 << (std::mem::offset_of!(x86defs::snp::GhcbSaveArea, sw_exit_code) / size_of::<u64>() - 64);
 const GHCB_SW_EXIT_INFO1_VALID_BIT: u64 =
     1 << (std::mem::offset_of!(x86defs::snp::GhcbSaveArea, sw_exit_info1) / size_of::<u64>() - 64);
+const GHCB_SW_EXIT_INFO2_VALID_BIT: u64 =
+    1 << (std::mem::offset_of!(x86defs::snp::GhcbSaveArea, sw_exit_info2) / size_of::<u64>() - 64);
+const GHCB_SW_SCRATCH_VALID_BIT: u64 =
+    1 << (std::mem::offset_of!(x86defs::snp::GhcbSaveArea, sw_scratch) / size_of::<u64>() - 64);
+const GHCB_SHARED_BUFFER_OFFSET: u64 =
+    std::mem::offset_of!(x86defs::snp::GhcbPage, shared_buffer) as u64;
 
 fn set_ghcb_rax(ghcb: &mut x86defs::snp::GhcbPage, rax: u64) {
     ghcb.save.rax = rax;
@@ -101,6 +107,11 @@ fn ghcb_rax_is_valid(ghcb: &x86defs::snp::GhcbPage) -> bool {
 fn ghcb_exit_fields_are_valid(ghcb: &x86defs::snp::GhcbPage) -> bool {
     ghcb.save.valid_bitmap1 & (GHCB_SW_EXIT_CODE_VALID_BIT | GHCB_SW_EXIT_INFO1_VALID_BIT)
         == GHCB_SW_EXIT_CODE_VALID_BIT | GHCB_SW_EXIT_INFO1_VALID_BIT
+}
+
+fn ghcb_mmio_fields_are_valid(ghcb: &x86defs::snp::GhcbPage) -> bool {
+    ghcb.save.valid_bitmap1 & (GHCB_SW_EXIT_INFO2_VALID_BIT | GHCB_SW_SCRATCH_VALID_BIT)
+        == GHCB_SW_EXIT_INFO2_VALID_BIT | GHCB_SW_SCRATCH_VALID_BIT
 }
 
 impl virt::Hypervisor for LinuxMshv {
@@ -625,6 +636,17 @@ mod tests {
         assert!(!ghcb_exit_fields_are_valid(&ghcb));
         ghcb.save.valid_bitmap1 |= GHCB_SW_EXIT_INFO1_VALID_BIT;
         assert!(ghcb_exit_fields_are_valid(&ghcb));
+    }
+
+    #[test]
+    fn validates_ghcb_mmio_fields() {
+        let mut ghcb = x86defs::snp::GhcbPage::new_zeroed();
+
+        assert!(!ghcb_mmio_fields_are_valid(&ghcb));
+        ghcb.save.valid_bitmap1 |= GHCB_SW_EXIT_INFO2_VALID_BIT;
+        assert!(!ghcb_mmio_fields_are_valid(&ghcb));
+        ghcb.save.valid_bitmap1 |= GHCB_SW_SCRATCH_VALID_BIT;
+        assert!(ghcb_mmio_fields_are_valid(&ghcb));
     }
 }
 
@@ -1388,6 +1410,53 @@ impl MshvProcessor<'_> {
                     set_ghcb_rax(ghcb, u64::from_le_bytes(rax));
                 }
                 ghcb.save.sw_exit_info1 = 0;
+            }
+            exit_code
+                if exit_code == u64::from(SVM_EXITCODE_MMIO_READ)
+                    || exit_code == u64::from(SVM_EXITCODE_MMIO_WRITE) =>
+            {
+                let ghcb = self
+                    .runner
+                    .ghcb_page()
+                    .ok_or(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 })?;
+                let len = usize::try_from(info.ghcb_page.standard.sw_exit_info2)
+                    .ok()
+                    .filter(|len| matches!(len, 1 | 2 | 4 | 8))
+                    .ok_or(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 })?;
+                let expected_scratch = ghcb_gpa
+                    .checked_add(GHCB_SHARED_BUFFER_OFFSET)
+                    .ok_or(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 })?;
+                if !ghcb_mmio_fields_are_valid(ghcb)
+                    || ghcb.save.sw_exit_info2 != info.ghcb_page.standard.sw_exit_info2
+                    || ghcb.save.sw_scratch != info.ghcb_page.standard.sw_scratch
+                    || info.ghcb_page.standard.sw_scratch != expected_scratch
+                {
+                    return Err(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 });
+                }
+
+                let address = info.ghcb_page.standard.sw_exit_info1;
+                address
+                    .checked_add((len - 1) as u64)
+                    .ok_or(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 })?;
+                if exit_code == u64::from(SVM_EXITCODE_MMIO_READ) {
+                    let mut data = [0; 8];
+                    dev.read_mmio(self.vpindex, address, &mut data[..len]).await;
+                    let ghcb = self
+                        .runner
+                        .ghcb_page()
+                        .ok_or(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 })?;
+                    ghcb.shared_buffer[..len].copy_from_slice(&data[..len]);
+                    ghcb.save.sw_exit_info1 = 0;
+                } else {
+                    let mut data = [0; 8];
+                    data[..len].copy_from_slice(&ghcb.shared_buffer[..len]);
+                    dev.write_mmio(self.vpindex, address, &data[..len]).await;
+                    let ghcb = self
+                        .runner
+                        .ghcb_page()
+                        .ok_or(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 })?;
+                    ghcb.save.sw_exit_info1 = 0;
+                }
             }
             exit_code => {
                 tracelimit::warn_ratelimited!(
