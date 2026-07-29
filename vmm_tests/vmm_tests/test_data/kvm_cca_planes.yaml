@@ -77,6 +77,14 @@ build:
       revision: 6810c578fff399b33528335c7eae3c90e33847ff
 
 run:
+  terminals:
+    bp.terminal_1:
+      friendly: edk2
+      type: stdout
+    bp.terminal_3:
+      friendly: rmm
+      type: stdout
+
   params:
      # Enable Permission Indirection.
     -C cluster0.has_permission_indirection_s1: 2
