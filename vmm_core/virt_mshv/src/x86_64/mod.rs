@@ -1273,6 +1273,7 @@ impl MshvProcessor<'_> {
         );
 
         match ghcb_op {
+            GHCB_INFO_SPECIAL_DBGPRINT => {}
             GHCB_INFO_HYP_FEATURE_REQUEST if ghcb_data == 0 => {
                 let features = GHCB_HYP_FEATURE_SEV_SNP;
                 let response = GHCB_INFO_HYP_FEATURE_RESPONSE as u64
