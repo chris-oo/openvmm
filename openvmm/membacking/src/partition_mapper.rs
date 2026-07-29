@@ -31,6 +31,8 @@ pub enum PartitionMapperError {
     Map(#[source] anyhow::Error),
     #[error("failed to pin range to partition")]
     Pin(#[source] anyhow::Error),
+    #[error("failed to unmap range from partition")]
+    Unmap(#[source] anyhow::Error),
 }
 
 impl PartitionMapper {
@@ -132,14 +134,13 @@ impl PartitionMapper {
     /// `range` may overlap zero, one, or many regions that were mapped with
     /// `map_region`, but it must fully contain any regions it overlaps.
     ///
-    /// This cannot fail, but on some hypervisors, it may panic on partial
-    /// region unmap.
-    pub fn unmap_region(&mut self, range: MemoryRange) {
+    pub fn unmap_region(&mut self, range: MemoryRange) -> Result<(), PartitionMapperError> {
         if let Some(partition) = self.partition.upgrade() {
             partition
                 .unmap_range(range.start().checked_add(self.offset).unwrap(), range.len())
-                .expect("unmap cannot fail");
+                .map_err(PartitionMapperError::Unmap)?;
         }
+        Ok(())
     }
 }
 
@@ -147,6 +148,12 @@ impl Drop for PartitionMapper {
     fn drop(&mut self) {
         // Ensure everything is unmapped from the partition since the underlying
         // VA is going away.
-        self.unmap_region(MemoryRange::new(0..self.mapper.len() as u64));
+        if let Err(err) = self.unmap_region(MemoryRange::new(0..self.mapper.len() as u64)) {
+            tracing::error!(
+                error = &err as &dyn std::error::Error,
+                "failed to unmap partition memory; leaking VA reservation"
+            );
+            std::mem::forget(self.mapper.clone());
+        }
     }
 }

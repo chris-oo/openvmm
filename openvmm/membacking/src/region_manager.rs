@@ -291,9 +291,9 @@ struct RegionManagerTaskInner {
 #[derive(MeshPayload)]
 enum RegionRequest {
     AddRegion(Rpc<RegionParams, Result<RegionId, AddRegionError>>),
-    RemoveRegion(Rpc<RegionId, ()>),
+    RemoveRegion(FailableRpc<RegionId, ()>),
     MapRegion(FailableRpc<(RegionId, MapParams), ()>),
-    UnmapRegion(Rpc<RegionId, ()>),
+    UnmapRegion(FailableRpc<RegionId, ()>),
     AddMapping(FailableRpc<(RegionId, RegionMappingParams), ()>),
     RemoveMappings(Rpc<(RegionId, MemoryRange), ()>),
     AddPartition(
@@ -370,7 +370,7 @@ impl RegionManagerTask {
                 }
                 RegionRequest::AddRegion(rpc) => rpc.handle_sync(|params| self.add_region(params)),
                 RegionRequest::RemoveRegion(rpc) => {
-                    rpc.handle(async |id| self.unmap_region(id, true).await)
+                    rpc.handle_failable(async |id| self.unmap_region(id, true).await)
                         .await
                 }
                 RegionRequest::MapRegion(rpc) => {
@@ -378,7 +378,7 @@ impl RegionManagerTask {
                         .await
                 }
                 RegionRequest::UnmapRegion(rpc) => {
-                    rpc.handle(async |id| self.unmap_region(id, false).await)
+                    rpc.handle_failable(async |id| self.unmap_region(id, false).await)
                         .await
                 }
                 RegionRequest::Inspect(deferred) => {
@@ -599,7 +599,7 @@ impl RegionManagerTask {
                 // Overlay disable: a higher/equal-priority region is taking
                 // over this range, so the disabled region may be re-enabled
                 // later. This is transient.
-                self.inner.disable_region(other_region, true).await;
+                self.inner.disable_region(other_region, true).await?;
             }
         }
 
@@ -610,7 +610,7 @@ impl RegionManagerTask {
         Ok(())
     }
 
-    async fn unmap_region(&mut self, id: RegionId, remove: bool) {
+    async fn unmap_region(&mut self, id: RegionId, remove: bool) -> anyhow::Result<()> {
         let index = self.region_index(id);
         let region = &mut self.regions[index];
         tracing::debug!(
@@ -624,7 +624,7 @@ impl RegionManagerTask {
         if active_range.is_some() {
             // A removal is a permanent teardown; keeping the region registered
             // (remove == false) is transient, since a re-map can re-enable it.
-            self.inner.disable_region(region, !remove).await;
+            self.inner.disable_region(region, !remove).await?;
         }
 
         if remove {
@@ -638,6 +638,7 @@ impl RegionManagerTask {
                  this should not fail because the region was previously active",
             );
         }
+        Ok(())
     }
 
     async fn add_mapping(
@@ -861,7 +862,7 @@ impl RegionManagerTaskInner {
     /// region, which is the highest priority), so guard it with an assert to
     /// turn a future regression into an immediate, located panic rather than
     /// silent corruption.
-    async fn disable_region(&mut self, region: &mut Region, transient: bool) {
+    async fn disable_region(&mut self, region: &mut Region, transient: bool) -> anyhow::Result<()> {
         assert!(region.is_active);
         assert!(
             !transient
@@ -889,10 +890,11 @@ impl RegionManagerTaskInner {
         }
 
         for partition in &mut self.partitions {
-            partition.unmap_region(region_range);
+            partition.unmap_region(region_range)?;
         }
         self.mapping_manager.remove_mappings(region_range).await;
         region.is_active = false;
+        Ok(())
     }
 }
 
@@ -1061,11 +1063,11 @@ impl RegionHandle {
     }
 
     /// Unmaps this region.
-    pub async fn unmap(&self) {
-        let _ = self
-            .req_send
+    pub async fn unmap(&self) -> Result<(), RemoteError> {
+        self.req_send
             .call(RegionRequest::UnmapRegion, self.id.unwrap())
-            .await;
+            .await
+            .map_err(RemoteError::new)?
     }
 
     /// Adds a mapping to the region.
@@ -1114,11 +1116,14 @@ impl RegionHandle {
     }
 
     /// Tears the region down, waiting for all mappings to be unreferenced.
-    pub async fn teardown(mut self) {
-        let _ = self
-            .req_send
-            .call(RegionRequest::RemoveRegion, self.id.take().unwrap())
-            .await;
+    pub async fn teardown(mut self) -> Result<(), RemoteError> {
+        let id = self.id.unwrap();
+        self.req_send
+            .call(RegionRequest::RemoveRegion, id)
+            .await
+            .map_err(RemoteError::new)??;
+        self.id.take();
+        Ok(())
     }
 }
 
@@ -1230,7 +1235,7 @@ mod tests {
             }
 
             async fn remove(&mut self, id: RegionId) {
-                self.0.unmap_region(id, true).await;
+                self.0.unmap_region(id, true).await.unwrap();
             }
         }
 
@@ -1477,7 +1482,7 @@ mod tests {
         target.take_events(); // discard replay
 
         // Disabling the region should unmap the entire region range.
-        t.task.unmap_region(r, false).await;
+        t.task.unmap_region(r, false).await.unwrap();
         assert_eq!(
             target.take_events(),
             vec![DmaEvent::Unmap(MemoryRange::new(0x0..0x10000))]
@@ -1513,7 +1518,7 @@ mod tests {
         t.add_mapping(r, 0x0..0x4000).await;
 
         // Disable the region before registering the mapper.
-        t.task.unmap_region(r, false).await;
+        t.task.unmap_region(r, false).await.unwrap();
 
         let target = Arc::new(RecordingDmaTarget::default());
         let _id = t.task.add_dma_mapper(target.clone(), false).await.unwrap();
@@ -1616,7 +1621,7 @@ mod tests {
         t.add_mapping(r, 0x0..0x4000).await;
 
         // Disable so we can re-enable with DMA mappers present.
-        t.task.unmap_region(r, false).await;
+        t.task.unmap_region(r, false).await.unwrap();
 
         let good_target = Arc::new(RecordingDmaTarget::default());
         let _good_id = t
@@ -1672,7 +1677,7 @@ mod tests {
         t.add_mapping(r, 0x8000..0xC000).await;
 
         // Disable the region so we can re-enable with a DMA mapper present.
-        t.task.unmap_region(r, false).await;
+        t.task.unmap_region(r, false).await.unwrap();
 
         // Register a DMA mapper that fails on the third map_dma call
         // (i.e., the third sub-mapping). The first two succeed.

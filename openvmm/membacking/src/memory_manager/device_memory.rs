@@ -155,7 +155,7 @@ impl MappableGuestMemory for DeviceMemoryControl {
         block_on(async {
             let mut state = self.0.state.lock();
             if let Some(handle) = state.handle.take() {
-                handle.teardown().await;
+                handle.teardown().await.map_err(io::Error::other)?;
             }
             let handle = self
                 .0
@@ -202,7 +202,12 @@ impl MappableGuestMemory for DeviceMemoryControl {
     fn unmap_from_guest(&mut self) {
         let mut state = self.0.state.lock();
         if let Some(handle) = state.handle.take() {
-            block_on(handle.teardown());
+            if let Err(err) = block_on(handle.teardown()) {
+                tracing::error!(
+                    error = &err as &dyn std::error::Error,
+                    "failed to tear down device memory mapping"
+                );
+            }
         }
     }
 }

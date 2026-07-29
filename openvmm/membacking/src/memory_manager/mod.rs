@@ -869,6 +869,15 @@ pub enum RamVisibilityError {
         #[source]
         error: mesh::error::RemoteError,
     },
+    /// Failed to unmap the region.
+    #[error("failed to unmap RAM range {range}")]
+    Unmap {
+        /// The range that failed.
+        range: MemoryRange,
+        /// The error.
+        #[source]
+        error: mesh::error::RemoteError,
+    },
 }
 
 impl RamVisibilityControl {
@@ -901,7 +910,13 @@ impl RamVisibilityControl {
                     .await
                     .map_err(|error| RamVisibilityError::Map { range, error })?;
             }
-            RamVisibility::Unmapped => region.handle.unmap().await,
+            RamVisibility::Unmapped => {
+                region
+                    .handle
+                    .unmap()
+                    .await
+                    .map_err(|error| RamVisibilityError::Unmap { range, error })?;
+            }
         }
         Ok(())
     }
