@@ -229,6 +229,7 @@ pub struct Kvm {
     supports_gic_v3: bool,
     supports_its: bool,
     ipa_size: u8,
+    cca_ipa_size: Option<u8>,
 }
 
 impl Kvm {
@@ -249,6 +250,24 @@ impl Kvm {
             v if v > 0 => v as u8,
             _ => 40,
         };
+        let cca_ipa_size = if kvm
+            .check_extension(KVM_CAP_ARM_RMI_UAPI)
+            .map_err(kvm::Error::CheckExtension)?
+            != 0
+        {
+            match kvm.new_realm_vm_with_max_ipa_size(ipa_size) {
+                Ok((_probe_realm, cca_ipa_size)) => Some(cca_ipa_size),
+                Err(err) => {
+                    tracing::warn!(
+                        error = &err as &dyn std::error::Error,
+                        "failed to probe KVM CCA Realm IPA size"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let probe_vm = kvm.new_vm(kvm::VmType::Default)?;
         let supports_gic_v3 = if probe_vm
             .test_create_device(kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V3)
@@ -264,7 +283,12 @@ impl Kvm {
             return Err(KvmError::NoGic);
         };
 
-        tracing::info!(supports_gic_v3, "detected KVM GIC version");
+        tracing::info!(
+            supports_gic_v3,
+            host_ipa_size = ipa_size,
+            ?cca_ipa_size,
+            "detected KVM GIC version and IPA sizes"
+        );
 
         // Probe ITS support: only available with GICv3.
         let supports_its = supports_gic_v3
@@ -279,6 +303,7 @@ impl Kvm {
             supports_gic_v3,
             supports_its,
             ipa_size,
+            cca_ipa_size,
         })
     }
 }
@@ -519,7 +544,7 @@ impl virt::Processor for KvmProcessor<'_> {
                     Err(kvm::Error::RunMemoryFault {
                         flags, gpa, size, ..
                     }) if self.partition.caps.isolation == virt::IsolationType::Cca => {
-                        match self.partition.set_cca_memory_attributes(gpa, size, flags) {
+                        match self.partition.handle_cca_ripas_change(gpa, size, flags) {
                             Ok(()) => {
                                 pending_exit = false;
                                 continue;
@@ -895,9 +920,11 @@ impl virt::ProtoPartition for KvmProtoPartition<'_> {
             .collect();
         let memory_backing_mode = match self.config.isolation {
             virt::IsolationType::None => KvmMemoryBackingMode::Userspace,
-            virt::IsolationType::Cca => {
-                KvmMemoryBackingMode::guest_memfd(&self.vm, ram_ranges.iter().copied(), true)?
-            }
+            virt::IsolationType::Cca => KvmMemoryBackingMode::guest_memfd(
+                &self.vm,
+                ram_ranges.iter().copied(),
+                crate::memory::KvmGuestMemfdPrivateState::GuestMemfdDefault,
+            )?,
             virt::IsolationType::Vbs | virt::IsolationType::Snp | virt::IsolationType::Tdx => {
                 unreachable!()
             }
@@ -1226,7 +1253,7 @@ impl virt::Hypervisor for Kvm {
             supports_its: self.supports_its,
             // TODO: Revisit whether CCA should share an abstraction with SNP's
             // vtom/shared-GPA-boundary model instead of using a separate field.
-            shared_gpa_bit: Some(1_u64 << (self.ipa_size - 1)),
+            shared_gpa_bit: self.cca_ipa_size.map(|ipa_size| 1_u64 << (ipa_size - 1)),
         }
     }
 
@@ -1265,14 +1292,22 @@ impl virt::Hypervisor for Kvm {
             }
         }
 
-        let ipa_size = self.ipa_size;
+        let ipa_size = match config.isolation {
+            virt::IsolationType::Cca => self
+                .cca_ipa_size
+                .ok_or(KvmError::MissingCcaCapability("KVM_CAP_ARM_RMI"))?,
+            _ => self.ipa_size,
+        };
 
         let vm = match config.isolation {
             virt::IsolationType::None => self.kvm.new_vm(kvm::VmType::Default)?,
             virt::IsolationType::Cca => {
                 let vm = self.kvm.new_vm(kvm::VmType::Realm { ipa_bits: ipa_size })?;
-                crate::memory::check_private_memory_extensions(&vm)
-                    .map_err(map_cca_capability_error)?;
+                crate::memory::check_private_memory_extensions(
+                    &vm,
+                    crate::memory::KvmGuestMemfdPrivateState::GuestMemfdDefault,
+                )
+                .map_err(map_cca_capability_error)?;
                 vm
             }
             virt::IsolationType::Vbs | virt::IsolationType::Snp | virt::IsolationType::Tdx => {

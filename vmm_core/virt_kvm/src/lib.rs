@@ -106,6 +106,8 @@ pub enum KvmError {
     UnalignedCcaPopulateRange,
     #[error("CCA initial population range is not contained in guest_memfd private memory")]
     InvalidCcaPopulateRange,
+    #[error("KVM_ARM_RMI_POPULATE returned without making progress")]
+    CcaPopulateNoProgress,
     #[cfg(guest_arch = "aarch64")]
     #[error("invalid CCA memory fault")]
     InvalidCcaMemoryFault,

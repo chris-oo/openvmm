@@ -74,8 +74,11 @@ impl KvmPartitionInner {
         &self,
         pages: &[virt::InitialPageImport],
     ) -> Result<(), KvmError> {
-        crate::memory::check_private_memory_extensions(&self.kvm)
-            .map_err(map_cca_capability_error)?;
+        crate::memory::check_private_memory_extensions(
+            &self.kvm,
+            crate::memory::KvmGuestMemfdPrivateState::GuestMemfdDefault,
+        )
+        .map_err(map_cca_capability_error)?;
 
         let pages = pages.to_vec();
 
@@ -93,6 +96,7 @@ impl KvmPartitionInner {
             };
 
             while populate.size != 0 {
+                let previous = populate;
                 tracing::trace!(
                     gpa = populate.base,
                     len = populate.size,
@@ -103,6 +107,9 @@ impl KvmPartitionInner {
                     "KVM_ARM_RMI_POPULATE"
                 );
                 self.kvm.arm_rmi_populate(&mut populate)?;
+                if populate.size >= previous.size {
+                    return Err(KvmError::CcaPopulateNoProgress);
+                }
             }
         }
 
