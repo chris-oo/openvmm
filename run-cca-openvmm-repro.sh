@@ -4,8 +4,9 @@
 
 set -euo pipefail
 
-HOST_KERNEL="${CCA_REPRO_HOST_KERNEL:-target/cca-test/cca-kernels-v15/host-Image}"
-GUEST_KERNEL="${CCA_REPRO_GUEST_KERNEL:-target/cca-test/cca-kernels-v15/guest-Image}"
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+HOST_KERNEL="${CCA_REPRO_HOST_KERNEL:-$REPO_ROOT/target/cca-test/cca-kernels-v15/host-Image}"
+GUEST_KERNEL="${CCA_REPRO_GUEST_KERNEL:-$REPO_ROOT/target/cca-test/cca-kernels-v15/guest-Image}"
 OPENVMM_MEMORY="${CCA_REPRO_OPENVMM_MEMORY:-256M}"
 LOGS_DIR="${CCA_REPRO_LOGS_DIR:-target/cca-test/kvm-cca/logs/interactive}"
 TIMEOUT_SECONDS="${CCA_REPRO_TIMEOUT_SECONDS:-300}"
@@ -17,6 +18,7 @@ ERROR_PATTERN="${CCA_REPRO_ERROR_PATTERN:-fatal error|failed to run VP|[Gg]uest 
 SHELL_PATTERN="${CCA_REPRO_SHELL_PATTERN:-No root device specified\\. Dropping to a shell\\.|can.t access tty; job control turned off}"
 
 python3 - \
+    "$REPO_ROOT" \
     "$HOST_KERNEL" \
     "$GUEST_KERNEL" \
     "$OPENVMM_MEMORY" \
@@ -34,12 +36,12 @@ import pty
 import re
 import select
 import signal
-import subprocess
 import sys
 import termios
 import time
 
 (
+    repo_root,
     host_kernel,
     guest_kernel,
     openvmm_memory,
@@ -96,53 +98,16 @@ argv = [
     *extra_args,
 ]
 
-
-def fvp_pids():
-    try:
-        output = subprocess.check_output(["ps", "-eo", "pid=,args="], text=True)
-    except subprocess.SubprocessError:
-        return []
-    pids = []
-    for line in output.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        pid_text, _, args = stripped.partition(" ")
-        if not pid_text.isdigit():
-            continue
-        argv0 = args.split(" ", 1)[0]
-        basename = os.path.basename(argv0)
-        if basename.startswith("FVP_Base_RevC"):
-            pids.append(int(pid_text))
-    return pids
-
-
 def stop_fvp():
-    pids = fvp_pids()
-    if not pids:
+    global shrinkwrap_stop_requested
+    if shrinkwrap_stop_requested:
         return
-    print(f"\nStopping FVP_Base_RevC processes: {' '.join(str(pid) for pid in pids)}", flush=True)
-    for pid in pids:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        if not fvp_pids():
-            return
-        time.sleep(0.25)
-    remaining = fvp_pids()
-    if remaining:
-        print(
-            f"Force stopping remaining FVP_Base_RevC processes: {' '.join(str(pid) for pid in remaining)}",
-            flush=True,
-        )
-        for pid in remaining:
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+    print("\nStopping repro FVP through Shrinkwrap Ctrl-]", flush=True)
+    try:
+        os.write(fd, b"\x1d")
+    except OSError:
+        pass
+    shrinkwrap_stop_requested = True
 
 
 def child_exit_code(status):
@@ -180,6 +145,7 @@ def send_smoke_test():
 
 pid, fd = pty.fork()
 if pid == 0:
+    os.chdir(repo_root)
     os.execvp(argv[0], argv)
 
 attrs = termios.tcgetattr(fd)
@@ -201,6 +167,7 @@ openvmm_quit_command_sent = False
 openvmm_quit_deadline = None
 guest_shell_ready = False
 smoke_sent = False
+shrinkwrap_stop_requested = False
 
 try:
     while True:
@@ -353,7 +320,7 @@ try:
             flush=True,
         )
         try:
-            os.kill(pid, signal.SIGTERM)
+            os.killpg(pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
         _, child_status = os.waitpid(pid, 0)

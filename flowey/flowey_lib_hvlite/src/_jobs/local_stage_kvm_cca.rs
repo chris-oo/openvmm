@@ -280,8 +280,14 @@ echo "guest_initrd=$KERNEL_DIR/initrd" | tee -a /cca/logs/kvm-cca-inputs.log
 echo "openvmm_memory={openvmm_memory}" | tee -a /cca/logs/kvm-cca-inputs.log
 echo "openvmm_extra_args={extra_args}" | tee -a /cca/logs/kvm-cca-inputs.log
 
-"$ARTIFACT_DIR/kvm_cca_preflight" 2>&1 | tee /cca/logs/kvm-cca-preflight.log
-preflight_rc=$?
+set +e
+{{
+    "$ARTIFACT_DIR/kvm_cca_preflight"
+    echo "$?" >/cca/logs/.kvm-cca-preflight.status
+}} 2>&1 | tee /cca/logs/kvm-cca-preflight.log
+preflight_rc=$(cat /cca/logs/.kvm-cca-preflight.status)
+rm -f /cca/logs/.kvm-cca-preflight.status
+set -e
 echo "$preflight_rc" >/cca/logs/kvm-cca-preflight.status
 if [ "$preflight_rc" -ne 0 ]; then
     sync
@@ -293,6 +299,7 @@ if [ ! -e /etc/resolv.conf ]; then
     printf 'nameserver 10.0.0.1\n' >/etc/resolv.conf
 fi
 set +e
+{{
 RUST_BACKTRACE=1 "$ARTIFACT_DIR/openvmm" \
     --isolation cca \
     --kernel "$KERNEL_DIR/guest-Image" \
@@ -309,9 +316,11 @@ RUST_BACKTRACE=1 "$ARTIFACT_DIR/openvmm" \
     --pcie-root-port rc0:net \
     --virtio-net pcie_port=net:consomme \
     --cmdline "console=hvc0" \
-    {extra_args} \
-    2>&1 | tee /cca/logs/openvmm.log
-openvmm_rc=$?
+    {extra_args}
+echo "$?" >/cca/logs/.openvmm.status
+}} 2>&1 | tee /cca/logs/openvmm.log
+openvmm_rc=$(cat /cca/logs/.openvmm.status)
+rm -f /cca/logs/.openvmm.status
 set -e
 echo "$openvmm_rc" >/cca/logs/openvmm.status
 dmesg >/cca/logs/host-dmesg-after-openvmm.log 2>&1 || true
