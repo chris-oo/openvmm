@@ -213,9 +213,16 @@ impl SimpleFlowNode for Node {
                 )?;
 
                 let generated_dir = stage_dir.join("generated");
-                fs::create_dir_all(&generated_dir)?;
+                fs::create_dir_all(&generated_dir).with_context(|| {
+                    format!("failed to create generated directory {}", generated_dir.display())
+                })?;
                 let debugfs_input_dir = generated_dir.join("debugfs-inputs");
-                fs::create_dir_all(&debugfs_input_dir)?;
+                fs::create_dir_all(&debugfs_input_dir).with_context(|| {
+                    format!(
+                        "failed to create debugfs input directory {}",
+                        debugfs_input_dir.display()
+                    )
+                })?;
                 let run_script = generated_dir.join("run-openvmm-kvm-cca.sh");
                 let mount_share_script = generated_dir.join("mount-kvm-cca-share.sh");
                 fs::write(
@@ -227,8 +234,19 @@ if ! mountpoint -q /cca-share; then
     mount -t 9p -o trans=virtio,version=9p2000.L FM /cca-share
 fi
 "#,
-                )?;
-                set_executable(&mount_share_script)?;
+                )
+                .with_context(|| {
+                    format!(
+                        "failed to write mount script {}",
+                        mount_share_script.display()
+                    )
+                })?;
+                set_executable(&mount_share_script).with_context(|| {
+                    format!(
+                        "failed to make mount script executable {}",
+                        mount_share_script.display()
+                    )
+                })?;
                 if matches!(
                     mode,
                     StageMode::StageOnly | StageMode::InteractiveHost | StageMode::RunOpenvmm
@@ -306,13 +324,21 @@ poweroff -f || poweroff || halt -f || halt || exit "$openvmm_rc"
                             extra_args = openvmm_extra_args.as_deref().unwrap_or(""),
                             openvmm_memory = openvmm_memory,
                         ),
-                    )?;
+                    )
+                    .with_context(|| {
+                        format!("failed to write OpenVMM run script {}", run_script.display())
+                    })?;
                 }
                 if matches!(
                     mode,
                     StageMode::StageOnly | StageMode::InteractiveHost | StageMode::RunOpenvmm
                 ) {
-                    set_executable(&run_script)?;
+                    set_executable(&run_script).with_context(|| {
+                        format!(
+                            "failed to make OpenVMM run script executable {}",
+                            run_script.display()
+                        )
+                    })?;
                 }
                 let init_hook = generated_dir.join(match mode {
                     StageMode::StageOnly => "S99run-openvmm-kvm-cca",
@@ -387,8 +413,12 @@ exit 0
 "#
                     }
                 };
-                fs::write(&init_hook, init_hook_contents)?;
-                set_executable(&init_hook)?;
+                fs::write(&init_hook, init_hook_contents).with_context(|| {
+                    format!("failed to write init hook {}", init_hook.display())
+                })?;
+                set_executable(&init_hook).with_context(|| {
+                    format!("failed to make init hook executable {}", init_hook.display())
+                })?;
 
                 let inject_result = (|| -> anyhow::Result<()> {
                     debugfs_run(&debugfs_bin, &rootfs_file, "mkdir /cca", None)?;
@@ -483,7 +513,10 @@ exit 0
                     let shrinkwrap_dir = test_root.join("shrinkwrap");
                     let venv_dir = shrinkwrap_dir.join("venv");
                     let shrinkwrap_bin = venv_dir.join("bin/shrinkwrap");
+                    let shrinkwrap_overlay =
+                        shrinkwrap_dir.join("config/kvm_cca_planes.yaml");
                     validate_regular_file(&shrinkwrap_bin, "shrinkwrap executable")?;
+                    validate_regular_file(&shrinkwrap_overlay, "KVM CCA shrinkwrap overlay")?;
                     anyhow::ensure!(
                         venv_dir.is_dir(),
                         "shrinkwrap venv is missing at {}",
@@ -494,25 +527,66 @@ exit 0
                         venv_dir.join("bin").display(),
                         env::var("PATH").unwrap_or_default()
                     );
+                    let fvp_wrapper = generated_dir.join("run-fvp-kvm-cca.sh");
+                    fs::write(
+                        &fvp_wrapper,
+                        r#"#!/bin/sh
+set -eu
+exec "$SHRINKWRAP_BIN" \
+    --runtime=docker \
+    --image="$SHRINKWRAP_IMAGE" \
+    run \
+    --overlay "$SHRINKWRAP_OVERLAY" \
+    cca-3world.yaml \
+    --rtvar "ROOTFS=$CCA_ROOTFS" \
+    --rtvar "KERNEL=$CCA_HOST_KERNEL" \
+    --rtvar "SHARE=$CCA_SHARE"
+"#,
+                    )
+                    .with_context(|| {
+                        format!("failed to write FVP wrapper {}", fvp_wrapper.display())
+                    })?;
+                    set_executable(&fvp_wrapper).with_context(|| {
+                        format!(
+                            "failed to make FVP wrapper executable {}",
+                            fvp_wrapper.display()
+                        )
+                    })?;
                     if matches!(mode, StageMode::InteractiveHost) {
                         print_interactive_host_instructions(&rootfs_file, &logs_dir);
                     }
-                    let fvp_command = if matches!(mode, StageMode::InteractiveHost) {
+                    let fvp_result = if matches!(mode, StageMode::InteractiveHost) {
                         flowey::shell_cmd!(
                             rt,
-                            "{shrinkwrap_bin} --runtime=docker --image={SHRINKWRAP_IMAGE} run cca-3world.yaml --rtvar ROOTFS={rootfs_file} --rtvar KERNEL={host_kernel} --rtvar SHARE={share_dir}"
+                            "{shrinkwrap_bin} --runtime=docker --image={SHRINKWRAP_IMAGE} run --overlay {shrinkwrap_overlay} cca-3world.yaml --rtvar ROOTFS={rootfs_file} --rtvar KERNEL={host_kernel} --rtvar SHARE={share_dir}"
                         )
-                    } else {
-                        flowey::shell_cmd!(
-                            rt,
-                            "timeout --foreground 20m {shrinkwrap_bin} --runtime=docker --image={SHRINKWRAP_IMAGE} run cca-3world.yaml --rtvar ROOTFS={rootfs_file} --rtvar KERNEL={host_kernel} --rtvar SHARE={share_dir}"
-                        )
-                    };
-                    let fvp_result = fvp_command
                         .env("VIRTUAL_ENV", &venv_dir)
                         .env("PATH", &venv_bin_path)
                         .env("SHRINKWRAP_CONFIG", shrinkwrap_dir.join("config"))
-                        .run();
+                        .run()
+                        .map_err(anyhow::Error::from)
+                    } else {
+                        run_command(
+                            "launch FVP for KVM CCA",
+                            Command::new("timeout")
+                                .arg("--foreground")
+                                .arg("20m")
+                                .arg("script")
+                                .arg("-qefc")
+                                .arg("./run-fvp-kvm-cca.sh")
+                                .arg("/dev/null")
+                                .current_dir(&generated_dir)
+                                .env("VIRTUAL_ENV", &venv_dir)
+                                .env("PATH", &venv_bin_path)
+                                .env("SHRINKWRAP_CONFIG", shrinkwrap_dir.join("config"))
+                                .env("SHRINKWRAP_BIN", &shrinkwrap_bin)
+                                .env("SHRINKWRAP_IMAGE", SHRINKWRAP_IMAGE)
+                                .env("SHRINKWRAP_OVERLAY", &shrinkwrap_overlay)
+                                .env("CCA_ROOTFS", &rootfs_file)
+                                .env("CCA_HOST_KERNEL", &host_kernel)
+                                .env("CCA_SHARE", &share_dir),
+                        )
+                    };
                     extract_logs(&debugfs_bin, &rootfs_file, &logs_dir)?;
                     fvp_result.with_context(|| {
                         format!(
@@ -764,7 +838,9 @@ fn stage_share_dir(
     if let Some(guest_initrd) = guest_initrd {
         files_to_copy.push((guest_initrd, "initrd"));
     }
-    files_to_copy.push((run_script, "run-openvmm-kvm-cca.sh"));
+    if run_script.is_file() {
+        files_to_copy.push((run_script, "run-openvmm-kvm-cca.sh"));
+    }
 
     for (src, dest_name) in files_to_copy {
         let dest = share_dir.join(dest_name);
@@ -774,7 +850,12 @@ fn stage_share_dir(
                 format!("failed to copy {} to {}", src.display(), dest.display())
             })?;
         }
-        set_executable(&dest)?;
+        set_executable(&dest).with_context(|| {
+            format!(
+                "failed to make staged artifact executable {}",
+                dest.display()
+            )
+        })?;
     }
 
     Ok(())
