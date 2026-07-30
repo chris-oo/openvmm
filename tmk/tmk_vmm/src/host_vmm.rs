@@ -44,6 +44,7 @@ impl RunContext<'_> {
                 hv_config: None,
                 vmtime: self.vmtime_source,
                 isolation: virt::IsolationType::None,
+                snp_aci_hyperv: false,
                 nested_virt: false,
             })
             .context("failed to create proto partition")?;

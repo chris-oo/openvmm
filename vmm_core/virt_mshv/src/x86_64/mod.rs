@@ -253,6 +253,46 @@ fn sanitize_snp_cpuid(function: u32, index: u32, values: &mut [u32; 4]) {
     }
 }
 
+fn snp_hv_cpuid_overrides(native_max_leaf: u32) -> [virt::CpuidLeaf; 3] {
+    const HV_ISOLATION_FEATURE: u32 = 1 << 22;
+    const HV_ISOLATION_TYPE_SNP: u32 = 2;
+
+    // TODO: Investigate why this MSHV environment does not derive the Hyper-V
+    // isolation CPUID contract from MSHV_PT_ISOLATION_SNP. Cloud Hypervisor
+    // does not install an equivalent override, but we have not confirmed
+    // whether its environment receives the isolation leaves correctly from
+    // MSHV. Without these overrides, ACI Linux does not recognize a
+    // non-paravisor Hyper-V SNP guest and uses the hypercall-page overlay
+    // instead of direct VMMCALL hypercalls. Correctly describing isolation
+    // also keeps ACI's restricted-injection doorbell EOI path active, making
+    // the previous APIC-access recommendation mask unnecessary.
+    [
+        // Make the isolation configuration leaf discoverable.
+        virt::CpuidLeaf::new(
+            hvdef::HV_CPUID_FUNCTION_HV_VENDOR_AND_MAX_FUNCTION,
+            [
+                native_max_leaf.max(hvdef::HV_CPUID_FUNCTION_MS_HV_ISOLATION_CONFIGURATION),
+                0,
+                0,
+                0,
+            ],
+        )
+        .masked([u32::MAX, 0, 0, 0]),
+        // Tell the guest that this is an isolated Hyper-V partition.
+        virt::CpuidLeaf::new(
+            hvdef::HV_CPUID_FUNCTION_MS_HV_FEATURES,
+            [0, HV_ISOLATION_FEATURE, 0, 0],
+        )
+        .masked([0, HV_ISOLATION_FEATURE, 0, 0]),
+        // Describe physical SNP without a paravisor or vTOM boundary.
+        virt::CpuidLeaf::new(
+            hvdef::HV_CPUID_FUNCTION_MS_HV_ISOLATION_CONFIGURATION,
+            [0, HV_ISOLATION_TYPE_SNP, 0, 0],
+        )
+        .masked([u32::MAX; 4]),
+    ]
+}
+
 impl virt::Hypervisor for LinuxMshv {
     type ProtoPartition<'a> = MshvProtoPartition<'a>;
     type Partition = MshvPartition;
@@ -500,24 +540,13 @@ impl ProtoPartition for MshvProtoPartition<'_> {
         config: PartitionConfig<'_>,
     ) -> Result<(Self::Partition, Vec<Self::ProcessorBinder>), Self::Error> {
         let mut cpuid = config.cpuid.to_vec();
-        if self.config.isolation == virt::IsolationType::Snp {
-            // HACK/TODO: ACI's restricted-injection support installs a
-            // doorbell-backed EOI callback, but generic Hyper-V initialization
-            // later replaces it with the VP-assist/synthetic-EOI path whenever
-            // this recommendation is present. The first lazy-EOI access then
-            // faults on the VP-assist overlay under MSHV direct boot.
-            //
-            // Keep interrupt-control registers available, but suppress only
-            // the recommendation to use them. Remove this override once the
-            // guest and MSHV agree on VP-assist behavior for non-paravisor,
-            // restricted-injection SNP guests.
-            cpuid.push(
-                virt::CpuidLeaf::new(
-                    hvdef::HV_CPUID_FUNCTION_MS_HV_ENLIGHTENMENT_INFORMATION,
-                    [0; 4],
-                )
-                .masked([1 << 3, 0, 0, 0]),
-            );
+        if self.config.isolation == virt::IsolationType::Snp && self.config.snp_aci_hyperv {
+            let native_max_leaf = self
+                .bsp
+                .get_cpuid_values(hvdef::HV_CPUID_FUNCTION_HV_VENDOR_AND_MAX_FUNCTION, 0, 0, 0)
+                .map(|values| values[0])
+                .unwrap_or(hvdef::HV_CPUID_FUNCTION_MS_HV_ISOLATION_CONFIGURATION);
+            cpuid.extend(snp_hv_cpuid_overrides(native_max_leaf));
         }
         let cpuid = virt::CpuidLeafSet::new(cpuid);
 
@@ -665,6 +694,14 @@ mod tests {
             0
         );
         assert_eq!(pt_num_cpu_fbanks, 0);
+    }
+
+    #[test]
+    fn snp_hv_cpuid_exposes_isolation() {
+        let leaves = snp_hv_cpuid_overrides(0x40000010);
+        assert_eq!(leaves[0].result[0], 0x40000010);
+        assert_eq!(leaves[1].result[1], 1 << 22);
+        assert_eq!(leaves[2].result, [0, 2, 0, 0]);
     }
 
     #[test]
@@ -1248,7 +1285,9 @@ impl virt::X86Partition for MshvPartition {
     }
 
     fn pulse_lint(&self, vp_index: VpIndex, vtl: Vtl, lint: u8) {
-        // TODO
+        // TODO: MSHV encrypted VPs reject the direct LINT and ExtINT
+        // injection interfaces tried during ACI bring-up. The ACI IOAPIC path
+        // avoids this legacy PIC output.
         tracelimit::warn_ratelimited!(?vp_index, ?vtl, lint, "ignored lint pulse");
     }
 }

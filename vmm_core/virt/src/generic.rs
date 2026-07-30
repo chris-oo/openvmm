@@ -228,6 +228,11 @@ pub struct ProtoPartitionConfig<'a> {
     pub vmtime: &'a VmTimeSource,
     /// Isolation type for this partition.
     pub isolation: IsolationType,
+    /// Expose the temporary ACI Hyper-V SNP CPUID contract.
+    ///
+    /// TODO: Replace this bring-up switch with an explicit guest boot layout
+    /// configuration once the ACI mode has a dedicated CLI argument.
+    pub snp_aci_hyperv: bool,
     /// Expose hardware virtualization (VMX/SVM) to the guest so that it can run
     /// its own hypervisor.
     ///
