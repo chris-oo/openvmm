@@ -1,0 +1,430 @@
+#!/usr/bin/env bash
+# Build, deploy, and run the current one-vCPU MSHV SNP direct-boot repro.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+HOST="${MSHV_SNP_HOST:-wedson-mshv}"
+ACI_ROOT="${MSHV_SNP_ACI_ROOT:-$HOME/ai/leafeon/aci-6.6}"
+OPENVMM_BIN="${MSHV_SNP_OPENVMM:-$REPO_ROOT/target/x86_64-unknown-linux-musl/debug/openvmm}"
+KERNEL="${MSHV_SNP_KERNEL:-$ACI_ROOT/out/snp-nord/arch/x86/boot/bzImage}"
+INITRD="${MSHV_SNP_INITRD:-$REPO_ROOT/.packages/underhill-deps-private/x64/initrd}"
+MEMORY="${MSHV_SNP_MEMORY:-160MB}"
+PROCESSORS="${MSHV_SNP_PROCESSORS:-1}"
+TIMEOUT_SECONDS="${MSHV_SNP_TIMEOUT_SECONDS:-90}"
+OPENVMM_LOG="${OPENVMM_LOG:-info,virt_mshv=debug}"
+KERNEL_CMDLINE="${MSHV_SNP_CMDLINE:-console=ttyS0 earlyprintk=serial earlycon panic=-1 nokaslr}"
+BUILD_OPENVMM="${MSHV_SNP_BUILD_OPENVMM:-1}"
+BUILD_KERNEL="${MSHV_SNP_BUILD_KERNEL:-0}"
+KEEP_REMOTE="${MSHV_SNP_KEEP_REMOTE:-0}"
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0")
+
+Build, deploy, and run the current one-vCPU MSHV SNP direct-boot repro on
+wedson-mshv. Configuration is provided through environment variables:
+
+  MSHV_SNP_HOST              SSH host (default: wedson-mshv)
+  MSHV_SNP_ACI_ROOT          ACI Linux checkout
+  MSHV_SNP_OPENVMM           static-musl OpenVMM binary
+  MSHV_SNP_KERNEL            ACI bzImage
+  MSHV_SNP_INITRD            direct-boot initrd
+  MSHV_SNP_BUILD_OPENVMM     build OpenVMM first (default: 1)
+  MSHV_SNP_BUILD_KERNEL      incrementally build the ACI kernel (default: 0)
+  MSHV_SNP_MEMORY            guest memory (default: 160MB)
+  MSHV_SNP_TIMEOUT_SECONDS   boot timeout (default: 90)
+  MSHV_SNP_KEEP_REMOTE       retain a successful remote run (default: 0)
+EOF
+}
+
+if (( $# != 0 )); then
+    if [[ "$1" == "-h" || "$1" == "--help" ]]; then
+        usage
+        exit 0
+    fi
+    usage >&2
+    exit 2
+fi
+
+if [[ "$PROCESSORS" != 1 ]]; then
+    echo "ERROR: the current MSHV SNP repro supports only one processor; AP creation is not implemented" >&2
+    exit 2
+fi
+
+for value in "$BUILD_OPENVMM" "$BUILD_KERNEL" "$KEEP_REMOTE"; do
+    if [[ "$value" != 0 && "$value" != 1 ]]; then
+        echo "ERROR: boolean configuration values must be 0 or 1" >&2
+        exit 2
+    fi
+done
+
+for command in cargo python3 scp sha256sum ssh; do
+    if ! command -v "$command" >/dev/null; then
+        echo "ERROR: required command is unavailable: $command" >&2
+        exit 2
+    fi
+done
+
+change_id="unknown"
+if [[ -d "$REPO_ROOT/.jj" ]] && command -v jj >/dev/null; then
+    change_id="$(cd "$REPO_ROOT" && jj log --no-graph -r @ -T 'change_id' 2>/dev/null || true)"
+    change_id="${change_id:0:8}"
+    [[ -n "$change_id" ]] || change_id="unknown"
+fi
+
+printf -v run_nonce '%08x' "$(((RANDOM << 16) ^ RANDOM ^ $$))"
+run_id="$(date -u +%Y%m%dT%H%M%SZ)-$change_id-$run_nonce"
+logs_dir="$REPO_ROOT/target/mshv-snp/$run_id"
+console_log="$logs_dir/bsp.console.log"
+deploy_log="$logs_dir/deploy.log"
+manifest="$logs_dir/manifest.txt"
+mkdir -p "$logs_dir"
+
+remote_dir=
+remote_staged=0
+run_succeeded=0
+
+quote_command() {
+    local quoted
+    printf -v quoted '%q ' "$@"
+    printf '%s' "${quoted% }"
+}
+
+cleanup_remote_process() {
+    [[ "$remote_staged" == 1 ]] || return 0
+
+    local quoted_dir cleanup_command
+    printf -v quoted_dir '%q' "$remote_dir"
+    cleanup_command="cd $quoted_dir && if test -f openvmm.pgid; then
+        pgid=\$(cat openvmm.pgid)
+        case \"\$pgid\" in
+            ''|*[!0-9]*) exit 2 ;;
+        esac
+        if sudo -n /usr/bin/kill -0 -- \"-\$pgid\" 2>/dev/null; then
+            sudo -n /usr/bin/kill -TERM -- \"-\$pgid\"
+            i=0
+            while sudo -n /usr/bin/kill -0 -- \"-\$pgid\" 2>/dev/null && test \"\$i\" -lt 20; do
+                sleep 0.25
+                i=\$((i + 1))
+            done
+            if sudo -n /usr/bin/kill -0 -- \"-\$pgid\" 2>/dev/null; then
+                sudo -n /usr/bin/kill -KILL -- \"-\$pgid\"
+            fi
+        fi
+    fi"
+    ssh -o BatchMode=yes "$HOST" "$cleanup_command"
+}
+
+on_exit() {
+    local status=$?
+    trap - EXIT INT TERM
+
+    if ! cleanup_remote_process; then
+        echo "ERROR: failed to clean the recorded remote OpenVMM process group" >&2
+        (( status != 0 )) || status=1
+    fi
+
+    if [[ "$remote_staged" == 1 && "$run_succeeded" == 1 && "$KEEP_REMOTE" == 0 ]]; then
+        local quoted_dir
+        printf -v quoted_dir '%q' "$remote_dir"
+        if ! ssh -o BatchMode=yes "$HOST" "rm -rf -- $quoted_dir"; then
+            echo "ERROR: failed to remove successful remote run directory: $remote_dir" >&2
+            (( status != 0 )) || status=1
+        fi
+    elif [[ "$remote_staged" == 1 ]]; then
+        echo "Remote run retained at $HOST:$remote_dir" >&2
+    fi
+
+    exit "$status"
+}
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+echo "Checking $HOST..." | tee -a "$deploy_log"
+remote_home="$(
+    ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST" \
+        'set -eu; sudo -n true; command -v timeout >/dev/null; command -v setsid >/dev/null; setsid --help 2>&1 | grep -q -- --wait; printf %s "$HOME"' \
+        | tee -a "$deploy_log"
+)"
+if [[ -z "$remote_home" || "$remote_home" != /* ]]; then
+    echo "ERROR: failed to resolve the remote home directory" >&2
+    exit 3
+fi
+remote_dir="$remote_home/mshv-snp-openvmm/runs/$run_id"
+remote_base="$remote_home/mshv-snp-openvmm/runs"
+
+if [[ "$BUILD_KERNEL" == 1 ]]; then
+    if [[ ! -x "$ACI_ROOT/build-snp-guest.sh" ]]; then
+        echo "ERROR: missing ACI kernel build helper: $ACI_ROOT/build-snp-guest.sh" >&2
+        exit 3
+    fi
+    echo "Building the ACI SNP guest kernel..." | tee -a "$deploy_log"
+    (
+        cd "$ACI_ROOT"
+        SNP_GUEST_OUT="$ACI_ROOT/out/snp-nord" \
+            SNP_GUEST_BASE_CONFIG="$ACI_ROOT/arch/x86/configs/nord_defconfig" \
+            ./build-snp-guest.sh build
+    ) 2>&1 | tee -a "$deploy_log"
+fi
+
+if [[ "$BUILD_OPENVMM" == 1 ]]; then
+    if [[ ! -f "$INITRD" ]]; then
+        echo "Restoring packaged build dependencies..." | tee -a "$deploy_log"
+        (cd "$REPO_ROOT" && cargo xflowey restore-packages) 2>&1 | tee -a "$deploy_log"
+    fi
+    echo "Building static-musl OpenVMM..." | tee -a "$deploy_log"
+    (cd "$REPO_ROOT" && cargo build --target x86_64-unknown-linux-musl -p openvmm) \
+        2>&1 | tee -a "$deploy_log"
+fi
+
+check_artifact() {
+    local name=$1
+    local path=$2
+    local executable=${3:-0}
+
+    if [[ ! -f "$path" || ! -s "$path" || ! -r "$path" ]]; then
+        echo "ERROR: missing, empty, or unreadable $name: $path" >&2
+        exit 3
+    fi
+    if [[ "$executable" == 1 && ! -x "$path" ]]; then
+        echo "ERROR: $name is not executable: $path" >&2
+        exit 3
+    fi
+}
+
+check_artifact "OpenVMM binary" "$OPENVMM_BIN" 1
+check_artifact "ACI kernel" "$KERNEL"
+check_artifact "initrd" "$INITRD"
+
+openvmm_hash="$(sha256sum "$OPENVMM_BIN" | awk '{print $1}')"
+kernel_hash="$(sha256sum "$KERNEL" | awk '{print $1}')"
+initrd_hash="$(sha256sum "$INITRD" | awk '{print $1}')"
+artifact_bytes="$(
+    stat -c %s "$OPENVMM_BIN"
+    stat -c %s "$KERNEL"
+    stat -c %s "$INITRD"
+)"
+required_kib=0
+while IFS= read -r bytes; do
+    required_kib=$((required_kib + (bytes + 1023) / 1024))
+done <<<"$artifact_bytes"
+required_kib=$((required_kib + 64 * 1024))
+
+remote_available_kib="$(
+    ssh -o BatchMode=yes "$HOST" "df -Pk $(printf '%q' "$remote_home")" |
+        awk 'NR == 2 { print $4 }'
+)"
+if [[ ! "$remote_available_kib" =~ ^[0-9]+$ ]] || (( remote_available_kib < required_kib )); then
+    echo "ERROR: insufficient remote disk space: need ${required_kib} KiB, have ${remote_available_kib:-unknown} KiB" >&2
+    exit 3
+fi
+
+remote_kernel="$(
+    ssh -o BatchMode=yes "$HOST" \
+        'printf "uname=%s\nmshv=%s\n" "$(uname -sr)" "$(ls -l /dev/mshv 2>&1)"'
+)"
+
+{
+    printf 'run_id=%s\n' "$run_id"
+    printf 'change_id=%s\n' "$change_id"
+    printf 'host=%s\n' "$HOST"
+    printf 'remote_dir=%s\n' "$remote_dir"
+    printf 'openvmm=%s\nopenvmm_sha256=%s\n' "$OPENVMM_BIN" "$openvmm_hash"
+    printf 'kernel=%s\nkernel_sha256=%s\n' "$KERNEL" "$kernel_hash"
+    printf 'initrd=%s\ninitrd_sha256=%s\n' "$INITRD" "$initrd_hash"
+    printf 'memory=%s\nprocessors=%s\ntimeout_seconds=%s\n' "$MEMORY" "$PROCESSORS" "$TIMEOUT_SECONDS"
+    printf 'openvmm_log=%s\nkernel_cmdline=%s\n' "$OPENVMM_LOG" "$KERNEL_CMDLINE"
+    printf '%s\n' "$remote_kernel"
+} >"$manifest"
+
+echo "Staging artifacts in $HOST:$remote_dir..." | tee -a "$deploy_log"
+quoted_remote_dir="$(printf '%q' "$remote_dir")"
+quoted_remote_base="$(printf '%q' "$remote_base")"
+ssh -o BatchMode=yes "$HOST" \
+    "mkdir -p -- $quoted_remote_base && mkdir -- $quoted_remote_dir" \
+    2>&1 | tee -a "$deploy_log"
+remote_staged=1
+
+scp -q "$OPENVMM_BIN" "$HOST:$remote_dir/openvmm.new"
+scp -q "$KERNEL" "$HOST:$remote_dir/bzImage.new"
+scp -q "$INITRD" "$HOST:$remote_dir/initrd.new"
+
+verify_command="cd $quoted_remote_dir &&
+    test \"\$(sha256sum openvmm.new | awk '{print \$1}')\" = $(printf '%q' "$openvmm_hash") &&
+    test \"\$(sha256sum bzImage.new | awk '{print \$1}')\" = $(printf '%q' "$kernel_hash") &&
+    test \"\$(sha256sum initrd.new | awk '{print \$1}')\" = $(printf '%q' "$initrd_hash") &&
+    mv openvmm.new openvmm &&
+    mv bzImage.new bzImage &&
+    mv initrd.new initrd &&
+    chmod 755 openvmm"
+ssh -o BatchMode=yes "$HOST" "$verify_command" 2>&1 | tee -a "$deploy_log"
+
+openvmm_command=(
+    env "OPENVMM_LOG=$OPENVMM_LOG"
+    timeout --foreground "$TIMEOUT_SECONDS"
+    ./openvmm
+    --hypervisor mshv
+    --isolation snp
+    --snp-restricted-injection
+    --com1 console
+    --kernel ./bzImage
+    --initrd ./initrd
+    -m "$MEMORY"
+    -p "$PROCESSORS"
+    -c "$KERNEL_CMDLINE"
+)
+quoted_openvmm_command="$(quote_command "${openvmm_command[@]}")"
+runner_body="echo \$\$ > openvmm.pgid; exec $quoted_openvmm_command"
+remote_command="cd $quoted_remote_dir && exec sudo -n setsid --wait sh -c $(printf '%q' "$runner_body")"
+
+{
+    printf '\ncommand='
+    printf '%q ' "${openvmm_command[@]}"
+    printf '\n'
+} >>"$manifest"
+
+echo "Running one-vCPU MSHV SNP repro; full console: $console_log"
+set +e
+python3 - "$HOST" "$remote_command" "$TIMEOUT_SECONDS" "$console_log" <<'PY'
+import os
+import pty
+import re
+import select
+import signal
+import sys
+import termios
+import time
+
+host, remote_command, timeout_text, log_path = sys.argv[1:]
+timeout_seconds = int(timeout_text)
+shell_ready = re.compile(
+    r"No root device specified\. Dropping to a shell\.|"
+    r"can't access tty; job control turned off|"
+    r"(?:^|[\r\n])~ #\s*$"
+)
+fatal = re.compile(
+    r"fatal error|failed to run VP|guest halted|triple fault|panicked at|"
+    r"assertion failed|abnormal exit|SIGABRT|core dumped|Kernel panic"
+)
+
+argv = ["ssh", "-tt", "-o", "BatchMode=yes", host, remote_command]
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvp(argv[0], argv)
+
+attrs = termios.tcgetattr(fd)
+attrs[0] &= ~(termios.IXON | termios.IXOFF | termios.IXANY)
+termios.tcsetattr(fd, termios.TCSANOW, attrs)
+
+deadline = time.monotonic() + timeout_seconds + 15
+buffer = ""
+reached_shell = False
+matched_fatal = False
+control_prompt_requested = False
+quit_sent = False
+child_status = None
+timed_out = False
+
+with open(log_path, "wb", buffering=0) as log:
+    try:
+        while True:
+            finished, status = os.waitpid(pid, os.WNOHANG)
+            if finished:
+                child_status = status
+                break
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+
+            readable, _, _ = select.select([fd], [], [], min(0.5, remaining))
+            if not readable:
+                continue
+
+            try:
+                data = os.read(fd, 4096)
+            except OSError:
+                break
+            if not data:
+                break
+
+            os.write(sys.stdout.fileno(), data)
+            log.write(data)
+            text = data.decode(errors="replace")
+            buffer = (buffer + text)[-16384:]
+
+            if fatal.search(buffer):
+                matched_fatal = True
+                break
+
+            if not reached_shell and shell_ready.search(buffer):
+                reached_shell = True
+                print(
+                    "\nMSHV SNP repro: initrd shell reached; quitting OpenVMM",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                os.write(fd, b"\x11")
+                control_prompt_requested = True
+                buffer = ""
+                continue
+
+            if control_prompt_requested and not quit_sent and "openvmm>" in buffer:
+                os.write(fd, b"q\r")
+                quit_sent = True
+                buffer = ""
+
+        if child_status is None:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            finished, status = os.waitpid(pid, 0)
+            if finished:
+                child_status = status
+    except KeyboardInterrupt:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        os.waitpid(pid, 0)
+        raise
+
+if matched_fatal:
+    print("\nMSHV SNP repro failed: matched a fatal guest or OpenVMM error", file=sys.stderr)
+    sys.exit(1)
+if timed_out:
+    print("\nMSHV SNP repro failed: timed out before reaching the initrd shell", file=sys.stderr)
+    sys.exit(124)
+if child_status is not None:
+    exit_code = os.waitstatus_to_exitcode(child_status)
+    if exit_code != 0:
+        if exit_code < 0:
+            exit_code = 128 - exit_code
+        print(f"\nMSHV SNP repro failed: SSH exited with status {exit_code}", file=sys.stderr)
+        sys.exit(exit_code)
+if not reached_shell:
+    print("\nMSHV SNP repro failed: SSH or OpenVMM exited before reaching the initrd shell", file=sys.stderr)
+    sys.exit(1)
+if not quit_sent:
+    print("\nMSHV SNP repro failed: OpenVMM did not present its control prompt", file=sys.stderr)
+    sys.exit(1)
+if child_status is None:
+    print("\nMSHV SNP repro failed: SSH did not exit", file=sys.stderr)
+    sys.exit(1)
+PY
+run_status=$?
+set -e
+
+if (( run_status != 0 )); then
+    echo "MSHV SNP repro failed with status $run_status; see $console_log" >&2
+    exit "$run_status"
+fi
+
+run_succeeded=1
+echo "MSHV SNP repro passed: the ACI guest reached its initrd shell"
+echo "Logs: $logs_dir"
