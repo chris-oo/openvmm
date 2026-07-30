@@ -411,7 +411,27 @@ impl ProtoPartition for MshvProtoPartition<'_> {
         self,
         config: PartitionConfig<'_>,
     ) -> Result<(Self::Partition, Vec<Self::ProcessorBinder>), Self::Error> {
-        let cpuid = virt::CpuidLeafSet::new(config.cpuid.to_vec());
+        let mut cpuid = config.cpuid.to_vec();
+        if self.config.isolation == virt::IsolationType::Snp {
+            // HACK/TODO: ACI's restricted-injection support installs a
+            // doorbell-backed EOI callback, but generic Hyper-V initialization
+            // later replaces it with the VP-assist/synthetic-EOI path whenever
+            // this recommendation is present. The first lazy-EOI access then
+            // faults on the VP-assist overlay under MSHV direct boot.
+            //
+            // Keep interrupt-control registers available, but suppress only
+            // the recommendation to use them. Remove this override once the
+            // guest and MSHV agree on VP-assist behavior for non-paravisor,
+            // restricted-injection SNP guests.
+            cpuid.push(
+                virt::CpuidLeaf::new(
+                    hvdef::HV_CPUID_FUNCTION_MS_HV_ENLIGHTENMENT_INFORMATION,
+                    [0; 4],
+                )
+                .masked([1 << 3, 0, 0, 0]),
+            );
+        }
+        let cpuid = virt::CpuidLeafSet::new(cpuid);
 
         // Apply CPUID overrides partition-wide.
         for leaf in cpuid.leaves().iter() {
