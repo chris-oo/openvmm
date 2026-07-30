@@ -1,386 +1,462 @@
-# QEMU CCA support for OpenVMM VMM tests
+# QEMU CCA Incubator and VMM Test Plan
 
-> TOML snippets below are examples of the proposed incubator configuration.
+> This file is Markdown despite the `.toml` filename.
 
-## Summary
+## Goal
 
-OpenVMM can reuse the existing Petri **incubator target-runner** design for CCA.
-The host runs `cargo nextest`; for each selected aarch64-musl test binary,
-nextest invokes the incubator; the incubator boots an RME-capable Linux host
-under QEMU TCG; pipette runs the test binary in that host; and the test binary
-launches an L2 Realm with OpenVMM/KVM.
+Add a typed QEMU CCA incubator backend that boots an RME-capable L1 Linux/KVM
+host under QEMU TCG, runs aarch64 VMM-test binaries through pipette, and allows
+a normal `#[vmm_test]` to launch an L2 CCA Realm with OpenVMM.
 
-The current `qemu-tcg` profile cannot boot that CCA host. It only supports a
-direct kernel/initrd boot with one serial stream, a fixed 9p share, user-mode
-networking, and a small fixed set of PCI devices. CCA system emulation needs:
+QEMU support is additive:
 
-- QEMU built with experimental Arm FEAT_RME support.
-- `virt,secure=on,virtualization=on,gic-version=3`.
-- `-cpu max,x-rme=on` (and currently commonly `sme=off`).
-- A TF-A flash image containing TF-RMM and non-secure firmware/EDK2.
-- A CCA/KVM-capable host kernel.
-- A host root filesystem containing the required KVM CCA userspace, pipette,
-  OpenVMM test artifacts, and startup support.
-- Separate handling for firmware, host, secure, and optional Realm consoles.
-- A readiness mechanism that starts pipette after the CCA host boots.
+- retain FVP as the architectural reference and fallback;
+- retain the existing FVP/TMK CCA test;
+- do not change SNP behavior; and
+- do not change the existing generic aarch64 TCG incubator job.
 
-The recommended implementation is a new structured `qemu-cca` incubator
-backend that shares common process, pipette, path mapping, networking, and
-cleanup code with `qemu-tcg`. Avoid solving this only with an unrestricted
-`extra-args = [...]` field: the required firmware, rootfs, console, readiness,
-and artifact lifetimes are part of the backend contract and should be typed.
+## Verified v15 stack
 
-## What exists today
+| Component | Revision | Status |
+| --- | --- | --- |
+| Linux KVM CCA | `cca-host/v15` at `d6d40e6a310388f58def167f8b57e31d6c6057a2` | FVP preflight and OpenVMM smoke pass |
+| TF-RMM | `topics/rmm-v2.0-poc_3` at `f00eac344b6f7c18abc6dad1948b07e9a82ff9f0` | FVP preflight and smoke pass |
+| TF-A | v2.15 at `da738d5eae93af342fdc4995dd3c05acb4c9d757` | FVP preflight and smoke pass |
+| RMM specification | DEN0137 2.0-bet2 | Required by KVM CCA v15 |
+| kvm-unit-tests | `cca/v4` at `6810c578fff399b33528335c7eae3c90e33847ff` | Optional validation |
+| QEMU | Undecided | Must expose experimental `-cpu max,x-rme=on` |
 
-### Incubator and TOML profiles
+The QEMU, firmware, and Linux pins form one platform bundle. Do not update them
+independently after Phase 0 proves a compatible set.
 
-- `petri/incubator/src/profile.rs:20-26` has one backend:
+## Current implementation
+
+### Incubator
+
+- `petri/incubator/src/profile.rs` has only
   `IncubatorBackend::QemuTcg`.
-- `petri/incubator/src/profile.rs:140-163` describes only architecture,
-  binary, machine, CPU, memory, SMP, and kernel command line.
-- `petri/incubator/src/qemu.rs:35-68` unconditionally constructs a direct
-  `-kernel`/`-initrd` launch, `-nographic`, user networking, 9p, and
-  `-serial mon:stdio`.
-- `petri/incubator/src/profile.rs:50-70` supports only `virtio-blk`, `edu`,
-  and `ivshmem-plain` extra devices.
-- `petri/incubator/profiles/aarch64-tcg-pcie.toml` is an L1 nested-KVM/VFIO
+- `petri/incubator/src/qemu.rs` always direct-boots a kernel/initrd with one
+  serial stream, user networking, and a 9p share.
+- `petri/incubator/src/run.rs` assumes the backend is `QemuTcg` and scans QEMU
+  stdout for `pipette_client::PIPETTE_READY_MARKER`.
+- `petri/incubator/src/main.rs` requires a kernel and initrd for every backend.
+- `petri/incubator/profiles/aarch64-tcg-pcie.toml` is a generic nested-KVM/VFIO
   profile, not an RME platform.
 
-### Target-runner integration that should be reused
+### Flowey
 
-- `flowey/flowey_lib_hvlite/src/write_incubator_target_runner.rs:29-59`
-  installs the incubator binary as Cargo's target runner and forwards selected
-  environment variables into the L1 guest.
-- `flowey/flowey_lib_hvlite/src/write_incubator_target_runner.rs:137-176`
-  computes a shared host path, configures the profile, kernel, initrd, QEMU
-  binary, pipette, output directory, and guest working directory.
-- `flowey/flowey_lib_hvlite/src/_jobs/local_build_and_run_nextest_vmm_tests.rs:832-900`
-  already cross-builds aarch64 tests and runs them through the incubator.
-- `flowey/flowey_hvlite/src/pipelines/vmm_tests_run.rs:124-130` exposes this
-  locally as `--incubator --target linux-aarch64-musl`.
-- `flowey/flowey_hvlite/src/pipelines/checkin_gates.rs:1674-1694` has an
-  `aarch64-linux-tcg` CI job using the same mechanism.
+- `flowey/flowey_lib_hvlite/src/write_incubator_target_runner.rs` already
+  installs incubator as Cargo's target runner and passes kernel, initrd, QEMU,
+  pipette, share, output, and guest-working-directory paths.
+- The local/archived VMM-test flows currently resolve the same generic
+  kernel/initrd/QEMU artifacts for every incubator profile.
+- `flowey/flowey_lib_hvlite/src/resolve_openvmm_qemu.rs` models only the generic
+  `SystemAarch64` QEMU binary.
+- `flowey/flowey_lib_hvlite/src/resolve_openvmm_test_linux_kernel.rs` selects
+  `KvmCcaDev` for aarch64 incubator tests, but that published kernel has not
+  been verified against the v15 UAPI.
 
-This is the correct execution model for QEMU CCA. The missing part is the
-outer platform boot, not a new way to run nextest.
+### Working CCA path to reuse
 
-### Existing CCA test and FVP flow
+- `build_support/cca/build-kernels.sh` reproducibly builds distinct v15 host
+  and Realm guest kernels.
+- `flowey/flowey_lib_hvlite/src/build_cca_linux_kernels.rs` exposes them as a
+  typed Flowey artifact.
+- `flowey/flowey_lib_hvlite/src/_jobs/local_stage_kvm_cca.rs` stages the host
+  rootfs, preflight, OpenVMM, guest kernel/initrd, and generated launch scripts.
+- `run-cca-openvmm-repro.sh` is the current block/network smoke oracle.
+- `vmm_tests/vmm_tests/tests/cca.rs` is an FVP/Shrinkwrap `SimpleTest`; it is
+  not a normal `#[vmm_test]`.
 
-- `vmm_tests/vmm_tests/tests/cca.rs:78-138` resolves Shrinkwrap/FVP-specific
-  artifacts and prepares an FVP rootfs.
-- `vmm_tests/vmm_tests/tests/cca.rs:333-360` launches Shrinkwrap and waits for
-  serial markers.
-- `vmm_tests/vmm_tests/tests/cca.rs:708-718` registers a `SimpleTest`; it is
-  not a normal `#[vmm_test]` backed by `PetriVmBuilder`.
-- `vmm_tests/vmm_tests/test_data/cca_realm_overlay.yaml` auto-launches a Realm
-  with `lkvm`.
-- `vmm_tests/vmm_tests/test_data/cca_start_tmk.sh` runs
-  `tmk_vmm --hv cca --tmk simple_tmk` inside that Realm.
+### Petri gaps
 
-There is also a more directly reusable native OpenVMM CCA path:
+- `petri::IsolationType`, Petri requirements, OpenVMM construction, and
+  `vmm_test_macros` do not expose CCA.
+- `openvmm_defs::config::IsolationType::Cca` already exists.
+- `petri/petri_artifacts_common/src/lib.rs` does not define the `cca`
+  capability.
+- Isolation is currently tied to OpenHCL firmware configuration; CCA needs a
+  VM-level isolation selection usable by Linux direct boot.
 
-- `flowey/flowey_lib_hvlite/src/_jobs/local_stage_kvm_cca.rs:45-139`
-  builds/stages aarch64 OpenVMM, `kvm_cca_preflight`, host and guest kernels,
-  and the guest initrd.
-- `flowey/flowey_lib_hvlite/src/_jobs/local_stage_kvm_cca.rs:184-282`
-  generates the OpenVMM launch script with `--isolation cca`.
-- `flowey/flowey_lib_hvlite/src/_jobs/local_stage_kvm_cca.rs:368-449`
-  injects those artifacts into the host rootfs and 9p share.
-- `run-openvmm-kvm-cca.sh:34-57` is the current known launch shape for a CCA
-  Realm under OpenVMM.
+## Decision gates
 
-That staging logic should be factored into reusable artifact production rather
-than duplicated for QEMU.
+Resolve each gate in the named phase. Do not silently pick a fallback.
 
-## QEMU CCA model
+### D1: QEMU revision and delivery
 
-There are two distinct QEMU roles in the reference design:
+Options:
 
-1. **Outer system-emulation QEMU** uses TCG and emulates the Arm RME platform.
-   It boots TF-A, TF-RMM, non-secure firmware, and the L1 Linux/KVM host.
-2. **Inner VMM** asks KVM/RMM to create the Realm. Reference environments can
-   use QEMU with `-object rme-guest` and
-   `-M confidential-guest-support=...`; OpenVMM replaces that inner QEMU in
-   this proposal.
+1. Build a pinned upstream QEMU revision from source.
+2. Publish a static RME-capable QEMU in `openvmm-deps`.
+3. Use a downstream RME fork.
 
-A representative outer launch is:
+Recommendation: begin with a pinned upstream QEMU revision. RME is in-tree but
+experimental, and the local `~/ai/eevee/qemu` checkout is currently unbuilt.
+Probe any existing `openvmm-deps` QEMU for `x-rme` before adding a new artifact.
+
+Resolved in Phase 0; formalized in Phases 1 and 3.
+
+### D1a: Phase 0 boot chain
+
+Options:
+
+1. Direct Linux BL33: build TF-A with
+   `ARM_LINUX_KERNEL_AS_BL33=1` and `PRELOADED_BL33_BASE=0x40200000`.
+2. EDK2 as BL33 with an explicit UEFI boot device and startup configuration.
+
+Recommendation: use direct Linux BL33 for the first proof. Do not combine
+EDK2-as-BL33 with an assumed QEMU `-kernel/-append` boot path.
+
+Resolved in Phase 0.
+
+### D2: Host rootfs and pipette readiness
+
+Options:
+
+1. Dedicated CCA host rootfs with an init service that mounts 9p, configures
+   networking, runs `kvm_cca_preflight`, and starts pipette.
+2. Reuse the generic incubator initrd injection.
+3. Initially reuse the FVP buildroot rootfs with `debugfs` injection.
+
+Recommendation: use option 3 for Phase 0, then produce option 1 in Phase 1.
+The generic initrd is unlikely to contain all required firmware/KVM host
+support.
+
+Exit criterion: the primary host console emits the pipette ready marker only
+after `kvm_cca_preflight` passes.
+
+### D3: Console topology
+
+Model an arbitrary list of serial consoles with one marked primary. For QEMU
+`virt`, initially expect two PL011 streams: normal-world host and secure
+TF-A/RMM. Exactly one host console is scanned for readiness. Preserve every
+console as a separate log. Use `-display none`; do not combine `-nographic`
+with explicit serial chardevs.
+
+Resolved in Phase 2.
+
+### D4: Petri isolation representation
+
+Options:
+
+1. Add `PetriVmBuilder::with_isolation(IsolationType)` as a VM-level property.
+2. Add isolation to `Firmware::LinuxDirect` and create a distinct
+   `linux_direct_aarch64_cca` macro configuration.
+
+Recommendation: option 1. CCA is a KVM/VM property rather than firmware, and
+the builder method is reusable without multiplying configuration names.
+
+Resolved in Phase 4.
+
+### D5: Agent transport inside the Realm
+
+Linux direct boot already uses pipette as init, and `with_no_vmbus()` selects
+virtio-vsock. The primary question is whether virtio-PCI vsock works inside a
+Realm with the required shared-page/SWIOTLB behavior.
+
+Recommendation: try the existing pipette-as-init plus virtio-vsock path; use
+TCP pipette over virtio-net only if vsock fails.
+
+Resolved by a focused probe before Phase 5 is completed.
+
+## Phase 0: Prove the v15 stack under QEMU manually
+
+This phase is blocking. Do not implement the incubator backend until it passes.
+
+### Build
+
+- [ ] Pin and build QEMU with the `aarch64-softmmu` target.
+- [ ] Verify `qemu-system-aarch64 --version`.
+- [ ] Verify `-cpu max,x-rme=on` is accepted.
+- [ ] Build TF-RMM with `RMM_CONFIG=qemu_virt_defcfg`.
+- [ ] Build TF-A with `PLAT=qemu`, `ENABLE_RME=1`, the pinned RMM image,
+  `ARM_LINUX_KERNEL_AS_BL33=1`, and
+  `PRELOADED_BL33_BASE=0x40200000`.
+- [ ] Pack TF-A BL1/FIP into `flash.bin`.
+- [ ] Build the v15 host kernel from `build_support/cca/host.config`, adding a
+  QEMU fragment only if the current built-in virtio/PCI/9p set is insufficient.
+- [ ] Stage the current FVP buildroot rootfs with `kvm_cca_preflight`, OpenVMM,
+  guest kernel/initrd, and the generated OpenVMM CCA launch script.
+- [ ] Record revisions, configure/build commands, toolchains, and hashes in
+  `target/cca-qemu/manifest.txt`.
+
+### Representative boot
+
+Start with one CPU and 2 GiB. If firmware allocation or nested Realm memory
+fails, retry with the documented compatibility knobs `-m 8G`, `sme=off`, and
+`pauth-impdef=on`, recording which are actually required.
 
 ```text
 qemu-system-aarch64 \
   -accel tcg \
   -M virt,secure=on,virtualization=on,gic-version=3,acpi=off \
-  -cpu max,x-rme=on,sme=off \
-  -m 8G -smp 4 \
+  -cpu max,x-rme=on \
+  -m 2G -smp 1 \
   -bios flash.bin \
   -kernel host-Image \
   -drive if=none,id=rootfs,format=raw,file=host-rootfs.ext4 \
   -device virtio-blk-pci,drive=rootfs \
-  ...console, 9p, and networking arguments...
+  -virtfs local,path=<share>,mount_tag=host,security_model=none \
+  -append "nokaslr root=/dev/vda rw"
 ```
 
-The Linaro reference stack documents this topology and uses a TF-A
-`flash.bin` containing BL1 plus a FIP with TF-RMM and EDK2. It then launches a
-Realm from the emulated L1 Linux host through KVM. This is functional
-emulation only; it does not provide real CCA confidentiality because the
-physical machine is not enforcing RME.
+Add named firmware/RMM/host consoles and user networking as required.
+`nokaslr` is required by the current upstream QEMU RME reference stack.
 
-Authoritative references:
+### Acceptance
 
-- QEMU documents FEAT_RME as experimental:
-  <https://www.qemu.org/docs/master/system/arm/emulation.html>
-- QEMU `virt` machine documentation:
-  <https://www.qemu.org/docs/master/system/arm/virt.html>
-- Linaro's complete RME/QEMU stack and launch commands:
-  <https://linaro.atlassian.net/wiki/spaces/~654240343/pages/29275783169/Building+an+RME+stack+for+QEMU>
-- The reference manifest pins QEMU, TF-A, TF-RMM, Linux, EDK2, and kvmtool:
-  <https://git.codelinaro.org/linaro/dcap/op-tee/manifest/-/raw/cca/v2-attestation/qemu_v8_cca.xml>
+- [ ] Host reaches userspace.
+- [ ] Host log reports RMM/KVM Realm support.
+- [ ] `kvm_cca_preflight` passes capability 251, guestmemfd, Realm creation,
+  and VGICv3 checks.
+- [ ] The generated OpenVMM CCA launch script boots the L2 Realm.
+- [ ] The existing block/network smoke emits `OVMM_SMOKE_ALL_PASS`.
+- [ ] Firmware, RMM, host, and Realm logs are saved.
+- [ ] Record boot-to-preflight and smoke wall-clock timings.
 
-QEMU's RME support is still explicitly experimental. The OpenVMM dependency
-must pin a tested QEMU revision and compatible TF-A/TF-RMM/Linux revisions as
-one stack; independently taking "latest" components is likely to break ABI or
-platform assumptions.
+If any acceptance item fails, stop and update the platform pin set before
+proceeding.
 
-## Recommended profile and runtime design
+## Phase 1: Package reproducible QEMU CCA artifacts
 
-Add a distinct backend rather than making every field optional on `qemu-tcg`:
+- [ ] Add `build_support/cca/build-qemu.sh`, modeled on
+  `build-kernels.sh`: exact revision check, clean source export, incremental
+  output, reproducible environment, and manifest hashes.
+- [ ] Add `build_support/cca/build-qemu-firmware.sh` for TF-A, TF-RMM, EDK2,
+  and `flash.bin`.
+- [ ] Add a QEMU-specific host kernel config fragment if Phase 0 requires it.
+- [ ] Add a host-rootfs builder with a deterministic init service that mounts
+  9p, configures networking, runs preflight, and executes the freshly-built
+  pipette from the share. Do not bake a stale pipette into the image.
+- [ ] Add typed Flowey nodes:
+  - `build_cca_qemu`;
+  - `build_cca_qemu_firmware`; and
+  - `build_cca_host_rootfs`.
+- [ ] Centralize QEMU/TF-A/TF-RMM/Linux pins in one Rust module and have the
+  FVP/QEMU tooling consume it where practical.
+- [ ] Keep local-build artifacts first; publish a downloadable platform bundle
+  only after reproducibility is demonstrated.
 
-```toml
-[incubator]
-type = "qemu-cca"
-arch = "aarch64"
-binary = "qemu-system-aarch64"
-machine = "virt,secure=on,virtualization=on,gic-version=3,acpi=off"
-cpu = "max,x-rme=on,sme=off"
-memory = "8G"
-smp = "4"
-cmdline = "root=/dev/vda console=hvc0"
-capabilities = ["cca"]
+### Exit criteria
 
-[incubator.boot]
-type = "firmware-kernel-disk"
-# Paths are supplied by Flowey/INCUBATOR_* variables, not checked in here.
-firmware = "required"
-kernel = "required"
-rootfs = "required"
+- Two clean builds produce identical artifact hashes.
+- Typed Flowey outputs provide QEMU, `flash.bin`, host kernel, rootfs, and
+  manifest paths.
+- The packaged artifacts repeat the Phase 0 preflight and smoke result.
 
-[[incubator.consoles]]
-name = "firmware"
-kind = "serial"
+## Phase 2: Add a typed `qemu-cca` incubator backend
 
-[[incubator.consoles]]
-name = "secure"
-kind = "serial"
+### Profile
 
-[[incubator.consoles]]
-name = "host"
-kind = "virtio"
-primary = true
-```
+- [ ] Add `IncubatorBackend::QemuCca(QemuCcaConfig)` in
+  `petri/incubator/src/profile.rs`.
+- [ ] Model firmware, kernel, rootfs, machine, CPU, memory, SMP, an arbitrary
+  console list, primary console, capabilities, and a small typed
+  extra-argument escape hatch.
+- [ ] Add `petri/incubator/profiles/aarch64-qemu-cca.toml` with no
+  machine-local paths.
 
-The exact Serde shape can change, but preserve these properties:
+### Runtime
 
-- Checked-in TOML describes the stable platform shape.
-- Flowey supplies resolved paths through runtime fields such as:
-  - `INCUBATOR_QEMU_BINARY`
-  - `INCUBATOR_FIRMWARE`
-  - `INCUBATOR_KERNEL`
-  - `INCUBATOR_ROOTFS`
-- The backend owns console allocation and captures each console in a named log.
-- The primary host console is monitored for pipette readiness.
-- `PETRI_CAPABILITIES` includes `cca` only after the host is usable.
-- A small typed `extra_args` escape hatch is acceptable for experiments, but
-  required boot artifacts must remain first-class fields.
+- [ ] Split common QEMU process/readiness/path/network code from the current
+  direct-boot command builder.
+- [ ] Build the CCA command with `-bios`, host kernel, rootfs disk, named
+  consoles, 9p, and user networking.
+- [ ] Change `run_in_incubator` from an irrefutable `QemuTcg` binding to a
+  backend match.
+- [ ] Move `prepare_initrd` inside the `QemuTcg` branch; QEMU CCA rootfs boot
+  must not patch or require the generic initrd.
+- [ ] Monitor only the configured primary host console for pipette readiness.
+- [ ] Preserve all console logs on success and failure.
+- [ ] Kill the QEMU process group and all console relays on exit.
+- [ ] Add backend-conditional CLI/env fields:
+  - `INCUBATOR_FIRMWARE`;
+  - `INCUBATOR_ROOTFS`;
+  - existing `INCUBATOR_KERNEL`; and
+  - existing `INCUBATOR_QEMU_BINARY`.
+- [ ] Make kernel/initrd requirements backend-specific.
+- [ ] Extract capability publishing from `setup_vfio_devices`; it currently
+  returns early when no VFIO devices exist, while QEMU CCA still needs to
+  publish `PETRI_CAPABILITIES=cca`.
+- [ ] Advertise `cca` only after host preflight and pipette readiness.
 
-### Readiness and pipette
+### Tests
 
-The current backend injects `/tcg-init.sh` into an initrd. A firmware/rootfs CCA
-host needs a different startup path. Preferred options, in order:
+- Profile parsing for both backends.
+- CCA command-line construction.
+- Named-console and primary-console selection.
+- Capability merging.
+- Teardown and timeout behavior.
 
-1. Build a CCA host rootfs artifact with pipette and an init service that
-   mounts the 9p share, configures networking, runs `kvm_cca_preflight`, and
-   starts pipette.
-2. Reuse a compatible initrd injection path only if the CCA host kernel and
-   firmware stack can boot with the shared test initrd and all required KVM/RME
-   userspace support is present.
+## Phase 3: Wire backend-specific artifacts through Flowey
 
-The first option is more explicit and is closest to the already working
-`local_stage_kvm_cca` flow.
-
-## Artifact and Flowey work
-
-### Required resolved artifacts
-
-- A separately named and pinned RME-capable `qemu-system-aarch64`.
-  `resolve_openvmm_qemu.rs` currently exposes only `SystemAarch64`.
-- A CCA platform firmware artifact:
-  - TF-A BL1/FIP packed as `flash.bin`.
-  - Compatible TF-RMM.
-  - Compatible non-secure EDK2/BL33.
-- A CCA host rootfs image with pipette startup and KVM CCA support.
-- The CCA host kernel.
-  - The incubator already selects
-    `LinuxTestKernelVersion::KvmCcaDev`, not the generic default kernel
-    (`resolve_openvmm_test_linux_kernel.rs:95-102`).
-  - Verify that the published `kvm-cca-dev` kernel has the exact RME/KVM ABI
-    required by the chosen TF-RMM and OpenVMM branch.
-- The existing OpenVMM binary, guest kernel/initrd, and test archive.
-
-### Flowey changes
-
-- Add a resolver for a versioned CCA platform bundle or separate resolvers for
-  QEMU, firmware, and rootfs.
-- Extend `write_incubator_target_runner::Request` with firmware/rootfs inputs.
-- Extend local and archived VMM-test paths to request those inputs when the
-  selected profile is `qemu-cca`.
-- Do not always resolve the generic QEMU/initrd set for every incubator
-  profile; make artifact requirements backend/profile-specific.
-- Reuse/factor the artifact staging from `local_stage_kvm_cca`.
-- Add a local invocation such as:
+- [ ] Extend `write_incubator_target_runner::Request` and
+  `IncubatorRunnerConfig` with firmware/rootfs inputs.
+- [ ] Add `INCUBATOR_FIRMWARE` and `INCUBATOR_ROOTFS` to the runner
+  environment and unit tests.
+- [ ] Add an explicit `IncubatorPlatform::{QemuTcg,QemuCca}` parameter or
+  profile-name classification available at Flowey emit time. Do not depend on
+  reading profile contents; CI receives the profile path only as a runtime
+  `ReadVar`.
+- [ ] Keep the existing generic TCG kernel/initrd/QEMU resolution unchanged
+  for `QemuTcg`.
+- [ ] Resolve QEMU CCA firmware/rootfs/kernel/QEMU only for `QemuCca`.
+- [ ] Add a distinct QEMU resolver variant or platform-bundle resolver; do not
+  silently replace `QemuFile::SystemAarch64`.
+- [ ] Support:
 
 ```text
 cargo xflowey vmm-tests-run \
   --target linux-aarch64-musl \
-  --incubator petri/incubator/profiles/aarch64-tcg-cca.toml \
-  --filter "test(cca)"
+  --incubator petri/incubator/profiles/aarch64-qemu-cca.toml \
+  --filter "test(qemu_cca) & !binary(cca)"
 ```
 
-- Add a dedicated, initially non-blocking CI job because nested TCG CCA will
-  be substantially slower than the existing aarch64 TCG tests.
+### Exit criteria
 
-## Petri changes required for a normal `vmm_test`
+- A trivial incubator test binary runs through pipette in the QEMU CCA L1
+  host.
+- The generic aarch64 TCG incubator still passes unchanged.
+- Run `test(aarch64_tcg)` before and after the shared Flowey changes.
 
-OpenVMM's lower layers already support CCA:
+## Phase 4: Add CCA to Petri
 
-- `openvmm/openvmm_defs/src/config.rs:593-607` includes
-  `IsolationType::Cca`.
-- `openvmm/openvmm_entry/src/lib.rs:1650-1660` maps CLI CCA isolation on
-  aarch64.
+- [ ] Add `capabilities::CCA = "cca"` and include it in
+  `KNOWN_CAPABILITIES`.
+- [ ] Add `petri::IsolationType::Cca`.
+- [ ] Evaluate CCA solely through `requires(cca)` and `PETRI_CAPABILITIES`;
+  do not add an always-false Linux `TestRequirement::Isolation(Cca)` path.
+- [ ] Add a VM-level isolation field and
+  `PetriVmBuilder::with_isolation(IsolationType)`.
+- [ ] Map CCA to `openvmm_defs::config::IsolationType::Cca` in OpenVMM
+  construction.
+- [ ] Preserve existing OpenHCL firmware isolation behavior.
+- [ ] Add macro/config parsing only if the final API requires a named
+  CCA-specific config; `requires(cca)` should work from the known capability.
+- [ ] Run a Windows build and existing SNP test gate because Windows Hyper-V
+  Petri code also consumes `petri::IsolationType`.
 
-Petri does not yet expose it:
+### Exit criteria
 
-- `petri/src/vm/mod.rs:3112-3123` has only VBS, SNP, and TDX.
-- `petri/src/requirements.rs:43-52` has only VBS, SNP, and TDX requirements.
-- `petri/src/requirements.rs:221-229` has no CCA requirement evaluation.
-- `petri/src/vm/openvmm/construct.rs:596-602` maps only VBS and rejects other
-  isolation modes.
-- `vmm_tests/vmm_test_macros/src/lib.rs:804-854` has no CCA parser/token path.
+- Petri construction tests cover CCA.
+- Non-CCA configurations are unchanged.
+- A CCA test skips outside a CCA-capable incubator.
 
-Add:
+## Phase 5: Add the first normal CCA VMM test
 
-- `petri::IsolationType::Cca`.
-- `petri::requirements::IsolationType::Cca`.
-- `openvmm_defs::config::IsolationType::Cca` construction.
-- A known `cca` runtime capability in
-  `petri/petri_artifacts_common/src/lib.rs`.
-- CCA requirement evaluation based on that capability when running in an
-  emulated host.
-- Macro/config support for an aarch64 Linux-direct CCA configuration.
-
-A distinct config name is less ambiguous than overloading existing bracket
-syntax:
+Add an aarch64-exclusive test modeled on the existing no-VMBus TCG test:
 
 ```rust
 #[vmm_test_with(
     openvmm,
     requires(cca),
-    configs(linux_direct_aarch64_cca)
+    configs(linux_direct_aarch64)
 )]
 async fn boot_linux_direct_cca(
     config: PetriVmBuilder<OpenVmmPetriBackend>,
 ) -> anyhow::Result<()> {
-    let (vm, agent) = config.run().await?;
-    agent.ping().await?;
-    agent.power_off().await?;
-    vm.wait_for_clean_teardown().await?;
-    Ok(())
+    // with_isolation(Cca), no VMBus, supported Realm devices only
 }
 ```
 
-`linux_direct_aarch64_cca` should select:
+- [ ] Use `with_isolation(Cca)`.
+- [ ] Disable Hyper-V/VTL2/VMBus.
+- [ ] Use device-tree boot, one VP, and explicit small L2 memory.
+- [ ] Configure the PCIe root complex/root-port topology required by
+  virtio-vsock and supported CCA devices.
+- [ ] Set `hypervisor.with_hv = false`.
+- [ ] Use pipette-as-init with virtio-vsock first.
+- [ ] Select the CCA guest kernel built by `build-kernels.sh` if the generic
+  Petri guest kernel lacks the required Realm/CCA configuration.
+- [ ] If a CCA-specific guest kernel is needed, add its complete artifact
+  path: declaration, known-path/local resolver, local `BuildSelections`, and
+  archived/CI typed artifact-builder entry.
+- [ ] Resolve D5 with a focused vsock probe; TCP is the fallback.
+- [ ] Make Petri's hard-coded 10-minute VM watchdog configurable if Phase 0
+  timings show nested TCG CCA can exceed it.
+- [ ] Require agent ping, clean power-off, and clean VM teardown.
+- [ ] Preserve Realm and L1 host logs on failure.
+- [ ] Keep the existing FVP/TMK `cca_runtime` test.
 
-- aarch64 Linux direct boot;
-- `petri::IsolationType::Cca`;
-- OpenVMM only;
-- the normal guest kernel/initrd artifacts used by Petri;
-- a `cca` execution requirement so the test skips outside a provisioned
-  CCA incubator.
+### Exit criteria
 
-Once the basic boot test works, move the existing TMK smoke test into the same
-normal Petri shape or add a second CCA-specific test that resolves the TMK
-artifacts and launches them through the Realm.
+- Name the test with a `_qemu_cca` suffix.
+- `cargo xflowey vmm-tests-run ... --filter "test(qemu_cca) & !binary(cca)"`
+  passes without selecting the existing FVP test binary.
+- The same test skips when `cca` is not advertised.
+- No SNP or ordinary Linux-direct test changes behavior.
 
-## Suggested implementation sequence
+## Phase 6: CI and deduplication
 
-1. **Prove the QEMU platform manually**
-   - Pin a known compatible QEMU/TF-A/TF-RMM/Linux set.
-   - Boot the CCA host under TCG.
-   - Verify host logs show KVM communicating with the RMM.
-   - Run `kvm_cca_preflight`.
-   - Run the existing staged `run-openvmm-kvm-cca.sh`.
+- [ ] Add a dedicated initially non-blocking
+  `aarch64-linux-qemu-cca` VMM-test job.
+- [ ] Define how non-blocking is represented. Initially exclude the job from
+  required PR gates or add an explicit soft-fail mechanism.
+- [ ] Use Phase 0 timings to set a long but bounded timeout.
+- [ ] Filter only `test(qemu_cca) & !binary(cca)` initially.
+- [ ] Factor shared rootfs staging and log extraction from
+  `local_stage_kvm_cca.rs` for FVP and QEMU.
+- [ ] Consolidate duplicated CCA pin definitions.
+- [ ] Publish the QEMU CCA platform bundle after reproducibility is proven.
+- [ ] Keep FVP coverage for architecture behavior and features QEMU does not
+  emulate, including RME in SMMU/GIC and permission overlay/indirection.
 
-2. **Package reproducible platform artifacts**
-   - Publish static QEMU for x86_64 and aarch64 hosts as needed.
-   - Publish `flash.bin`, host rootfs, and the matching host kernel metadata.
-   - Record source revisions together.
+## Risks
 
-3. **Add the `qemu-cca` incubator backend**
-   - Firmware/kernel/rootfs boot.
-   - Named console capture.
-   - 9p/networking.
-   - Pipette startup/readiness.
-   - Clean process teardown without FVP-specific `pgrep` logic.
-
-4. **Wire Flowey**
-   - Resolve backend-specific artifacts.
-   - Add runtime environment variables.
-   - Support local and archived nextest flows.
-   - Advertise `PETRI_CAPABILITIES=cca`.
-
-5. **Wire Petri CCA isolation**
-   - Add enums, construction mapping, requirements, known capability, and
-     macro support.
-
-6. **Add the first standard VMM test**
-   - `boot_linux_direct_cca`.
-   - Filter it into a dedicated QEMU CCA job.
-   - Use a long timeout appropriate for nested TCG.
-
-7. **Retire duplication**
-   - Factor shared staging from `local_stage_kvm_cca`.
-   - Keep FVP as a second backend while QEMU matures; do not remove it until
-     QEMU covers the needed architecture and RMM behavior.
-
-## Main risks and open questions
-
-- **Version compatibility:** QEMU FEAT_RME is experimental, and the
-  QEMU/TF-A/TF-RMM/KVM UAPI revisions must be tested and pinned as a unit.
-- **Performance:** outer TCG plus an L2 Realm is slow. Start with one CPU and a
-  minimal boot/ping test; avoid multiplying the test matrix.
-- **Memory layout:** reference stacks often assume a fixed large RAM size and
-  fixed RMM carveout. Treat memory as profile data validated against the
-  firmware build, not an arbitrary test override.
-- **Host rootfs contents:** determine whether the existing OpenVMM test initrd
-  is sufficient. If not, publish a dedicated CCA host rootfs instead of
-  mutating images at test runtime with `sudo mount`.
-- **Console topology:** firmware/RMM logs are necessary to diagnose failures,
-  even if pipette uses only the host console/network.
-- **QEMU feature completeness:** retain FVP for architecture behavior that
-  QEMU does not emulate correctly yet, including any CCA Planes or permission
-  indirection/overlay features required by current tests.
-- **Current test intent:** the existing `cca_runtime` test validates
-  `tmk_vmm --hv cca`; the native OpenVMM path validates
-  `openvmm --isolation cca`. Decide whether the first QEMU test must preserve
-  the TMK test exactly or should first establish the simpler OpenVMM Realm
-  boot path. The recommended order is OpenVMM boot first, then TMK.
+- QEMU RME is experimental and its `x-rme` interface may change.
+- No public bundle currently proves the v15/bet2 stack under QEMU.
+- QEMU does not emulate RME in the SMMU or GIC; device assignment is out of
+  scope.
+- Outer TCG plus an L2 Realm will be slow.
+- Firmware memory carveouts and host RAM size must be treated as platform
+  data, not arbitrary test overrides.
+- Agent transport inside the Realm is not yet proven.
+- Petri's default 10-minute watchdog may be too short for nested TCG CCA.
+- Shared Petri isolation changes require a Windows/SNP compile and regression
+  gate.
+- The first test must not select the existing FVP `cca_runtime` binary.
+- `PETRI_CAPABILITIES` rejects unknown capabilities, so the `cca` constant
+  must land before a profile advertises it.
+- Retain FVP until QEMU demonstrates equivalent coverage for the required
+  behavior.
 
 ## Definition of done
 
-- A checked-in QEMU CCA profile has no machine-local paths.
-- `cargo xflowey vmm-tests-run --target linux-aarch64-musl --incubator ...`
-  boots an RME-capable L1 host under QEMU TCG.
-- The L1 host passes `kvm_cca_preflight`.
-- A normal `#[vmm_test]` launches OpenVMM with CCA isolation and boots an L2
-  Realm to a working pipette agent.
-- Firmware, host, and Realm logs are preserved on failure.
-- The same test automatically skips when `cca` is not advertised.
-- FVP remains available as a fallback/reference backend.
+- A pinned QEMU CCA platform manifest is reproducible.
+- A checked-in `aarch64-qemu-cca.toml` contains no machine-local paths.
+- QEMU boots the v15 L1 host and passes `kvm_cca_preflight`.
+- Incubator starts pipette and preserves named console logs.
+- A normal `#[vmm_test]` launches OpenVMM CCA and boots an L2 Realm to a
+  working agent.
+- The test skips outside a CCA incubator.
+- FVP CCA and SNP regression paths remain passing.
+
+## Removed stale assumptions
+
+- `run-openvmm-kvm-cca.sh` is generated by
+  `local_stage_kvm_cca.rs`; it is not a checked-in source file.
+- CCA rootfs staging uses `debugfs`, not `sudo mount`.
+- `INCUBATOR_QEMU_BINARY` already exists.
+- CI incubator profiles are selected by profile name.
+- Phase 0 starts at one CPU and 2 GiB, but retains 8 GiB, `sme=off`, and
+  `pauth-impdef=on` as measured compatibility fallbacks.
+- The public QEMU RME bundle and older Linaro manifest are references only;
+  neither is compatible with KVM CCA v15 without repinning.
+
+## Review
+
+Plan review verdict: **Minor revisions**. The review confirmed the phase
+structure and codebase survey. It required, and this plan now includes:
+
+- a coherent direct-Linux BL33 boot chain;
+- `security_model=none`;
+- measured memory/CPU fallback knobs;
+- a generic two-console initial QEMU model;
+- Flowey emit-time platform classification;
+- capability publishing independent of VFIO;
+- explicit Petri topology, memory, VP count, DT boot, and vsock transport;
+- complete ownership of a CCA-specific guest-kernel artifact if required;
+- a configurable Petri watchdog;
+- a `_qemu_cca` test/filter that excludes the FVP binary;
+- a defined non-blocking CI mechanism; and
+- Windows/SNP plus existing aarch64-TCG regression gates.
