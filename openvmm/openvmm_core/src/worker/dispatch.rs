@@ -1177,9 +1177,6 @@ impl InitializedVm {
             if !matches!(cfg.load_mode, LoadMode::Linux { .. }) {
                 anyhow::bail!("KVM SNP guest_memfd currently only supports direct Linux load mode");
             }
-            if cfg.hypervisor.with_hv {
-                anyhow::bail!("KVM SNP guest_memfd does not support Hyper-V enlightenments");
-            }
             if cfg.hypervisor.with_vtl2.is_some() {
                 anyhow::bail!("KVM SNP guest_memfd does not support VTL2");
             }
@@ -3184,6 +3181,7 @@ impl LoadedVmInner {
                                 .snp_c_bit
                                 .context("missing SNP C-bit CPUID information")?,
                             restricted_injection,
+                            vp_count: self.processor_topology.vp_count(),
                         },
                     ),
                     (
