@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build, deploy, and run the current one-vCPU MSHV SNP direct-boot repro.
+# Build, deploy, and run the MSHV SNP direct-boot repro.
 
 set -euo pipefail
 
@@ -18,12 +18,18 @@ KERNEL_CMDLINE="${MSHV_SNP_CMDLINE:-console=ttyS0 earlyprintk=serial earlycon pa
 BUILD_OPENVMM="${MSHV_SNP_BUILD_OPENVMM:-1}"
 BUILD_KERNEL="${MSHV_SNP_BUILD_KERNEL:-0}"
 KEEP_REMOTE="${MSHV_SNP_KEEP_REMOTE:-0}"
+SSH_OPTS=(
+    -o BatchMode=yes
+    -o ConnectTimeout=10
+    -o ServerAliveInterval=5
+    -o ServerAliveCountMax=3
+)
 
 usage() {
     cat <<EOF
 Usage: $(basename "$0")
 
-Build, deploy, and run the current one-vCPU MSHV SNP direct-boot repro on
+Build, deploy, and run the MSHV SNP direct-boot repro on
 wedson-mshv. Configuration is provided through environment variables:
 
   MSHV_SNP_HOST              SSH host (default: wedson-mshv)
@@ -34,6 +40,7 @@ wedson-mshv. Configuration is provided through environment variables:
   MSHV_SNP_BUILD_OPENVMM     build OpenVMM first (default: 1)
   MSHV_SNP_BUILD_KERNEL      incrementally build the ACI kernel (default: 0)
   MSHV_SNP_MEMORY            guest memory (default: 160MB)
+  MSHV_SNP_PROCESSORS        guest processor count (default: 1)
   MSHV_SNP_TIMEOUT_SECONDS   boot timeout (default: 90)
   MSHV_SNP_KEEP_REMOTE       retain a successful remote run (default: 0)
 EOF
@@ -48,8 +55,12 @@ if (( $# != 0 )); then
     exit 2
 fi
 
-if [[ "$PROCESSORS" != 1 ]]; then
-    echo "ERROR: the current MSHV SNP repro supports only one processor; AP creation is not implemented" >&2
+if [[ ! "$PROCESSORS" =~ ^[1-9][0-9]{0,2}$ ]] || (( PROCESSORS > 255 )); then
+    echo "ERROR: MSHV_SNP_PROCESSORS must be an integer from 1 through 255" >&2
+    exit 2
+fi
+if [[ ! "$TIMEOUT_SECONDS" =~ ^[1-9][0-9]{0,4}$ ]]; then
+    echo "ERROR: MSHV_SNP_TIMEOUT_SECONDS must be an integer from 1 through 99999" >&2
     exit 2
 fi
 
@@ -77,7 +88,11 @@ fi
 printf -v run_nonce '%08x' "$(((RANDOM << 16) ^ RANDOM ^ $$))"
 run_id="$(date -u +%Y%m%dT%H%M%SZ)-$change_id-$run_nonce"
 logs_dir="$REPO_ROOT/target/mshv-snp/$run_id"
-console_log="$logs_dir/bsp.console.log"
+if (( PROCESSORS == 1 )); then
+    console_log="$logs_dir/bsp.console.log"
+else
+    console_log="$logs_dir/smp.console.log"
+fi
 deploy_log="$logs_dir/deploy.log"
 manifest="$logs_dir/manifest.txt"
 mkdir -p "$logs_dir"
@@ -103,6 +118,15 @@ cleanup_remote_process() {
             ''|*[!0-9]*) exit 2 ;;
         esac
         if sudo -n /usr/bin/kill -0 -- \"-\$pgid\" 2>/dev/null; then
+            process_cwd=\$(sudo -n /usr/bin/readlink \"/proc/\$pgid/cwd\" 2>/dev/null || true)
+            if test -n \"\$process_cwd\" && test \"\$process_cwd\" != $quoted_dir; then
+                echo \"refusing to signal process group \$pgid with cwd \$process_cwd\" >&2
+                exit 3
+            fi
+            if test -z \"\$process_cwd\" &&
+                ! sudo -n /usr/bin/kill -0 -- \"-\$pgid\" 2>/dev/null; then
+                exit 0
+            fi
             sudo -n /usr/bin/kill -TERM -- \"-\$pgid\"
             i=0
             while sudo -n /usr/bin/kill -0 -- \"-\$pgid\" 2>/dev/null && test \"\$i\" -lt 20; do
@@ -114,7 +138,7 @@ cleanup_remote_process() {
             fi
         fi
     fi"
-    ssh -o BatchMode=yes "$HOST" "$cleanup_command"
+    ssh "${SSH_OPTS[@]}" "$HOST" "$cleanup_command"
 }
 
 on_exit() {
@@ -129,7 +153,7 @@ on_exit() {
     if [[ "$remote_staged" == 1 && "$run_succeeded" == 1 && "$KEEP_REMOTE" == 0 ]]; then
         local quoted_dir
         printf -v quoted_dir '%q' "$remote_dir"
-        if ! ssh -o BatchMode=yes "$HOST" "rm -rf -- $quoted_dir"; then
+        if ! ssh "${SSH_OPTS[@]}" "$HOST" "rm -rf -- $quoted_dir"; then
             echo "ERROR: failed to remove successful remote run directory: $remote_dir" >&2
             (( status != 0 )) || status=1
         fi
@@ -145,8 +169,8 @@ trap 'exit 143' TERM
 
 echo "Checking $HOST..." | tee -a "$deploy_log"
 remote_home="$(
-    ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST" \
-        'set -eu; sudo -n true; command -v timeout >/dev/null; command -v setsid >/dev/null; setsid --help 2>&1 | grep -q -- --wait; printf %s "$HOME"' \
+    ssh "${SSH_OPTS[@]}" "$HOST" \
+        'set -eu; sudo -n true; test -x /usr/bin/kill; test -x /usr/bin/readlink; command -v timeout >/dev/null; command -v setsid >/dev/null; setsid --help 2>&1 | grep -q -- --wait; printf %s "$HOME"' \
         | tee -a "$deploy_log"
 )"
 if [[ -z "$remote_home" || "$remote_home" != /* ]]; then
@@ -214,16 +238,17 @@ done <<<"$artifact_bytes"
 required_kib=$((required_kib + 64 * 1024))
 
 remote_available_kib="$(
-    ssh -o BatchMode=yes "$HOST" "df -Pk $(printf '%q' "$remote_home")" |
+    ssh "${SSH_OPTS[@]}" "$HOST" "df -Pk $(printf '%q' "$remote_home")" |
         awk 'NR == 2 { print $4 }'
 )"
 if [[ ! "$remote_available_kib" =~ ^[0-9]+$ ]] || (( remote_available_kib < required_kib )); then
     echo "ERROR: insufficient remote disk space: need ${required_kib} KiB, have ${remote_available_kib:-unknown} KiB" >&2
+    echo "       remove obsolete retained runs under $HOST:$remote_base" >&2
     exit 3
 fi
 
 remote_kernel="$(
-    ssh -o BatchMode=yes "$HOST" \
+    ssh "${SSH_OPTS[@]}" "$HOST" \
         'printf "uname=%s\nmshv=%s\n" "$(uname -sr)" "$(ls -l /dev/mshv 2>&1)"'
 )"
 
@@ -243,14 +268,14 @@ remote_kernel="$(
 echo "Staging artifacts in $HOST:$remote_dir..." | tee -a "$deploy_log"
 quoted_remote_dir="$(printf '%q' "$remote_dir")"
 quoted_remote_base="$(printf '%q' "$remote_base")"
-ssh -o BatchMode=yes "$HOST" \
+ssh "${SSH_OPTS[@]}" "$HOST" \
     "mkdir -p -- $quoted_remote_base && mkdir -- $quoted_remote_dir" \
     2>&1 | tee -a "$deploy_log"
 remote_staged=1
 
-scp -q "$OPENVMM_BIN" "$HOST:$remote_dir/openvmm.new"
-scp -q "$KERNEL" "$HOST:$remote_dir/bzImage.new"
-scp -q "$INITRD" "$HOST:$remote_dir/initrd.new"
+scp -q "${SSH_OPTS[@]}" "$OPENVMM_BIN" "$HOST:$remote_dir/openvmm.new"
+scp -q "${SSH_OPTS[@]}" "$KERNEL" "$HOST:$remote_dir/bzImage.new"
+scp -q "${SSH_OPTS[@]}" "$INITRD" "$HOST:$remote_dir/initrd.new"
 
 verify_command="cd $quoted_remote_dir &&
     test \"\$(sha256sum openvmm.new | awk '{print \$1}')\" = $(printf '%q' "$openvmm_hash") &&
@@ -260,7 +285,7 @@ verify_command="cd $quoted_remote_dir &&
     mv bzImage.new bzImage &&
     mv initrd.new initrd &&
     chmod 755 openvmm"
-ssh -o BatchMode=yes "$HOST" "$verify_command" 2>&1 | tee -a "$deploy_log"
+ssh "${SSH_OPTS[@]}" "$HOST" "$verify_command" 2>&1 | tee -a "$deploy_log"
 
 openvmm_command=(
     env "OPENVMM_LOG=$OPENVMM_LOG"
@@ -286,9 +311,9 @@ remote_command="cd $quoted_remote_dir && exec sudo -n setsid --wait sh -c $(prin
     printf '\n'
 } >>"$manifest"
 
-echo "Running one-vCPU MSHV SNP repro; full console: $console_log"
+echo "Running $PROCESSORS-vCPU MSHV SNP repro; full console: $console_log"
 set +e
-python3 - "$HOST" "$remote_command" "$TIMEOUT_SECONDS" "$console_log" <<'PY'
+python3 - "$HOST" "$remote_command" "$TIMEOUT_SECONDS" "$PROCESSORS" "$console_log" <<'PY'
 import os
 import pty
 import re
@@ -298,8 +323,9 @@ import sys
 import termios
 import time
 
-host, remote_command, timeout_text, log_path = sys.argv[1:]
+host, remote_command, timeout_text, processors_text, log_path = sys.argv[1:]
 timeout_seconds = int(timeout_text)
+processors = int(processors_text)
 shell_ready = re.compile(
     r"No root device specified\. Dropping to a shell\.|"
     r"can't access tty; job control turned off|"
@@ -309,8 +335,24 @@ fatal = re.compile(
     r"fatal error|failed to run VP|guest halted|triple fault|panicked at|"
     r"assertion failed|abnormal exit|SIGABRT|core dumped|Kernel panic"
 )
+smp_ready = re.compile(
+    rf"smp: Brought up [0-9]+ node(?:s)?, {processors} CPU(?:s)?"
+)
 
-argv = ["ssh", "-tt", "-o", "BatchMode=yes", host, remote_command]
+argv = [
+    "ssh",
+    "-tt",
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ConnectTimeout=10",
+    "-o",
+    "ServerAliveInterval=5",
+    "-o",
+    "ServerAliveCountMax=3",
+    host,
+    remote_command,
+]
 pid, fd = pty.fork()
 if pid == 0:
     os.execvp(argv[0], argv)
@@ -322,26 +364,43 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
 deadline = time.monotonic() + timeout_seconds + 15
 buffer = ""
 reached_shell = False
+reached_processor_count = False
 matched_fatal = False
+fatal_since = None
+missing_processors = False
 control_prompt_requested = False
 quit_sent = False
 child_status = None
+child_exit_deadline = None
 timed_out = False
 
 with open(log_path, "wb", buffering=0) as log:
     try:
         while True:
-            finished, status = os.waitpid(pid, os.WNOHANG)
-            if finished:
-                child_status = status
+            now = time.monotonic()
+            if child_status is None:
+                finished, status = os.waitpid(pid, os.WNOHANG)
+                if finished:
+                    child_status = status
+                    child_exit_deadline = now + 2
+
+            if fatal_since is not None and now - fatal_since >= 2:
+                break
+            if child_exit_deadline is not None and now >= child_exit_deadline:
                 break
 
-            remaining = deadline - time.monotonic()
+            remaining = deadline - now
             if remaining <= 0:
                 timed_out = True
                 break
 
-            readable, _, _ = select.select([fd], [], [], min(0.5, remaining))
+            wait = min(0.5, remaining)
+            if fatal_since is not None:
+                wait = min(wait, fatal_since + 2 - now)
+            if child_exit_deadline is not None:
+                wait = min(wait, child_exit_deadline - now)
+
+            readable, _, _ = select.select([fd], [], [], max(0, wait))
             if not readable:
                 continue
 
@@ -359,10 +418,21 @@ with open(log_path, "wb", buffering=0) as log:
 
             if fatal.search(buffer):
                 matched_fatal = True
-                break
+                if fatal_since is None:
+                    fatal_since = time.monotonic()
+                continue
+
+            if matched_fatal:
+                continue
+
+            if smp_ready.search(buffer):
+                reached_processor_count = True
 
             if not reached_shell and shell_ready.search(buffer):
                 reached_shell = True
+                if not reached_processor_count:
+                    missing_processors = True
+                    break
                 print(
                     "\nMSHV SNP repro: initrd shell reached; quitting OpenVMM",
                     file=sys.stderr,
@@ -383,17 +453,82 @@ with open(log_path, "wb", buffering=0) as log:
                 os.kill(pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
-            finished, status = os.waitpid(pid, 0)
-            if finished:
-                child_status = status
+            terminate_deadline = time.monotonic() + 5
+            terminate_child_exit_deadline = None
+            pty_eof = False
+            while time.monotonic() < terminate_deadline:
+                now = time.monotonic()
+                if not pty_eof:
+                    readable, _, _ = select.select([fd], [], [], 0.1)
+                else:
+                    readable = []
+                    time.sleep(0.1)
+                if readable:
+                    try:
+                        data = os.read(fd, 4096)
+                    except OSError:
+                        data = b""
+                    if data:
+                        os.write(sys.stdout.fileno(), data)
+                        log.write(data)
+                        text = data.decode(errors="replace")
+                        buffer = (buffer + text)[-16384:]
+                        if fatal.search(buffer):
+                            matched_fatal = True
+                        if smp_ready.search(buffer):
+                            reached_processor_count = True
+                    else:
+                        pty_eof = True
+
+                if child_status is None:
+                    finished, status = os.waitpid(pid, os.WNOHANG)
+                    if finished:
+                        child_status = status
+                        terminate_child_exit_deadline = now + 2
+
+                if child_status is not None and (
+                    pty_eof
+                    or (
+                        terminate_child_exit_deadline is not None
+                        and now >= terminate_child_exit_deadline
+                    )
+                ):
+                    break
+
+            if child_status is None:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                _, child_status = os.waitpid(pid, 0)
     except KeyboardInterrupt:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        os.waitpid(pid, 0)
+        if child_status is None:
+            try:
+                finished, _ = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                finished = pid
+            if not finished:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                interrupt_deadline = time.monotonic() + 5
+                while time.monotonic() < interrupt_deadline:
+                    finished, _ = os.waitpid(pid, os.WNOHANG)
+                    if finished:
+                        break
+                    time.sleep(0.1)
+                else:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    os.waitpid(pid, 0)
         raise
 
+if missing_processors:
+    print(f"\nMSHV SNP repro failed: guest did not bring up {processors} CPUs", file=sys.stderr)
+    sys.exit(1)
 if matched_fatal:
     print("\nMSHV SNP repro failed: matched a fatal guest or OpenVMM error", file=sys.stderr)
     sys.exit(1)
@@ -426,5 +561,5 @@ if (( run_status != 0 )); then
 fi
 
 run_succeeded=1
-echo "MSHV SNP repro passed: the ACI guest reached its initrd shell"
+echo "MSHV SNP repro passed: the ACI guest reached its initrd shell with $PROCESSORS processor(s)"
 echo "Logs: $logs_dir"
