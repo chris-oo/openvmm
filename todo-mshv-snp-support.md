@@ -188,7 +188,10 @@ runtime guest-request pages and future shared/private transitions
 
 `MSHV_IMPORT_ISOLATED_PAGES` accepts only 4 KiB guest PFNs and an explicit page
 type. Import, completion, and PSP guest request use the partition's single
-asynchronous-hypercall slot, so userspace must serialize them
+asynchronous-hypercall completion state. The kernel holds the partition
+`pt_mutex` while waiting for each partition-fd ioctl to complete, so issuing
+these operations through that ioctl boundary provides the required
+serialization
 (`include/uapi/linux/mshv.h:390-464`;
 `drivers/hv/mshv_root_main.c:3084-3198`).
 
@@ -638,13 +641,15 @@ hold in addition to I/O, MMIO, guest request, AP creation, and doorbell
 operations. At minimum, termination must produce a deterministic VP halt
 instead of falling into an unknown-exit panic.
 
-`MSHV_IMPORT_ISOLATED_PAGES`, completion, PSP guest request, SNP AP creation,
-and `HVCALL_SET_PARTITION_PROPERTY` share the partition's asynchronous-hypercall
-slot. Add a partition-level async-operation serializer used by creation,
-launch, runtime VMGEXIT handlers, and property transitions. Document its lock
-ordering relative to the VP run loop and never hold it while awaiting device
-I/O. Concurrent guest requests should receive a deterministic protocol error
-or serialize, not leak `EBUSY` as an unexplained fatal exit.
+`MSHV_IMPORT_ISOLATED_PAGES`, completion, PSP guest request, and
+`HVCALL_SET_PARTITION_PROPERTY` use the partition's asynchronous-hypercall
+completion state. The target kernel holds the partition `pt_mutex` across each
+partition ioctl and waits for asynchronous completion before releasing it, so
+these operations are already serialized at the kernel boundary. SNP AP
+creation is different: its ioctl performs synchronous VP-register hypercalls
+under the same `pt_mutex`. Keep runtime operations on the partition-fd ioctl
+paths so this serialization remains effective, and return deterministic GHCB
+errors rather than exposing kernel contention or ioctl failures as fatal exits.
 
 ### 7. Attestation and ID block
 
