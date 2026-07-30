@@ -374,7 +374,7 @@ fn import_snp_boot_pages(
         let entry = &mut cpuid_page.cpuid_leaf_info[index];
         entry.eax_in = leaf.eax;
         entry.ecx_in = leaf.ecx;
-        if leaf.eax == CpuidFunction::ExtendedStateEnumeration.0 {
+        if leaf.eax == CpuidFunction::ExtendedStateEnumeration.0 && leaf.ecx <= 1 {
             entry.xfem_in = 1;
         }
     }
@@ -1646,7 +1646,7 @@ mod tests {
             assert_eq!(entry.ecx_in, leaf.ecx);
             assert_eq!(
                 entry.xfem_in,
-                u64::from(leaf.eax == CpuidFunction::ExtendedStateEnumeration.0)
+                u64::from(leaf.eax == CpuidFunction::ExtendedStateEnumeration.0 && leaf.ecx <= 1)
             );
             assert_eq!(entry.xss_in, 0);
         }
