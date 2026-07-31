@@ -16,7 +16,7 @@ SHARE_DIR="${QEMU_CCA_SHARE_DIR:-$CCA_TEST_ROOT/kvm-cca/share}"
 LOG_DIR="${QEMU_CCA_LOG_DIR:-$QEMU_CCA_ROOT/logs}"
 MEMORY="${QEMU_CCA_MEMORY:-2G}"
 PROCESSORS="${QEMU_CCA_PROCESSORS:-1}"
-CPU="${QEMU_CCA_CPU:-max,x-rme=on}"
+CPU="${QEMU_CCA_CPU:-max,x-rme=on,lpa2=off,sme=off,pauth-impdef=on}"
 
 for path in "$QEMU_BIN" "$FIRMWARE" "$HOST_KERNEL" "$HOST_ROOTFS"; do
     [[ -f "$path" ]] || {
