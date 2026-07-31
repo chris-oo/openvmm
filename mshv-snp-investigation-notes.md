@@ -9,8 +9,7 @@ guest on MSHV. The known-working configuration uses:
 - 160 MB of guest RAM;
 - restricted interrupt injection;
 - the MSHV SNP GHCB handlers currently implemented in `virt_mshv`;
-- temporary CPUID compatibility masks for VP-assist lazy EOI and supervisor
-  XSTATE.
+- the temporary supervisor-XSTATE CPUID compatibility mask.
 
 The current ACI boot also emits a nonfatal invalid-physical-address warning
 from `boot_params_ksysfs_init()`. Reaching the initrd shell is the current
