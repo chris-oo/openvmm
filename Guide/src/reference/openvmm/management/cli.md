@@ -78,10 +78,11 @@ as well as the generated CLI help (via `cargo run -- --help`).
   `snp`.
 
   SNP support is currently limited to Linux direct boot and is intended for
-  bring-up. It does not support UEFI, Hyper-V enlightenments, VTL2, VMBus,
-  or hugetlb-backed memory. In addition to the minimal emulated chipset and
-  serial console, optional devices are limited to virtio devices attached
-  through PCIe.
+  bring-up. MSHV SNP can expose Hyper-V enlightenments with `--hv --no-vmbus`;
+  VMBus devices remain unsupported. SNP does not support UEFI, VTL2, or
+  hugetlb-backed memory. In addition to the minimal emulated chipset and serial
+  console, optional devices are limited to virtio devices attached through
+  PCIe.
 * `--snp-restricted-injection`: Enable restricted interrupt injection in the
   loader-generated SNP VMSA. This bring-up option has no default and requires
   `--hypervisor mshv --isolation snp` with Linux direct boot. Do not enable it

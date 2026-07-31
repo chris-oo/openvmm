@@ -1066,14 +1066,6 @@ impl InitializedVm {
             anyhow::bail!("the selected hypervisor does not support nested virtualization");
         }
 
-        let snp_aci_hyperv = matches!(
-            &cfg.load_mode,
-            LoadMode::Linux {
-                snp_restricted_injection: true,
-                ..
-            }
-        ) && cfg.hypervisor.with_isolation
-            == Some(openvmm_defs::config::IsolationType::Snp);
         let proto = hypervisor
             .new_partition(virt::ProtoPartitionConfig {
                 processor_topology: &processor_topology,
@@ -1084,7 +1076,6 @@ impl InitializedVm {
                     .with_isolation
                     .map(|typ| typ.into())
                     .unwrap_or(virt::IsolationType::None),
-                snp_aci_hyperv,
                 nested_virt: cfg.hypervisor.nested_virt,
             })
             .context("failed to create the prototype partition")?;
@@ -1201,9 +1192,6 @@ impl InitializedVm {
         if cfg.hypervisor.with_isolation == Some(openvmm_defs::config::IsolationType::Snp) {
             if !matches!(cfg.load_mode, LoadMode::Linux { .. }) {
                 anyhow::bail!("KVM SNP guest_memfd currently only supports direct Linux load mode");
-            }
-            if cfg.hypervisor.with_hv {
-                anyhow::bail!("KVM SNP guest_memfd does not support Hyper-V enlightenments");
             }
             if cfg.hypervisor.with_vtl2.is_some() {
                 anyhow::bail!("KVM SNP guest_memfd does not support VTL2");
