@@ -1,7 +1,5 @@
 # QEMU CCA Incubator and VMM Test Plan
 
-> This file is Markdown despite the `.toml` filename.
-
 ## Goal
 
 Add a typed QEMU CCA incubator backend that boots an RME-capable L1 Linux/KVM
@@ -24,10 +22,15 @@ QEMU support is additive:
 | TF-A | v2.15 at `da738d5eae93af342fdc4995dd3c05acb4c9d757` | FVP preflight and smoke pass |
 | RMM specification | DEN0137 2.0-bet2 | Required by KVM CCA v15 |
 | kvm-unit-tests | `cca/v4` at `6810c578fff399b33528335c7eae3c90e33847ff` | Optional validation |
-| QEMU | Undecided | Must expose experimental `-cpu max,x-rme=on` |
+| QEMU | `openvmm-deps` `0.3.0-110`, QEMU 11.0.1 | Restored binary accepts experimental `-cpu max,x-rme=on` |
 
 The QEMU, firmware, and Linux pins form one platform bundle. Do not update them
 independently after Phase 0 proves a compatible set.
+
+TF-A and TF-RMM do not require persistent host source checkouts. Build them in
+a pinned Docker builder that clones the exact revisions inside the container.
+Persist only explicit inputs, Git/download caches, build outputs, and the
+manifest on the host.
 
 ## Current implementation
 
@@ -90,22 +93,27 @@ Options:
 2. Publish a static RME-capable QEMU in `openvmm-deps`.
 3. Use a downstream RME fork.
 
-Recommendation: begin with a pinned upstream QEMU revision. RME is in-tree but
-experimental, and the local `~/ai/eevee/qemu` checkout is currently unbuilt.
-Probe any existing `openvmm-deps` QEMU for `x-rme` before adding a new artifact.
+Decision for Phase 0: use the pinned `openvmm-deps` `0.3.0-110` static QEMU
+11.0.1. It accepts:
 
-Resolved in Phase 0; formalized in Phases 1 and 3.
+```text
+-accel tcg
+-M virt,secure=on,virtualization=on,gic-version=3,acpi=off
+-cpu max,x-rme=on
+```
+
+Do not require a QEMU source checkout unless the manual v15 platform proof
+finds a QEMU bug that is fixed only after 11.0.1. If that happens, pin and
+build the minimum upstream revision containing the fix, then publish it as a
+new `openvmm-deps` artifact.
+
+Resolved for Phase 0; formalized in Phase 3 artifact selection.
 
 ### D1a: Phase 0 boot chain
 
-Options:
-
-1. Direct Linux BL33: build TF-A with
-   `ARM_LINUX_KERNEL_AS_BL33=1` and `PRELOADED_BL33_BASE=0x40200000`.
-2. EDK2 as BL33 with an explicit UEFI boot device and startup configuration.
-
-Recommendation: use direct Linux BL33 for the first proof. Do not combine
-EDK2-as-BL33 with an assumed QEMU `-kernel/-append` boot path.
+Decision: use EDK2 `ArmVirtQemuKernel` as TF-A BL33. QEMU's aarch64 firmware
+boot protocol accepts the host `-kernel`/`-append` arguments with this EDK2
+platform, matching the upstream QEMU RME functional test.
 
 Resolved in Phase 0.
 
@@ -165,39 +173,59 @@ This phase is blocking. Do not implement the incubator backend until it passes.
 
 ### Build
 
-- [ ] Pin and build QEMU with the `aarch64-softmmu` target.
-- [ ] Verify `qemu-system-aarch64 --version`.
-- [ ] Verify `-cpu max,x-rme=on` is accepted.
-- [ ] Build TF-RMM with `RMM_CONFIG=qemu_virt_defcfg`.
-- [ ] Build TF-A with `PLAT=qemu`, `ENABLE_RME=1`, the pinned RMM image,
-  `ARM_LINUX_KERNEL_AS_BL33=1`, and
-  `PRELOADED_BL33_BASE=0x40200000`.
-- [ ] Pack TF-A BL1/FIP into `flash.bin`.
-- [ ] Build the v15 host kernel from `build_support/cca/host.config`, adding a
+- [x] Restore `openvmm-deps` and use its QEMU 11.0.1
+  `qemu-system-aarch64`.
+- [x] Verify `qemu-system-aarch64 --version`.
+- [x] Verify `-cpu max,x-rme=on` is accepted.
+- [x] Add a Docker firmware builder that:
+  - uses a pinned builder image by immutable digest;
+  - clones TF-RMM and TF-A into container-local working directories;
+  - checks out exact commits, never branch names;
+  - reuses a mounted Git/download cache without treating it as source;
+  - builds TF-RMM with `RMM_CONFIG=qemu_virt_defcfg`;
+  - builds EDK2 `ArmVirtQemuKernel`;
+  - builds TF-A with `PLAT=qemu`, `ENABLE_RME=1`, the RMM image, and EDK2 as
+    BL33; and
+  - packs TF-A BL1/FIP into `flash.bin`.
+- [x] Publish `rmm.img`, `QEMU_EFI.fd`, `bl1.bin`, `fip.bin`, `flash.bin`,
+  logs, and the manifest through a staged atomic directory swap.
+- [x] Run the builder as the invoking host UID/GID so outputs are not
+  root-owned.
+- [x] Do not mount the Docker socket or grant `--privileged`.
+- [x] Build the v15 host kernel from `build_support/cca/host.config`, adding a
   QEMU fragment only if the current built-in virtio/PCI/9p set is insufficient.
-- [ ] Stage the current FVP buildroot rootfs with `kvm_cca_preflight`, OpenVMM,
+- [x] Stage the current FVP buildroot rootfs with `kvm_cca_preflight`, OpenVMM,
   guest kernel/initrd, and the generated OpenVMM CCA launch script.
-- [ ] Record revisions, configure/build commands, toolchains, and hashes in
-  `target/cca-qemu/manifest.txt`.
+- [x] Record the builder image digest, repository URLs, revisions,
+  configure/build commands, toolchains, and output hashes in
+  `target/cca-qemu/firmware/manifest.txt`.
 
 ### Representative boot
 
-Start with one CPU and 2 GiB. If firmware allocation or nested Realm memory
-fails, retry with the documented compatibility knobs `-m 8G`, `sme=off`, and
-`pauth-impdef=on`, recording which are actually required.
+The proven Phase 0 CPU shape is:
+
+```text
+max,x-rme=on,lpa2=off,sme=off,pauth-impdef=on
+```
+
+`lpa2=off` is required: QEMU otherwise exposes a 52-bit Realm IPA and the L2
+guest resets before reaching userspace. With LPA2 disabled, host and Realm IPA
+are both 48 bits and the smoke passes. One CPU and 2 GiB are sufficient.
 
 ```text
 qemu-system-aarch64 \
+  -nodefaults \
   -accel tcg \
   -M virt,secure=on,virtualization=on,gic-version=3,acpi=off \
-  -cpu max,x-rme=on \
+  -cpu max,x-rme=on,lpa2=off,sme=off,pauth-impdef=on \
   -m 2G -smp 1 \
   -bios flash.bin \
   -kernel host-Image \
   -drive if=none,id=rootfs,format=raw,file=host-rootfs.ext4 \
-  -device virtio-blk-pci,drive=rootfs \
-  -virtfs local,path=<share>,mount_tag=host,security_model=none \
-  -append "nokaslr root=/dev/vda rw"
+  -device virtio-blk-pci,drive=rootfs,romfile= \
+  -virtfs local,path=<share>,mount_tag=FM,security_model=none \
+  -append "nokaslr root=/dev/vda rw console=ttyAMA0" \
+  -display none -serial stdio
 ```
 
 Add named firmware/RMM/host consoles and user networking as required.
@@ -205,25 +233,50 @@ Add named firmware/RMM/host consoles and user networking as required.
 
 ### Acceptance
 
-- [ ] Host reaches userspace.
-- [ ] Host log reports RMM/KVM Realm support.
-- [ ] `kvm_cca_preflight` passes capability 251, guestmemfd, Realm creation,
+- [x] Host reaches userspace.
+- [x] Host log reports RMM/KVM Realm support.
+- [x] `kvm_cca_preflight` passes capability 251, guestmemfd, Realm creation,
   and VGICv3 checks.
-- [ ] The generated OpenVMM CCA launch script boots the L2 Realm.
-- [ ] The existing block/network smoke emits `OVMM_SMOKE_ALL_PASS`.
-- [ ] Firmware, RMM, host, and Realm logs are saved.
-- [ ] Record boot-to-preflight and smoke wall-clock timings.
+- [x] The generated OpenVMM CCA launch script boots the L2 Realm.
+- [x] The existing block/network smoke emits `OVMM_SMOKE_ALL_PASS`.
+- [x] Firmware, RMM, host, and Realm output is captured in the host console
+  logs, with the secondary serial retained separately.
+- [x] Record boot-to-preflight and smoke wall-clock timings.
+
+### Phase 0 result
+
+Phase 0 passes:
+
+- `run-qemu-cca-preflight.sh`: approximately 4 seconds;
+- `run-qemu-cca-smoke.sh`: approximately 32 seconds;
+- host and Realm IPA: 48 bits;
+- all block/network smoke markers pass; and
+- QEMU exits normally after L1 `poweroff`.
+
+The complete platform record is
+`target/cca-qemu/phase0-manifest.txt`.
 
 If any acceptance item fails, stop and update the platform pin set before
 proceeding.
 
-## Phase 1: Package reproducible QEMU CCA artifacts
+## Phase 1: Package QEMU CCA artifacts
 
-- [ ] Add `build_support/cca/build-qemu.sh`, modeled on
-  `build-kernels.sh`: exact revision check, clean source export, incremental
-  output, reproducible environment, and manifest hashes.
-- [ ] Add `build_support/cca/build-qemu-firmware.sh` for TF-A, TF-RMM, EDK2,
-  and `flash.bin`.
+- [x] Continue resolving QEMU 11.0.1 from `openvmm-deps` unless Phase 0 proves
+  a source-only fix is required.
+- [ ] If a source build is required, add `build_support/cca/build-qemu.sh`,
+  modeled on `build-kernels.sh`: exact revision check, clean source export,
+  incremental output, reproducible environment, and manifest hashes.
+- [x] Add `build_support/cca/build-qemu-firmware.sh` as the host wrapper for
+  the Docker build. It must:
+  - accept output/cache/input paths and exact revision overrides;
+  - reject output paths that overlap inputs;
+  - pull/verify the pinned image digest;
+  - mount inputs read-only;
+  - mount cache and output directories read-write;
+  - perform cleanup through container lifecycle, not broad host deletion; and
+  - verify all declared artifacts and hashes after the container exits.
+- [x] Add the Docker build recipe under `build_support/cca/` rather than
+  requiring TF-A/TF-RMM source directories beside the OpenVMM checkout.
 - [ ] Add a QEMU-specific host kernel config fragment if Phase 0 requires it.
 - [ ] Add a host-rootfs builder with a deterministic init service that mounts
   9p, configures networking, runs preflight, and executes the freshly-built
@@ -232,6 +285,9 @@ proceeding.
   - `build_cca_qemu`;
   - `build_cca_qemu_firmware`; and
   - `build_cca_host_rootfs`.
+- [ ] Have the firmware Flowey node install/verify Docker, invoke the wrapper,
+  and return the manifest and firmware artifacts. It must not expose or depend
+  on container-local source paths.
 - [ ] Centralize QEMU/TF-A/TF-RMM/Linux pins in one Rust module and have the
   FVP/QEMU tooling consume it where practical.
 - [ ] Keep local-build artifacts first; publish a downloadable platform bundle
@@ -239,7 +295,13 @@ proceeding.
 
 ### Exit criteria
 
-- Two clean builds produce identical artifact hashes.
+- The pinned Docker build succeeds from an empty cache and in offline/cache-only
+  mode after the cache is populated.
+- [ ] Future: make EDK2/FIP/flash byte-for-byte reproducible. TF-RMM and BL1
+  are already stable, but EDK2 firmware-volume output still varies.
+- A build succeeds on a machine with no TF-A or TF-RMM checkout.
+- A cache-hit rebuild avoids refetching unchanged Git objects while producing
+  identical outputs.
 - Typed Flowey outputs provide QEMU, `flash.bin`, host kernel, rootfs, and
   manifest paths.
 - The packaged artifacts repeat the Phase 0 preflight and smoke result.
@@ -405,6 +467,10 @@ async fn boot_linux_direct_cca(
 
 - QEMU RME is experimental and its `x-rme` interface may change.
 - No public bundle currently proves the v15/bet2 stack under QEMU.
+- The Docker builder image is part of the trusted pin set and must be immutable
+  by digest.
+- Network access is required only to populate an empty cache; support an
+  offline/cache-only mode after the first successful build.
 - QEMU does not emulate RME in the SMMU or GIC; device assignment is out of
   scope.
 - Outer TCG plus an L2 Realm will be slow.
