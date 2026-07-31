@@ -38,8 +38,6 @@ pub enum Error {
     MissingSnpCBit,
     #[error("failed to finalize SNP VMSA")]
     SnpVmsa(#[source] anyhow::Error),
-    #[error("ACI Hyper-V SNP direct boot supports only one processor until StartVP is implemented")]
-    AciMultipleVpsUnsupported,
 }
 
 struct Aarch64EfiInfo {
@@ -160,9 +158,6 @@ pub fn load_linux_x86(
     // The CLI currently validates restricted injection as MSHV-only, which
     // keeps the shared KVM SNP direct-boot layout unchanged.
     let aci_hyperv = cfg.isolation == Some(IsolationType::Snp) && cfg.snp_restricted_injection;
-    if aci_hyperv && cfg.vp_count != 1 {
-        return Err(Error::AciMultipleVpsUnsupported);
-    }
     if aci_hyperv {
         tracing::info!("using ACI Hyper-V SNP direct-boot layout");
     }
