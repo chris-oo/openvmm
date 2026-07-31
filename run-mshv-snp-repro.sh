@@ -14,7 +14,16 @@ MEMORY="${MSHV_SNP_MEMORY:-160MB}"
 PROCESSORS="${MSHV_SNP_PROCESSORS:-1}"
 TIMEOUT_SECONDS="${MSHV_SNP_TIMEOUT_SECONDS:-90}"
 OPENVMM_LOG="${OPENVMM_LOG:-info,virt_mshv=debug}"
-KERNEL_CMDLINE="${MSHV_SNP_CMDLINE:-console=ttyS0 earlyprintk=serial earlycon panic=-1 nokaslr}"
+DEVICE_TEST="${MSHV_SNP_DEVICE_TEST:-none}"
+DEFAULT_KERNEL_CMDLINE="console=ttyS0 earlyprintk=serial earlycon panic=-1 nokaslr"
+if [[ "$DEVICE_TEST" != none ]]; then
+    # The fixed ACI SNP metadata pages at 8 MiB are currently outside the
+    # loader's e820 RAM entries. Linux must treat them as encrypted RAM for
+    # late setup_data reads used by PCI/MSI initialization. Replace this with
+    # a proper loader e820 entry once the device bring-up experiment is done.
+    DEFAULT_KERNEL_CMDLINE+=" memmap=20K@8M ovmm_device_test=$DEVICE_TEST"
+fi
+KERNEL_CMDLINE="${MSHV_SNP_CMDLINE:-$DEFAULT_KERNEL_CMDLINE}"
 BUILD_OPENVMM="${MSHV_SNP_BUILD_OPENVMM:-1}"
 BUILD_KERNEL="${MSHV_SNP_BUILD_KERNEL:-0}"
 KEEP_REMOTE="${MSHV_SNP_KEEP_REMOTE:-0}"
@@ -42,6 +51,7 @@ wedson-mshv. Configuration is provided through environment variables:
   MSHV_SNP_MEMORY            guest memory (default: 160MB)
   MSHV_SNP_PROCESSORS        guest processor count (default: 1)
   MSHV_SNP_TIMEOUT_SECONDS   boot timeout (default: 90)
+  MSHV_SNP_DEVICE_TEST       device scenario: none | blk | net (default: none)
   MSHV_SNP_KEEP_REMOTE       retain a successful remote run (default: 0)
 EOF
 }
@@ -61,6 +71,10 @@ if [[ ! "$PROCESSORS" =~ ^[1-9][0-9]{0,2}$ ]] || (( PROCESSORS > 255 )); then
 fi
 if [[ ! "$TIMEOUT_SECONDS" =~ ^[1-9][0-9]{0,4}$ ]]; then
     echo "ERROR: MSHV_SNP_TIMEOUT_SECONDS must be an integer from 1 through 99999" >&2
+    exit 2
+fi
+if [[ ! "$DEVICE_TEST" =~ ^(none|blk|net)$ ]]; then
+    echo "ERROR: MSHV_SNP_DEVICE_TEST must be none, blk, or net" >&2
     exit 2
 fi
 
@@ -301,6 +315,24 @@ openvmm_command=(
     -p "$PROCESSORS"
     -c "$KERNEL_CMDLINE"
 )
+case "$DEVICE_TEST" in
+    none)
+        ;;
+    blk)
+        openvmm_command+=(
+            --pcie-root-complex rc0
+            --pcie-root-port rc0:blk
+            --virtio-blk mem:16M,pcie_port=blk
+        )
+        ;;
+    net)
+        openvmm_command+=(
+            --pcie-root-complex rc0
+            --pcie-root-port rc0:net
+            --virtio-net pcie_port=net:consomme
+        )
+        ;;
+esac
 quoted_openvmm_command="$(quote_command "${openvmm_command[@]}")"
 runner_body="echo \$\$ > openvmm.pgid; exec $quoted_openvmm_command"
 remote_command="cd $quoted_remote_dir && exec sudo -n setsid --wait sh -c $(printf '%q' "$runner_body")"
@@ -313,7 +345,7 @@ remote_command="cd $quoted_remote_dir && exec sudo -n setsid --wait sh -c $(prin
 
 echo "Running $PROCESSORS-vCPU MSHV SNP repro; full console: $console_log"
 set +e
-python3 - "$HOST" "$remote_command" "$TIMEOUT_SECONDS" "$PROCESSORS" "$console_log" <<'PY'
+python3 - "$HOST" "$remote_command" "$TIMEOUT_SECONDS" "$PROCESSORS" "$DEVICE_TEST" "$console_log" <<'PY'
 import os
 import pty
 import re
@@ -323,9 +355,14 @@ import sys
 import termios
 import time
 
-host, remote_command, timeout_text, processors_text, log_path = sys.argv[1:]
+host, remote_command, timeout_text, processors_text, device_test, log_path = sys.argv[1:]
 timeout_seconds = int(timeout_text)
 processors = int(processors_text)
+device_marker = {
+    "none": None,
+    "blk": "OVMM_VIRTIO_BLK_OK",
+    "net": "OVMM_VIRTIO_NET_OK",
+}[device_test]
 shell_ready = re.compile(
     r"No root device specified\. Dropping to a shell\.|"
     r"can't access tty; job control turned off|"
@@ -365,6 +402,7 @@ deadline = time.monotonic() + timeout_seconds + 15
 buffer = ""
 reached_shell = False
 reached_processor_count = False
+reached_device = device_marker is None
 matched_fatal = False
 fatal_since = None
 missing_processors = False
@@ -427,11 +465,15 @@ with open(log_path, "wb", buffering=0) as log:
 
             if smp_ready.search(buffer):
                 reached_processor_count = True
+            if device_marker is not None and device_marker in buffer:
+                reached_device = True
 
             if not reached_shell and shell_ready.search(buffer):
                 reached_shell = True
                 if not reached_processor_count:
                     missing_processors = True
+                    break
+                if not reached_device:
                     break
                 print(
                     "\nMSHV SNP repro: initrd shell reached; quitting OpenVMM",
@@ -528,6 +570,9 @@ with open(log_path, "wb", buffering=0) as log:
 
 if missing_processors:
     print(f"\nMSHV SNP repro failed: guest did not bring up {processors} CPUs", file=sys.stderr)
+    sys.exit(1)
+if not reached_device:
+    print(f"\nMSHV SNP repro failed: {device_test} smoke marker was not observed", file=sys.stderr)
     sys.exit(1)
 if matched_fatal:
     print("\nMSHV SNP repro failed: matched a fatal guest or OpenVMM error", file=sys.stderr)
