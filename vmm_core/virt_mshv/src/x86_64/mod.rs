@@ -1388,12 +1388,34 @@ impl MshvPartitionInner {
             return Err(ErrorInner::TooManySnpCpuidEntries(count).into());
         }
         if self.caps.hv1 {
-            // TODO: Determine whether MSHV can service these Hyper-V leaves
-            // without copying them into the measured SNP CPUID page.
-            // Linux services all CPUID instructions from the measured SNP
-            // table once one is installed. Missing Hyper-V leaves therefore
-            // read as zero instead of falling back to MSHV, preventing Linux
-            // from recognizing the Hyper-V interface and its APIC contract.
+            // TODO: Determine the correct long-term strategy for exposing
+            // synthetic Hyper-V CPUID leaves to direct-boot SNP guests: include
+            // them in the measured CPUID page, rely on GHCB CPUID fallback, or
+            // support both based on the guest contract.
+            //
+            // The loader creates this page with the architectural x86 and AMD
+            // leaves needed by an SNP guest. Add the synthetic Hyper-V leaf
+            // requests here because their values depend on the MSHV partition
+            // configuration. The loop below queries MSHV for every requested
+            // leaf and writes the results into this page before it is imported
+            // through the SNP launch API. The PSP consequently measures these
+            // synthetic values along with the rest of the CPUID page.
+            //
+            // This is not inherently required by the SNP or GHCB protocols. A
+            // guest can treat a synthetic leaf absent from the measured table
+            // as unsupported by that table and retry it through the GHCB CPUID
+            // protocol. With CPUID VMGEXIT offloading enabled, the hypervisor
+            // can answer that request using the CPUID intercept results
+            // registered above. With offloading disabled, OpenVMM answers the
+            // forwarded MSR or page-protocol request.
+            //
+            // Some Linux versions instead treat an absent, out-of-range
+            // synthetic leaf as a successful all-zero result. In particular,
+            // returning zeros for 0x40000000 prevents Hyper-V vendor detection
+            // and therefore disables the entire Hyper-V guest interface. Keep
+            // appending the leaves for compatibility with those guests. A
+            // guest that returns -EOPNOTSUPP for missing synthetic leaves does
+            // not require this augmentation.
             add_snp_hyperv_cpuid_leaves(&mut page).map_err(ErrorInner::TooManySnpCpuidEntries)?;
         }
         let count = page.count as usize;
