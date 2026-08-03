@@ -15,7 +15,9 @@ PROCESSORS="${MSHV_SNP_PROCESSORS:-1}"
 TIMEOUT_SECONDS="${MSHV_SNP_TIMEOUT_SECONDS:-90}"
 OPENVMM_LOG="${OPENVMM_LOG:-info,virt_mshv=debug}"
 DEVICE_TEST="${MSHV_SNP_DEVICE_TEST:-none}"
-DEFAULT_KERNEL_CMDLINE="console=ttyS0 earlyprintk=serial earlycon panic=-1 nokaslr"
+RESTRICTED_INJECTION="${MSHV_SNP_RESTRICTED_INJECTION:-0}"
+DISABLE_CPUID_OFFLOAD="${MSHV_SNP_DISABLE_CPUID_OFFLOAD:-0}"
+DEFAULT_KERNEL_CMDLINE="console=ttyS0 earlyprintk=serial earlycon panic=-1 nokaslr maxcpus=$PROCESSORS"
 if [[ "$DEVICE_TEST" != none ]]; then
     # The fixed ACI SNP metadata pages at 8 MiB are currently outside the
     # loader's e820 RAM entries. Linux must treat them as encrypted RAM for
@@ -51,7 +53,11 @@ wedson-mshv. Configuration is provided through environment variables:
   MSHV_SNP_MEMORY            guest memory (default: 160MB)
   MSHV_SNP_PROCESSORS        guest processor count (default: 1)
   MSHV_SNP_TIMEOUT_SECONDS   boot timeout (default: 90)
-  MSHV_SNP_DEVICE_TEST       device scenario: none | blk | net (default: none)
+  MSHV_SNP_DEVICE_TEST       device scenario: none | blk | net | both (default: none)
+  MSHV_SNP_RESTRICTED_INJECTION
+                              enable SNP restricted interrupt injection (default: 0)
+  MSHV_SNP_DISABLE_CPUID_OFFLOAD
+                              forward SNP GHCB CPUID requests to OpenVMM (default: 0)
   MSHV_SNP_KEEP_REMOTE       retain a successful remote run (default: 0)
 EOF
 }
@@ -73,12 +79,12 @@ if [[ ! "$TIMEOUT_SECONDS" =~ ^[1-9][0-9]{0,4}$ ]]; then
     echo "ERROR: MSHV_SNP_TIMEOUT_SECONDS must be an integer from 1 through 99999" >&2
     exit 2
 fi
-if [[ ! "$DEVICE_TEST" =~ ^(none|blk|net)$ ]]; then
-    echo "ERROR: MSHV_SNP_DEVICE_TEST must be none, blk, or net" >&2
+if [[ ! "$DEVICE_TEST" =~ ^(none|blk|net|both)$ ]]; then
+    echo "ERROR: MSHV_SNP_DEVICE_TEST must be none, blk, net, or both" >&2
     exit 2
 fi
 
-for value in "$BUILD_OPENVMM" "$BUILD_KERNEL" "$KEEP_REMOTE"; do
+for value in "$BUILD_OPENVMM" "$BUILD_KERNEL" "$KEEP_REMOTE" "$RESTRICTED_INJECTION" "$DISABLE_CPUID_OFFLOAD"; do
     if [[ "$value" != 0 && "$value" != 1 ]]; then
         echo "ERROR: boolean configuration values must be 0 or 1" >&2
         exit 2
@@ -275,6 +281,8 @@ remote_kernel="$(
     printf 'kernel=%s\nkernel_sha256=%s\n' "$KERNEL" "$kernel_hash"
     printf 'initrd=%s\ninitrd_sha256=%s\n' "$INITRD" "$initrd_hash"
     printf 'memory=%s\nprocessors=%s\ntimeout_seconds=%s\n' "$MEMORY" "$PROCESSORS" "$TIMEOUT_SECONDS"
+    printf 'restricted_injection=%s\n' "$RESTRICTED_INJECTION"
+    printf 'disable_cpuid_offload=%s\n' "$DISABLE_CPUID_OFFLOAD"
     printf 'openvmm_log=%s\nkernel_cmdline=%s\n' "$OPENVMM_LOG" "$KERNEL_CMDLINE"
     printf '%s\n' "$remote_kernel"
 } >"$manifest"
@@ -307,7 +315,8 @@ openvmm_command=(
     ./openvmm
     --hypervisor mshv
     --isolation snp
-    --snp-restricted-injection
+    --hv
+    --no-vmbus
     --com1 console
     --kernel ./bzImage
     --initrd ./initrd
@@ -315,6 +324,12 @@ openvmm_command=(
     -p "$PROCESSORS"
     -c "$KERNEL_CMDLINE"
 )
+if [[ "$RESTRICTED_INJECTION" == 1 ]]; then
+    openvmm_command+=(--snp-restricted-injection)
+fi
+if [[ "$DISABLE_CPUID_OFFLOAD" == 1 ]]; then
+    openvmm_command+=(--snp-disable-cpuid-offload)
+fi
 case "$DEVICE_TEST" in
     none)
         ;;
@@ -329,6 +344,15 @@ case "$DEVICE_TEST" in
         openvmm_command+=(
             --pcie-root-complex rc0
             --pcie-root-port rc0:net
+            --virtio-net pcie_port=net:consomme
+        )
+        ;;
+    both)
+        openvmm_command+=(
+            --pcie-root-complex rc0
+            --pcie-root-port rc0:blk
+            --pcie-root-port rc0:net
+            --virtio-blk mem:16M,pcie_port=blk
             --virtio-net pcie_port=net:consomme
         )
         ;;
@@ -362,6 +386,7 @@ device_marker = {
     "none": None,
     "blk": "OVMM_VIRTIO_BLK_OK",
     "net": "OVMM_VIRTIO_NET_OK",
+    "both": "OVMM_VIRTIO_BOTH_OK",
 }[device_test]
 shell_ready = re.compile(
     r"No root device specified\. Dropping to a shell\.|"
