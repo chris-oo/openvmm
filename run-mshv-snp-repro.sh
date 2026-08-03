@@ -15,15 +15,23 @@ PROCESSORS="${MSHV_SNP_PROCESSORS:-1}"
 TIMEOUT_SECONDS="${MSHV_SNP_TIMEOUT_SECONDS:-90}"
 OPENVMM_LOG="${OPENVMM_LOG:-info,virt_mshv=debug}"
 DEVICE_TEST="${MSHV_SNP_DEVICE_TEST:-none}"
+CONSOLE="${MSHV_SNP_CONSOLE:-serial}"
 RESTRICTED_INJECTION="${MSHV_SNP_RESTRICTED_INJECTION:-0}"
 DISABLE_CPUID_OFFLOAD="${MSHV_SNP_DISABLE_CPUID_OFFLOAD:-0}"
-DEFAULT_KERNEL_CMDLINE="console=ttyS0 earlyprintk=serial earlycon panic=-1 nokaslr maxcpus=$PROCESSORS"
+case "$CONSOLE" in
+    serial)
+        DEFAULT_KERNEL_CMDLINE="console=ttyS0 earlyprintk=serial earlycon panic=-1 nokaslr maxcpus=$PROCESSORS"
+        ;;
+    virtio)
+        DEFAULT_KERNEL_CMDLINE="console=hvc0 panic=-1 nokaslr maxcpus=$PROCESSORS"
+        ;;
+    *)
+        echo "ERROR: MSHV_SNP_CONSOLE must be serial or virtio" >&2
+        exit 2
+        ;;
+esac
 if [[ "$DEVICE_TEST" != none ]]; then
-    # The fixed ACI SNP metadata pages at 8 MiB are currently outside the
-    # loader's e820 RAM entries. Linux must treat them as encrypted RAM for
-    # late setup_data reads used by PCI/MSI initialization. Replace this with
-    # a proper loader e820 entry once the device bring-up experiment is done.
-    DEFAULT_KERNEL_CMDLINE+=" memmap=20K@8M ovmm_device_test=$DEVICE_TEST"
+    DEFAULT_KERNEL_CMDLINE+=" ovmm_device_test=$DEVICE_TEST"
 fi
 KERNEL_CMDLINE="${MSHV_SNP_CMDLINE:-$DEFAULT_KERNEL_CMDLINE}"
 BUILD_OPENVMM="${MSHV_SNP_BUILD_OPENVMM:-1}"
@@ -54,6 +62,7 @@ wedson-mshv. Configuration is provided through environment variables:
   MSHV_SNP_PROCESSORS        guest processor count (default: 1)
   MSHV_SNP_TIMEOUT_SECONDS   boot timeout (default: 90)
   MSHV_SNP_DEVICE_TEST       device scenario: none | blk | net | both (default: none)
+  MSHV_SNP_CONSOLE           console device: serial | virtio (default: serial)
   MSHV_SNP_RESTRICTED_INJECTION
                               enable SNP restricted interrupt injection (default: 0)
   MSHV_SNP_DISABLE_CPUID_OFFLOAD
@@ -120,6 +129,7 @@ mkdir -p "$logs_dir"
 remote_dir=
 remote_staged=0
 run_succeeded=0
+generated_initrd_dir=
 
 quote_command() {
     local quoted
@@ -164,6 +174,10 @@ cleanup_remote_process() {
 on_exit() {
     local status=$?
     trap - EXIT INT TERM
+
+    if [[ -n "$generated_initrd_dir" ]]; then
+        rm -rf -- "$generated_initrd_dir"
+    fi
 
     if ! cleanup_remote_process; then
         echo "ERROR: failed to clean the recorded remote OpenVMM process group" >&2
@@ -243,6 +257,24 @@ check_artifact "OpenVMM binary" "$OPENVMM_BIN" 1
 check_artifact "ACI kernel" "$KERNEL"
 check_artifact "initrd" "$INITRD"
 
+if [[ "$CONSOLE" == virtio ]]; then
+    generated_initrd_dir="$(mktemp -d)"
+    mkdir "$generated_initrd_dir/root"
+    (
+        cd "$generated_initrd_dir/root"
+        gzip -dc "$INITRD" | cpio -id --quiet
+        mv init init.base
+        printf '%s\n' \
+            '#!/bin/sh' \
+            "dmesg | grep 'smp: Brought up' || true" \
+            'exec /init.base "$@"' >init
+        chmod 755 init
+        find . -print0 | cpio --null -o --quiet -H newc |
+            gzip -n >"$generated_initrd_dir/initrd"
+    )
+    INITRD="$generated_initrd_dir/initrd"
+fi
+
 openvmm_hash="$(sha256sum "$OPENVMM_BIN" | awk '{print $1}')"
 kernel_hash="$(sha256sum "$KERNEL" | awk '{print $1}')"
 initrd_hash="$(sha256sum "$INITRD" | awk '{print $1}')"
@@ -317,13 +349,31 @@ openvmm_command=(
     --isolation snp
     --hv
     --no-vmbus
-    --com1 console
     --kernel ./bzImage
     --initrd ./initrd
     -m "$MEMORY"
     -p "$PROCESSORS"
     -c "$KERNEL_CMDLINE"
 )
+case "$CONSOLE" in
+    serial)
+        openvmm_command+=(--com1 console)
+        ;;
+    virtio)
+        # Keep ACI Linux IOAPIC support enabled for this configuration.
+        # The guest boots and transmits console output with IOAPIC disabled,
+        # but host-to-guest input does not complete. The current virtio-console
+        # path therefore relies on PCI INTx fallback through the emulated
+        # IOAPIC rather than a working MSI-X receive interrupt.
+        openvmm_command+=(
+            --com1 none
+            --pcie-root-complex console-rc
+            --pcie-root-port console-rc:console
+            --virtio-console console
+            --virtio-console-pcie-port console
+        )
+        ;;
+esac
 if [[ "$RESTRICTED_INJECTION" == 1 ]]; then
     openvmm_command+=(--snp-restricted-injection)
 fi
@@ -369,7 +419,7 @@ remote_command="cd $quoted_remote_dir && exec sudo -n setsid --wait sh -c $(prin
 
 echo "Running $PROCESSORS-vCPU MSHV SNP repro; full console: $console_log"
 set +e
-python3 - "$HOST" "$remote_command" "$TIMEOUT_SECONDS" "$PROCESSORS" "$DEVICE_TEST" "$console_log" <<'PY'
+python3 - "$HOST" "$remote_command" "$TIMEOUT_SECONDS" "$PROCESSORS" "$DEVICE_TEST" "$CONSOLE" "$console_log" <<'PY'
 import os
 import pty
 import re
@@ -379,7 +429,7 @@ import sys
 import termios
 import time
 
-host, remote_command, timeout_text, processors_text, device_test, log_path = sys.argv[1:]
+host, remote_command, timeout_text, processors_text, device_test, console, log_path = sys.argv[1:]
 timeout_seconds = int(timeout_text)
 processors = int(processors_text)
 device_marker = {
@@ -388,11 +438,17 @@ device_marker = {
     "net": "OVMM_VIRTIO_NET_OK",
     "both": "OVMM_VIRTIO_BOTH_OK",
 }[device_test]
-shell_ready = re.compile(
-    r"No root device specified\. Dropping to a shell\.|"
-    r"can't access tty; job control turned off|"
-    r"(?:^|[\r\n])~ #\s*$"
-)
+if console == "virtio":
+    shell_ready = re.compile(
+        r"can't access tty; job control turned off|"
+        r"(?:^|[\r\n])~ #\s*$"
+    )
+else:
+    shell_ready = re.compile(
+        r"No root device specified\. Dropping to a shell\.|"
+        r"can't access tty; job control turned off|"
+        r"(?:^|[\r\n])~ #\s*$"
+    )
 fatal = re.compile(
     r"fatal error|failed to run VP|guest halted|triple fault|panicked at|"
     r"assertion failed|abnormal exit|SIGABRT|core dumped|Kernel panic"
@@ -426,11 +482,14 @@ termios.tcsetattr(fd, termios.TCSANOW, attrs)
 deadline = time.monotonic() + timeout_seconds + 15
 buffer = ""
 reached_shell = False
+# The SMP bring-up marker is printed before a virtio console can be probed.
 reached_processor_count = False
 reached_device = device_marker is None
 matched_fatal = False
 fatal_since = None
 missing_processors = False
+input_probe_requested = False
+input_probe_verified = console != "virtio"
 control_prompt_requested = False
 quit_sent = False
 child_status = None
@@ -493,6 +552,19 @@ with open(log_path, "wb", buffering=0) as log:
             if device_marker is not None and device_marker in buffer:
                 reached_device = True
 
+            if input_probe_requested and "OVMM_VIRTIO_CONSOLE_INPUT_OK" in buffer:
+                input_probe_verified = True
+                print(
+                    "\nMSHV SNP repro: virtio-console input verified; quitting OpenVMM",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                os.write(fd, b"\x11")
+                control_prompt_requested = True
+                input_probe_requested = False
+                buffer = ""
+                continue
+
             if not reached_shell and shell_ready.search(buffer):
                 reached_shell = True
                 if not reached_processor_count:
@@ -500,6 +572,19 @@ with open(log_path, "wb", buffering=0) as log:
                     break
                 if not reached_device:
                     break
+                if not input_probe_verified:
+                    print(
+                        "\nMSHV SNP repro: testing virtio-console input",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    os.write(
+                        fd,
+                        b"printf '%s%s\\n' OVMM_VIRTIO_CONSOLE_ INPUT_OK\n",
+                    )
+                    input_probe_requested = True
+                    buffer = ""
+                    continue
                 print(
                     "\nMSHV SNP repro: initrd shell reached; quitting OpenVMM",
                     file=sys.stderr,
