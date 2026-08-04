@@ -13,6 +13,7 @@ FIRMWARE="${QEMU_CCA_FIRMWARE:-$QEMU_CCA_ROOT/firmware/flash.bin}"
 HOST_KERNEL="${QEMU_CCA_HOST_KERNEL:-$CCA_TEST_ROOT/cca-kernels-v15/host-Image}"
 HOST_ROOTFS="${QEMU_CCA_HOST_ROOTFS:-$CCA_TEST_ROOT/kvm-cca/rootfs.ext2}"
 SHARE_DIR="${QEMU_CCA_SHARE_DIR:-$CCA_TEST_ROOT/kvm-cca/share}"
+MOUNT_TAG="${QEMU_CCA_MOUNT_TAG:-FM}"
 LOG_DIR="${QEMU_CCA_LOG_DIR:-$QEMU_CCA_ROOT/logs}"
 MEMORY="${QEMU_CCA_MEMORY:-2G}"
 PROCESSORS="${QEMU_CCA_PROCESSORS:-1}"
@@ -41,7 +42,7 @@ exec "$QEMU_BIN" \
     -kernel "$HOST_KERNEL" \
     -drive "if=none,id=rootfs,format=raw,file=$HOST_ROOTFS" \
     -device virtio-blk-pci,drive=rootfs,romfile= \
-    -virtfs "local,path=$SHARE_DIR,mount_tag=FM,security_model=none,readonly=off" \
+    -virtfs "local,path=$SHARE_DIR,mount_tag=$MOUNT_TAG,security_model=none,readonly=off" \
     -netdev user,id=net0 \
     -device virtio-net-pci,netdev=net0,romfile= \
     -append "nokaslr root=/dev/vda rw console=ttyAMA0" \
