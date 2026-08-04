@@ -5,8 +5,6 @@ use flowey::node::prelude::ReadVar;
 use flowey::pipeline::prelude::*;
 use std::path::PathBuf;
 
-const CCA_V15_KERNEL_REVISION: &str = "d6d40e6a310388f58def167f8b57e31d6c6057a2";
-
 /// Native OpenVMM KVM CCA debug and test flows.
 #[derive(clap::Args)]
 pub struct KvmCcaTestsCli {
@@ -203,7 +201,9 @@ impl IntoPipeline for KvmCcaTestsCli {
                 }
                 (None, None) => {
                     let source = cca_kernel_src.unwrap_or(default_cca_kernel_source()?);
-                    let revision = cca_kernel_rev.unwrap_or_else(|| CCA_V15_KERNEL_REVISION.into());
+                    let revision = cca_kernel_rev.unwrap_or_else(|| {
+                        flowey_lib_hvlite::cca_pins::LINUX_CCA_V15_REVISION.into()
+                    });
                     flowey_lib_hvlite::_jobs::local_stage_kvm_cca::CcaKernelSource::Build(
                         flowey_lib_hvlite::build_cca_linux_kernels::CcaLinuxKernelBuildParams {
                             openvmm_root: crate::repo_root(),
