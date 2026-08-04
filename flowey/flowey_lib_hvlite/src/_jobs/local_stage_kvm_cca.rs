@@ -18,6 +18,7 @@ use std::process::Command;
 #[derive(Serialize, Deserialize, Copy, Clone, Debug)]
 pub enum StageMode {
     StageOnly,
+    StageInteractiveHost,
     Preflight,
     InteractiveHost,
     RunOpenvmm,
@@ -77,7 +78,10 @@ impl SimpleFlowNode for Node {
         };
         let openvmm = matches!(
             mode,
-            StageMode::StageOnly | StageMode::InteractiveHost | StageMode::RunOpenvmm
+            StageMode::StageOnly
+                | StageMode::StageInteractiveHost
+                | StageMode::InteractiveHost
+                | StageMode::RunOpenvmm
         )
         .then(|| {
             ctx.reqv(|v| crate::build_openvmm::Request {
@@ -98,7 +102,10 @@ impl SimpleFlowNode for Node {
         });
         let guest_initrd = matches!(
             mode,
-            StageMode::StageOnly | StageMode::InteractiveHost | StageMode::RunOpenvmm
+            StageMode::StageOnly
+                | StageMode::StageInteractiveHost
+                | StageMode::InteractiveHost
+                | StageMode::RunOpenvmm
         )
         .then(|| {
             guest_initrd.map_or_else(
@@ -248,7 +255,10 @@ fi
                 })?;
                 if matches!(
                     mode,
-                    StageMode::StageOnly | StageMode::InteractiveHost | StageMode::RunOpenvmm
+                    StageMode::StageOnly
+                        | StageMode::StageInteractiveHost
+                        | StageMode::InteractiveHost
+                        | StageMode::RunOpenvmm
                 ) {
                     fs::write(
                         &run_script,
@@ -339,7 +349,10 @@ poweroff -f || poweroff || halt -f || halt || exit "$openvmm_rc"
                 }
                 if matches!(
                     mode,
-                    StageMode::StageOnly | StageMode::InteractiveHost | StageMode::RunOpenvmm
+                    StageMode::StageOnly
+                        | StageMode::StageInteractiveHost
+                        | StageMode::InteractiveHost
+                        | StageMode::RunOpenvmm
                 ) {
                     set_executable(&run_script).with_context(|| {
                         format!(
@@ -351,7 +364,9 @@ poweroff -f || poweroff || halt -f || halt || exit "$openvmm_rc"
                 let init_hook = generated_dir.join(match mode {
                     StageMode::StageOnly => "S99run-openvmm-kvm-cca",
                     StageMode::Preflight => "S99kvm-cca-preflight",
-                    StageMode::InteractiveHost => "S99kvm-cca-interactive-host",
+                    StageMode::StageInteractiveHost | StageMode::InteractiveHost => {
+                        "S99kvm-cca-interactive-host"
+                    }
                     StageMode::RunOpenvmm => "S99run-openvmm-kvm-cca",
                 });
                 let init_hook_contents = match mode {
@@ -369,7 +384,7 @@ esac
 exit 0
 "#
                     }
-                    StageMode::InteractiveHost => {
+                    StageMode::StageInteractiveHost | StageMode::InteractiveHost => {
                         r#"#!/bin/sh
 
 case "$1" in
@@ -438,10 +453,16 @@ exit 0
                     );
 
                     let mut files_to_copy = vec![(&mount_share_script, "mount-kvm-cca-share.sh")];
-                    if !matches!(mode, StageMode::InteractiveHost) {
+                    if !matches!(
+                        mode,
+                        StageMode::StageInteractiveHost | StageMode::InteractiveHost
+                    ) {
                         files_to_copy.push((&preflight, "kvm_cca_preflight"));
                     }
-                    if !matches!(mode, StageMode::InteractiveHost)
+                    if !matches!(
+                        mode,
+                        StageMode::StageInteractiveHost | StageMode::InteractiveHost
+                    )
                         && let Some(openvmm) = &openvmm
                     {
                         files_to_copy.push((openvmm, "openvmm"));

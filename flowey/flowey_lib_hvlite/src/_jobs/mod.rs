@@ -33,6 +33,7 @@ pub mod local_install_cca_emu;
 pub mod local_restore_packages;
 pub mod local_run_cca_test;
 pub mod local_stage_kvm_cca;
+pub mod local_stage_qemu_cca;
 pub mod local_update_cca_emu;
 pub mod publish_openvmm_gh_release;
 pub mod publish_vmgstool_gh_release;

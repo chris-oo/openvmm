@@ -42,6 +42,7 @@ smoke_begin = re.compile(r"(?:^|[\r\n])OVMM_SMOKE_BEGIN(?:[\r\n]|$)")
 failure_pattern = re.compile(
     r"Kernel panic|fatal error|failed to run VP|Guest crash|VCPU panic"
 )
+openvmm_exit = re.compile(r'mesh child exited successfully .* name="vm"')
 smoke_command = (
     'ok=1; echo OVMM_SMOKE_BEGIN; '
     'd=; for p in /sys/class/block/vd*; do [ -e "$p" ] || continue; '
@@ -71,6 +72,7 @@ smoke_sent = False
 smoke_started = False
 quit_escape_sent = False
 quit_command_sent = False
+openvmm_exit_observed = False
 poweroff_sent = False
 shutdown_deadline = None
 success = False
@@ -161,7 +163,14 @@ with open(host_log, "w", encoding="utf-8", errors="replace") as log:
                 quit_command_sent = True
                 buffer = ""
                 continue
-            if quit_command_sent and shell_prompt.search(buffer) and not poweroff_sent:
+            if openvmm_exit.search(buffer):
+                openvmm_exit_observed = True
+            if (
+                quit_command_sent
+                and openvmm_exit_observed
+                and shell_prompt.search(buffer)
+                and not poweroff_sent
+            ):
                 os.write(fd, b"poweroff -f\r")
                 poweroff_sent = True
                 shutdown_deadline = time.monotonic() + 30

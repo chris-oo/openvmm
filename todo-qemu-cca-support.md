@@ -263,7 +263,9 @@ proceeding.
 
 - [x] Continue resolving QEMU 11.0.1 from `openvmm-deps` unless Phase 0 proves
   a source-only fix is required.
-- [ ] If a source build is required, add `build_support/cca/build-qemu.sh`,
+- [x] A QEMU source build is not required; the pinned `openvmm-deps` QEMU
+  11.0.1 binary provides the required RME support. If that changes, add
+  `build_support/cca/build-qemu.sh`,
   modeled on `build-kernels.sh`: exact revision check, clean source export,
   incremental output, reproducible environment, and manifest hashes.
 - [x] Add `build_support/cca/build-qemu-firmware.sh` as the host wrapper for
@@ -277,34 +279,48 @@ proceeding.
   - verify all declared artifacts and hashes after the container exits.
 - [x] Add the Docker build recipe under `build_support/cca/` rather than
   requiring TF-A/TF-RMM source directories beside the OpenVMM checkout.
-- [ ] Add a QEMU-specific host kernel config fragment if Phase 0 requires it.
-- [ ] Add a host-rootfs builder with a deterministic init service that mounts
+- [x] A QEMU-specific host kernel config fragment is not required; the common
+  v15 host kernel passes on both FVP and QEMU.
+- [x] Add a host-rootfs builder with a deterministic init service that mounts
   9p, configures networking, runs preflight, and executes the freshly-built
   pipette from the share. Do not bake a stale pipette into the image.
-- [ ] Add typed Flowey nodes:
-  - `build_cca_qemu`;
+- [x] Add typed Flowey nodes:
+  - `resolve_cca_qemu`;
   - `build_cca_qemu_firmware`; and
-  - `build_cca_host_rootfs`.
-- [ ] Have the firmware Flowey node install/verify Docker, invoke the wrapper,
+  - `build_cca_qemu_host_rootfs`.
+- [x] Have the firmware Flowey node install/verify Docker, invoke the wrapper,
   and return the manifest and firmware artifacts. It must not expose or depend
   on container-local source paths.
-- [ ] Centralize QEMU/TF-A/TF-RMM/Linux pins in one Rust module and have the
+- [x] Centralize QEMU/TF-A/TF-RMM/Linux pins in one Rust module and have the
   FVP/QEMU tooling consume it where practical.
 - [ ] Keep local-build artifacts first; publish a downloadable platform bundle
   only after reproducibility is demonstrated.
 
 ### Exit criteria
 
-- The pinned Docker build succeeds from an empty cache and in offline/cache-only
+- [x] The pinned Docker build succeeds from an empty cache and in
+  offline/cache-only
   mode after the cache is populated.
 - [ ] Future: make EDK2/FIP/flash byte-for-byte reproducible. TF-RMM and BL1
   are already stable, but EDK2 firmware-volume output still varies.
-- A build succeeds on a machine with no TF-A or TF-RMM checkout.
-- A cache-hit rebuild avoids refetching unchanged Git objects while producing
+- [x] A build succeeds on a machine with no TF-A or TF-RMM checkout.
+- [x] A cache-hit rebuild avoids refetching unchanged Git objects while producing
   identical outputs.
-- Typed Flowey outputs provide QEMU, `flash.bin`, host kernel, rootfs, and
+- [x] Typed Flowey outputs provide QEMU, `flash.bin`, host kernel, rootfs, and
   manifest paths.
-- The packaged artifacts repeat the Phase 0 preflight and smoke result.
+- [x] The packaged artifacts repeat the Phase 0 preflight and smoke result.
+
+### Phase 1 validation
+
+`cargo xflowey qemu-cca-artifacts` stages the typed platform and generated
+launchers under `target/cca-qemu-packaged`. The offline/cache-only packaging
+run completed successfully.
+
+- Packaged host-rootfs preflight: 4.377 seconds, `PIPETTE READY`, child exit 0.
+- Nested OpenVMM smoke: 36.201 seconds, block and network markers passed,
+  normal QEMU poweroff, child exit 0.
+- Combined platform record:
+  `target/cca-qemu-packaged/phase1-manifest.txt`.
 
 ## Phase 2: Add a typed `qemu-cca` incubator backend
 

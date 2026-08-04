@@ -6,6 +6,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 TIMEOUT_SECONDS="${QEMU_CCA_PREFLIGHT_TIMEOUT_SECONDS:-1800}"
+EXPECT_PIPETTE_READY="${QEMU_CCA_EXPECT_PIPETTE_READY:-0}"
 LOG_DIR="${QEMU_CCA_LOG_DIR:-$REPO_ROOT/target/cca-qemu/logs}"
 HOST_LOG="$LOG_DIR/host-console.log"
 STATUS_FILE="$LOG_DIR/preflight.status"
@@ -13,7 +14,7 @@ TIMING_FILE="$LOG_DIR/preflight-timing.txt"
 mkdir -p "$LOG_DIR"
 rm -f "$STATUS_FILE" "$TIMING_FILE"
 
-python3 - "$REPO_ROOT" "$TIMEOUT_SECONDS" "$HOST_LOG" "$STATUS_FILE" "$TIMING_FILE" <<'PY'
+python3 - "$REPO_ROOT" "$TIMEOUT_SECONDS" "$HOST_LOG" "$STATUS_FILE" "$TIMING_FILE" "$EXPECT_PIPETTE_READY" <<'PY'
 import os
 import pty
 import re
@@ -22,12 +23,14 @@ import signal
 import sys
 import time
 
-repo_root, timeout_seconds, host_log, status_file, timing_file = sys.argv[1:]
+repo_root, timeout_seconds, host_log, status_file, timing_file, expect_pipette_ready = sys.argv[1:]
 timeout_seconds = int(timeout_seconds)
+expect_pipette_ready = expect_pipette_ready == "1"
 started = time.monotonic()
 login_prompt = re.compile(r"buildroot login:")
 shell_prompt = re.compile(r"(?:^|[\r\n])[^#\r\n]*#\s*$")
 status_pattern = re.compile(r"QEMU_CCA_PREFLIGHT_STATUS=(\d+)")
+pipette_ready = re.compile(r"(?:^|[\r\n])PIPETTE READY(?:[\r\n]|$)")
 failure_pattern = re.compile(r"Kernel panic|Unable to mount root|No working init")
 
 argv = [os.path.join(repo_root, "run-qemu-cca-host.sh")]
@@ -75,6 +78,10 @@ with open(host_log, "w", encoding="utf-8", errors="replace") as log:
 
             if failure_pattern.search(buffer):
                 outcome = "boot_failure"
+                break
+            if expect_pipette_ready and pipette_ready.search(buffer):
+                status = 0
+                outcome = "completed"
                 break
             if login_prompt.search(buffer) and not logged_in:
                 os.write(fd, b"root\r")
