@@ -23,6 +23,8 @@ use petri_artifacts_core::ArtifactId;
 use petri_artifacts_core::ArtifactListOutput;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
@@ -129,6 +131,10 @@ pub struct VmmTestsRunCli {
     #[clap(long, num_args = 0..=1)]
     #[expect(clippy::option_option)]
     incubator: Option<Option<PathBuf>>,
+
+    /// linux-cca source tree used to build QEMU CCA host and guest kernels.
+    #[clap(long, env = "OPENVMM_CCA_KERNEL_SRC")]
+    cca_kernel_src: Option<PathBuf>,
 }
 
 struct CargoNextestListRequest<'a> {
@@ -137,6 +143,13 @@ struct CargoNextestListRequest<'a> {
     filter: &'a str,
     release: bool,
     include_ignored: bool,
+    target_runner: Option<&'a TargetRunner>,
+}
+
+struct TargetRunner {
+    program: OsString,
+    args: Vec<OsString>,
+    cargo_value: OsString,
 }
 
 struct RustSuite {
@@ -186,6 +199,7 @@ impl IntoPipeline for VmmTestsRunCli {
             no_reuse_prepped_vhds,
             disable_secure_avic,
             incubator,
+            cca_kernel_src,
         } = self;
 
         // When --incubator is set, --target must also be specified
@@ -228,6 +242,36 @@ impl IntoPipeline for VmmTestsRunCli {
                 },
             )?),
         };
+        let incubator_platform = incubator_profile
+            .as_deref()
+            .map(classify_incubator_platform)
+            .transpose()?;
+        let cca_kernel_src = match incubator_platform {
+            Some(flowey_lib_hvlite::write_incubator_target_runner::IncubatorPlatform::QemuCca) => {
+                let source = cca_kernel_src
+                    .map(|path| {
+                        if path.is_absolute() {
+                            path
+                        } else {
+                            repo_root.join(path)
+                        }
+                    })
+                    .unwrap_or_else(|| repo_root.parent().unwrap_or(&repo_root).join("linux-cca"));
+                anyhow::ensure!(
+                    source.is_dir(),
+                    "QEMU CCA kernel source not found at {}; pass --cca-kernel-src",
+                    source.display()
+                );
+                Some(source)
+            }
+            _ => {
+                anyhow::ensure!(
+                    cca_kernel_src.is_none(),
+                    "--cca-kernel-src requires a QEMU CCA incubator profile"
+                );
+                None
+            }
+        };
 
         // Artifact discovery only needs to execute the test binary far enough
         // to dump its static artifact metadata (`--list-required-artifacts`),
@@ -251,6 +295,7 @@ impl IntoPipeline for VmmTestsRunCli {
         );
 
         // Determine which tests match the filter
+        let target_runner = cross_target_list_runner(&target_str)?;
         let suites = run_cargo_nextest_list(CargoNextestListRequest {
             repo_root: &repo_root,
             target: &target_str,
@@ -261,6 +306,7 @@ impl IntoPipeline for VmmTestsRunCli {
             // petri marks incompatible tests as ignored.
             //
             include_ignored,
+            target_runner: target_runner.as_ref(),
         })?;
 
         if suites.is_empty() {
@@ -270,7 +316,10 @@ impl IntoPipeline for VmmTestsRunCli {
         // Query for the required artifacts
         let mut artifacts = Vec::new();
         for suite in suites.values() {
-            artifacts.append(&mut query_test_binary_artifacts(suite)?);
+            artifacts.append(&mut query_test_binary_artifacts(
+                suite,
+                target_runner.as_ref(),
+            )?);
         }
 
         // Resolve to build selections
@@ -317,10 +366,13 @@ impl IntoPipeline for VmmTestsRunCli {
 
                 if !hyperv_testcases.is_empty() {
                     hyperv_tests += hyperv_testcases.len();
-                    hyperv_artifacts.append(&mut query_test_binary_artifacts(&RustSuite {
-                        binary_path: suite.binary_path.clone(),
-                        testcases: hyperv_testcases,
-                    })?);
+                    hyperv_artifacts.append(&mut query_test_binary_artifacts(
+                        &RustSuite {
+                            binary_path: suite.binary_path.clone(),
+                            testcases: hyperv_testcases,
+                        },
+                        target_runner.as_ref(),
+                    )?);
                 }
             }
 
@@ -375,7 +427,7 @@ impl IntoPipeline for VmmTestsRunCli {
         std::fs::create_dir_all(&test_content_dir).context("failed to create output directory")?;
 
         let openvmm_repo = flowey_lib_common::git_checkout::RepoSource::ExistingClone(
-            ReadVar::from_static(repo_root),
+            ReadVar::from_static(repo_root.clone()),
         );
 
         let mut pipeline = Pipeline::new();
@@ -434,6 +486,7 @@ impl IntoPipeline for VmmTestsRunCli {
                     target,
                     windows_guest_platform,
                     test_content_dir,
+                    openvmm_root: repo_root.clone(),
                     selections: selections_from_resolved(filter, resolved, target_os),
                     release,
                     build_only,
@@ -449,6 +502,8 @@ impl IntoPipeline for VmmTestsRunCli {
                     reuse_prepped_vhds: !no_reuse_prepped_vhds,
                     disable_secure_avic,
                     incubator_profile,
+                    incubator_platform,
+                    cca_kernel_src,
                     done: ctx.new_done_handle(),
                 }
             });
@@ -471,6 +526,7 @@ fn run_cargo_nextest_list<'a>(
         filter,
         release,
         include_ignored,
+        target_runner,
     } = req;
 
     // Check that cargo-nextest is available
@@ -508,12 +564,56 @@ fn run_cargo_nextest_list<'a>(
     if include_ignored {
         cmd.args(["--run-ignored", "all"]);
     }
+    if let Some(target_runner) = target_runner {
+        cmd.env(
+            "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUNNER",
+            &target_runner.cargo_value,
+        );
+    }
     let nextest_output = cmd.output().context("failed to run cargo nextest list")?;
     anyhow::ensure!(nextest_output.status.success(), "cargo nextest list failed",);
     let nextest_stdout = String::from_utf8(nextest_output.stdout)
         .map_err(|e| anyhow::anyhow!("nextest output is not valid UTF-8: {}", e))?;
 
     parse_nextest_output(&nextest_stdout)
+}
+
+fn cross_target_list_runner(target: &str) -> anyhow::Result<Option<TargetRunner>> {
+    const AARCH64_MUSL: &str = "aarch64-unknown-linux-musl";
+    const RUNNER_ENV: &str = "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUNNER";
+
+    if target != AARCH64_MUSL || std::env::consts::ARCH == "aarch64" {
+        return Ok(None);
+    }
+    if let Some(runner) = std::env::var_os(RUNNER_ENV) {
+        return Ok(Some(parse_target_runner(&runner)?));
+    }
+
+    let runner = std::env::var_os("PATH")
+        .and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|directory| directory.join("qemu-aarch64"))
+                .find(|candidate| candidate.is_file())
+        })
+        .map(|runner| TargetRunner {
+            cargo_value: runner.as_os_str().to_owned(),
+            program: runner.into_os_string(),
+            args: Vec::new(),
+        });
+    Ok(runner)
+}
+
+fn parse_target_runner(value: &OsStr) -> anyhow::Result<TargetRunner> {
+    let value = value.to_str().context("target runner is not valid UTF-8")?;
+    let words = value.split_ascii_whitespace().collect::<Vec<_>>();
+    let (program, args) = words
+        .split_first()
+        .context("target runner must not be empty")?;
+    Ok(TargetRunner {
+        program: program.into(),
+        args: args.iter().map(Into::into).collect(),
+        cargo_value: value.into(),
+    })
 }
 
 /// Parse `cargo nextest list --message-format json` output to extract test
@@ -568,11 +668,21 @@ fn parse_nextest_output(stdout: &str) -> anyhow::Result<BTreeMap<String, RustSui
 /// Runs the test binary with `--list-required-artifacts --tests-from-stdin`
 /// and returns all the required and optional artifacts for all test defined
 /// in the RustSuite.
-fn query_test_binary_artifacts(suite: &RustSuite) -> anyhow::Result<Vec<String>> {
+fn query_test_binary_artifacts(
+    suite: &RustSuite,
+    target_runner: Option<&TargetRunner>,
+) -> anyhow::Result<Vec<String>> {
     log::info!("Using test binary: {}", suite.binary_path.display());
     log::info!("Querying artifacts for {} tests", suite.testcases.len());
 
-    let mut command = Command::new(&suite.binary_path);
+    let mut command = if let Some(target_runner) = target_runner {
+        let mut command = Command::new(&target_runner.program);
+        command.args(&target_runner.args);
+        command.arg(&suite.binary_path);
+        command
+    } else {
+        Command::new(&suite.binary_path)
+    };
     command.arg("--list-required-artifacts");
     command.arg("--tests-from-stdin").stdin(Stdio::piped());
 
@@ -669,6 +779,30 @@ fn default_incubator_profile(repo_root: &Path, target: &CommonTriple) -> Option<
             .join("petri/incubator/profiles")
             .join(format!("{name}.toml")),
     )
+}
+
+fn classify_incubator_platform(
+    profile: &Path,
+) -> anyhow::Result<flowey_lib_hvlite::write_incubator_target_runner::IncubatorPlatform> {
+    let contents = std::fs::read_to_string(profile)
+        .with_context(|| format!("failed to read incubator profile {}", profile.display()))?;
+    let document = contents
+        .parse::<toml_edit::DocumentMut>()
+        .with_context(|| format!("failed to parse incubator profile {}", profile.display()))?;
+    let backend = document
+        .get("incubator")
+        .and_then(|incubator| incubator.get("type"))
+        .and_then(toml_edit::Item::as_str)
+        .context("incubator profile is missing incubator.type")?;
+    match backend {
+        "qemu-cca" => {
+            Ok(flowey_lib_hvlite::write_incubator_target_runner::IncubatorPlatform::QemuCca)
+        }
+        "qemu-tcg" => {
+            Ok(flowey_lib_hvlite::write_incubator_target_runner::IncubatorPlatform::QemuTcg)
+        }
+        other => anyhow::bail!("unsupported incubator backend type: {other}"),
+    }
 }
 
 /// Validate the output directory path based on the current platform.
@@ -958,5 +1092,36 @@ impl ResolvedArtifactSelections {
             _ => anyhow::bail!("unknown artifact: {id}"),
         };
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_target_runner_with_arguments() {
+        let runner = parse_target_runner(OsStr::new("qemu-aarch64 -L '/sys root'")).unwrap();
+
+        assert_eq!(runner.program, "qemu-aarch64");
+        assert_eq!(runner.args, ["-L", "'/sys", "root'"]);
+    }
+
+    #[test]
+    fn classifies_incubator_profile_backend() {
+        assert_eq!(
+            classify_incubator_platform(
+                &crate::repo_root().join("petri/incubator/profiles/aarch64-qemu-cca.toml")
+            )
+            .unwrap(),
+            flowey_lib_hvlite::write_incubator_target_runner::IncubatorPlatform::QemuCca
+        );
+        assert_eq!(
+            classify_incubator_platform(
+                &crate::repo_root().join("petri/incubator/profiles/aarch64-tcg-pcie.toml")
+            )
+            .unwrap(),
+            flowey_lib_hvlite::write_incubator_target_runner::IncubatorPlatform::QemuTcg
+        );
     }
 }

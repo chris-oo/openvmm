@@ -380,20 +380,20 @@ run completed successfully.
 
 ## Phase 3: Wire backend-specific artifacts through Flowey
 
-- [ ] Extend `write_incubator_target_runner::Request` and
+- [x] Extend `write_incubator_target_runner::Request` and
   `IncubatorRunnerConfig` with firmware/rootfs inputs.
-- [ ] Add `INCUBATOR_FIRMWARE` and `INCUBATOR_ROOTFS` to the runner
+- [x] Add `INCUBATOR_FIRMWARE` and `INCUBATOR_ROOTFS` to the runner
   environment and unit tests.
-- [ ] Add an explicit `IncubatorPlatform::{QemuTcg,QemuCca}` parameter or
+- [x] Add an explicit `IncubatorPlatform::{QemuTcg,QemuCca}` parameter or
   profile-name classification available at Flowey emit time. Do not depend on
   reading profile contents; CI receives the profile path only as a runtime
   `ReadVar`.
-- [ ] Keep the existing generic TCG kernel/initrd/QEMU resolution unchanged
+- [x] Keep the existing generic TCG kernel/initrd/QEMU resolution unchanged
   for `QemuTcg`.
-- [ ] Resolve QEMU CCA firmware/rootfs/kernel/QEMU only for `QemuCca`.
-- [ ] Add a distinct QEMU resolver variant or platform-bundle resolver; do not
+- [x] Resolve QEMU CCA firmware/rootfs/kernel/QEMU only for `QemuCca`.
+- [x] Add a distinct QEMU resolver variant or platform-bundle resolver; do not
   silently replace `QemuFile::SystemAarch64`.
-- [ ] Support:
+- [x] Support:
 
 ```text
 cargo xflowey vmm-tests-run \
@@ -408,6 +408,18 @@ cargo xflowey vmm-tests-run \
   host.
 - The generic aarch64 TCG incubator still passes unchanged.
 - Run `test(aarch64_tcg)` before and after the shared Flowey changes.
+
+### Phase 3 validation
+
+- The planned `test(qemu_cca) & !binary(cca)` command passed through the typed
+  QEMU CCA platform in 12.112 seconds.
+- The unchanged generic `test(aarch64_tcg)` pass completed both existing
+  VFIO/P2P tests in 83.167 seconds.
+- Foreign AArch64 artifact discovery uses Cargo-compatible
+  `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUNNER` semantics. On an x86-64
+  host without binfmt, install `qemu-user` or place `qemu-aarch64` on `PATH`.
+- The CCA kernel source defaults to a sibling `linux-cca` checkout and can be
+  overridden with `--cca-kernel-src` or `OPENVMM_CCA_KERNEL_SRC`.
 
 ## Phase 4: Add CCA to Petri
 

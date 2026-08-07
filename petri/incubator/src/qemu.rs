@@ -141,12 +141,21 @@ pub fn build_qemu_cca_command(
     kernel: &Path,
     rootfs: &Path,
     share_dir: &Path,
+    guest_pipette_path: &str,
     host_pipette_port: u16,
     output_dir: &Path,
     instance_id: u64,
 ) -> anyhow::Result<QemuCcaCommand> {
     let rootfs = qemu_option_path(rootfs, "QEMU CCA rootfs")?;
     let share_dir = qemu_option_path(share_dir, "QEMU CCA share directory")?;
+    let guest_pipette_path =
+        kernel_command_line_value(guest_pipette_path, "QEMU CCA guest pipette path")?;
+    let guest_preflight_path = Path::new(guest_pipette_path)
+        .with_file_name("kvm_cca_preflight")
+        .to_string_lossy()
+        .into_owned();
+    let guest_preflight_path =
+        kernel_command_line_value(&guest_preflight_path, "QEMU CCA guest preflight path")?;
     let mut cmd = Command::new(&config.binary);
 
     cmd.arg("-nodefaults");
@@ -170,8 +179,11 @@ pub fn build_qemu_cca_command(
     ));
     cmd.arg("-device")
         .arg("virtio-net-pci,netdev=net0,romfile=");
-    cmd.arg("-append")
-        .arg("nokaslr root=/dev/vda rw console=ttyAMA0");
+    cmd.arg("-append").arg(format!(
+        "nokaslr root=/dev/vda rw console=ttyAMA0 \
+             incubator.pipette={guest_pipette_path} \
+             incubator.preflight={guest_preflight_path}"
+    ));
     cmd.arg("-display").arg("none");
     cmd.arg("-monitor").arg("none");
     cmd.arg("-no-reboot");
@@ -214,6 +226,17 @@ fn qemu_option_path<'a>(path: &'a Path, label: &str) -> anyhow::Result<&'a str> 
         "{label} contains a character that cannot be represented in a QEMU option"
     );
     Ok(path)
+}
+
+fn kernel_command_line_value<'a>(value: &'a str, label: &str) -> anyhow::Result<&'a str> {
+    anyhow::ensure!(
+        !value.is_empty()
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic() && byte != b'='),
+        "{label} contains a character that cannot be represented on the kernel command line"
+    );
+    Ok(value)
 }
 
 /// First PCI device number (`addr=`) used for extra-device root ports.
@@ -728,6 +751,7 @@ mod tests {
             Path::new("/artifacts/host-Image"),
             Path::new("/scratch/host-rootfs.ext4"),
             Path::new("/share"),
+            "/share/content/pipette",
             50000,
             Path::new("/logs"),
             42,
@@ -767,6 +791,10 @@ mod tests {
                 .any(|args| args == ["-serial", "file:/logs/incubator-secure.42.log"])
         );
         assert!(args.windows(2).any(|args| args == ["-d", "guest_errors"]));
+        assert!(args.iter().any(|arg| {
+            arg.contains("incubator.pipette=/share/content/pipette")
+                && arg.contains("incubator.preflight=/share/content/kvm_cca_preflight")
+        }));
         assert_eq!(
             built.console_logs["host"],
             PathBuf::from("/logs/incubator-host.42.log")
@@ -785,6 +813,7 @@ mod tests {
             Path::new("/artifacts/host-Image"),
             Path::new("/scratch/rootfs,unsafe.ext4"),
             Path::new("/share"),
+            "/share/content/pipette",
             50000,
             Path::new("/logs"),
             42,

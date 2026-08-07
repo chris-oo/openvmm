@@ -6,6 +6,19 @@ set -eu
 
 case "${1:-start}" in
 start | "")
+    pipette=/share/pipette
+    preflight=/share/kvm_cca_preflight
+    for argument in $(cat /proc/cmdline); do
+        case "$argument" in
+        incubator.pipette=*)
+            pipette=${argument#incubator.pipette=}
+            ;;
+        incubator.preflight=*)
+            preflight=${argument#incubator.preflight=}
+            ;;
+        esac
+    done
+
     mkdir -p /share /cca/logs
     if ! mount -t 9p -o trans=virtio,version=9p2000.L host /share 2>/dev/null; then
         mount -t 9p -o trans=virtio,version=9p2000.L FM /share
@@ -18,7 +31,7 @@ start | "")
     printf 'nameserver 10.0.2.3\n' >/etc/resolv.conf
 
     set +e
-    /share/kvm_cca_preflight > /cca/logs/kvm-cca-preflight.log 2>&1
+    "$preflight" > /cca/logs/kvm-cca-preflight.log 2>&1
     preflight_status=$?
     set -e
     echo "$preflight_status" >/cca/logs/kvm-cca-preflight.status
@@ -30,7 +43,7 @@ start | "")
 
     export HOME=/root
     cd /share
-    exec /share/pipette --transport tcp
+    exec "$pipette" --transport tcp
     ;;
 esac
 

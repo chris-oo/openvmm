@@ -89,7 +89,7 @@ CACHE_ROOT="$(realpath -m "$CACHE_ROOT")"
 [[ "$CACHE_ROOT" != "$OUTPUT_ROOT/"* ]] ||
     fail "cache root must be outside output root"
 
-for tool in docker python3 realpath sha256sum; do
+for tool in docker flock python3 realpath sha256sum; do
     command -v "$tool" >/dev/null || fail "missing required tool: $tool"
 done
 if [[ -n "$JOBS" && ! "$JOBS" =~ ^[1-9][0-9]*$ ]]; then
@@ -100,6 +100,8 @@ JOBS="${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)}"
 OUTPUT_PARENT="$(dirname "$OUTPUT_ROOT")"
 OUTPUT_NAME="$(basename "$OUTPUT_ROOT")"
 mkdir -p "$OUTPUT_PARENT" "$CACHE_ROOT"
+exec 9>"$CACHE_ROOT/.openvmm-cca-firmware.lock"
+flock 9
 
 STAGE_ROOT="$(mktemp -d "$OUTPUT_PARENT/.${OUTPUT_NAME}.stage.XXXXXXXXXX")"
 cleanup_stage() {

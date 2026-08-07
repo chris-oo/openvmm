@@ -16,6 +16,21 @@ use vm_resource::IntoResource;
 use vmm_test_macros::vmm_test;
 use vmm_test_macros::vmm_test_with;
 
+/// Verify that a VMM test can execute inside the QEMU CCA incubator.
+#[vmm_test_with(openvmm, requires(cca), configs(linux_direct_aarch64))]
+async fn qemu_cca_incubator_smoke(
+    _config: PetriVmBuilder<OpenVmmPetriBackend>,
+) -> anyhow::Result<()> {
+    let capabilities = std::env::var("PETRI_CAPABILITIES").unwrap_or_default();
+    assert!(
+        capabilities
+            .split(',')
+            .any(|capability| capability == petri_artifacts_common::capabilities::CCA),
+        "QEMU CCA incubator did not publish the CCA capability"
+    );
+    Ok(())
+}
+
 /// Boot Linux and verify the PMU interrupt is available.
 ///
 /// TODO: This is only supported on WHP and Hyper-V.

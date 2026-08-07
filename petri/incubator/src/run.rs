@@ -263,6 +263,7 @@ fn run_once(config: &RuntimeConfig) -> anyhow::Result<AttemptResult> {
                     kernel,
                     &writable_rootfs,
                     &config.share_dir,
+                    &config.guest_pipette_path,
                     host_port,
                     &output_dir,
                     instance_id,

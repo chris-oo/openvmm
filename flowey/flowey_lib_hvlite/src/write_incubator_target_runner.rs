@@ -34,6 +34,15 @@ const INCUBATOR_ENV_POLICY: &[&str] = &[
 const NEXTEST_ARCHIVE_TMP_DIR: &str = "nextest-archive-tmp";
 const DEFAULT_INCUBATOR_RUST_LOG: &str = "info";
 
+/// Incubator platform selected at Flowey graph construction time.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IncubatorPlatform {
+    /// Generic direct-boot QEMU TCG platform.
+    QemuTcg,
+    /// QEMU Arm CCA L1 host platform.
+    QemuCca,
+}
+
 fn cargo_target_runner_env_var(target: &target_lexicon::Triple) -> String {
     format!(
         "CARGO_TARGET_{}_RUNNER",
@@ -69,6 +78,10 @@ flowey_request! {
         pub kernel: Option<ReadVar<PathBuf>>,
         /// Path to the base initrd. If omitted, incubator auto-detects it.
         pub initrd: Option<ReadVar<PathBuf>>,
+        /// Path to the platform firmware image.
+        pub firmware: Option<ReadVar<PathBuf>>,
+        /// Path to the writable host rootfs image.
+        pub rootfs: Option<ReadVar<PathBuf>>,
         /// Path to the OpenVMM repo root. Must contain any repo-relative paths
         /// referenced by the runner's environment (e.g. `NEXTEST_WORKSPACE_ROOT`,
         /// `CARGO_MANIFEST_DIR`) so they fall under the computed incubator share
@@ -106,6 +119,8 @@ impl SimpleFlowNode for Node {
             profile_path,
             kernel,
             initrd,
+            firmware,
+            rootfs,
             repo_root,
             test_content_dir,
             extra_share_paths,
@@ -120,6 +135,8 @@ impl SimpleFlowNode for Node {
             let profile_path = profile_path.claim(ctx);
             let kernel = kernel.claim(ctx);
             let initrd = initrd.claim(ctx);
+            let firmware = firmware.claim(ctx);
+            let rootfs = rootfs.claim(ctx);
             let repo_root = repo_root.claim(ctx);
             let test_content_dir = test_content_dir.claim(ctx);
             let extra_share_paths = extra_share_paths.claim(ctx);
@@ -132,6 +149,8 @@ impl SimpleFlowNode for Node {
                 let profile_path = rt.read(profile_path).absolute()?;
                 let kernel = kernel.map(|v| rt.read(v).absolute()).transpose()?;
                 let initrd = initrd.map(|v| rt.read(v).absolute()).transpose()?;
+                let firmware = firmware.map(|v| rt.read(v).absolute()).transpose()?;
+                let rootfs = rootfs.map(|v| rt.read(v).absolute()).transpose()?;
                 let repo_root = rt.read(repo_root).absolute()?;
                 let test_content_dir = rt.read(test_content_dir).absolute()?;
                 let extra_share_paths = rt
@@ -166,6 +185,8 @@ impl SimpleFlowNode for Node {
                     profile_path: &profile_path,
                     kernel: kernel.as_deref(),
                     initrd: initrd.as_deref(),
+                    firmware: firmware.as_deref(),
+                    rootfs: rootfs.as_deref(),
                     share_root: &share_root,
                     output_dir: &output_dir,
                     guest_pipette: &format!("{guest_test_content_dir}/pipette"),
@@ -190,6 +211,8 @@ struct IncubatorRunnerConfig<'a> {
     pub profile_path: &'a Path,
     pub kernel: Option<&'a Path>,
     pub initrd: Option<&'a Path>,
+    pub firmware: Option<&'a Path>,
+    pub rootfs: Option<&'a Path>,
     pub share_root: &'a Path,
     pub output_dir: &'a Path,
     pub guest_pipette: &'a str,
@@ -206,6 +229,8 @@ fn incubator_runner_env(config: IncubatorRunnerConfig<'_>) -> BTreeMap<String, S
         profile_path,
         kernel,
         initrd,
+        firmware,
+        rootfs,
         share_root,
         output_dir,
         guest_pipette,
@@ -241,6 +266,12 @@ fn incubator_runner_env(config: IncubatorRunnerConfig<'_>) -> BTreeMap<String, S
     }
     if let Some(initrd) = initrd {
         env.insert("INCUBATOR_INITRD".into(), initrd.display().to_string());
+    }
+    if let Some(firmware) = firmware {
+        env.insert("INCUBATOR_FIRMWARE".into(), firmware.display().to_string());
+    }
+    if let Some(rootfs) = rootfs {
+        env.insert("INCUBATOR_ROOTFS".into(), rootfs.display().to_string());
     }
     if let Some(qemu_binary) = qemu_binary {
         env.insert(
@@ -306,6 +337,8 @@ mod tests {
             profile_path: Path::new("/tmp/profiles/aarch64-tcg.toml"),
             kernel: Some(Path::new("/tmp/kernel Image")),
             initrd: Some(Path::new("/tmp/initrd.gz")),
+            firmware: Some(Path::new("/tmp/flash.bin")),
+            rootfs: Some(Path::new("/tmp/rootfs.ext4")),
             share_root: Path::new("/tmp/test content"),
             output_dir: Path::new("/tmp/test content/test_results"),
             guest_pipette: "/share/pipette",
@@ -320,6 +353,8 @@ mod tests {
         );
         assert_eq!(env.get("INCUBATOR_KERNEL").unwrap(), "/tmp/kernel Image");
         assert_eq!(env.get("INCUBATOR_INITRD").unwrap(), "/tmp/initrd.gz");
+        assert_eq!(env.get("INCUBATOR_FIRMWARE").unwrap(), "/tmp/flash.bin");
+        assert_eq!(env.get("INCUBATOR_ROOTFS").unwrap(), "/tmp/rootfs.ext4");
         assert_eq!(env.get("INCUBATOR_SHARE").unwrap(), "/tmp/test content");
         assert_eq!(
             env.get("INCUBATOR_OUTPUT_DIR").unwrap(),
@@ -347,6 +382,8 @@ mod tests {
             profile_path: Path::new("/tmp/profile.toml"),
             kernel: None,
             initrd: None,
+            firmware: None,
+            rootfs: None,
             share_root: Path::new("/tmp/share"),
             output_dir: Path::new("/tmp/share/test_results"),
             guest_pipette: "/share/pipette",
@@ -357,6 +394,8 @@ mod tests {
 
         assert!(!env.contains_key("INCUBATOR_KERNEL"));
         assert!(!env.contains_key("INCUBATOR_INITRD"));
+        assert!(!env.contains_key("INCUBATOR_FIRMWARE"));
+        assert!(!env.contains_key("INCUBATOR_ROOTFS"));
         assert!(!env.contains_key("INCUBATOR_QEMU_BINARY"));
     }
 
