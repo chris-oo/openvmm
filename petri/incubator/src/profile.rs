@@ -5,6 +5,7 @@
 
 use anyhow::Context;
 use serde::Deserialize;
+use std::collections::BTreeSet;
 use std::path::Path;
 
 /// An incubator profile describing the backend platform and how to run it.
@@ -23,6 +24,8 @@ pub struct IncubatorProfile {
 pub enum IncubatorBackend {
     /// QEMU TCG emulation.
     QemuTcg(QemuTcgConfig),
+    /// QEMU Arm CCA emulation.
+    QemuCca(QemuCcaConfig),
 }
 
 impl IncubatorBackend {
@@ -30,6 +33,7 @@ impl IncubatorBackend {
     pub fn arch(&self) -> Arch {
         match self {
             IncubatorBackend::QemuTcg(config) => config.arch,
+            IncubatorBackend::QemuCca(_) => Arch::Aarch64,
         }
     }
 }
@@ -170,6 +174,49 @@ pub struct QemuTcgConfig {
     pub cmdline: String,
 }
 
+/// QEMU Arm CCA configuration parsed from the profile.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct QemuCcaConfig {
+    /// Path or name of the QEMU binary.
+    pub binary: String,
+    /// Machine configuration.
+    pub machine: String,
+    /// CPU model and features.
+    pub cpu: String,
+    /// Memory size.
+    pub memory: String,
+    /// Number of CPUs.
+    pub smp: String,
+    /// Ordered serial console names. Each entry maps to one QEMU `-serial`
+    /// device in the same order.
+    pub consoles: Vec<String>,
+    /// Console monitored for pipette readiness.
+    pub primary_console: String,
+    /// Capabilities published after the CCA host reaches pipette readiness.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    /// Additional QEMU arguments for narrowly-scoped platform overrides.
+    #[serde(default)]
+    pub extra_args: Vec<QemuCcaExtraArg>,
+}
+
+/// A typed additional QEMU CCA argument.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum QemuCcaExtraArg {
+    /// Enable a QEMU trace category through `-d`.
+    Trace {
+        /// QEMU trace category expression.
+        value: String,
+    },
+    /// Set a QEMU global device property through `-global`.
+    Global {
+        /// QEMU global property expression.
+        value: String,
+    },
+}
+
 impl IncubatorProfile {
     /// Load a profile from a TOML file.
     pub fn from_file(path: &Path) -> anyhow::Result<Self> {
@@ -179,6 +226,180 @@ impl IncubatorProfile {
 
     /// Parse a profile from a TOML string.
     pub fn from_toml(toml: &str) -> anyhow::Result<Self> {
-        toml_edit::de::from_str(toml).context("failed to parse incubator profile")
+        let profile: Self =
+            toml_edit::de::from_str(toml).context("failed to parse incubator profile")?;
+        profile.validate()?;
+        Ok(profile)
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        if let IncubatorBackend::QemuCca(config) = &self.incubator {
+            validate_qemu_cca(config)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_qemu_cca(config: &QemuCcaConfig) -> anyhow::Result<()> {
+    for (name, value) in [
+        ("binary", &config.binary),
+        ("machine", &config.machine),
+        ("cpu", &config.cpu),
+        ("memory", &config.memory),
+        ("smp", &config.smp),
+        ("primary-console", &config.primary_console),
+    ] {
+        anyhow::ensure!(!value.is_empty(), "QEMU CCA {name} must not be empty");
+    }
+    anyhow::ensure!(
+        config.binary != "."
+            && config.binary != ".."
+            && config.binary.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'+')
+            }),
+        "QEMU CCA binary must be a bare executable name"
+    );
+    anyhow::ensure!(
+        !config.consoles.is_empty(),
+        "QEMU CCA must configure at least one console"
+    );
+
+    let mut consoles = BTreeSet::new();
+    for console in &config.consoles {
+        anyhow::ensure!(
+            !console.is_empty(),
+            "QEMU CCA console names must not be empty"
+        );
+        anyhow::ensure!(
+            consoles.insert(console),
+            "duplicate QEMU CCA console name: {console}"
+        );
+    }
+    anyhow::ensure!(
+        consoles.contains(&config.primary_console),
+        "QEMU CCA primary console {} is not present in the console list",
+        config.primary_console
+    );
+
+    let mut capabilities = BTreeSet::new();
+    for capability in &config.capabilities {
+        anyhow::ensure!(
+            petri_artifacts_common::capabilities::is_known_name(capability),
+            "unknown QEMU CCA capability: {capability}"
+        );
+        anyhow::ensure!(
+            capabilities.insert(capability),
+            "duplicate QEMU CCA capability: {capability}"
+        );
+    }
+
+    for extra_arg in &config.extra_args {
+        let value = match extra_arg {
+            QemuCcaExtraArg::Trace { value } | QemuCcaExtraArg::Global { value } => value,
+        };
+        anyhow::ensure!(
+            !value.is_empty(),
+            "QEMU CCA extra argument must not be empty"
+        );
+        anyhow::ensure!(
+            !value.contains('\0') && !value.contains('\n'),
+            "QEMU CCA extra argument contains an invalid character"
+        );
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_qemu_tcg_profile() {
+        let profile =
+            IncubatorProfile::from_toml(include_str!("../profiles/aarch64-tcg-pcie.toml")).unwrap();
+
+        assert_eq!(profile.incubator.arch(), Arch::Aarch64);
+        assert!(matches!(profile.incubator, IncubatorBackend::QemuTcg(_)));
+    }
+
+    #[test]
+    fn parses_qemu_cca_profile() {
+        let profile =
+            IncubatorProfile::from_toml(include_str!("../profiles/aarch64-qemu-cca.toml")).unwrap();
+
+        let IncubatorBackend::QemuCca(config) = profile.incubator else {
+            panic!("expected QEMU CCA profile");
+        };
+        assert_eq!(config.primary_console, "host");
+        assert_eq!(config.consoles, ["host", "secure"]);
+        assert_eq!(config.capabilities, ["cca"]);
+    }
+
+    #[test]
+    fn rejects_missing_qemu_cca_primary_console() {
+        let error = IncubatorProfile::from_toml(
+            r#"
+[incubator]
+type = "qemu-cca"
+binary = "qemu-system-aarch64"
+machine = "virt"
+cpu = "max,x-rme=on"
+memory = "2G"
+smp = "1"
+consoles = ["host"]
+primary-console = "missing"
+"#,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("primary console missing is not present")
+        );
+    }
+
+    #[test]
+    fn rejects_machine_local_qemu_cca_binary() {
+        for binary in ["/tmp/qemu-system-aarch64", r"C:\qemu\qemu.exe"] {
+            let error = IncubatorProfile::from_toml(&format!(
+                r#"
+[incubator]
+type = "qemu-cca"
+binary = {binary:?}
+machine = "virt"
+cpu = "max,x-rme=on"
+memory = "2G"
+smp = "1"
+consoles = ["host"]
+primary-console = "host"
+"#
+            ))
+            .unwrap_err();
+
+            assert!(error.to_string().contains("bare executable name"));
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_qemu_cca_capability() {
+        let error = IncubatorProfile::from_toml(
+            r#"
+[incubator]
+type = "qemu-cca"
+binary = "qemu-system-aarch64"
+machine = "virt"
+cpu = "max,x-rme=on"
+memory = "2G"
+smp = "1"
+consoles = ["host"]
+primary-console = "host"
+capabilities = ["unknown"]
+"#,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("unknown QEMU CCA capability"));
     }
 }

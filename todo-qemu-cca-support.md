@@ -326,12 +326,13 @@ run completed successfully.
 
 ### Profile
 
-- [ ] Add `IncubatorBackend::QemuCca(QemuCcaConfig)` in
+- [x] Add `IncubatorBackend::QemuCca(QemuCcaConfig)` in
   `petri/incubator/src/profile.rs`.
-- [ ] Model firmware, kernel, rootfs, machine, CPU, memory, SMP, an arbitrary
-  console list, primary console, capabilities, and a small typed
-  extra-argument escape hatch.
-- [ ] Add `petri/incubator/profiles/aarch64-qemu-cca.toml` with no
+- [x] Model machine, CPU, memory, SMP, an ordered console list, primary
+  console, capabilities, and a small typed extra-argument escape hatch.
+  Firmware, kernel, rootfs, and QEMU paths remain backend-specific runtime
+  artifacts so profiles do not contain machine-local paths.
+- [x] Add `petri/incubator/profiles/aarch64-qemu-cca.toml` with no
   machine-local paths.
 
 ### Runtime
@@ -399,7 +400,7 @@ cargo xflowey vmm-tests-run \
 
 ## Phase 4: Add CCA to Petri
 
-- [ ] Add `capabilities::CCA = "cca"` and include it in
+- [x] Add `capabilities::CCA = "cca"` and include it in
   `KNOWN_CAPABILITIES`.
 - [ ] Add `petri::IsolationType::Cca`.
 - [ ] Evaluate CCA solely through `requires(cca)` and `PETRI_CAPABILITIES`;

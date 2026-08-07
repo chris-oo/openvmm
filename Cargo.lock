@@ -3908,6 +3908,7 @@ dependencies = [
  "initrd_cpio",
  "mesh",
  "pal_async",
+ "petri_artifacts_common",
  "pipette_client",
  "serde",
  "tempfile",

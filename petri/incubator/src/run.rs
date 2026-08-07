@@ -70,6 +70,13 @@ pub fn run_in_incubator(config: IncubatorConfig) -> anyhow::Result<IncubatorOutp
 
     let host_port = pick_free_port().context("failed to find a free port")?;
 
+    let qemu_config = match &config.profile.incubator {
+        IncubatorBackend::QemuTcg(qemu_config) => qemu_config,
+        IncubatorBackend::QemuCca(_) => {
+            anyhow::bail!("QEMU CCA incubator runtime support is not implemented")
+        }
+    };
+
     // --- prepare the boot initrd (inject the init script) ---
 
     let patched_initrd_path = qemu::prepare_initrd(
@@ -79,8 +86,6 @@ pub fn run_in_incubator(config: IncubatorConfig) -> anyhow::Result<IncubatorOutp
     )?;
 
     // --- launch QEMU ---
-
-    let IncubatorBackend::QemuTcg(ref qemu_config) = config.profile.incubator;
 
     // Apply QEMU binary override if specified.
     let qemu_config_override;

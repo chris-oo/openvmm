@@ -1,0 +1,18 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# Incubator profile: AArch64 QEMU CCA host
+#
+# Firmware, host kernel, and host rootfs are resolved as runtime artifacts.
+# This profile contains only portable platform configuration.
+
+[incubator]
+type = "qemu-cca"
+binary = "qemu-system-aarch64"
+machine = "virt,secure=on,virtualization=on,gic-version=3,acpi=off"
+cpu = "max,x-rme=on,lpa2=off,sme=off,pauth-impdef=on"
+memory = "2G"
+smp = "1"
+consoles = ["host", "secure"]
+primary-console = "host"
+capabilities = ["cca"]

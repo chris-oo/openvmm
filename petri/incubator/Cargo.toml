@@ -15,6 +15,7 @@ futures-concurrency.workspace = true
 initrd_cpio.workspace = true
 mesh.workspace = true
 pal_async.workspace = true
+petri_artifacts_common.workspace = true
 pipette_client.workspace = true
 serde = { workspace = true, features = ["derive"] }
 tempfile.workspace = true
