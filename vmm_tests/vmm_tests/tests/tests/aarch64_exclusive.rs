@@ -6,6 +6,7 @@
 use anyhow::Context;
 use pal_async::DefaultDriver;
 use pal_async::timer::PolledTimer;
+use petri::IsolationType;
 use petri::PetriVmBuilder;
 use petri::PetriVmmBackend;
 use petri::openvmm::OpenVmmPetriBackend;
@@ -16,18 +17,51 @@ use vm_resource::IntoResource;
 use vmm_test_macros::vmm_test;
 use vmm_test_macros::vmm_test_with;
 
-/// Verify that a VMM test can execute inside the QEMU CCA incubator.
+/// Boot a Linux-direct CCA Realm and verify the pipette agent over virtio-vsock.
 #[vmm_test_with(openvmm, requires(cca), configs(linux_direct_aarch64))]
-async fn qemu_cca_incubator_smoke(
-    _config: PetriVmBuilder<OpenVmmPetriBackend>,
-) -> anyhow::Result<()> {
+async fn boot_linux_direct_cca(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Result<()> {
     let capabilities = std::env::var("PETRI_CAPABILITIES").unwrap_or_default();
     assert!(
         capabilities
             .split(',')
             .any(|capability| capability == petri_artifacts_common::capabilities::CCA),
-        "QEMU CCA incubator did not publish the CCA capability"
+        "CCA incubator did not publish the CCA capability"
     );
+
+    let (vm, agent) = config
+        .with_isolation(IsolationType::Cca)
+        .with_memory(petri::MemoryConfig {
+            startup_bytes: 256 * 1024 * 1024,
+            // CCA private memory lives in guestmemfd; the separate userspace
+            // backing must remain shared for shared-GPA aliases.
+            private_memory: Some(false),
+            transparent_hugepages: false,
+            ..Default::default()
+        })
+        .with_processor_topology(petri::ProcessorTopology {
+            vp_count: 1,
+            ..Default::default()
+        })
+        // FVP traps each emulated UART access; disabling the diagnostic console
+        // cuts Realm boot time substantially while pipette remains on virtio-vsock.
+        .without_serial_output()
+        .modify_backend(|backend| {
+            backend
+                .with_pcie_root_topology(1, 1, 1)
+                .with_custom_config(|config| {
+                    for root_complex in &mut config.pcie_root_complexes {
+                        for port in &mut root_complex.ports {
+                            port.hotplug = false;
+                        }
+                    }
+                })
+        })
+        .run()
+        .await?;
+    agent.ping().await?;
+    agent.power_off().await?;
+    vm.wait_for_clean_teardown().await?;
+
     Ok(())
 }
 

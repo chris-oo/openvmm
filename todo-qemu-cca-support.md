@@ -461,24 +461,24 @@ async fn boot_linux_direct_cca(
 }
 ```
 
-- [ ] Use `with_isolation(Cca)`.
-- [ ] Disable Hyper-V/VTL2/VMBus.
-- [ ] Use device-tree boot, one VP, and explicit small L2 memory.
-- [ ] Configure the PCIe root complex/root-port topology required by
+- [x] Use `with_isolation(Cca)`.
+- [x] Disable Hyper-V/VTL2/VMBus.
+- [x] Use device-tree boot, one VP, and explicit small L2 memory.
+- [x] Configure the PCIe root complex/root-port topology required by
   virtio-vsock and supported CCA devices.
-- [ ] Set `hypervisor.with_hv = false`.
-- [ ] Use pipette-as-init with virtio-vsock first.
-- [ ] Select the CCA guest kernel built by `build-kernels.sh` if the generic
+- [x] Set `hypervisor.with_hv = false`.
+- [x] Use pipette-as-init with virtio-vsock first.
+- [x] Select the CCA guest kernel built by `build-kernels.sh` if the generic
   Petri guest kernel lacks the required Realm/CCA configuration.
-- [ ] If a CCA-specific guest kernel is needed, add its complete artifact
+- [x] If a CCA-specific guest kernel is needed, add its complete artifact
   path: declaration, known-path/local resolver, local `BuildSelections`, and
   archived/CI typed artifact-builder entry.
-- [ ] Resolve D5 with a focused vsock probe; TCP is the fallback.
-- [ ] Make Petri's hard-coded 10-minute VM watchdog configurable if Phase 0
+- [x] Resolve D5 with a focused vsock probe; TCP is the fallback.
+- [x] Make Petri's hard-coded 10-minute VM watchdog configurable if Phase 0
   timings show nested TCG CCA can exceed it.
-- [ ] Require agent ping, clean power-off, and clean VM teardown.
-- [ ] Preserve Realm and L1 host logs on failure.
-- [ ] Keep the existing FVP/TMK `cca_runtime` test.
+- [x] Require agent ping, clean power-off, and clean VM teardown.
+- [x] Preserve Realm and L1 host logs on failure.
+- [x] Keep the existing FVP/TMK `cca_runtime` test.
 
 ### Exit criteria
 
@@ -487,6 +487,20 @@ async fn boot_linux_direct_cca(
   passes without selecting the existing FVP test binary.
 - The same test skips when `cca` is not advertised.
 - No SNP or ordinary Linux-direct test changes behavior.
+
+### Phase 5 validation
+
+- `boot_linux_direct_qemu_cca` launches a 256 MiB, one-VP Realm with
+  device-tree Linux direct boot, no VMBus/Hyper-V interfaces, and a static PCIe
+  root port carrying virtio-vsock.
+- The packaged generic AArch64 test kernel is already the
+  `openvmm-test-linux-kvm-cca-dev` kernel, so no new guest-kernel artifact was
+  required.
+- The Realm agent pinged successfully, powered off, and completed clean
+  teardown in 71.563 seconds.
+- Under the generic QEMU TCG incubator, the CCA test was skipped by
+  `requires(cca)` while both existing `aarch64_tcg` tests passed.
+- The existing FVP/TMK `cca_runtime` binary remains unchanged.
 
 ## Phase 6: CI and deduplication
 
