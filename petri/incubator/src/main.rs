@@ -28,6 +28,12 @@ struct Args {
     /// Path to the initrd (auto-detected if omitted).
     #[clap(long, env = "INCUBATOR_INITRD")]
     initrd: Option<PathBuf>,
+    /// Path to the platform firmware image.
+    #[clap(long, env = "INCUBATOR_FIRMWARE")]
+    firmware: Option<PathBuf>,
+    /// Path to the writable host rootfs image.
+    #[clap(long, env = "INCUBATOR_ROOTFS")]
+    rootfs: Option<PathBuf>,
     /// Directory to share with the guest.
     #[clap(long, env = "INCUBATOR_SHARE")]
     share: String,
@@ -84,19 +90,49 @@ fn main() -> anyhow::Result<()> {
 
     let profile = incubator::IncubatorProfile::from_file(std::path::Path::new(&args.profile))?;
 
-    let arch = profile.incubator.arch();
-    let kernel = match args.kernel {
-        Some(kernel) => kernel,
-        None => kernel_or_initrd_from_env(arch, "OPENVMM_LINUX_DIRECT_KERNEL")?,
-    };
-    let initrd = match args.initrd {
-        Some(initrd) => initrd,
-        None => kernel_or_initrd_from_env(arch, "OPENVMM_LINUX_DIRECT_INITRD")?,
+    let (kernel, initrd, firmware, rootfs) = match &profile.incubator {
+        incubator::IncubatorBackend::QemuTcg(_) => {
+            let arch = profile.incubator.arch();
+            let kernel = match args.kernel {
+                Some(kernel) => kernel,
+                None => kernel_or_initrd_from_env(arch, "OPENVMM_LINUX_DIRECT_KERNEL")?,
+            };
+            let initrd = match args.initrd {
+                Some(initrd) => initrd,
+                None => kernel_or_initrd_from_env(arch, "OPENVMM_LINUX_DIRECT_INITRD")?,
+            };
+            (Some(kernel), Some(initrd), None, None)
+        }
+        incubator::IncubatorBackend::QemuCca(_) => (
+            Some(
+                args.kernel
+                    .context("--kernel or INCUBATOR_KERNEL is required for QEMU CCA")?,
+            ),
+            None,
+            Some(
+                args.firmware
+                    .context("--firmware or INCUBATOR_FIRMWARE is required for QEMU CCA")?,
+            ),
+            Some(
+                args.rootfs
+                    .context("--rootfs or INCUBATOR_ROOTFS is required for QEMU CCA")?,
+            ),
+        ),
     };
 
     tracing::info!(profile = %args.profile, "profile");
-    tracing::info!(kernel = %kernel.display(), "kernel");
-    tracing::info!(initrd = %initrd.display(), "initrd");
+    if let Some(kernel) = &kernel {
+        tracing::info!(kernel = %kernel.display(), "kernel");
+    }
+    if let Some(initrd) = &initrd {
+        tracing::info!(initrd = %initrd.display(), "initrd");
+    }
+    if let Some(firmware) = &firmware {
+        tracing::info!(firmware = %firmware.display(), "firmware");
+    }
+    if let Some(rootfs) = &rootfs {
+        tracing::info!(rootfs = %rootfs.display(), "rootfs");
+    }
     let mut command = args.command;
     if args.map_command_path {
         let host_command = command.first().context("empty guest command")?.clone();
@@ -113,24 +149,46 @@ fn main() -> anyhow::Result<()> {
         guest_env.insert(env.key, env.value);
     }
 
-    let output = incubator::run_in_incubator(incubator::IncubatorConfig {
-        profile,
-        kernel,
-        initrd,
-        share_dir: share_dir.clone(),
-        output_dir: args
-            .output_dir
-            .unwrap_or_else(|| share_dir.join("test_results")),
-        guest_pipette_path: guest_pipette,
-        guest_command: command,
-        guest_env,
-        guest_current_dir: args.guest_current_dir,
-        timeout: std::time::Duration::from_secs(args.timeout),
-        qemu_binary_override: args.qemu_binary,
-        // Only drive an interactive PTY when stdin is a real terminal and the
-        // caller hasn't opted out (cargo-nextest sets --no-pty).
-        allocate_pty: !args.no_pty && std::io::stdin().is_terminal(),
-    })?;
+    let output_dir = args
+        .output_dir
+        .unwrap_or_else(|| share_dir.join("test_results"));
+    let timeout = std::time::Duration::from_secs(args.timeout);
+    let allocate_pty = !args.no_pty && std::io::stdin().is_terminal();
+    let output = match profile.incubator {
+        incubator::IncubatorBackend::QemuTcg(_) => {
+            incubator::run_in_incubator(incubator::IncubatorConfig {
+                profile,
+                kernel: kernel.unwrap(),
+                initrd: initrd.unwrap(),
+                share_dir,
+                output_dir,
+                guest_pipette_path: guest_pipette,
+                guest_command: command,
+                guest_env,
+                guest_current_dir: args.guest_current_dir,
+                timeout,
+                qemu_binary_override: args.qemu_binary,
+                allocate_pty,
+            })?
+        }
+        incubator::IncubatorBackend::QemuCca(_) => {
+            incubator::run_in_qemu_cca_incubator(incubator::QemuCcaIncubatorConfig {
+                profile,
+                kernel: kernel.unwrap(),
+                firmware: firmware.unwrap(),
+                rootfs: rootfs.unwrap(),
+                share_dir,
+                output_dir,
+                guest_pipette_path: guest_pipette,
+                guest_command: command,
+                guest_env,
+                guest_current_dir: args.guest_current_dir,
+                timeout,
+                qemu_binary_override: args.qemu_binary,
+                allocate_pty,
+            })?
+        }
+    };
 
     tracing::info!(
         elapsed_secs = output.elapsed.as_secs_f64(),

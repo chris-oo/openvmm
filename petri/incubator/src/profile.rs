@@ -235,6 +235,10 @@ impl IncubatorProfile {
     fn validate(&self) -> anyhow::Result<()> {
         if let IncubatorBackend::QemuCca(config) = &self.incubator {
             validate_qemu_cca(config)?;
+            anyhow::ensure!(
+                self.devices.is_empty(),
+                "QEMU CCA profiles do not yet support extra devices"
+            );
         }
         Ok(())
     }
@@ -267,8 +271,11 @@ fn validate_qemu_cca(config: &QemuCcaConfig) -> anyhow::Result<()> {
     let mut consoles = BTreeSet::new();
     for console in &config.consoles {
         anyhow::ensure!(
-            !console.is_empty(),
-            "QEMU CCA console names must not be empty"
+            !console.is_empty()
+                && console
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+            "invalid QEMU CCA console name: {console}"
         );
         anyhow::ensure!(
             consoles.insert(console),

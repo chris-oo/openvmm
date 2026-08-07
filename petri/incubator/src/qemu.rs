@@ -5,6 +5,8 @@
 
 use crate::GUEST_SHARE_ROOT;
 use crate::profile::DeviceConfig;
+use crate::profile::QemuCcaConfig;
+use crate::profile::QemuCcaExtraArg;
 use crate::profile::QemuTcgConfig;
 use anyhow::Context;
 use futures::AsyncReadExt;
@@ -57,7 +59,7 @@ pub fn build_qemu_command(
 
     // User-mode networking with port forwarding for pipette TCP
     cmd.arg("-netdev").arg(format!(
-        "user,id=net0,hostfwd=tcp::{host_pipette_port}-:{guest_port}",
+        "user,id=net0,hostfwd=tcp:127.0.0.1:{host_pipette_port}-:{guest_port}",
         guest_port = pipette_client::PIPETTE_PORT,
     ));
     cmd.arg("-device")
@@ -118,6 +120,100 @@ pub fn build_qemu_command(
     }
 
     Ok(cmd)
+}
+
+/// A QEMU CCA command and the log path for each named serial console.
+pub struct QemuCcaCommand {
+    /// Configured QEMU command.
+    pub command: Command,
+    /// Console name to host log path.
+    pub console_logs: BTreeMap<String, PathBuf>,
+}
+
+/// Build the QEMU command line for an Arm CCA L1 host.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the arguments are the complete QEMU CCA boot artifact contract"
+)]
+pub fn build_qemu_cca_command(
+    config: &QemuCcaConfig,
+    firmware: &Path,
+    kernel: &Path,
+    rootfs: &Path,
+    share_dir: &Path,
+    host_pipette_port: u16,
+    output_dir: &Path,
+    instance_id: u64,
+) -> anyhow::Result<QemuCcaCommand> {
+    let rootfs = qemu_option_path(rootfs, "QEMU CCA rootfs")?;
+    let share_dir = qemu_option_path(share_dir, "QEMU CCA share directory")?;
+    let mut cmd = Command::new(&config.binary);
+
+    cmd.arg("-nodefaults");
+    cmd.arg("-accel").arg("tcg");
+    cmd.arg("-machine").arg(&config.machine);
+    cmd.arg("-cpu").arg(&config.cpu);
+    cmd.arg("-m").arg(&config.memory);
+    cmd.arg("-smp").arg(&config.smp);
+    cmd.arg("-bios").arg(firmware);
+    cmd.arg("-kernel").arg(kernel);
+    cmd.arg("-drive")
+        .arg(format!("if=none,id=rootfs,format=raw,file={rootfs}"));
+    cmd.arg("-device")
+        .arg("virtio-blk-pci,drive=rootfs,romfile=");
+    cmd.arg("-virtfs").arg(format!(
+        "local,path={share_dir},mount_tag=host,security_model=none,readonly=off"
+    ));
+    cmd.arg("-netdev").arg(format!(
+        "user,id=net0,hostfwd=tcp:127.0.0.1:{host_pipette_port}-:{guest_port}",
+        guest_port = pipette_client::PIPETTE_PORT,
+    ));
+    cmd.arg("-device")
+        .arg("virtio-net-pci,netdev=net0,romfile=");
+    cmd.arg("-append")
+        .arg("nokaslr root=/dev/vda rw console=ttyAMA0");
+    cmd.arg("-display").arg("none");
+    cmd.arg("-monitor").arg("none");
+    cmd.arg("-no-reboot");
+
+    for extra_arg in &config.extra_args {
+        match extra_arg {
+            QemuCcaExtraArg::Trace { value } => {
+                cmd.arg("-d").arg(value);
+            }
+            QemuCcaExtraArg::Global { value } => {
+                cmd.arg("-global").arg(value);
+            }
+        }
+    }
+
+    let mut console_logs = BTreeMap::new();
+    for console in &config.consoles {
+        let log_path = output_dir.join(format!("incubator-{console}.{instance_id}.log"));
+        if console == &config.primary_console {
+            cmd.arg("-serial").arg("stdio");
+        } else {
+            let log_path_arg = qemu_option_path(&log_path, "QEMU CCA console log")?;
+            cmd.arg("-serial").arg(format!("file:{log_path_arg}"));
+        }
+        console_logs.insert(console.clone(), log_path);
+    }
+
+    Ok(QemuCcaCommand {
+        command: cmd,
+        console_logs,
+    })
+}
+
+fn qemu_option_path<'a>(path: &'a Path, label: &str) -> anyhow::Result<&'a str> {
+    let path = path
+        .to_str()
+        .with_context(|| format!("{label} is not valid UTF-8"))?;
+    anyhow::ensure!(
+        !path.contains([',', '\n', '\r']),
+        "{label} contains a character that cannot be represented in a QEMU option"
+    );
+    Ok(path)
 }
 
 /// First PCI device number (`addr=`) used for extra-device root ports.
@@ -274,6 +370,21 @@ fn host_ca_certificates_path() -> anyhow::Result<PathBuf> {
         .context("could not find a host CA certificate bundle for the incubator")
 }
 
+/// Copy the base host rootfs to a unique writable file for one QEMU CCA run.
+pub fn prepare_rootfs(
+    base_rootfs: &Path,
+    scratch_dir: &Path,
+) -> anyhow::Result<tempfile::TempPath> {
+    std::fs::create_dir_all(scratch_dir).context("failed to create incubator output dir")?;
+    let mut rootfs = tempfile::Builder::new()
+        .prefix(".incubator-rootfs")
+        .suffix(".ext4")
+        .tempfile_in(scratch_dir)
+        .context("failed to create writable QEMU CCA rootfs")?;
+    let mut source = std::fs::File::open(base_rootfs).context("failed to open QEMU CCA rootfs")?;
+    std::io::copy(&mut source, rootfs.as_file_mut()).context("failed to copy QEMU CCA rootfs")?;
+    Ok(rootfs.into_temp_path())
+}
 /// Wait for pipette to signal readiness via the serial console relay
 /// task. Races against QEMU exit and a timeout.
 pub async fn wait_for_pipette_ready(
@@ -321,6 +432,61 @@ pub async fn wait_for_pipette_ready(
         Event::Timeout => {
             anyhow::bail!("timed out waiting for pipette ready signal");
         }
+    }
+}
+
+/// Wait for QEMU to exit, bounded by `timeout`.
+pub async fn wait_for_qemu_exit(
+    driver: &impl pal_async::driver::Driver,
+    timeout: Duration,
+    qemu_child: &mut PolledChild<std::process::Child>,
+) -> anyhow::Result<std::process::ExitStatus> {
+    enum Event {
+        Exited(std::io::Result<std::process::ExitStatus>),
+        Timeout,
+    }
+
+    let event = (async { Event::Exited(qemu_child.wait().await) }, async {
+        pal_async::timer::PolledTimer::new(driver)
+            .sleep(timeout)
+            .await;
+        Event::Timeout
+    })
+        .race()
+        .await;
+
+    match event {
+        Event::Exited(status) => status.context("failed to wait for QEMU"),
+        Event::Timeout => anyhow::bail!("timed out waiting for QEMU to exit"),
+    }
+}
+
+/// Configure QEMU to run in an isolated process group where supported.
+pub fn configure_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+}
+
+/// Terminate QEMU and any helper processes it started.
+pub fn terminate_process_tree(pid: u32, force: bool) {
+    #[cfg(unix)]
+    {
+        let signal = if force { "-KILL" } else { "-TERM" };
+        let _ = Command::new("kill")
+            .args([signal, "--", &format!("-{pid}")])
+            .status();
+    }
+    #[cfg(windows)]
+    {
+        let mut command = Command::new("taskkill");
+        command.args(["/PID", &pid.to_string(), "/T"]);
+        if force {
+            command.arg("/F");
+        }
+        let _ = command.status();
     }
 }
 
@@ -497,20 +663,148 @@ pub async fn setup_vfio_devices(
         capabilities.push(device.capability());
     }
 
-    // Advertise all provisioned capabilities to the guest command via
-    // PETRI_CAPABILITIES (comma-separated), which petri's requirement
-    // evaluation reads. Augment any capabilities already present in the
-    // incubator's environment rather than overwriting them, so that
-    // host-provided capabilities are preserved.
-    if !capabilities.is_empty() {
-        let mut value = capabilities.join(",");
-        if let Ok(existing) = std::env::var("PETRI_CAPABILITIES") {
-            if !existing.is_empty() {
-                value = format!("{existing},{value}");
-            }
-        }
-        env.insert("PETRI_CAPABILITIES".to_string(), value);
-    }
+    publish_capabilities(&mut env, &capabilities);
 
     Ok(env)
+}
+
+/// Add runtime capabilities to the guest command environment.
+pub fn publish_capabilities(env: &mut BTreeMap<String, String>, capabilities: &[String]) {
+    let mut values = std::env::var("PETRI_CAPABILITIES")
+        .ok()
+        .into_iter()
+        .flat_map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .chain(capabilities.iter().cloned())
+        .collect::<std::collections::BTreeSet<_>>();
+    if let Some(existing) = env.get("PETRI_CAPABILITIES") {
+        values.extend(
+            existing
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+        );
+    }
+    if !values.is_empty() {
+        env.insert(
+            "PETRI_CAPABILITIES".to_string(),
+            values.into_iter().collect::<Vec<_>>().join(","),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn qemu_cca_config() -> QemuCcaConfig {
+        QemuCcaConfig {
+            binary: "qemu-system-aarch64".into(),
+            machine: "virt,secure=on,virtualization=on,gic-version=3,acpi=off".into(),
+            cpu: "max,x-rme=on,lpa2=off,sme=off,pauth-impdef=on".into(),
+            memory: "2G".into(),
+            smp: "1".into(),
+            consoles: vec!["host".into(), "secure".into()],
+            primary_console: "host".into(),
+            capabilities: vec!["cca".into()],
+            extra_args: vec![QemuCcaExtraArg::Trace {
+                value: "guest_errors".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn builds_qemu_cca_command_with_named_consoles() {
+        let built = build_qemu_cca_command(
+            &qemu_cca_config(),
+            Path::new("/artifacts/flash.bin"),
+            Path::new("/artifacts/host-Image"),
+            Path::new("/scratch/host-rootfs.ext4"),
+            Path::new("/share"),
+            50000,
+            Path::new("/logs"),
+            42,
+        )
+        .unwrap();
+        let args: Vec<_> = built
+            .command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(
+            built.command.get_program(),
+            std::ffi::OsStr::new("qemu-system-aarch64")
+        );
+        assert!(
+            args.windows(2)
+                .any(|args| args == ["-bios", "/artifacts/flash.bin"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|args| args == ["-kernel", "/artifacts/host-Image"])
+        );
+        assert!(
+            args.iter()
+                .any(|arg| arg == "if=none,id=rootfs,format=raw,file=/scratch/host-rootfs.ext4")
+        );
+        assert!(args.iter().any(|arg| {
+            arg == &format!(
+                "user,id=net0,hostfwd=tcp:127.0.0.1:50000-:{}",
+                pipette_client::PIPETTE_PORT
+            )
+        }));
+        assert!(args.windows(2).any(|args| args == ["-serial", "stdio"]));
+        assert!(
+            args.windows(2)
+                .any(|args| args == ["-serial", "file:/logs/incubator-secure.42.log"])
+        );
+        assert!(args.windows(2).any(|args| args == ["-d", "guest_errors"]));
+        assert_eq!(
+            built.console_logs["host"],
+            PathBuf::from("/logs/incubator-host.42.log")
+        );
+        assert_eq!(
+            built.console_logs["secure"],
+            PathBuf::from("/logs/incubator-secure.42.log")
+        );
+    }
+
+    #[test]
+    fn rejects_unrepresentable_qemu_cca_option_path() {
+        let error = build_qemu_cca_command(
+            &qemu_cca_config(),
+            Path::new("/artifacts/flash.bin"),
+            Path::new("/artifacts/host-Image"),
+            Path::new("/scratch/rootfs,unsafe.ext4"),
+            Path::new("/share"),
+            50000,
+            Path::new("/logs"),
+            42,
+        )
+        .err()
+        .unwrap();
+
+        assert!(error.to_string().contains("cannot be represented"));
+    }
+
+    #[test]
+    fn preserves_explicit_capabilities_without_runtime_capabilities() {
+        let mut env = BTreeMap::from([("PETRI_CAPABILITIES".to_string(), "explicit".to_string())]);
+
+        publish_capabilities(&mut env, &[]);
+
+        assert!(
+            env["PETRI_CAPABILITIES"]
+                .split(',')
+                .any(|capability| capability == "explicit")
+        );
+    }
 }

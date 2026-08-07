@@ -337,27 +337,27 @@ run completed successfully.
 
 ### Runtime
 
-- [ ] Split common QEMU process/readiness/path/network code from the current
+- [x] Split common QEMU process/readiness/path/network code from the current
   direct-boot command builder.
-- [ ] Build the CCA command with `-bios`, host kernel, rootfs disk, named
+- [x] Build the CCA command with `-bios`, host kernel, rootfs disk, named
   consoles, 9p, and user networking.
-- [ ] Change `run_in_incubator` from an irrefutable `QemuTcg` binding to a
+- [x] Change `run_in_incubator` from an irrefutable `QemuTcg` binding to a
   backend match.
-- [ ] Move `prepare_initrd` inside the `QemuTcg` branch; QEMU CCA rootfs boot
+- [x] Move `prepare_initrd` inside the `QemuTcg` branch; QEMU CCA rootfs boot
   must not patch or require the generic initrd.
-- [ ] Monitor only the configured primary host console for pipette readiness.
-- [ ] Preserve all console logs on success and failure.
-- [ ] Kill the QEMU process group and all console relays on exit.
-- [ ] Add backend-conditional CLI/env fields:
+- [x] Monitor only the configured primary host console for pipette readiness.
+- [x] Preserve all console logs on success and failure.
+- [x] Kill the QEMU process group and all console relays on exit.
+- [x] Add backend-conditional CLI/env fields:
   - `INCUBATOR_FIRMWARE`;
   - `INCUBATOR_ROOTFS`;
   - existing `INCUBATOR_KERNEL`; and
   - existing `INCUBATOR_QEMU_BINARY`.
-- [ ] Make kernel/initrd requirements backend-specific.
-- [ ] Extract capability publishing from `setup_vfio_devices`; it currently
+- [x] Make kernel/initrd requirements backend-specific.
+- [x] Extract capability publishing from `setup_vfio_devices`; it currently
   returns early when no VFIO devices exist, while QEMU CCA still needs to
   publish `PETRI_CAPABILITIES=cca`.
-- [ ] Advertise `cca` only after host preflight and pipette readiness.
+- [x] Advertise `cca` only after host preflight and pipette readiness.
 
 ### Tests
 
@@ -366,6 +366,17 @@ run completed successfully.
 - Named-console and primary-console selection.
 - Capability merging.
 - Teardown and timeout behavior.
+
+### Phase 2 runtime validation
+
+- A command executed through the packaged QEMU CCA L1 pipette path and exited
+  zero in 4.31 seconds.
+- `PETRI_CAPABILITIES=cca` was visible to the guest command only after
+  preflight-backed pipette readiness.
+- The host and secure console logs were retained, the writable host rootfs was
+  per-run, and no QEMU process remained after completion.
+- The existing AArch64 `qemu-tcg` profile completed `/bin/true` unchanged,
+  including all three VFIO device setup paths.
 
 ## Phase 3: Wire backend-specific artifacts through Flowey
 
