@@ -112,13 +112,14 @@ impl PetriVmConfigOpenVmm {
         openvmm_path: &ResolvedArtifact,
         petri_vm_config: PetriVmConfig,
         resources: &PetriVmResources,
-        properties: PetriVmProperties,
+        mut properties: PetriVmProperties,
     ) -> anyhow::Result<Self> {
         let PetriVmConfig {
             name: _,
             arch,
             host_log_levels,
             firmware,
+            isolation,
             memory,
             proc_topology,
             vmgs,
@@ -131,6 +132,10 @@ impl PetriVmConfigOpenVmm {
 
         if !physical_nvme_devices.is_empty() {
             anyhow::bail!("Physical NVMe devices are only supported with the Hyper-V backend");
+        }
+
+        if matches!(isolation, Some(IsolationType::Cca)) {
+            properties.no_vmbus = true;
         }
 
         tracing::debug!(?firmware, ?arch, "Petri VM firmware configuration");
@@ -146,6 +151,7 @@ impl PetriVmConfigOpenVmm {
         let setup = PetriVmConfigSetupCore {
             arch,
             firmware: &firmware,
+            isolation,
             driver,
             logger: log_source,
             vmgs: &vmgs,
@@ -656,16 +662,12 @@ impl PetriVmConfigOpenVmm {
 
             // Basic virtualization device support
             hypervisor: HypervisorConfig {
-                with_hv: !properties.no_hv,
+                with_hv: !properties.no_hv && openvmm_with_hv(isolation),
                 with_vtl2,
-                with_isolation: match firmware.isolation() {
-                    Some(IsolationType::Vbs) => Some(openvmm_defs::config::IsolationType::Vbs),
-                    None => None,
-                    _ => anyhow::bail!("unsupported isolation type"),
-                },
+                with_isolation: isolation.map(openvmm_isolation_type).transpose()?,
                 nested_virt: false,
             },
-            vmbus: if properties.no_vmbus {
+            vmbus: if !openvmm_with_vmbus(isolation, properties.no_vmbus) {
                 None
             } else {
                 Some(VmbusConfig {
@@ -773,6 +775,7 @@ impl PetriVmConfigOpenVmm {
 struct PetriVmConfigSetupCore<'a> {
     arch: MachineArch,
     firmware: &'a Firmware,
+    isolation: Option<IsolationType>,
     driver: &'a DefaultDriver,
     logger: &'a PetriLogSource,
     vmgs: &'a PetriVmgsResource,
@@ -784,6 +787,35 @@ struct PetriVmConfigSetupCore<'a> {
     use_virtio_vsock: bool,
     no_vmbus: bool,
     no_hv: bool,
+}
+
+fn openvmm_isolation_type(
+    isolation: IsolationType,
+) -> anyhow::Result<openvmm_defs::config::IsolationType> {
+    Ok(match isolation {
+        IsolationType::Vbs => openvmm_defs::config::IsolationType::Vbs,
+        IsolationType::Snp => openvmm_defs::config::IsolationType::Snp,
+        IsolationType::Cca => openvmm_defs::config::IsolationType::Cca,
+        IsolationType::Tdx => anyhow::bail!("TDX isolation is not supported by OpenVMM"),
+    })
+}
+
+fn openvmm_with_hv(isolation: Option<IsolationType>) -> bool {
+    !matches!(isolation, Some(IsolationType::Cca))
+}
+
+fn openvmm_with_vmbus(isolation: Option<IsolationType>, no_vmbus: bool) -> bool {
+    !no_vmbus && !matches!(isolation, Some(IsolationType::Cca))
+}
+
+fn openvmm_linux_boot_mode(
+    isolation: Option<IsolationType>,
+) -> openvmm_defs::config::LinuxDirectBootMode {
+    if matches!(isolation, Some(IsolationType::Cca)) {
+        openvmm_defs::config::LinuxDirectBootMode::DeviceTree
+    } else {
+        openvmm_defs::config::LinuxDirectBootMode::Acpi
+    }
 }
 
 struct SerialData {
@@ -911,7 +943,7 @@ impl PetriVmConfigSetupCore<'_> {
                     initrd: Some(initrd),
                     cmdline,
                     enable_serial: self.enable_serial,
-                    boot_mode: openvmm_defs::config::LinuxDirectBootMode::Acpi,
+                    boot_mode: openvmm_linux_boot_mode(self.isolation),
                 }
             }
             (
@@ -1205,7 +1237,7 @@ impl PetriVmConfigSetupCore<'_> {
     fn config_video(
         &self,
     ) -> anyhow::Result<Option<(VideoDevice, Framebuffer, FramebufferAccess)>> {
-        if self.firmware.isolation().is_some() {
+        if self.isolation.is_some() {
             return Ok(None);
         }
 
@@ -1278,7 +1310,7 @@ impl PetriVmConfigSetupCore<'_> {
                         register_layout,
                         guest_secret_key: None,
                         logger: None,
-                        is_confidential_vm: self.firmware.isolation().is_some(),
+                        is_confidential_vm: self.isolation.is_some(),
                         // TODO: generate an actual BIOS GUID and put it here
                         bios_guid: Guid::ZERO,
                         nvram_size: None,
@@ -1538,4 +1570,38 @@ async fn vmbus_storage_controllers_to_openvmm(
     }
 
     Ok((vmbus_devices, vpci_devices))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_cca_isolation() {
+        assert_eq!(
+            openvmm_isolation_type(IsolationType::Cca).unwrap(),
+            openvmm_defs::config::IsolationType::Cca
+        );
+    }
+
+    #[test]
+    fn rejects_tdx_isolation() {
+        assert!(openvmm_isolation_type(IsolationType::Tdx).is_err());
+    }
+
+    #[test]
+    fn cca_disables_hyperv_interfaces() {
+        assert!(!openvmm_with_hv(Some(IsolationType::Cca)));
+        assert!(!openvmm_with_vmbus(Some(IsolationType::Cca), false));
+        assert!(openvmm_with_hv(None));
+        assert!(openvmm_with_vmbus(None, false));
+        assert_eq!(
+            openvmm_linux_boot_mode(Some(IsolationType::Cca)),
+            openvmm_defs::config::LinuxDirectBootMode::DeviceTree
+        );
+        assert_eq!(
+            openvmm_linux_boot_mode(None),
+            openvmm_defs::config::LinuxDirectBootMode::Acpi
+        );
+    }
 }

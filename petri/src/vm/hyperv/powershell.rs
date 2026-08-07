@@ -474,6 +474,7 @@ impl HyperVNewCustomVMArgs {
             name,
             arch,
             firmware,
+            isolation,
             memory,
             proc_topology,
             vmgs,
@@ -496,10 +497,13 @@ impl HyperVNewCustomVMArgs {
             } else {
                 HyperVGeneration::Two
             }),
-            guest_state_isolation_type: match firmware.isolation() {
+            guest_state_isolation_type: match isolation {
                 Some(IsolationType::Vbs) => Some(HyperVGuestStateIsolationType::Vbs),
                 Some(IsolationType::Snp) => Some(HyperVGuestStateIsolationType::Snp),
                 Some(IsolationType::Tdx) => Some(HyperVGuestStateIsolationType::Tdx),
+                Some(IsolationType::Cca) => {
+                    anyhow::bail!("CCA isolation is not supported by Hyper-V")
+                }
                 None if properties.is_openhcl => Some(HyperVGuestStateIsolationType::OpenHCL),
                 None => None,
             },
