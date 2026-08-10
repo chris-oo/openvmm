@@ -19,6 +19,7 @@ usage() {
 Usage: build-qemu-host-rootfs.sh --source-rootfs PATH --output-root PATH [OPTIONS]
 
 Options:
+  --init-script PATH  init script to inject (default: qemu-host-init.sh)
   --size SIZE       output filesystem size (default: 1024M)
   --e2fsck PATH     e2fsck binary
   --resize2fs PATH  resize2fs binary
@@ -73,6 +74,11 @@ while [[ $# -gt 0 ]]; do
         SIZE=$2
         shift 2
         ;;
+    --init-script)
+        require_value "$@"
+        INIT_SCRIPT=$2
+        shift 2
+        ;;
     --e2fsck)
         require_value "$@"
         E2FSCK=$2
@@ -103,8 +109,10 @@ done
 [[ "$SIZE" =~ ^[1-9][0-9]*[MG]$ ]] ||
     fail "--size must use an M or G suffix, for example 1024M or 2G"
 SOURCE_ROOTFS="$(realpath "$SOURCE_ROOTFS")"
+INIT_SCRIPT="$(realpath "$INIT_SCRIPT")"
 OUTPUT_ROOT="$(realpath -m "$OUTPUT_ROOT")"
 [[ -f "$SOURCE_ROOTFS" ]] || fail "source rootfs is not a regular file"
+[[ -f "$INIT_SCRIPT" ]] || fail "init script is not a regular file"
 [[ "$OUTPUT_ROOT" != "/" ]] || fail "--output-root cannot be the filesystem root"
 [[ "$SOURCE_ROOTFS" != "$OUTPUT_ROOT" && "$SOURCE_ROOTFS" != "$OUTPUT_ROOT/"* ]] ||
     fail "output root must not contain the source rootfs"
