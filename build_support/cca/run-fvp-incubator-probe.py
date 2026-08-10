@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+"""Run the noninteractive FVP CCA incubator platform probe."""
+
+import argparse
+import fcntl
+import hashlib
+import os
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+
+SHRINKWRAP_IMAGE = "shrinkwraptool/base-slim:2026.9.0.dev0"
+PIPETTE_PORT = 0x1337
+
+
+def regular_file(path: Path, label: str) -> Path:
+    path = path.resolve()
+    if not path.is_file():
+        raise RuntimeError(f"{label} is not a regular file: {path}")
+    return path
+
+
+def directory(path: Path, label: str) -> Path:
+    path = path.resolve()
+    if not path.is_dir():
+        raise RuntimeError(f"{label} is not a directory: {path}")
+    return path
+
+
+def reserve_port() -> socket.socket:
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    return listener
+
+
+def docker_containers(label: str) -> set[str]:
+    output = subprocess.check_output(
+        ["docker", "ps", "-q", "--filter", f"label={label}"],
+        text=True,
+    )
+    return set(output.split())
+
+
+def stop_container(container: str) -> None:
+    subprocess.run(
+        ["docker", "stop", "--timeout", "5", container],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
+
+def wait_for_marker(path: Path, marker: str, process: subprocess.Popen, timeout: int) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.is_file() and marker in path.read_text(errors="replace"):
+            return
+        status = process.poll()
+        if status is not None:
+            raise RuntimeError(
+                f"Shrinkwrap exited with status {status} before {marker!r}"
+            )
+        time.sleep(0.5)
+    raise RuntimeError(f"timed out waiting for {marker!r}")
+
+
+def assert_loopback_listener(port: int) -> None:
+    output = subprocess.check_output(["ss", "-ltn"], text=True)
+    expected = f"127.0.0.1:{port}"
+    if expected not in output:
+        raise RuntimeError(f"pipette listener is not loopback-only: {expected}")
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--platform-root", required=True, type=Path)
+    parser.add_argument("--output-root", required=True, type=Path)
+    parser.add_argument("--host-kernel", required=True, type=Path)
+    parser.add_argument("--host-rootfs", required=True, type=Path)
+    parser.add_argument("--share-dir", required=True, type=Path)
+    parser.add_argument("--pipette-probe", required=True, type=Path)
+    args = parser.parse_args()
+
+    platform_root = directory(args.platform_root, "FVP platform root")
+    output_root = args.output_root.resolve()
+    if output_root == platform_root or platform_root in output_root.parents:
+        raise RuntimeError("probe output root must be outside the FVP platform root")
+    host_kernel = regular_file(args.host_kernel, "CCA host kernel")
+    host_rootfs = regular_file(args.host_rootfs, "CCA host rootfs")
+    share_dir = directory(args.share_dir, "CCA share")
+    pipette_probe = regular_file(args.pipette_probe, "pipette TCP probe")
+    shrinkwrap_root = directory(platform_root / "shrinkwrap", "Shrinkwrap checkout")
+    shrinkwrap = regular_file(
+        shrinkwrap_root / "venv/bin/shrinkwrap", "Shrinkwrap executable"
+    )
+    overlay = regular_file(
+        shrinkwrap_root / "config/kvm_cca_planes.yaml", "KVM CCA overlay"
+    )
+    source_rootfs = regular_file(
+        platform_root / "kvm-cca/rootfs.ext2", "FVP CCA source rootfs"
+    )
+
+    output_root.mkdir(parents=True, exist_ok=True)
+    logs = output_root / "logs"
+    shutil.rmtree(logs, ignore_errors=True)
+    logs.mkdir()
+    for name in [
+        "container-id.txt",
+        "fvp-argv.txt",
+        "manifest.txt",
+        "probe-overlay.yaml",
+        "shrinkwrap-command.txt",
+    ]:
+        (output_root / name).unlink(missing_ok=True)
+    status_path = output_root / "status.txt"
+    status_path.write_text("running\n")
+
+    lock_path = platform_root / ".openvmm-fvp-cca.lock"
+    with lock_path.open("w") as lock:
+        lock_deadline = time.monotonic() + 60
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= lock_deadline:
+                    status_path.write_text("failed\n")
+                    raise RuntimeError("timed out acquiring FVP CCA platform lock")
+                time.sleep(0.25)
+
+        platform_hash = hashlib.sha256(str(platform_root).encode()).hexdigest()[:16]
+        platform_label = f"openvmm.fvp-cca-platform={platform_hash}"
+        stale = docker_containers(platform_label)
+        for container in stale:
+            stop_container(container)
+        if docker_containers(platform_label):
+            status_path.write_text("failed\n")
+            raise RuntimeError("stale FVP CCA containers could not be removed")
+
+        run_id = uuid.uuid4().hex
+        run_label = f"openvmm.fvp-cca-run={run_id}"
+        ssh_reservation = reserve_port()
+        pipette_reservation = reserve_port()
+        ssh_port = ssh_reservation.getsockname()[1]
+        pipette_port = pipette_reservation.getsockname()[1]
+        generated_overlay = output_root / "probe-overlay.yaml"
+        generated_overlay.write_text(
+            f"""%YAML 1.2
+---
+run:
+  terminals:
+    bp.terminal_0:
+      friendly: host
+      type: stdout
+      logfile: {logs / "host.log"}
+    bp.terminal_1:
+      friendly: edk2
+      type: stdout
+      logfile: {logs / "edk2.log"}
+    bp.terminal_3:
+      friendly: rmm
+      type: stdout
+      logfile: {logs / "rmm.log"}
+  params:
+    -C bp.hostbridge.userNetPorts: 127.0.0.1:{ssh_port}=22,127.0.0.1:{pipette_port}={PIPETTE_PORT}
+"""
+        )
+
+        command = [
+            str(shrinkwrap),
+            "--runtime=docker",
+            f"--image={SHRINKWRAP_IMAGE}",
+            "run",
+            "--no-color",
+            "--overlay",
+            str(overlay),
+            "--overlay",
+            str(generated_overlay),
+            "cca-3world.yaml",
+            "--rtvar",
+            f"ROOTFS={host_rootfs}",
+            "--rtvar",
+            f"KERNEL={host_kernel}",
+            "--rtvar",
+            f"SHARE={share_dir}",
+        ]
+        environment = os.environ.copy()
+        environment["VIRTUAL_ENV"] = str(shrinkwrap_root / "venv")
+        environment["PATH"] = (
+            f"{shrinkwrap_root / 'venv/bin'}:{environment.get('PATH', '')}"
+        )
+        environment["SHRINKWRAP_CONFIG"] = str(shrinkwrap_root / "config")
+        environment["TUXMAKE_DOCKER_RUN"] = (
+            f"--label openvmm.fvp-cca=true "
+            f"--label {platform_label} --label {run_label}"
+        )
+
+        script_log = logs / "shrinkwrap.log"
+        script_command = [
+            "script",
+            "-qefc",
+            shlex.join(command),
+            str(script_log),
+        ]
+        process = None
+        containers: set[str] = set()
+        succeeded = False
+
+        def interrupted(signum, _frame):
+            raise RuntimeError(f"interrupted by signal {signum}")
+
+        old_int = signal.signal(signal.SIGINT, interrupted)
+        old_term = signal.signal(signal.SIGTERM, interrupted)
+        try:
+            dry_run = subprocess.run(
+                command[:3] + ["run", "--dry-run"] + command[4:],
+                cwd=shrinkwrap_root,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            (output_root / "fvp-argv.txt").write_text(dry_run.stdout)
+            (output_root / "shrinkwrap-command.txt").write_text(
+                shlex.join(command) + "\n"
+            )
+
+            ssh_reservation.close()
+            pipette_reservation.close()
+            process = subprocess.Popen(
+                script_command,
+                cwd=shrinkwrap_root,
+                env=environment,
+                start_new_session=True,
+            )
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline:
+                containers = docker_containers(run_label)
+                if containers:
+                    break
+                if process.poll() is not None:
+                    break
+                time.sleep(0.25)
+            if len(containers) != 1:
+                raise RuntimeError(
+                    f"expected one new Shrinkwrap container, found {sorted(containers)}"
+                )
+            container = next(iter(containers))
+            (output_root / "container-id.txt").write_text(container + "\n")
+
+            wait_for_marker(logs / "host.log", "PIPETTE READY", process, 300)
+            assert_loopback_listener(pipette_port)
+            subprocess.run(
+                [
+                    str(pipette_probe),
+                    "--port",
+                    str(pipette_port),
+                    "--output-dir",
+                    str(output_root / "pipette"),
+                    "/bin/true",
+                ],
+                check=True,
+                timeout=120,
+            )
+            try:
+                return_code = process.wait(timeout=60)
+            except subprocess.TimeoutExpired as error:
+                raise RuntimeError("Shrinkwrap did not exit after L1 poweroff") from error
+            if return_code != 0:
+                raise RuntimeError(f"Shrinkwrap exited with status {return_code}")
+
+            manifest = output_root / "manifest.txt"
+            manifest.write_text(
+                "\n".join(
+                    [
+                        f"platform_root={platform_root}",
+                        f"shrinkwrap={shrinkwrap}",
+                        f"shrinkwrap_image={SHRINKWRAP_IMAGE}",
+                        f"host_kernel={host_kernel}",
+                        f"host_kernel_sha256={sha256(host_kernel)}",
+                        f"host_rootfs={host_rootfs}",
+                        f"host_rootfs_sha256={sha256(host_rootfs)}",
+                        f"source_rootfs={source_rootfs}",
+                        f"share_dir={share_dir}",
+                        f"ssh_port={ssh_port}",
+                        f"pipette_port={pipette_port}",
+                        f"container_id={container}",
+                        f"run_id={run_id}",
+                    ]
+                )
+                + "\n"
+            )
+            succeeded = True
+        except BaseException:
+            status_path.write_text("failed\n")
+            raise
+        finally:
+            signal.signal(signal.SIGINT, old_int)
+            signal.signal(signal.SIGTERM, old_term)
+            if process is not None and process.poll() is None:
+                os.killpg(process.pid, signal.SIGTERM)
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=5)
+            ssh_reservation.close()
+            pipette_reservation.close()
+            containers |= docker_containers(run_label)
+            for container in containers:
+                stop_container(container)
+            remaining = docker_containers(run_label)
+            if remaining:
+                status_path.write_text("failed\n")
+                raise RuntimeError(
+                    f"FVP probe containers remain after cleanup: {sorted(remaining)}"
+                )
+        if not succeeded:
+            status_path.write_text("failed\n")
+            raise RuntimeError("FVP CCA probe did not complete")
+        status_path.write_text("passed\n")
+        return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as error:
+        print(f"error: {error}", file=sys.stderr)
+        sys.exit(1)

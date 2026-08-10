@@ -3,6 +3,7 @@
 
 use cca_tests::CcaTestsCli;
 use flowey::pipeline::prelude::*;
+use fvp_cca_incubator_probe::FvpCcaIncubatorProbeCli;
 use kvm_cca_tests::KvmCcaTestsCli;
 use qemu_cca_artifacts::QemuCcaArtifactsCli;
 use restore_packages::RestorePackagesCli;
@@ -15,6 +16,7 @@ pub mod build_reproducible;
 pub mod cca_tests;
 pub mod checkin_gates;
 pub mod custom_vmfirmwareigvm_dll;
+pub mod fvp_cca_incubator_probe;
 pub mod kvm_cca_tests;
 pub mod openvmm_source_release;
 pub mod qemu_cca_artifacts;
@@ -54,6 +56,9 @@ pub enum OpenvmmPipelines {
 
     /// Build and stage the typed QEMU CCA platform artifacts
     QemuCcaArtifacts(QemuCcaArtifactsCli),
+
+    /// Build and run the FVP CCA incubator platform probe
+    FvpCcaIncubatorProbe(FvpCcaIncubatorProbeCli),
 }
 
 #[derive(clap::Subcommand)]
@@ -97,6 +102,7 @@ impl IntoPipeline for OpenvmmPipelines {
             OpenvmmPipelines::CcaTests(cmd) => cmd.into_pipeline(pipeline_hint),
             OpenvmmPipelines::KvmCcaTests(cmd) => cmd.into_pipeline(pipeline_hint),
             OpenvmmPipelines::QemuCcaArtifacts(cmd) => cmd.into_pipeline(pipeline_hint),
+            OpenvmmPipelines::FvpCcaIncubatorProbe(cmd) => cmd.into_pipeline(pipeline_hint),
         }
     }
 }

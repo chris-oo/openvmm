@@ -10,6 +10,7 @@ pub struct CcaQemuHostRootfsBuildParams {
     pub openvmm_root: PathBuf,
     pub source_rootfs: ReadVar<PathBuf>,
     pub output_root: PathBuf,
+    pub init_script: Option<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -69,11 +70,14 @@ impl FlowNode for Node {
                         script.display()
                     );
                     let output_root = &params.output_root;
-                    flowey::shell_cmd!(
+                    let mut command = flowey::shell_cmd!(
                         rt,
                         "{script} --source-rootfs {source_rootfs} --output-root {output_root}"
-                    )
-                    .run()?;
+                    );
+                    if let Some(init_script) = &params.init_script {
+                        command = command.arg("--init-script").arg(init_script);
+                    }
+                    command.run()?;
 
                     let artifact = CcaQemuHostRootfsOutput {
                         image: params.output_root.join("host-rootfs.ext4"),

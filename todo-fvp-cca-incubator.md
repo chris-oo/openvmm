@@ -135,6 +135,40 @@ Do not make `QemuCca` accept FVP-specific fields or special cases.
 
 The probe must be completed before adding a production `FvpCca` backend.
 
+### Verified probe findings
+
+- [x] FVP accepts multiple comma-separated user-network mappings.
+- [x] Address-qualified mappings bind only to loopback:
+
+  ```text
+  127.0.0.1:<SSH_PORT>=22,127.0.0.1:<PIPETTE_PORT>=4919
+  ```
+
+- [x] The FVP user network uses `172.20.51.0/24`; the L1 received
+      `172.20.51.1` with gateway `172.20.51.254` through DHCP.
+- [x] Shrinkwrap supports terminal-specific host log files.
+- [x] The shared host kernel required built-in `CONFIG_SMC91X`; the packaged
+      rootfs contains no loadable kernel modules.
+- [x] The FVP-specific probe init mounted the `FM` 9p share, retained DHCP,
+      passed preflight, and emitted `PIPETTE READY`.
+- [x] The host probe client executed `/bin/true` through pipette and requested
+      L1 poweroff.
+- [x] FVP and the forwarded listeners exited after poweroff.
+- [x] Shrinkwrap left an idle Docker container after successful FVP exit; the
+      durable probe now labels, identifies, and removes that exact container.
+- [x] A forced client failure returned nonzero, wrote `status=failed`, and
+      removed the labeled container and FVP process.
+- [x] `cargo xflowey fvp-cca-incubator-probe --fvp-platform-root
+      target/cca-test` passes and emits the planned manifest, generated overlay,
+      FVP argv, status, terminal logs, and pipette command output.
+
+Remaining Phase 0 hardening:
+
+- [ ] Add explicit port-bind collision retry.
+- [ ] Add readiness-timeout, SIGINT, and SIGTERM failure-injection runs.
+- [ ] Add durable lease-state manifest transitions in addition to the stable
+      platform lock and Docker labels.
+
 ### Purpose
 
 Prove the missing runtime contracts independently of the normal VMM-test flow:

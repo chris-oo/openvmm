@@ -962,6 +962,7 @@ impl SimpleFlowNode for Node {
                                         openvmm_root: openvmm_root.clone(),
                                         source_rootfs: ReadVar::from_static(source_rootfs),
                                         output_root: test_content_dir.join("cca-qemu-host-rootfs"),
+                                        init_script: None,
                                     },
                                 output: v,
                             });

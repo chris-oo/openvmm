@@ -6688,6 +6688,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pipette_tcp_probe"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "pal_async",
+ "pipette_client",
+]
+
+[[package]]
 name = "pkcs1"
 version = "0.8.0-rc.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

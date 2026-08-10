@@ -115,6 +115,7 @@ impl SimpleFlowNode for Node {
                 openvmm_root: openvmm_root.clone(),
                 source_rootfs,
                 output_root: output_root.join("host-rootfs"),
+                init_script: None,
             },
             output: v,
         });

@@ -48,6 +48,7 @@ members = [
   # in-guest test bins
   "guest_test_uefi",
   "petri/pipette",
+  "petri/pipette_tcp_probe",
   # tools
   "petri/incubator",
   "petri/make_imc_hive",
