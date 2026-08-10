@@ -141,12 +141,20 @@ Each row in the mapping table follows:
 - Guide paths are relative to `Guide/src/`
 - Multiple Guide pages for one code path: comma-separated
 - Use glob-style `*` in code paths for crate families (e.g., `nvme*/`)
+---
 
 ## Code-to-Guide Mapping
 
 | Code path | Guide page |
-| --- | --- |
+|-----------|------------|
 | `openvmm/openvmm_build_info/` | `reference/openvmm/management/cli.md` |
+| `build_support/cca/` | `dev_guide/tests/vmm/qemu_cca.md` |
+| `petri/incubator/` | `dev_guide/tests/vmm/qemu_cca.md` |
+| `flowey/flowey_hvlite/src/pipelines/vmm_tests_run.rs` | `dev_guide/tests/vmm/qemu_cca.md` |
+| `flowey/flowey_lib_hvlite/src/build_cca_qemu_firmware.rs` | `dev_guide/tests/vmm/qemu_cca.md` |
+| `flowey/flowey_lib_hvlite/src/build_cca_qemu_host_rootfs.rs` | `dev_guide/tests/vmm/qemu_cca.md` |
+| `flowey/flowey_lib_hvlite/src/_jobs/local_build_and_run_nextest_vmm_tests.rs` | `dev_guide/tests/vmm/qemu_cca.md` |
+| `vmm_tests/vmm_tests/tests/tests/aarch64_exclusive.rs` | `dev_guide/tests/vmm/qemu_cca.md` |
 
 ## What to Flag
 
@@ -155,3 +163,5 @@ Each row in the mapping table follows:
   update `reference/openvmm/management/cli.md`, and
   `dev_guide/contrib/openvmm_packaging.md` when the packager-facing contract
   changes.
+- QEMU CCA prerequisites, profile names, artifact locations, runner flags, or
+  test filters changed → update `dev_guide/tests/vmm/qemu_cca.md`.
