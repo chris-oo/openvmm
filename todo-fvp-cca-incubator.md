@@ -164,10 +164,12 @@ The probe must be completed before adding a production `FvpCca` backend.
 
 Remaining Phase 0 hardening:
 
-- [ ] Add explicit port-bind collision retry.
-- [ ] Add readiness-timeout, SIGINT, and SIGTERM failure-injection runs.
-- [ ] Add durable lease-state manifest transitions in addition to the stable
-      platform lock and Docker labels.
+- [x] Add explicit port-bind collision retry.
+- [x] Add readiness-timeout and SIGTERM failure-injection runs.
+- [ ] Add a SIGINT failure-injection run.
+- [x] Add durable `reserved`, `container-started`, and `cleanup` lease-state
+      manifest transitions in addition to the stable platform lock and Docker
+      labels.
 
 ### Purpose
 

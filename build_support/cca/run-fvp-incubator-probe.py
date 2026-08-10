@@ -8,6 +8,7 @@
 import argparse
 import fcntl
 import hashlib
+import json
 import os
 import shlex
 import shutil
@@ -15,12 +16,18 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
 
 SHRINKWRAP_IMAGE = "shrinkwraptool/base-slim:2026.9.0.dev0"
 PIPETTE_PORT = 0x1337
+PORT_COLLISION_EXIT = 75
+
+
+class PortCollision(RuntimeError):
+    """The selected FVP host-forward port was claimed by another process."""
 
 
 def regular_file(path: Path, label: str) -> Path:
@@ -75,10 +82,13 @@ def wait_for_marker(path: Path, marker: str, process: subprocess.Popen, timeout:
 
 
 def assert_loopback_listener(port: int) -> None:
-    output = subprocess.check_output(["ss", "-ltn"], text=True)
+    output = subprocess.check_output(["ss", "-ltnp"], text=True)
     expected = f"127.0.0.1:{port}"
-    if expected not in output:
-        raise RuntimeError(f"pipette listener is not loopback-only: {expected}")
+    matching = [line for line in output.splitlines() if expected in line]
+    if not matching:
+        raise PortCollision(f"FVP did not bind the pipette port: {expected}")
+    if not any("FVP_Base" in line for line in matching):
+        raise PortCollision(f"pipette port is owned by another process: {expected}")
 
 
 def sha256(path: Path) -> str:
@@ -89,6 +99,32 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def atomic_write(path: Path, contents: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w", dir=path.parent, prefix=f".{path.name}.", delete=False
+    ) as stream:
+        temporary = Path(stream.name)
+        stream.write(contents)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+    directory_fd = os.open(path.parent, os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def remove_durable(path: Path) -> None:
+    path.unlink(missing_ok=True)
+    directory_fd = os.open(path.parent, os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--platform-root", required=True, type=Path)
@@ -97,7 +133,35 @@ def main() -> int:
     parser.add_argument("--host-rootfs", required=True, type=Path)
     parser.add_argument("--share-dir", required=True, type=Path)
     parser.add_argument("--pipette-probe", required=True, type=Path)
+    parser.add_argument("--readiness-timeout", type=int, default=300)
+    parser.add_argument("--ready-marker", default="PIPETTE READY")
+    parser.add_argument("--launch-only", action="store_true")
+    parser.add_argument("--endpoint-file", type=Path)
+    parser.add_argument("--session-timeout", type=int, default=1800)
+    parser.add_argument("--lock-timeout", type=int)
+    parser.add_argument("--guest-pipette-path", default="/share/pipette")
+    parser.add_argument("--consoles", default="host,edk2,rmm")
+    parser.add_argument("--primary-console", default="host")
+    parser.add_argument("--internal-attempt", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+
+    if not args.internal_attempt:
+        environment = os.environ.copy()
+        for attempt in range(1, 4):
+            result = subprocess.run(
+                [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:], "--internal-attempt"],
+                env=environment,
+                check=False,
+            )
+            if result.returncode != PORT_COLLISION_EXIT:
+                return result.returncode
+            print(
+                f"warning: FVP port collision on attempt {attempt}; retrying",
+                file=sys.stderr,
+            )
+            environment.pop("OPENVMM_FVP_PROBE_PIPETTE_PORT", None)
+        raise RuntimeError("FVP port forwarding collided on all three attempts")
+    lock_timeout = args.lock_timeout or args.session_timeout * 8
 
     platform_root = directory(args.platform_root, "FVP platform root")
     output_root = args.output_root.resolve()
@@ -134,8 +198,9 @@ def main() -> int:
     status_path.write_text("running\n")
 
     lock_path = platform_root / ".openvmm-fvp-cca.lock"
+    lease_path = platform_root / ".openvmm-fvp-cca-lease.json"
     with lock_path.open("w") as lock:
-        lock_deadline = time.monotonic() + 60
+        lock_deadline = time.monotonic() + lock_timeout
         while True:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -154,13 +219,40 @@ def main() -> int:
         if docker_containers(platform_label):
             status_path.write_text("failed\n")
             raise RuntimeError("stale FVP CCA containers could not be removed")
+        remove_durable(lease_path)
 
         run_id = uuid.uuid4().hex
         run_label = f"openvmm.fvp-cca-run={run_id}"
+        process_start = Path("/proc/self/stat").read_text().split()[21]
+
+        def write_lease(state: str, container_id: str | None = None) -> None:
+            atomic_write(
+                lease_path,
+                json.dumps(
+                    {
+                        "state": state,
+                        "run_id": run_id,
+                        "owner_pid": os.getpid(),
+                        "owner_start": process_start,
+                        "platform_root": str(platform_root),
+                        "platform_hash": platform_hash,
+                        "container_id": container_id,
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+            )
+
+        write_lease("reserved")
         ssh_reservation = reserve_port()
-        pipette_reservation = reserve_port()
+        forced_pipette_port = os.environ.get("OPENVMM_FVP_PROBE_PIPETTE_PORT")
+        pipette_reservation = None if forced_pipette_port else reserve_port()
         ssh_port = ssh_reservation.getsockname()[1]
-        pipette_port = pipette_reservation.getsockname()[1]
+        pipette_port = (
+            int(forced_pipette_port)
+            if forced_pipette_port
+            else pipette_reservation.getsockname()[1]
+        )
         generated_overlay = output_root / "probe-overlay.yaml"
         generated_overlay.write_text(
             f"""%YAML 1.2
@@ -244,7 +336,8 @@ run:
             )
 
             ssh_reservation.close()
-            pipette_reservation.close()
+            if pipette_reservation is not None:
+                pipette_reservation.close()
             process = subprocess.Popen(
                 script_command,
                 cwd=shrinkwrap_root,
@@ -265,8 +358,14 @@ run:
                 )
             container = next(iter(containers))
             (output_root / "container-id.txt").write_text(container + "\n")
+            write_lease("container-started", container)
 
-            wait_for_marker(logs / "host.log", "PIPETTE READY", process, 300)
+            wait_for_marker(
+                logs / "host.log",
+                args.ready_marker,
+                process,
+                args.readiness_timeout,
+            )
             assert_loopback_listener(pipette_port)
             subprocess.run(
                 [
@@ -313,6 +412,10 @@ run:
             status_path.write_text("failed\n")
             raise
         finally:
+            write_lease(
+                "cleanup",
+                next(iter(containers)) if len(containers) == 1 else None,
+            )
             signal.signal(signal.SIGINT, old_int)
             signal.signal(signal.SIGTERM, old_term)
             if process is not None and process.poll() is None:
@@ -323,7 +426,8 @@ run:
                     os.killpg(process.pid, signal.SIGKILL)
                     process.wait(timeout=5)
             ssh_reservation.close()
-            pipette_reservation.close()
+            if pipette_reservation is not None:
+                pipette_reservation.close()
             containers |= docker_containers(run_label)
             for container in containers:
                 stop_container(container)
@@ -333,6 +437,7 @@ run:
                 raise RuntimeError(
                     f"FVP probe containers remain after cleanup: {sorted(remaining)}"
                 )
+            remove_durable(lease_path)
         if not succeeded:
             status_path.write_text("failed\n")
             raise RuntimeError("FVP CCA probe did not complete")
@@ -343,6 +448,9 @@ run:
 if __name__ == "__main__":
     try:
         sys.exit(main())
+    except PortCollision as error:
+        print(f"port collision: {error}", file=sys.stderr)
+        sys.exit(PORT_COLLISION_EXIT)
     except Exception as error:
         print(f"error: {error}", file=sys.stderr)
         sys.exit(1)
