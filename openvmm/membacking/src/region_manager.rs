@@ -25,6 +25,7 @@ use mesh::rpc::RpcSend;
 use pal_async::task::Spawn;
 use std::cmp::Ordering;
 use std::sync::Arc;
+use std::time::Instant;
 use thiserror::Error;
 use vmcore::local_only::LocalOnly;
 
@@ -380,7 +381,14 @@ impl RegionManagerTask {
     ) -> anyhow::Result<DmaMapperId> {
         // Create a VaMapper if the target needs host VAs for IOMMU programming.
         let va_mapper = if needs_va {
-            let mapper = self.inner.mapping_manager.new_mapper(true).await?;
+            let va_mapper_start = Instant::now();
+            let mapper = self.inner.mapping_manager.new_mapper(true).await;
+            tracing::info!(
+                duration = ?va_mapper_start.elapsed(),
+                success = mapper.is_ok(),
+                "DMA mapper eager VA setup complete"
+            );
+            let mapper = mapper?;
             assert!(mapper.is_eager(), "DMA mapper requires an eager VaMapper");
             Some(mapper)
         } else {
@@ -398,22 +406,42 @@ impl RegionManagerTask {
 
         // Replay existing active sub-mappings so the new IOMMU consumer
         // gets the current state.
+        let replay_start = Instant::now();
+        let mut replay_count = 0usize;
         for region in &self.regions {
             if region.is_active {
                 for mapping in &region.mappings {
                     let range = range_within(region.params.range, mapping.params.range_in_region);
                     let writable = mapping.params.writable && region.map_params.unwrap().writable;
-                    mapper.map_dma(DmaMapRequest {
+                    let result = mapper.map_dma(DmaMapRequest {
                         range,
                         host_va: None,
                         mappable: &mapping.params.mappable,
                         file_offset: mapping.params.file_offset,
                         writable,
                         mapping_type: region.params.mapping_type,
-                    })?;
+                    });
+                    if let Err(err) = result {
+                        tracing::info!(
+                            mapper_id = id.0,
+                            replay_count,
+                            duration = ?replay_start.elapsed(),
+                            success = false,
+                            "DMA mapper replay complete"
+                        );
+                        return Err(err);
+                    }
+                    replay_count += 1;
                 }
             }
         }
+        tracing::info!(
+            mapper_id = id.0,
+            replay_count,
+            duration = ?replay_start.elapsed(),
+            success = true,
+            "DMA mapper replay complete"
+        );
 
         self.inner.dma_mappers.push(mapper);
         Ok(id)

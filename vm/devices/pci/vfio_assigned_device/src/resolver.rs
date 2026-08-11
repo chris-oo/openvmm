@@ -16,6 +16,7 @@ use pci_resources::ResolvePciDeviceHandleParams;
 use pci_resources::ResolvedPciDevice;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use vfio_assigned_device_resources::VfioCdevDeviceHandle;
 use vfio_assigned_device_resources::VfioDeviceHandle;
 use vm_resource::AsyncResolveResource;
@@ -83,11 +84,15 @@ impl AsyncResolveResource<PciDeviceHandleKind, VfioDeviceHandle> for VfioDeviceR
 
         // Ask the container manager to prepare (or reuse) a container and
         // group for this device.
-        let binding = self
-            .client
-            .prepare_device(pci_id.clone(), group)
-            .await
-            .context("VFIO container manager failed")?;
+        let prepare_start = Instant::now();
+        let binding = self.client.prepare_device(pci_id.clone(), group).await;
+        tracing::info!(
+            pci_id = pci_id.as_str(),
+            duration = ?prepare_start.elapsed(),
+            success = binding.is_ok(),
+            "VFIO container preparation complete"
+        );
+        let binding = binding.context("VFIO container manager failed")?;
 
         let memory_mapper = input
             .shared_mem_mapper
@@ -262,17 +267,25 @@ impl AsyncResolveResource<PciDeviceHandleKind, VfioCdevDeviceHandle> for VfioCde
             "opening VFIO cdev device with iommufd"
         );
 
-        let mut resp = self
+        let prepare_start = Instant::now();
+        let resp = self
             .client
             .prepare_device(crate::manager::CdevPrepareRequest {
                 pci_id: pci_id.clone(),
                 cdev,
                 iommufd,
-                iommu_id,
+                iommu_id: iommu_id.clone(),
                 smmu_id: nesting_entry.as_ref().map(|e| e.smmu_id),
             })
-            .await
-            .context("VFIO cdev manager failed")?;
+            .await;
+        tracing::info!(
+            pci_id = pci_id.as_str(),
+            iommu_id,
+            duration = ?prepare_start.elapsed(),
+            success = resp.is_ok(),
+            "VFIO cdev preparation complete"
+        );
+        let mut resp = resp.context("VFIO cdev manager failed")?;
 
         // If the device is nested, wire the manager's iommufd objects into
         // the emulated SMMU: finalize host-derived parameters and register
