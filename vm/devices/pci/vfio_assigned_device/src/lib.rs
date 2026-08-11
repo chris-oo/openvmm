@@ -41,6 +41,7 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 use std::os::fd::AsFd;
 use std::os::unix::fs::FileExt;
+use std::time::Instant;
 use vfio_assigned_device_resources::BarAddressConfig;
 use vmcore::device_state::ChangeDeviceState;
 use vmcore::save_restore::RestoreError;
@@ -285,10 +286,18 @@ impl VfioAssignedPciDevice {
         memory_mapper: &dyn MemoryMapper,
         bar_addresses: [BarAddressConfig; 6],
     ) -> anyhow::Result<Self> {
+        let open_start = Instant::now();
         let vfio_device = binding
             .group()
             .open_device(&pci_id)
-            .with_context(|| format!("failed to open VFIO device {pci_id}"))?;
+            .with_context(|| format!("failed to open VFIO device {pci_id}"));
+        tracing::info!(
+            pci_id = pci_id.as_str(),
+            duration = ?open_start.elapsed(),
+            success = vfio_device.is_ok(),
+            "VFIO device open complete"
+        );
+        let vfio_device = vfio_device?;
 
         Self::from_device(
             vfio_device,
@@ -333,9 +342,18 @@ impl VfioAssignedPciDevice {
         memory_mapper: &dyn MemoryMapper,
         bar_addresses: [BarAddressConfig; 6],
     ) -> anyhow::Result<Self> {
+        let init_start = Instant::now();
+        let config_region_start = Instant::now();
         let config_info = vfio_device
             .region_info(vfio_bindings::bindings::vfio::VFIO_PCI_CONFIG_REGION_INDEX)
-            .context("failed to get VFIO config region info")?;
+            .context("failed to get VFIO config region info");
+        tracing::info!(
+            pci_id = pci_id.as_str(),
+            duration = ?config_region_start.elapsed(),
+            success = config_info.is_ok(),
+            "VFIO config region query complete"
+        );
+        let config_info = config_info?;
 
         let vfio_device = VfioPciDevice {
             device: vfio_device,
@@ -356,7 +374,16 @@ impl VfioAssignedPciDevice {
         while processed < 6 {
             let i = processed;
             processed += 1;
-            let Ok(info) = vfio_device.device.region_info(i as u32) else {
+            let region_info_start = Instant::now();
+            let info = vfio_device.device.region_info(i as u32);
+            tracing::info!(
+                pci_id = pci_id.as_str(),
+                bar = i,
+                duration = ?region_info_start.elapsed(),
+                success = info.is_ok(),
+                "VFIO BAR region query complete"
+            );
+            let Ok(info) = info else {
                 continue;
             };
             if info.size == 0 {
@@ -364,10 +391,19 @@ impl VfioAssignedPciDevice {
             }
 
             let mut flags = 0;
-            vfio_device.read_config(
+            let config_read_start = Instant::now();
+            let config_read = vfio_device.read_config(
                 HeaderType00::BAR0.0 + (i as u16) * 4,
                 ByteEnabledDwordRead::with_all_bytes_enabled(&mut flags),
-            )?;
+            );
+            tracing::info!(
+                pci_id = pci_id.as_str(),
+                bar = i,
+                duration = ?config_read_start.elapsed(),
+                success = config_read.is_ok(),
+                "VFIO BAR config read complete"
+            );
+            config_read?;
             flags &= 0xf;
             bar_flags[i] = flags;
             let encoded = cfg_space::BarEncodingBits::from(bar_flags[i]);
@@ -399,28 +435,47 @@ impl VfioAssignedPciDevice {
             });
 
             bar_mmio_controls[i] = Some(register_mmio.new_io_region(&format!("bar{i}"), info.size));
-            bar_mmap_areas[i] = vfio_device
+            let mmap_query_start = Instant::now();
+            let mmap_areas = vfio_device
                 .device
                 .region_mmap_areas(i as u32)
-                .with_context(|| format!("failed to query VFIO mmap areas for BAR {i}"))?;
+                .with_context(|| format!("failed to query VFIO mmap areas for BAR {i}"));
+            tracing::info!(
+                pci_id = pci_id.as_str(),
+                bar = i,
+                duration = ?mmap_query_start.elapsed(),
+                success = mmap_areas.is_ok(),
+                "VFIO BAR mmap query complete"
+            );
+            bar_mmap_areas[i] = mmap_areas?;
         }
 
         // Walk both the standard and extended PCI capability chains in a
         // single pass. This discovers MSI-X (for emulation) and PM (for
         // BAR unmap on D-state transitions), and builds the config patch
         // table that hides capabilities the guest shouldn't see.
+        let capability_start = Instant::now();
         let caps = discover_capabilities(&vfio_device, msi_target);
+        tracing::info!(
+            pci_id = pci_id.as_str(),
+            duration = ?capability_start.elapsed(),
+            "VFIO capability discovery complete"
+        );
         let msix = caps.msix;
         let pm_csr_offset = caps.pm_csr_offset;
         let config_patches = caps.config_patches;
 
         // Cache whether the device supports VFIO_DEVICE_RESET so we can skip
         // the ioctl on every VM reset for devices that don't support it.
-        let supports_reset = vfio_device
-            .device
-            .info()
-            .map(|info| info.flags.reset())
-            .unwrap_or(false);
+        let device_info_start = Instant::now();
+        let device_info = vfio_device.device.info();
+        tracing::info!(
+            pci_id = pci_id.as_str(),
+            duration = ?device_info_start.elapsed(),
+            success = device_info.is_ok(),
+            "VFIO device info query complete"
+        );
+        let supports_reset = device_info.map(|info| info.flags.reset()).unwrap_or(false);
 
         // If the device has MSI-X, remove the table and PBA regions from
         // the mmap areas so they remain trap-and-emulate.
@@ -468,12 +523,22 @@ impl VfioAssignedPciDevice {
             };
             for &area in areas {
                 let name = format!("vfio-{pci_id}-bar{i}-{area}");
-                let (memory, mapped_region) = memory_mapper
-                    .new_region(area.len() as usize, name)
-                    .with_context(|| {
+                let new_region_start = Instant::now();
+                let new_region = memory_mapper.new_region(area.len() as usize, name);
+                tracing::info!(
+                    pci_id = pci_id.as_str(),
+                    bar = i,
+                    area = %area,
+                    duration = ?new_region_start.elapsed(),
+                    success = new_region.is_ok(),
+                    "VFIO BAR memory region creation complete"
+                );
+                let (memory, mapped_region) = new_region.with_context(|| {
                     format!("failed to create BAR {i} direct mapping region for {pci_id}")
                 })?;
-                mapped_region
+
+                let backing_map_start = Instant::now();
+                let backing_map = mapped_region
                     .map(
                         0,
                         &vfio_device.device,
@@ -486,7 +551,16 @@ impl VfioAssignedPciDevice {
                             "failed to map VFIO BAR {i} region at offset {:#x}",
                             area.start()
                         )
-                    })?;
+                    });
+                tracing::info!(
+                    pci_id = pci_id.as_str(),
+                    bar = i,
+                    area = %area,
+                    duration = ?backing_map_start.elapsed(),
+                    success = backing_map.is_ok(),
+                    "VFIO BAR backing map complete"
+                );
+                backing_map?;
                 bar_direct_maps.push(BarDirectMap {
                     memory,
                     bar_index: i as u8,
@@ -540,6 +614,7 @@ impl VfioAssignedPciDevice {
             ?bar_masks,
             has_msix = msix.is_some(),
             supports_reset,
+            duration = ?init_start.elapsed(),
             "VFIO assigned PCI device initialized"
         );
 
@@ -617,6 +692,7 @@ impl VfioAssignedPciDevice {
     /// creation by requesting the backing event. Passes the resulting
     /// events to VFIO so the physical device signals them on interrupt.
     fn msix_enable(&mut self) -> anyhow::Result<()> {
+        let total_start = Instant::now();
         let msix = self.msix.as_ref().expect("msix must be present");
         let count = msix.vector_count;
 
@@ -626,20 +702,36 @@ impl VfioAssignedPciDevice {
             .map(|i| msix.emulator.interrupt(i).expect("vector in range"))
             .collect();
 
-        let events: Vec<_> = interrupts
-            .iter()
-            .map(|int| int.event())
-            .collect::<Option<Vec<_>>>()
-            .context("failed to allocate irqfd routes for MSI-X vectors")?;
+        let irqfd_start = Instant::now();
+        let events: Option<Vec<_>> = interrupts.iter().map(|int| int.event()).collect();
+        tracing::info!(
+            count,
+            pci_id = self.pci_id.as_str(),
+            duration = ?irqfd_start.elapsed(),
+            success = events.is_some(),
+            "VFIO MSI-X irqfd allocation complete"
+        );
+        let events = events.context("failed to allocate irqfd routes for MSI-X vectors")?;
 
-        self.vfio_device
+        let map_start = Instant::now();
+        let result = self
+            .vfio_device
             .device
             .map_msix(0, &events)
-            .context("VFIO map_msix failed")?;
+            .context("VFIO map_msix failed");
+        tracing::info!(
+            count,
+            pci_id = self.pci_id.as_str(),
+            duration = ?map_start.elapsed(),
+            success = result.is_ok(),
+            "VFIO MSI-X map ioctl complete"
+        );
+        result?;
 
         tracing::info!(
             count,
             pci_id = self.pci_id.as_str(),
+            duration = ?total_start.elapsed(),
             "MSI-X enabled: mapped vectors to irqfd routes"
         );
         Ok(())
@@ -710,7 +802,18 @@ impl VfioAssignedPciDevice {
             for dm in &mut self.bar_direct_maps {
                 if dm.bar_index == new.index {
                     let gpa = new.base_address + dm.bar_range.start();
-                    match dm.memory.map_to_guest(gpa, true) {
+                    let map_start = Instant::now();
+                    let result = dm.memory.map_to_guest(gpa, true);
+                    tracelimit::info_ratelimited!(
+                        bar = dm.bar_index,
+                        gpa,
+                        range = %dm.bar_range,
+                        pci_id = self.pci_id.as_str(),
+                        duration = ?map_start.elapsed(),
+                        success = result.is_ok(),
+                        "VFIO BAR guest mapping complete"
+                    );
+                    match result {
                         Ok(()) => {
                             dm.mapping = Some(MemoryRange::new(gpa..gpa + dm.bar_range.len()));
                         }

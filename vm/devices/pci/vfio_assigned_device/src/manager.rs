@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::os::unix::prelude::*;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Implements [`membacking::DmaTarget`] for VFIO type1 IOMMU containers.
 ///
@@ -36,6 +37,7 @@ impl membacking::DmaTarget for VfioType1DmaTarget {
         let vaddr = request.host_va;
         let range = request.range;
         let _span = tracing::info_span!("vfio map", %range).entered();
+        let start = Instant::now();
         // SAFETY: The caller (DmaMapper in membacking) guarantees that the
         // host VA is backed and stable via eager mapping + VaMapper lifetime.
         let result = unsafe {
@@ -43,6 +45,12 @@ impl membacking::DmaTarget for VfioType1DmaTarget {
                 .map_dma(range.start(), vaddr, range.len(), request.writable)
                 .context("VFIO DMA map failed")
         };
+        tracelimit::info_ratelimited!(
+            duration = ?start.elapsed(),
+            mapping_type = ?request.mapping_type,
+            success = result.is_ok(),
+            "VFIO DMA map ioctl complete"
+        );
         if let Err(e) = &result {
             if request.mapping_type == membacking::MappingType::Device {
                 // Device BAR memory may not be mappable into the IOMMU (e.g.,
@@ -209,7 +217,15 @@ impl VfioContainerManager {
             match rpc {
                 VfioManagerRpc::PrepareDevice(rpc) => {
                     rpc.handle_failable(async |(pci_id, group_file)| {
-                        self.prepare_device(pci_id, group_file).await
+                        let start = Instant::now();
+                        let result = self.prepare_device(pci_id.clone(), group_file).await;
+                        tracing::info!(
+                            pci_id,
+                            duration = ?start.elapsed(),
+                            success = result.is_ok(),
+                            "VFIO container prepare request complete"
+                        );
+                        result
                     })
                     .await
                 }
@@ -436,11 +452,20 @@ impl VfioContainerManager {
         // compatible with private RAM. The region manager replays all existing
         // active sub-mappings (guest RAM + any active device BARs) into this
         // container's IOMMU.
+        let dma_registration_start = Instant::now();
         let dma_handle = self
             .dma_mapper_client
             .add_dma_mapper(dma_target, false)
-            .await
-            .context("failed to register VFIO container with region manager")?;
+            .await;
+        tracing::info!(
+            pci_id,
+            group_id,
+            duration = ?dma_registration_start.elapsed(),
+            success = dma_handle.is_ok(),
+            "VFIO container DMA mapper registration complete"
+        );
+        let dma_handle =
+            dma_handle.context("failed to register VFIO container with region manager")?;
 
         tracing::info!(
             pci_id,
@@ -756,9 +781,16 @@ impl IoasManager {
                     cdev,
                     respond,
                 } => {
-                    respond
-                        .handle_failable(async |()| self.prepare_device(pci_id, cdev))
-                        .await
+                    let start = Instant::now();
+                    let result = self.prepare_device(pci_id.clone(), cdev);
+                    tracing::info!(
+                        pci_id,
+                        iommu_id = self.iommu_id,
+                        duration = ?start.elapsed(),
+                        success = result.is_ok(),
+                        "VFIO cdev IOAS prepare request complete"
+                    );
+                    respond.handle_failable(async |()| result).await
                 }
                 IoasManagerRpc::RemoveDevice(device_id) => {
                     self.remove_device(device_id);
@@ -943,6 +975,7 @@ impl VfioCdevManager {
         req: CdevPrepareRequest,
         respond: FailableRpc<(), CdevPrepareResponse>,
     ) {
+        let dispatch_start = Instant::now();
         let CdevPrepareRequest {
             pci_id,
             cdev,
@@ -956,6 +989,7 @@ impl VfioCdevManager {
                 let mut ioas_recv: mesh::Receiver<IoasManagerRpc> = mesh::Receiver::new();
                 let sender = ioas_recv.sender();
 
+                let manager_start = Instant::now();
                 let mgr = match IoasManager::new(
                     iommu_id.clone(),
                     iommufd,
@@ -968,10 +1002,24 @@ impl VfioCdevManager {
                 }) {
                     Ok(mgr) => mgr,
                     Err(e) => {
+                        tracing::info!(
+                            pci_id,
+                            iommu_id,
+                            duration = ?manager_start.elapsed(),
+                            success = false,
+                            "VFIO cdev IOAS manager initialization complete"
+                        );
                         respond.fail(e);
                         return;
                     }
                 };
+                tracing::info!(
+                    pci_id,
+                    iommu_id,
+                    duration = ?manager_start.elapsed(),
+                    success = true,
+                    "VFIO cdev IOAS manager initialization complete"
+                );
 
                 let task = self
                     .spawner
@@ -984,10 +1032,16 @@ impl VfioCdevManager {
         // Forward to the per-iommu manager task. The manager will
         // complete the respond half after the bind/attach ioctls.
         sender.send(IoasManagerRpc::PrepareDevice {
-            pci_id,
+            pci_id: pci_id.clone(),
             cdev,
             respond,
         });
+        tracing::info!(
+            pci_id,
+            iommu_id,
+            duration = ?dispatch_start.elapsed(),
+            "VFIO cdev prepare request dispatched"
+        );
     }
 
     pub(crate) fn client(&mut self) -> VfioCdevManagerClient {

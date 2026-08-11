@@ -13,6 +13,7 @@ use pal_async::task::Spawn as _;
 use pci_resources::ResolvePciDeviceHandleParams;
 use pci_resources::ResolvedPciDevice;
 use std::sync::Arc;
+use std::time::Instant;
 use vfio_assigned_device_resources::VfioCdevDeviceHandle;
 use vfio_assigned_device_resources::VfioDeviceHandle;
 use vm_resource::AsyncResolveResource;
@@ -84,11 +85,15 @@ impl AsyncResolveResource<PciDeviceHandleKind, VfioDeviceHandle> for VfioDeviceR
 
         // Ask the container manager to prepare (or reuse) a container and
         // group for this device.
-        let binding = self
-            .client
-            .prepare_device(pci_id.clone(), group)
-            .await
-            .context("VFIO container manager failed")?;
+        let prepare_start = Instant::now();
+        let binding = self.client.prepare_device(pci_id.clone(), group).await;
+        tracing::info!(
+            pci_id = pci_id.as_str(),
+            duration = ?prepare_start.elapsed(),
+            success = binding.is_ok(),
+            "VFIO container preparation complete"
+        );
+        let binding = binding.context("VFIO container manager failed")?;
 
         let memory_mapper = input
             .shared_mem_mapper
@@ -174,16 +179,24 @@ impl AsyncResolveResource<PciDeviceHandleKind, VfioCdevDeviceHandle> for VfioCde
 
         tracing::info!(pci_id, iommu_id, "opening VFIO cdev device with iommufd");
 
+        let prepare_start = Instant::now();
         let resp = self
             .client
             .prepare_device(crate::manager::CdevPrepareRequest {
                 pci_id: pci_id.clone(),
                 cdev,
                 iommufd,
-                iommu_id,
+                iommu_id: iommu_id.clone(),
             })
-            .await
-            .context("VFIO cdev manager failed")?;
+            .await;
+        tracing::info!(
+            pci_id = pci_id.as_str(),
+            iommu_id,
+            duration = ?prepare_start.elapsed(),
+            success = resp.is_ok(),
+            "VFIO cdev preparation complete"
+        );
+        let resp = resp.context("VFIO cdev manager failed")?;
 
         let cdev_binding = crate::manager::VfioCdevBinding::from_response(resp, pci_id.clone());
 

@@ -8,6 +8,7 @@
 
 use pci_resource_assignment::AssignmentError;
 use pci_resource_assignment::PciConfigAccess;
+use std::time::Instant;
 use vm_topology::pcie::PcieHostBridge;
 use vmotherboard::Chipset;
 
@@ -55,6 +56,7 @@ pub async fn assign_pci_resources_for_root_complexes(
     pcie_host_bridges: &[PcieHostBridge],
 ) -> Result<(), AssignmentError> {
     for hb in pcie_host_bridges {
+        let start = Instant::now();
         let params = pci_resource_assignment::AssignmentParams {
             start_bus: hb.start_bus,
             end_bus: hb.end_bus,
@@ -64,7 +66,16 @@ pub async fn assign_pci_resources_for_root_complexes(
         };
         let mut ecam =
             EcamConfigAccess::new(chipset, hb.ecam_range.start(), hb.start_bus, hb.end_bus);
-        pci_resource_assignment::assign_pci_resources(&mut ecam, &params).await?;
+        let result = pci_resource_assignment::assign_pci_resources(&mut ecam, &params).await;
+        tracing::info!(
+            start_bus = hb.start_bus,
+            end_bus = hb.end_bus,
+            ecam_base = hb.ecam_range.start(),
+            duration = ?start.elapsed(),
+            success = result.is_ok(),
+            "PCI resource assignment complete"
+        );
+        result?;
     }
     Ok(())
 }
