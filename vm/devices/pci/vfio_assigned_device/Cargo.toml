@@ -24,6 +24,7 @@ vmcore.workspace = true
 
 anyhow.workspace = true
 async-trait.workspace = true
+blocking.workspace = true
 parking_lot.workspace = true
 tracelimit.workspace = true
 tracing.workspace = true

@@ -159,6 +159,23 @@ This is intentionally a narrow experiment. It should allow the concurrent
 device futures to submit `VFIO_GROUP_GET_DEVICE_FD` calls to blocking worker
 threads without first restructuring all device initialization.
 
+### Experiment Implementation
+
+The narrow experiment now wraps only the legacy `Group::open_device` call in
+`blocking::unblock`. The closure owns and returns the VFIO binding, opened
+device, and PCI ID so the group and container remain alive throughout the
+operation. The cdev/iommufd path and the subsequent synchronous probing phase
+are unchanged.
+
+Tracing records:
+
+- time from submission until a blocking worker starts;
+- time spent inside `VFIO_GROUP_GET_DEVICE_FD`;
+- total time until the async caller observes completion.
+
+This allows the next run to distinguish blocking-pool queueing from kernel
+ioctl time and to show whether device opens overlap.
+
 Keep this behavior behind a temporary experimental switch so a test host can
 immediately return to the original serialized path. Parallel opens may exercise
 vfio-pci open/reset behavior concurrently across related GPU functions or

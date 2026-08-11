@@ -286,18 +286,35 @@ impl VfioAssignedPciDevice {
         memory_mapper: &dyn MemoryMapper,
         bar_addresses: [BarAddressConfig; 6],
     ) -> anyhow::Result<Self> {
-        let open_start = Instant::now();
-        let vfio_device = binding
-            .group()
-            .open_device(&pci_id)
-            .with_context(|| format!("failed to open VFIO device {pci_id}"));
+        let submitted = Instant::now();
+        let result = blocking::unblock(move || {
+            tracing::info!(
+                pci_id = pci_id.as_str(),
+                queue_duration = ?submitted.elapsed(),
+                "VFIO device open blocking worker started"
+            );
+
+            let open_start = Instant::now();
+            let vfio_device = binding
+                .group()
+                .open_device(&pci_id)
+                .with_context(|| format!("failed to open VFIO device {pci_id}"));
+            tracing::info!(
+                pci_id = pci_id.as_str(),
+                duration = ?open_start.elapsed(),
+                success = vfio_device.is_ok(),
+                "VFIO device open complete"
+            );
+
+            vfio_device.map(|vfio_device| (binding, vfio_device, pci_id))
+        })
+        .await;
         tracing::info!(
-            pci_id = pci_id.as_str(),
-            duration = ?open_start.elapsed(),
-            success = vfio_device.is_ok(),
-            "VFIO device open complete"
+            duration = ?submitted.elapsed(),
+            success = result.is_ok(),
+            "VFIO device open blocking operation complete"
         );
-        let vfio_device = vfio_device?;
+        let (binding, vfio_device, pci_id) = result?;
 
         Self::from_device(
             vfio_device,
