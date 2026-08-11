@@ -181,6 +181,7 @@ pub fn build_qemu_cca_command(
         .arg("virtio-net-pci,netdev=net0,romfile=");
     cmd.arg("-append").arg(format!(
         "nokaslr root=/dev/vda rw console=ttyAMA0 \
+             incubator.mount_tag=host incubator.network=qemu-static \
              incubator.pipette={guest_pipette_path} \
              incubator.preflight={guest_preflight_path}"
     ));
@@ -792,7 +793,9 @@ mod tests {
         );
         assert!(args.windows(2).any(|args| args == ["-d", "guest_errors"]));
         assert!(args.iter().any(|arg| {
-            arg.contains("incubator.pipette=/share/content/pipette")
+            arg.contains("incubator.mount_tag=host")
+                && arg.contains("incubator.network=qemu-static")
+                && arg.contains("incubator.pipette=/share/content/pipette")
                 && arg.contains("incubator.preflight=/share/content/kvm_cca_preflight")
         }));
         assert_eq!(

@@ -293,6 +293,9 @@ run:
             f"KERNEL={host_kernel}",
             "--rtvar",
             f"SHARE={share_dir}",
+            "--rtvar",
+            "CMDLINE=console=ttyAMA0 earlycon=pl011,0x1c090000 root=/dev/vda "
+            "ip=dhcp incubator.mount_tag=FM incubator.network=dhcp",
         ]
         environment = os.environ.copy()
         environment["VIRTUAL_ENV"] = str(shrinkwrap_root / "venv")

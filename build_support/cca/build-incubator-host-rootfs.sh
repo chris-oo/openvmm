@@ -5,7 +5,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-INIT_SCRIPT="$SCRIPT_DIR/qemu-host-init.sh"
+INIT_SCRIPT="$SCRIPT_DIR/incubator-host-init.sh"
 
 SOURCE_ROOTFS=
 OUTPUT_ROOT=
@@ -16,10 +16,9 @@ DEBUGFS="${DEBUGFS:-debugfs}"
 
 usage() {
     cat <<'EOF'
-Usage: build-qemu-host-rootfs.sh --source-rootfs PATH --output-root PATH [OPTIONS]
+Usage: build-incubator-host-rootfs.sh --source-rootfs PATH --output-root PATH [OPTIONS]
 
 Options:
-  --init-script PATH  init script to inject (default: qemu-host-init.sh)
   --size SIZE       output filesystem size (default: 1024M)
   --e2fsck PATH     e2fsck binary
   --resize2fs PATH  resize2fs binary
@@ -72,11 +71,6 @@ while [[ $# -gt 0 ]]; do
     --size)
         require_value "$@"
         SIZE=$2
-        shift 2
-        ;;
-    --init-script)
-        require_value "$@"
-        INIT_SCRIPT=$2
         shift 2
         ;;
     --e2fsck)
@@ -163,20 +157,20 @@ elif ((target_size < current_size)); then
     truncate --size "$SIZE" "$ROOTFS"
 fi
 
-cp "$INIT_SCRIPT" "$STAGE_ROOT/qemu-host-init.sh"
+cp "$INIT_SCRIPT" "$STAGE_ROOT/incubator-host-init.sh"
 (
     cd "$STAGE_ROOT"
     "$DEBUGFS" -w -R "rm /etc/init.d/S99kvm-cca-interactive-host" host-rootfs.ext4 \
         >/dev/null 2>&1 || true
     "$DEBUGFS" -w -R "rm /etc/init.d/S99qemu-cca-host" host-rootfs.ext4 \
         >/dev/null 2>&1 || true
-    "$DEBUGFS" -w -R "write qemu-host-init.sh /etc/init.d/S99qemu-cca-host" \
+    "$DEBUGFS" -w -R "write incubator-host-init.sh /etc/init.d/S99qemu-cca-host" \
         host-rootfs.ext4
     "$DEBUGFS" -w -R "set_inode_field /etc/init.d/S99qemu-cca-host mode 0100755" \
         host-rootfs.ext4
 )
 
-INJECTED_INIT="$STAGE_ROOT/injected-qemu-host-init.sh"
+INJECTED_INIT="$STAGE_ROOT/injected-incubator-host-init.sh"
 "$DEBUGFS" -R "dump /etc/init.d/S99qemu-cca-host $INJECTED_INIT" "$ROOTFS"
 cmp "$INIT_SCRIPT" "$INJECTED_INIT" ||
     fail "injected QEMU CCA host init script does not match its source"
@@ -195,6 +189,7 @@ cat >"$STAGE_ROOT/manifest.txt" <<EOF
 source_rootfs=$SOURCE_ROOTFS
 source_rootfs_sha256=$(sha256sum "$SOURCE_ROOTFS" | awk '{print $1}')
 init_script_sha256=$(sha256sum "$INIT_SCRIPT" | awk '{print $1}')
+init_contract=1
 rootfs_size=$SIZE
 host_rootfs_sha256=$(sha256sum "$ROOTFS" | awk '{print $1}')
 EOF

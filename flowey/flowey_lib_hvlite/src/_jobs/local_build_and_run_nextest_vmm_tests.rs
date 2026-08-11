@@ -118,7 +118,7 @@ impl SimpleFlowNode for Node {
         ctx.import::<crate::build_incubator::Node>();
         ctx.import::<crate::build_cca_linux_kernels::Node>();
         ctx.import::<crate::build_cca_qemu_firmware::Node>();
-        ctx.import::<crate::build_cca_qemu_host_rootfs::Node>();
+        ctx.import::<crate::build_cca_incubator_host_rootfs::Node>();
         ctx.import::<crate::build_kvm_cca_preflight::Node>();
         ctx.import::<crate::build_nextest_vmm_tests::Node>();
         ctx.import::<crate::build_openhcl_igvm_from_recipe::Node>();
@@ -956,13 +956,12 @@ impl SimpleFlowNode for Node {
                             )
                         };
                         let rootfs_output =
-                            ctx.reqv(|v| crate::build_cca_qemu_host_rootfs::Request {
+                            ctx.reqv(|v| crate::build_cca_incubator_host_rootfs::Request {
                                 params:
-                                    crate::build_cca_qemu_host_rootfs::CcaQemuHostRootfsBuildParams {
+                                    crate::build_cca_incubator_host_rootfs::CcaIncubatorHostRootfsBuildParams {
                                         openvmm_root: openvmm_root.clone(),
                                         source_rootfs: ReadVar::from_static(source_rootfs),
                                         output_root: test_content_dir.join("cca-qemu-host-rootfs"),
-                                        init_script: None,
                                     },
                                 output: v,
                             });

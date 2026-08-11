@@ -152,7 +152,7 @@ Each row in the mapping table follows:
 | `petri/incubator/` | `dev_guide/tests/vmm/qemu_cca.md` |
 | `flowey/flowey_hvlite/src/pipelines/vmm_tests_run.rs` | `dev_guide/tests/vmm/qemu_cca.md` |
 | `flowey/flowey_lib_hvlite/src/build_cca_qemu_firmware.rs` | `dev_guide/tests/vmm/qemu_cca.md` |
-| `flowey/flowey_lib_hvlite/src/build_cca_qemu_host_rootfs.rs` | `dev_guide/tests/vmm/qemu_cca.md` |
+| `flowey/flowey_lib_hvlite/src/build_cca_incubator_host_rootfs.rs` | `dev_guide/tests/vmm/qemu_cca.md` |
 | `flowey/flowey_lib_hvlite/src/_jobs/local_build_and_run_nextest_vmm_tests.rs` | `dev_guide/tests/vmm/qemu_cca.md` |
 | `vmm_tests/vmm_tests/tests/tests/aarch64_exclusive.rs` | `dev_guide/tests/vmm/qemu_cca.md` |
 

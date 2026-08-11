@@ -287,7 +287,7 @@ proceeding.
 - [x] Add typed Flowey nodes:
   - `resolve_cca_qemu`;
   - `build_cca_qemu_firmware`; and
-  - `build_cca_qemu_host_rootfs`.
+  - `build_cca_incubator_host_rootfs`.
 - [x] Have the firmware Flowey node install/verify Docker, invoke the wrapper,
   and return the manifest and firmware artifacts. It must not expose or depend
   on container-local source paths.

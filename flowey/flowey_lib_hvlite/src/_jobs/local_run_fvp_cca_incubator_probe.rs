@@ -28,7 +28,7 @@ impl SimpleFlowNode for Node {
 
     fn imports(ctx: &mut ImportCtx<'_>) {
         ctx.import::<crate::build_cca_linux_kernels::Node>();
-        ctx.import::<crate::build_cca_qemu_host_rootfs::Node>();
+        ctx.import::<crate::build_cca_incubator_host_rootfs::Node>();
         ctx.import::<crate::build_kvm_cca_preflight::Node>();
         ctx.import::<crate::build_pipette::Node>();
         ctx.import::<crate::run_cargo_build::Node>();
@@ -93,12 +93,11 @@ impl SimpleFlowNode for Node {
             pre_build_deps: Vec::new(),
             output: v,
         });
-        let rootfs = ctx.reqv(|v| crate::build_cca_qemu_host_rootfs::Request {
-            params: crate::build_cca_qemu_host_rootfs::CcaQemuHostRootfsBuildParams {
+        let rootfs = ctx.reqv(|v| crate::build_cca_incubator_host_rootfs::Request {
+            params: crate::build_cca_incubator_host_rootfs::CcaIncubatorHostRootfsBuildParams {
                 openvmm_root: openvmm_root.clone(),
                 source_rootfs: ReadVar::from_static(platform_root.join("kvm-cca/rootfs.ext2")),
                 output_root: output_root.join("host-rootfs"),
-                init_script: Some(openvmm_root.join("build_support/cca/fvp-probe-host-init.sh")),
             },
             output: v,
         });

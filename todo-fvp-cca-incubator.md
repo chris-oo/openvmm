@@ -425,6 +425,18 @@ Phase 0 may use a disposable probe-specific init to discover the FVP network
 contract. Phase 1 is required before final Phase 0 acceptance and before the
 production incubator backend.
 
+### Phase 1 result
+
+- [x] QEMU and FVP use one `incubator-host-init.sh`.
+- [x] QEMU selects `mount_tag=host` and `network=qemu-static`.
+- [x] FVP selects `mount_tag=FM` and `network=dhcp` through Shrinkwrap
+      `CMDLINE`.
+- [x] Pipette and preflight paths remain typed `/share/...` arguments.
+- [x] The shared rootfs manifest records `init_contract=1`.
+- [x] Flowey exposes `build_cca_incubator_host_rootfs`.
+- [x] The durable FVP probe passes with the shared image.
+- [x] The normal nested QEMU CCA Realm test passes with the shared image.
+
 ### Init configuration
 
 - [ ] Rename QEMU-specific host init/build concepts where they become shared.
@@ -456,8 +468,8 @@ production incubator backend.
 
 ### Typed artifact
 
-- [ ] Generalize `build_cca_qemu_host_rootfs` into a shared CCA incubator
-      host-rootfs artifact, or add a thin FVP variant over the shared builder.
+- [x] Generalize `build_cca_qemu_host_rootfs` into the shared
+      `build_cca_incubator_host_rootfs` artifact.
 - [ ] Preserve deterministic injection, manifest hashes, per-output locking,
       managed-output checks, and atomic publication.
 - [ ] Record the init contract/version in the manifest.
