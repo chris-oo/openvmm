@@ -1,0 +1,13 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# Incubator profile: AArch64 FVP CCA host
+#
+# Shrinkwrap, the licensed FVP model, host kernel, and host rootfs are supplied
+# as local runtime artifacts.
+
+[incubator]
+type = "fvp-cca"
+consoles = ["host", "edk2", "rmm"]
+primary-console = "host"
+capabilities = ["cca"]

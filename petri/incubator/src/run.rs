@@ -279,6 +279,9 @@ fn run_once(config: &RuntimeConfig) -> anyhow::Result<AttemptResult> {
                     writable_rootfs,
                 )
             }
+            IncubatorBackend::FvpCca(_) => {
+                anyhow::bail!("FVP CCA incubator runtime support is not implemented")
+            }
         };
 
     if matches!(config.profile.incubator, IncubatorBackend::QemuTcg(_)) {

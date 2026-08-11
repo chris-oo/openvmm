@@ -118,6 +118,9 @@ fn main() -> anyhow::Result<()> {
                     .context("--rootfs or INCUBATOR_ROOTFS is required for QEMU CCA")?,
             ),
         ),
+        incubator::IncubatorBackend::FvpCca(_) => {
+            anyhow::bail!("FVP CCA incubator runtime support is not implemented")
+        }
     };
 
     tracing::info!(profile = %args.profile, "profile");
@@ -188,6 +191,7 @@ fn main() -> anyhow::Result<()> {
                 allocate_pty,
             })?
         }
+        incubator::IncubatorBackend::FvpCca(_) => unreachable!(),
     };
 
     tracing::info!(

@@ -26,6 +26,8 @@ pub enum IncubatorBackend {
     QemuTcg(QemuTcgConfig),
     /// QEMU Arm CCA emulation.
     QemuCca(QemuCcaConfig),
+    /// Arm FVP CCA emulation.
+    FvpCca(FvpCcaConfig),
 }
 
 impl IncubatorBackend {
@@ -33,7 +35,7 @@ impl IncubatorBackend {
     pub fn arch(&self) -> Arch {
         match self {
             IncubatorBackend::QemuTcg(config) => config.arch,
-            IncubatorBackend::QemuCca(_) => Arch::Aarch64,
+            IncubatorBackend::QemuCca(_) | IncubatorBackend::FvpCca(_) => Arch::Aarch64,
         }
     }
 }
@@ -217,6 +219,19 @@ pub enum QemuCcaExtraArg {
     },
 }
 
+/// Arm FVP CCA configuration parsed from the profile.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct FvpCcaConfig {
+    /// Ordered console names retained by the incubator.
+    pub consoles: Vec<String>,
+    /// Console monitored for pipette readiness.
+    pub primary_console: String,
+    /// Capabilities published after the CCA host reaches pipette readiness.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
 impl IncubatorProfile {
     /// Load a profile from a TOML file.
     pub fn from_file(path: &Path) -> anyhow::Result<Self> {
@@ -240,8 +255,54 @@ impl IncubatorProfile {
                 "QEMU CCA profiles do not yet support extra devices"
             );
         }
+        if let IncubatorBackend::FvpCca(config) = &self.incubator {
+            validate_fvp_cca(config)?;
+            anyhow::ensure!(
+                self.devices.is_empty(),
+                "FVP CCA profiles do not support extra devices"
+            );
+        }
         Ok(())
     }
+}
+
+fn validate_fvp_cca(config: &FvpCcaConfig) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !config.consoles.is_empty(),
+        "FVP CCA must configure at least one console"
+    );
+    let mut consoles = BTreeSet::new();
+    for console in &config.consoles {
+        anyhow::ensure!(
+            !console.is_empty()
+                && console
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+            "invalid FVP CCA console name: {console}"
+        );
+        anyhow::ensure!(
+            consoles.insert(console),
+            "duplicate FVP CCA console name: {console}"
+        );
+    }
+    anyhow::ensure!(
+        consoles.contains(&config.primary_console),
+        "FVP CCA primary console {} is not present in the console list",
+        config.primary_console
+    );
+
+    let mut capabilities = BTreeSet::new();
+    for capability in &config.capabilities {
+        anyhow::ensure!(
+            petri_artifacts_common::capabilities::is_known_name(capability),
+            "unknown FVP CCA capability: {capability}"
+        );
+        anyhow::ensure!(
+            capabilities.insert(capability),
+            "duplicate FVP CCA capability: {capability}"
+        );
+    }
+    Ok(())
 }
 
 fn validate_qemu_cca(config: &QemuCcaConfig) -> anyhow::Result<()> {
@@ -341,6 +402,36 @@ mod tests {
         assert_eq!(config.primary_console, "host");
         assert_eq!(config.consoles, ["host", "secure"]);
         assert_eq!(config.capabilities, ["cca"]);
+    }
+
+    #[test]
+    fn parses_fvp_cca_profile() {
+        let profile =
+            IncubatorProfile::from_toml(include_str!("../profiles/aarch64-fvp-cca.toml")).unwrap();
+
+        let IncubatorBackend::FvpCca(config) = profile.incubator else {
+            panic!("expected FVP CCA profile");
+        };
+        assert_eq!(config.primary_console, "host");
+        assert_eq!(config.consoles, ["host", "edk2", "rmm"]);
+        assert_eq!(config.capabilities, ["cca"]);
+    }
+
+    #[test]
+    fn rejects_machine_local_fvp_cca_field() {
+        let error = IncubatorProfile::from_toml(
+            r#"
+[incubator]
+type = "fvp-cca"
+consoles = ["host"]
+primary-console = "host"
+capabilities = ["cca"]
+model-path = "/opt/licensed/FVP"
+"#,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("unknown field"));
     }
 
     #[test]
