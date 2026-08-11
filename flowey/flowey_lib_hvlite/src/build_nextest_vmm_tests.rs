@@ -161,6 +161,7 @@ impl FlowNode for Node {
                         nextest_working_dir: None,
                         nextest_config_file: None,
                         run_ignored: false,
+                        test_threads: None,
                         extra_env: Some(extra_env),
                         pre_run_deps: ambient_deps,
                         results,

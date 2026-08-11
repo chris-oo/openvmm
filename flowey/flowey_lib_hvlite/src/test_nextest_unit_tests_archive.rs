@@ -61,6 +61,7 @@ impl FlowNode for Node {
                 nextest_working_dir: None,
                 nextest_config_file: None,
                 run_ignored: false,
+                test_threads: None,
                 // Prevent tests from silently skipping when optional
                 // dependencies (e.g., Windows SDK DLLs) are missing.
                 extra_env: Some(ReadVar::from_static(BTreeMap::from([(

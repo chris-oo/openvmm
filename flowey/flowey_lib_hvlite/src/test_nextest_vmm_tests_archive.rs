@@ -29,6 +29,8 @@ flowey_request! {
         pub nextest_bin: Option<ReadVar<PathBuf>>,
         /// Target for the tests to run on
         pub target: Option<ReadVar<target_lexicon::Triple>>,
+        /// Override the number of test threads.
+        pub test_threads: Option<usize>,
         /// Additional env vars set when executing the tests.
         pub extra_env: ReadVar<BTreeMap<String, String>>,
         /// Wait for specified side-effects to resolve before building / running
@@ -58,6 +60,7 @@ impl SimpleFlowNode for Node {
             nextest_config_file,
             nextest_bin,
             target,
+            test_threads,
             extra_env,
             pre_run_deps,
             results,
@@ -73,6 +76,7 @@ impl SimpleFlowNode for Node {
                 nextest_bin,
             },
             nextest_profile,
+            test_threads,
             nextest_filter_expr,
             nextest_working_dir,
             nextest_config_file,

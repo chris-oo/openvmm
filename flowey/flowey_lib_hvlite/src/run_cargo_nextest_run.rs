@@ -43,6 +43,8 @@ flowey_request! {
         pub nextest_config_file: Option<ReadVar<PathBuf>>,
         /// Whether to run ignored test
         pub run_ignored: bool,
+        /// Override the number of test threads.
+        pub test_threads: Option<usize>,
         /// Additional env vars set when executing the tests.
         pub extra_env: Option<ReadVar<BTreeMap<String, String>>>,
         /// Wait for specified side-effects to resolve before building / running any
@@ -81,6 +83,7 @@ impl FlowNode for Node {
             nextest_working_dir,
             nextest_config_file,
             run_ignored,
+            test_threads,
             pre_run_deps,
             results,
             extra_env,
@@ -118,6 +121,7 @@ impl FlowNode for Node {
                     with_rlimit_unlimited_core_size: true,
                     nextest_filter_expr,
                     run_ignored,
+                    test_threads,
                     pre_run_deps,
                     results,
                 },

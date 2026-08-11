@@ -25,8 +25,6 @@ const INCUBATOR_ENV_POLICY: &[&str] = &[
     "VMM_TESTS_CONTENT_DIR/p",
     "TEST_OUTPUT_PATH/p",
     "VMM_TEST_IMAGES/p",
-    "NEXTEST_WORKSPACE_ROOT/p",
-    "CARGO_MANIFEST_DIR/p",
     "CARGO_BIN_EXE_*/p",
     "NEXTEST_BIN_EXE_*/p",
 ];
@@ -41,6 +39,8 @@ pub enum IncubatorPlatform {
     QemuTcg,
     /// QEMU Arm CCA L1 host platform.
     QemuCca,
+    /// Arm FVP CCA L1 host platform.
+    FvpCca,
 }
 
 fn cargo_target_runner_env_var(target: &target_lexicon::Triple) -> String {
@@ -82,15 +82,14 @@ flowey_request! {
         pub firmware: Option<ReadVar<PathBuf>>,
         /// Path to the writable host rootfs image.
         pub rootfs: Option<ReadVar<PathBuf>>,
-        /// Path to the OpenVMM repo root. Must contain any repo-relative paths
-        /// referenced by the runner's environment (e.g. `NEXTEST_WORKSPACE_ROOT`,
-        /// `CARGO_MANIFEST_DIR`) so they fall under the computed incubator share
-        /// root and translate correctly into the guest.
-        pub repo_root: ReadVar<PathBuf>,
+        /// Root of the locally provisioned FVP CCA platform.
+        pub fvp_platform_root: Option<ReadVar<PathBuf>>,
+        /// Path to the FVP lifecycle launcher.
+        pub fvp_launcher: Option<ReadVar<PathBuf>>,
         /// Directory containing VMM test runtime artifacts and test outputs.
         pub test_content_dir: ReadVar<PathBuf>,
-        /// Additional host paths that must be visible in the incubator share.
-        pub extra_share_paths: Vec<ReadVar<PathBuf>>,
+        /// Staged files that must exist beneath the test content directory.
+        pub required_share_files: Vec<ReadVar<PathBuf>>,
         /// Additional environment variables used to discover path roots that
         /// must be visible in the incubator share.
         pub extra_env: Option<ReadVar<BTreeMap<String, String>>>,
@@ -121,9 +120,10 @@ impl SimpleFlowNode for Node {
             initrd,
             firmware,
             rootfs,
-            repo_root,
+            fvp_platform_root,
+            fvp_launcher,
             test_content_dir,
-            extra_share_paths,
+            required_share_files,
             extra_env,
             qemu_binary,
             target,
@@ -137,9 +137,10 @@ impl SimpleFlowNode for Node {
             let initrd = initrd.claim(ctx);
             let firmware = firmware.claim(ctx);
             let rootfs = rootfs.claim(ctx);
-            let repo_root = repo_root.claim(ctx);
+            let fvp_platform_root = fvp_platform_root.claim(ctx);
+            let fvp_launcher = fvp_launcher.claim(ctx);
             let test_content_dir = test_content_dir.claim(ctx);
-            let extra_share_paths = extra_share_paths.claim(ctx);
+            let required_share_files = required_share_files.claim(ctx);
             let extra_env = extra_env.claim(ctx);
             let qemu_binary = qemu_binary.claim(ctx);
             let nextest_env = nextest_env.claim(ctx);
@@ -151,25 +152,36 @@ impl SimpleFlowNode for Node {
                 let initrd = initrd.map(|v| rt.read(v).absolute()).transpose()?;
                 let firmware = firmware.map(|v| rt.read(v).absolute()).transpose()?;
                 let rootfs = rootfs.map(|v| rt.read(v).absolute()).transpose()?;
-                let repo_root = rt.read(repo_root).absolute()?;
+                let fvp_platform_root = fvp_platform_root
+                    .map(|v| rt.read(v).absolute())
+                    .transpose()?;
+                let fvp_launcher = fvp_launcher.map(|v| rt.read(v).absolute()).transpose()?;
                 let test_content_dir = rt.read(test_content_dir).absolute()?;
-                let extra_share_paths = rt
-                    .read(extra_share_paths)
+                let required_share_files = rt
+                    .read(required_share_files)
                     .into_iter()
-                    .map(|p| p.absolute().map_err(Into::into))
+                    .map(|path| path.absolute().map_err(Into::into))
                     .collect::<anyhow::Result<Vec<_>>>()?;
                 let extra_env = extra_env.map(|v| rt.read(v)).unwrap_or_default();
                 let qemu_binary = qemu_binary.map(|v| rt.read(v).absolute()).transpose()?;
 
-                let mut share_paths = vec![repo_root.as_path(), test_content_dir.as_path()];
-                share_paths.extend(extra_share_paths.iter().map(|p| p.as_path()));
                 let images_dir = extra_env.get("VMM_TEST_IMAGES").map(PathBuf::from);
                 if let Some(ref images_dir) = images_dir {
-                    share_paths.push(images_dir.as_path());
+                    anyhow::ensure!(
+                        images_dir.starts_with(&test_content_dir),
+                        "VMM test images must be staged under the test content directory"
+                    );
                 }
-                let share_root = common_ancestor(&share_paths)?;
-
-                let guest_test_content_dir = guest_path(&share_root, &test_content_dir)?;
+                for path in required_share_files {
+                    anyhow::ensure!(
+                        path.is_file() && path.starts_with(&test_content_dir),
+                        "required incubator share file is not staged under {}: {}",
+                        test_content_dir.display(),
+                        path.display()
+                    );
+                }
+                let share_root = test_content_dir.clone();
+                let guest_test_content_dir = "/share";
                 let output_dir = test_content_dir.join("test_results");
                 let tmp_dir = test_content_dir.join(NEXTEST_ARCHIVE_TMP_DIR);
                 fs_err::create_dir_all(&output_dir)?;
@@ -187,10 +199,12 @@ impl SimpleFlowNode for Node {
                     initrd: initrd.as_deref(),
                     firmware: firmware.as_deref(),
                     rootfs: rootfs.as_deref(),
+                    fvp_platform_root: fvp_platform_root.as_deref(),
+                    fvp_launcher: fvp_launcher.as_deref(),
                     share_root: &share_root,
                     output_dir: &output_dir,
                     guest_pipette: &format!("{guest_test_content_dir}/pipette"),
-                    guest_current_dir: &guest_test_content_dir,
+                    guest_current_dir: guest_test_content_dir,
                     qemu_binary: qemu_binary.as_deref(),
                     tmp_dir: &tmp_dir,
                 }));
@@ -213,6 +227,8 @@ struct IncubatorRunnerConfig<'a> {
     pub initrd: Option<&'a Path>,
     pub firmware: Option<&'a Path>,
     pub rootfs: Option<&'a Path>,
+    pub fvp_platform_root: Option<&'a Path>,
+    pub fvp_launcher: Option<&'a Path>,
     pub share_root: &'a Path,
     pub output_dir: &'a Path,
     pub guest_pipette: &'a str,
@@ -231,6 +247,8 @@ fn incubator_runner_env(config: IncubatorRunnerConfig<'_>) -> BTreeMap<String, S
         initrd,
         firmware,
         rootfs,
+        fvp_platform_root,
+        fvp_launcher,
         share_root,
         output_dir,
         guest_pipette,
@@ -273,6 +291,18 @@ fn incubator_runner_env(config: IncubatorRunnerConfig<'_>) -> BTreeMap<String, S
     if let Some(rootfs) = rootfs {
         env.insert("INCUBATOR_ROOTFS".into(), rootfs.display().to_string());
     }
+    if let Some(fvp_platform_root) = fvp_platform_root {
+        env.insert(
+            "INCUBATOR_FVP_PLATFORM_ROOT".into(),
+            fvp_platform_root.display().to_string(),
+        );
+    }
+    if let Some(fvp_launcher) = fvp_launcher {
+        env.insert(
+            "INCUBATOR_FVP_LAUNCHER".into(),
+            fvp_launcher.display().to_string(),
+        );
+    }
     if let Some(qemu_binary) = qemu_binary {
         env.insert(
             "INCUBATOR_QEMU_BINARY".into(),
@@ -282,54 +312,9 @@ fn incubator_runner_env(config: IncubatorRunnerConfig<'_>) -> BTreeMap<String, S
     env
 }
 
-fn guest_path(share_root: &Path, path: &Path) -> anyhow::Result<String> {
-    let relative = path.strip_prefix(share_root).with_context(|| {
-        format!(
-            "{} is not under share root {}",
-            path.display(),
-            share_root.display()
-        )
-    })?;
-
-    if relative.as_os_str().is_empty() {
-        Ok("/share".to_string())
-    } else {
-        Ok(format!("/share/{}", relative.display()))
-    }
-}
-
-fn common_ancestor(paths: &[&Path]) -> anyhow::Result<PathBuf> {
-    let mut candidate = paths
-        .first()
-        .context("no paths for share root")?
-        .to_path_buf();
-
-    loop {
-        if paths.iter().all(|path| path.starts_with(&candidate)) {
-            return Ok(candidate);
-        }
-
-        if !candidate.pop() {
-            anyhow::bail!("paths do not share a common root")
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn maps_guest_share_paths() {
-        assert_eq!(
-            guest_path(Path::new("/tmp/share"), Path::new("/tmp/share/bin/test")).unwrap(),
-            "/share/bin/test"
-        );
-        assert_eq!(
-            guest_path(Path::new("/tmp/share"), Path::new("/tmp/share")).unwrap(),
-            "/share"
-        );
-    }
 
     #[test]
     fn builds_incubator_runner_env() {
@@ -339,6 +324,8 @@ mod tests {
             initrd: Some(Path::new("/tmp/initrd.gz")),
             firmware: Some(Path::new("/tmp/flash.bin")),
             rootfs: Some(Path::new("/tmp/rootfs.ext4")),
+            fvp_platform_root: Some(Path::new("/tmp/fvp")),
+            fvp_launcher: Some(Path::new("/tmp/run-fvp.py")),
             share_root: Path::new("/tmp/test content"),
             output_dir: Path::new("/tmp/test content/test_results"),
             guest_pipette: "/share/pipette",
@@ -355,6 +342,11 @@ mod tests {
         assert_eq!(env.get("INCUBATOR_INITRD").unwrap(), "/tmp/initrd.gz");
         assert_eq!(env.get("INCUBATOR_FIRMWARE").unwrap(), "/tmp/flash.bin");
         assert_eq!(env.get("INCUBATOR_ROOTFS").unwrap(), "/tmp/rootfs.ext4");
+        assert_eq!(env.get("INCUBATOR_FVP_PLATFORM_ROOT").unwrap(), "/tmp/fvp");
+        assert_eq!(
+            env.get("INCUBATOR_FVP_LAUNCHER").unwrap(),
+            "/tmp/run-fvp.py"
+        );
         assert_eq!(env.get("INCUBATOR_SHARE").unwrap(), "/tmp/test content");
         assert_eq!(
             env.get("INCUBATOR_OUTPUT_DIR").unwrap(),
@@ -384,6 +376,8 @@ mod tests {
             initrd: None,
             firmware: None,
             rootfs: None,
+            fvp_platform_root: None,
+            fvp_launcher: None,
             share_root: Path::new("/tmp/share"),
             output_dir: Path::new("/tmp/share/test_results"),
             guest_pipette: "/share/pipette",
@@ -396,6 +390,8 @@ mod tests {
         assert!(!env.contains_key("INCUBATOR_INITRD"));
         assert!(!env.contains_key("INCUBATOR_FIRMWARE"));
         assert!(!env.contains_key("INCUBATOR_ROOTFS"));
+        assert!(!env.contains_key("INCUBATOR_FVP_PLATFORM_ROOT"));
+        assert!(!env.contains_key("INCUBATOR_FVP_LAUNCHER"));
         assert!(!env.contains_key("INCUBATOR_QEMU_BINARY"));
     }
 

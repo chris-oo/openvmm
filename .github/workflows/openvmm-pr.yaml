@@ -6360,8 +6360,6 @@ jobs:
         flowey e 29 flowey_core::pipeline::artifact::resolve 6
         flowey e 29 flowey_lib_hvlite::_jobs::consume_and_test_nextest_vmm_tests_archive 3
         flowey e 29 flowey_lib_hvlite::_jobs::consume_and_test_nextest_vmm_tests_archive 4
-        flowey e 29 flowey_core::pipeline::artifact::resolve 4
-        flowey e 29 flowey_lib_hvlite::_jobs::consume_and_test_nextest_vmm_tests_archive 5
         flowey v 29 'flowey_lib_hvlite::_jobs::consume_and_test_nextest_vmm_tests_archive:0:flowey_core/src/node/github_context.rs' --is-raw-string update --env-source runner.temp <<EOF
         ${{ runner.temp }}
         EOF
@@ -6439,6 +6437,7 @@ jobs:
       run: |-
         flowey e 29 flowey_lib_hvlite::write_incubator_target_runner 0
         flowey e 29 flowey_lib_hvlite::run_cargo_nextest_run 0
+        flowey e 29 flowey_core::pipeline::artifact::resolve 4
         flowey e 29 flowey_lib_hvlite::test_nextest_vmm_tests_archive 0
       shell: bash
     - name: generate nextest command
@@ -6451,12 +6450,12 @@ jobs:
       run: |-
         flowey e 29 flowey_lib_common::run_cargo_nextest_run 0
         flowey e 29 flowey_lib_common::run_cargo_nextest_run 1
-        flowey e 29 flowey_lib_hvlite::_jobs::consume_and_test_nextest_vmm_tests_archive 6
+        flowey e 29 flowey_lib_hvlite::_jobs::consume_and_test_nextest_vmm_tests_archive 5
       shell: bash
     - name: summarize failing vmm tests
       run: |-
+        flowey e 29 flowey_lib_hvlite::_jobs::consume_and_test_nextest_vmm_tests_archive 6
         flowey e 29 flowey_lib_hvlite::_jobs::consume_and_test_nextest_vmm_tests_archive 7
-        flowey e 29 flowey_lib_hvlite::_jobs::consume_and_test_nextest_vmm_tests_archive 8
         flowey e 29 flowey_lib_common::publish_test_results 0
         flowey e 29 flowey_lib_common::publish_test_results 1
         flowey v 29 'flowey_lib_common::publish_test_results:2:flowey_lib_common/src/publish_test_results.rs' --is-raw-string --condvar flowey_lib_common::publish_test_results:0:flowey_lib_common/src/publish_test_results.rs write-to-env github floweyvar1
@@ -6484,7 +6483,7 @@ jobs:
       name: 'publish test results: aarch64-linux-tcg-vmm-tests (logs)'
       if: ${{ fromJSON(env.FLOWEY_CONDITION) }}
     - name: report test results to overall pipeline status
-      run: flowey e 29 flowey_lib_hvlite::_jobs::consume_and_test_nextest_vmm_tests_archive 9
+      run: flowey e 29 flowey_lib_hvlite::_jobs::consume_and_test_nextest_vmm_tests_archive 8
       shell: bash
     - name: 'validate cache entry: cargo-nextest'
       run: flowey e 29 flowey_lib_common::cache 3

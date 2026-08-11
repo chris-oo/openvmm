@@ -110,6 +110,8 @@ pub struct Run {
     pub nextest_filter_expr: Option<String>,
     /// Whether to run ignored tests
     pub run_ignored: bool,
+    /// Override the number of test threads.
+    pub test_threads: Option<usize>,
     /// Set rlimits to allow unlimited sized coredump file (if supported)
     pub with_rlimit_unlimited_core_size: bool,
     /// Additional env vars set when executing the tests.
@@ -181,6 +183,7 @@ impl FlowNodeWithConfig for Node {
             with_rlimit_unlimited_core_size,
             nextest_filter_expr,
             run_ignored,
+            test_threads,
             pre_run_deps,
             results,
         } in run
@@ -232,6 +235,7 @@ impl FlowNodeWithConfig for Node {
                 nextest_profile: nextest_profile.clone(),
                 nextest_filter_expr,
                 run_ignored,
+                test_threads,
                 fail_fast,
                 extra_env,
                 extra_commands: None,

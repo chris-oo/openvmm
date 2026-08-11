@@ -132,9 +132,13 @@ pub struct VmmTestsRunCli {
     #[expect(clippy::option_option)]
     incubator: Option<Option<PathBuf>>,
 
-    /// linux-cca source tree used to build QEMU CCA host and guest kernels.
+    /// linux-cca source tree used to build CCA host and guest kernels.
     #[clap(long, env = "OPENVMM_CCA_KERNEL_SRC")]
     cca_kernel_src: Option<PathBuf>,
+
+    /// Root populated by `cargo xflowey kvm-cca-tests --install-emu`.
+    #[clap(long, env = "OPENVMM_FVP_CCA_PLATFORM_ROOT")]
+    fvp_platform_root: Option<PathBuf>,
 }
 
 struct CargoNextestListRequest<'a> {
@@ -200,6 +204,7 @@ impl IntoPipeline for VmmTestsRunCli {
             disable_secure_avic,
             incubator,
             cca_kernel_src,
+            fvp_platform_root,
         } = self;
 
         // When --incubator is set, --target must also be specified
@@ -247,7 +252,10 @@ impl IntoPipeline for VmmTestsRunCli {
             .map(classify_incubator_platform)
             .transpose()?;
         let cca_kernel_src = match incubator_platform {
-            Some(flowey_lib_hvlite::write_incubator_target_runner::IncubatorPlatform::QemuCca) => {
+            Some(
+                flowey_lib_hvlite::write_incubator_target_runner::IncubatorPlatform::QemuCca
+                | flowey_lib_hvlite::write_incubator_target_runner::IncubatorPlatform::FvpCca,
+            ) => {
                 let source = cca_kernel_src
                     .map(|path| {
                         if path.is_absolute() {
@@ -259,7 +267,7 @@ impl IntoPipeline for VmmTestsRunCli {
                     .unwrap_or_else(|| repo_root.parent().unwrap_or(&repo_root).join("linux-cca"));
                 anyhow::ensure!(
                     source.is_dir(),
-                    "QEMU CCA kernel source not found at {}; pass --cca-kernel-src",
+                    "CCA kernel source not found at {}; pass --cca-kernel-src",
                     source.display()
                 );
                 Some(source)
@@ -267,7 +275,35 @@ impl IntoPipeline for VmmTestsRunCli {
             _ => {
                 anyhow::ensure!(
                     cca_kernel_src.is_none(),
-                    "--cca-kernel-src requires a QEMU CCA incubator profile"
+                    "--cca-kernel-src requires a CCA incubator profile"
+                );
+                None
+            }
+        };
+        let fvp_platform_root = match incubator_platform {
+            Some(flowey_lib_hvlite::write_incubator_target_runner::IncubatorPlatform::FvpCca) => {
+                let root = fvp_platform_root.context(
+                    "--fvp-platform-root or OPENVMM_FVP_CCA_PLATFORM_ROOT is required for FVP CCA",
+                )?;
+                let root = if root.is_absolute() {
+                    root
+                } else {
+                    repo_root.join(root)
+                };
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "FVP platform aliases must have one stable lock identity"
+                )]
+                let root = std::fs::canonicalize(&root).with_context(|| {
+                    format!("FVP platform root not found at {}", root.display())
+                })?;
+                anyhow::ensure!(root.is_dir(), "{} is not a directory", root.display());
+                Some(root)
+            }
+            _ => {
+                anyhow::ensure!(
+                    fvp_platform_root.is_none(),
+                    "--fvp-platform-root requires an FVP CCA incubator profile"
                 );
                 None
             }
@@ -504,6 +540,7 @@ impl IntoPipeline for VmmTestsRunCli {
                     incubator_profile,
                     incubator_platform,
                     cca_kernel_src,
+                    fvp_platform_root,
                     done: ctx.new_done_handle(),
                 }
             });
@@ -797,6 +834,9 @@ fn classify_incubator_platform(
     match backend {
         "qemu-cca" => {
             Ok(flowey_lib_hvlite::write_incubator_target_runner::IncubatorPlatform::QemuCca)
+        }
+        "fvp-cca" => {
+            Ok(flowey_lib_hvlite::write_incubator_target_runner::IncubatorPlatform::FvpCca)
         }
         "qemu-tcg" => {
             Ok(flowey_lib_hvlite::write_incubator_target_runner::IncubatorPlatform::QemuTcg)
@@ -1122,6 +1162,13 @@ mod tests {
             )
             .unwrap(),
             flowey_lib_hvlite::write_incubator_target_runner::IncubatorPlatform::QemuTcg
+        );
+        assert_eq!(
+            classify_incubator_platform(
+                &crate::repo_root().join("petri/incubator/profiles/aarch64-fvp-cca.toml")
+            )
+            .unwrap(),
+            flowey_lib_hvlite::write_incubator_target_runner::IncubatorPlatform::FvpCca
         );
     }
 }

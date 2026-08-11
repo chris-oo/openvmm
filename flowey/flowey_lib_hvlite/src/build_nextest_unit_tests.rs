@@ -263,6 +263,7 @@ impl FlowNode for Node {
                                 nextest_working_dir: None,
                                 nextest_config_file: None,
                                 run_ignored: false,
+                                test_threads: None,
                                 extra_env: None,
                                 pre_run_deps: pre_run_deps.clone(),
                                 results: v,

@@ -103,6 +103,8 @@ flowey_request! {
             Option<crate::write_incubator_target_runner::IncubatorPlatform>,
         /// linux-cca source tree for QEMU CCA kernel builds.
         pub cca_kernel_src: Option<PathBuf>,
+        /// Root of the locally provisioned FVP CCA platform.
+        pub fvp_platform_root: Option<PathBuf>,
 
         pub done: WriteVar<SideEffect>,
     }
@@ -145,6 +147,7 @@ impl SimpleFlowNode for Node {
         ctx.import::<crate::resolve_openvmm_test_linux_kernel::Node>();
         ctx.import::<crate::resolve_openvmm_qemu::Node>();
         ctx.import::<crate::resolve_cca_qemu::Node>();
+        ctx.import::<crate::resolve_cca_fvp_platform::Node>();
         ctx.import::<crate::run_prep_steps::Node>();
         ctx.import::<crate::build_vmgstool::Node>();
         ctx.import::<crate::write_incubator_target_runner::Node>();
@@ -169,10 +172,28 @@ impl SimpleFlowNode for Node {
             incubator_profile,
             incubator_platform,
             cca_kernel_src,
+            fvp_platform_root,
             done,
         } = request;
 
         let test_content_dir = test_content_dir.absolute()?;
+        let incubator_share_dir = incubator_profile
+            .is_some()
+            .then(|| test_content_dir.join(format!("incubator-share-{}", std::process::id())));
+        let runtime_content_dir = incubator_share_dir
+            .clone()
+            .unwrap_or_else(|| test_content_dir.clone());
+        let runtime_relative_dir = incubator_share_dir
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        if let Some(incubator_share_dir) = &incubator_share_dir {
+            if incubator_share_dir.exists() {
+                fs_err::remove_dir_all(incubator_share_dir)?;
+            }
+            fs_err::create_dir_all(incubator_share_dir)?;
+        }
         let custom_kernel_modules_abs = custom_kernel_modules.map(|p| p.absolute()).transpose()?;
         let custom_kernel_abs = custom_kernel.map(|p| p.absolute()).transpose()?;
 
@@ -566,7 +587,7 @@ impl SimpleFlowNode for Node {
             });
 
             copy_to_dir.push((
-                prep_steps_bin.to_owned(),
+                runtime_relative_dir.join(prep_steps_bin),
                 output.map(ctx, |x| {
                     Some(match x {
                         crate::build_prep_steps::PrepStepsOutput::WindowsBin { exe, pdb: _ } => exe,
@@ -602,7 +623,7 @@ impl SimpleFlowNode for Node {
                 })
                 .collect();
 
-            let prep_steps_bin = test_content_dir.join(prep_steps_bin);
+            let prep_steps_bin = runtime_content_dir.join(prep_steps_bin);
             let output = output.map(ctx, |mut output| {
                 let path = match &mut output {
                     crate::build_prep_steps::PrepStepsOutput::WindowsBin { exe, pdb: _ } => exe,
@@ -652,7 +673,7 @@ impl SimpleFlowNode for Node {
             nextest_archive.map(ctx, |x| Some(x.archive_file)),
         ));
 
-        let vmm_test_artifacts_dir = test_content_dir.join("images");
+        let vmm_test_artifacts_dir = runtime_content_dir.join("images");
         fs_err::create_dir_all(&vmm_test_artifacts_dir)?;
         ctx.config(crate::download_openvmm_vmm_tests_artifacts::Config {
             custom_cache_dir: Some(vmm_test_artifacts_dir),
@@ -722,7 +743,7 @@ impl SimpleFlowNode for Node {
         });
 
         let extra_env = ctx.reqv(|v| crate::init_vmm_tests_env::Request {
-            test_content_dir: ReadVar::from_static(test_content_dir.clone()),
+            test_content_dir: ReadVar::from_static(runtime_content_dir.clone()),
             vmm_tests_target: target_triple.clone(),
             register_openvmm,
             register_openvmm_vhost,
@@ -814,6 +835,11 @@ impl SimpleFlowNode for Node {
             nextest_profile: nextest_profile.as_str().to_owned(),
             nextest_filter_expr: Some(nextest_filter_expr.clone()),
             run_ignored: false,
+            test_threads: matches!(
+                incubator_platform,
+                Some(crate::write_incubator_target_runner::IncubatorPlatform::FvpCca)
+            )
+            .then_some(1),
             fail_fast: None,
             extra_env: Some(extra_env.clone()),
             extra_commands: register_prep_steps
@@ -881,10 +907,18 @@ impl SimpleFlowNode for Node {
 
             let incubator_bin = incubator_bin.map(ctx, |o| o.bin);
 
-            let (kernel, initrd, firmware, rootfs, qemu_binary, mut extra_share_paths) =
-                match incubator_platform {
-                    crate::write_incubator_target_runner::IncubatorPlatform::QemuTcg => {
-                        let kernel = ctx.reqv(|v| {
+            let (
+                kernel,
+                initrd,
+                firmware,
+                rootfs,
+                qemu_binary,
+                fvp_platform_root,
+                fvp_launcher,
+                required_share_files,
+            ) = match incubator_platform {
+                crate::write_incubator_target_runner::IncubatorPlatform::QemuTcg => {
+                    let kernel = ctx.reqv(|v| {
                             crate::resolve_openvmm_test_linux_kernel::Request::Get(
                                 crate::resolve_openvmm_test_linux_kernel::OpenvmmTestKernelFile::Kernel,
                                 arch,
@@ -892,70 +926,73 @@ impl SimpleFlowNode for Node {
                                 v,
                             )
                         });
-                        let initrd =
-                            ctx.reqv(|v| crate::resolve_openvmm_test_initrd::Request::Get(arch, v));
-                        let qemu_binary = ctx.reqv(|v| {
-                            crate::resolve_openvmm_qemu::Request::Get(
-                                crate::resolve_openvmm_qemu::QemuFile::SystemAarch64,
-                                host_arch,
-                                v,
-                            )
-                        });
-                        (kernel, Some(initrd), None, None, qemu_binary, Vec::new())
-                    }
-                    crate::write_incubator_target_runner::IncubatorPlatform::QemuCca => {
-                        anyhow::ensure!(
-                            arch == CommonArch::Aarch64,
-                            "QEMU CCA incubator requires an AArch64 target"
-                        );
-                        let home = std::env::var_os("HOME")
-                            .map(PathBuf::from)
-                            .context("HOME is not set")?;
-                        let kernel_source = cca_kernel_src
-                            .clone()
-                            .context("QEMU CCA kernel source was not provided")?;
-                        let kernel_output = ctx.reqv(|v| crate::build_cca_linux_kernels::Request {
-                            params: crate::build_cca_linux_kernels::CcaLinuxKernelBuildParams {
-                                openvmm_root: openvmm_root.clone(),
-                                source: kernel_source,
-                                revision: crate::cca_pins::LINUX_CCA_V15_REVISION.into(),
-                                output_root: test_content_dir.join("cca-kernels-v15"),
-                            },
-                            output: v,
-                        });
-                        let kernel = kernel_output.map(ctx, |output| output.host_image);
+                    let initrd =
+                        ctx.reqv(|v| crate::resolve_openvmm_test_initrd::Request::Get(arch, v));
+                    let qemu_binary = ctx.reqv(|v| {
+                        crate::resolve_openvmm_qemu::Request::Get(
+                            crate::resolve_openvmm_qemu::QemuFile::SystemAarch64,
+                            host_arch,
+                            v,
+                        )
+                    });
+                    (
+                        kernel,
+                        Some(initrd),
+                        None,
+                        None,
+                        Some(qemu_binary),
+                        None,
+                        None,
+                        Vec::new(),
+                    )
+                }
+                crate::write_incubator_target_runner::IncubatorPlatform::QemuCca => {
+                    anyhow::ensure!(
+                        arch == CommonArch::Aarch64,
+                        "QEMU CCA incubator requires an AArch64 target"
+                    );
+                    let home = std::env::var_os("HOME")
+                        .map(PathBuf::from)
+                        .context("HOME is not set")?;
+                    let kernel_source = cca_kernel_src
+                        .clone()
+                        .context("QEMU CCA kernel source was not provided")?;
+                    let kernel_output = ctx.reqv(|v| crate::build_cca_linux_kernels::Request {
+                        params: crate::build_cca_linux_kernels::CcaLinuxKernelBuildParams {
+                            openvmm_root: openvmm_root.clone(),
+                            source: kernel_source,
+                            revision: crate::cca_pins::LINUX_CCA_V15_REVISION.into(),
+                            output_root: test_content_dir.join("cca-kernels-v15"),
+                        },
+                        output: v,
+                    });
+                    let kernel = kernel_output.map(ctx, |output| output.host_image);
 
-                        let firmware_output =
-                            ctx.reqv(|v| crate::build_cca_qemu_firmware::Request {
-                                params:
-                                    crate::build_cca_qemu_firmware::CcaQemuFirmwareBuildParams {
-                                        openvmm_root: openvmm_root.clone(),
-                                        output_root: test_content_dir.join("cca-qemu-firmware"),
-                                        cache_root: Some(
-                                            openvmm_root.join("target/cca-qemu/firmware.cache"),
-                                        ),
-                                        offline: false,
-                                    },
-                                output: v,
-                            });
-                        let firmware = firmware_output.map(ctx, |output| output.flash);
+                    let firmware_output = ctx.reqv(|v| crate::build_cca_qemu_firmware::Request {
+                        params: crate::build_cca_qemu_firmware::CcaQemuFirmwareBuildParams {
+                            openvmm_root: openvmm_root.clone(),
+                            output_root: test_content_dir.join("cca-qemu-firmware"),
+                            cache_root: Some(openvmm_root.join("target/cca-qemu/firmware.cache")),
+                            offline: false,
+                        },
+                        output: v,
+                    });
+                    let firmware = firmware_output.map(ctx, |output| output.flash);
 
-                        let packaged_rootfs =
-                            home.join(".shrinkwrap/package/cca-3world/rootfs.ext2");
-                        let build_rootfs = home.join(
-                            ".shrinkwrap/build/build/cca-3world/buildroot/images/rootfs.ext2",
-                        );
-                        let source_rootfs = if packaged_rootfs.is_file() {
-                            packaged_rootfs
-                        } else if build_rootfs.is_file() {
-                            build_rootfs
-                        } else {
-                            anyhow::bail!(
-                                "QEMU CCA host rootfs source is missing; run \
+                    let packaged_rootfs = home.join(".shrinkwrap/package/cca-3world/rootfs.ext2");
+                    let build_rootfs = home
+                        .join(".shrinkwrap/build/build/cca-3world/buildroot/images/rootfs.ext2");
+                    let source_rootfs = if packaged_rootfs.is_file() {
+                        packaged_rootfs
+                    } else if build_rootfs.is_file() {
+                        build_rootfs
+                    } else {
+                        anyhow::bail!(
+                            "QEMU CCA host rootfs source is missing; run \
                                  `cargo xflowey kvm-cca-tests --install-emu` first"
-                            )
-                        };
-                        let rootfs_output =
+                        )
+                    };
+                    let rootfs_output =
                             ctx.reqv(|v| crate::build_cca_incubator_host_rootfs::Request {
                                 params:
                                     crate::build_cca_incubator_host_rootfs::CcaIncubatorHostRootfsBuildParams {
@@ -965,59 +1002,130 @@ impl SimpleFlowNode for Node {
                                     },
                                 output: v,
                             });
-                        let rootfs = rootfs_output.map(ctx, |output| output.image);
+                    let rootfs = rootfs_output.map(ctx, |output| output.image);
 
-                        let qemu_binary = ctx.reqv(|v| crate::resolve_cca_qemu::Request {
-                            host_arch,
-                            output: v,
-                        });
-                        let qemu_binary = qemu_binary.map(ctx, |output| output.binary);
+                    let qemu_binary = ctx.reqv(|v| crate::resolve_cca_qemu::Request {
+                        host_arch,
+                        output: v,
+                    });
+                    let qemu_binary = qemu_binary.map(ctx, |output| output.binary);
 
-                        let preflight = ctx.reqv(|v| crate::build_kvm_cca_preflight::Request {
-                            params: crate::build_kvm_cca_preflight::KvmCcaPreflightBuildParams {
-                                profile: CommonProfile::Debug,
-                                target: CommonTriple::Common {
-                                    arch: CommonArch::Aarch64,
-                                    platform: CommonPlatform::LinuxMusl,
-                                },
+                    let preflight = ctx.reqv(|v| crate::build_kvm_cca_preflight::Request {
+                        params: crate::build_kvm_cca_preflight::KvmCcaPreflightBuildParams {
+                            profile: CommonProfile::Debug,
+                            target: CommonTriple::Common {
+                                arch: CommonArch::Aarch64,
+                                platform: CommonPlatform::LinuxMusl,
                             },
-                            preflight: v,
-                        });
-                        let (staged_preflight, write_staged_preflight) = ctx.new_var();
-                        ctx.emit_rust_step("stage QEMU CCA preflight", |ctx| {
-                            let preflight = preflight.claim(ctx);
-                            let write_staged_preflight = write_staged_preflight.claim(ctx);
-                            let destination = test_content_dir.join("kvm_cca_preflight");
-                            move |rt| {
-                                let source = rt.read(preflight).bin;
-                                fs_err::copy(&source, &destination).with_context(|| {
-                                    format!(
-                                        "failed to copy {} to {}",
-                                        source.display(),
-                                        destination.display()
-                                    )
-                                })?;
-                                destination.make_executable()?;
-                                rt.write(write_staged_preflight, &destination);
-                                Ok(())
-                            }
-                        });
+                        },
+                        preflight: v,
+                    });
+                    let (staged_preflight, write_staged_preflight) = ctx.new_var();
+                    ctx.emit_rust_step("stage QEMU CCA preflight", |ctx| {
+                        let preflight = preflight.claim(ctx);
+                        let write_staged_preflight = write_staged_preflight.claim(ctx);
+                        let destination = runtime_content_dir.join("kvm_cca_preflight");
+                        move |rt| {
+                            let source = rt.read(preflight).bin;
+                            fs_err::copy(&source, &destination).with_context(|| {
+                                format!(
+                                    "failed to copy {} to {}",
+                                    source.display(),
+                                    destination.display()
+                                )
+                            })?;
+                            destination.make_executable()?;
+                            rt.write(write_staged_preflight, &destination);
+                            Ok(())
+                        }
+                    });
 
-                        (
-                            kernel,
-                            None,
-                            Some(firmware),
-                            Some(rootfs),
-                            qemu_binary,
-                            vec![staged_preflight],
-                        )
-                    }
-                };
-            extra_share_paths.extend([
-                ReadVar::from_static(nextest_archive_file.clone()),
-                ReadVar::from_static(nextest_config_file.clone()),
-            ]);
-
+                    (
+                        kernel,
+                        None,
+                        Some(firmware),
+                        Some(rootfs),
+                        Some(qemu_binary),
+                        None,
+                        None,
+                        vec![staged_preflight],
+                    )
+                }
+                crate::write_incubator_target_runner::IncubatorPlatform::FvpCca => {
+                    anyhow::ensure!(
+                        arch == CommonArch::Aarch64,
+                        "FVP CCA incubator requires an AArch64 target"
+                    );
+                    let platform_root = fvp_platform_root
+                        .clone()
+                        .context("FVP CCA platform root was not provided")?;
+                    let platform = ctx.reqv(|v| crate::resolve_cca_fvp_platform::Request {
+                        platform_root,
+                        output: v,
+                    });
+                    let source_rootfs = platform.clone().map(ctx, |output| output.source_rootfs);
+                    let platform_root = platform.map(ctx, |output| output.platform_root);
+                    let kernel_source = cca_kernel_src
+                        .clone()
+                        .context("FVP CCA kernel source was not provided")?;
+                    let kernel_output = ctx.reqv(|v| crate::build_cca_linux_kernels::Request {
+                        params: crate::build_cca_linux_kernels::CcaLinuxKernelBuildParams {
+                            openvmm_root: openvmm_root.clone(),
+                            source: kernel_source,
+                            revision: crate::cca_pins::LINUX_CCA_V15_REVISION.into(),
+                            output_root: test_content_dir.join("cca-fvp-kernels-v15"),
+                        },
+                        output: v,
+                    });
+                    let kernel = kernel_output.map(ctx, |output| output.host_image);
+                    let rootfs_output =
+                            ctx.reqv(|v| crate::build_cca_incubator_host_rootfs::Request {
+                                params:
+                                    crate::build_cca_incubator_host_rootfs::CcaIncubatorHostRootfsBuildParams {
+                                        openvmm_root: openvmm_root.clone(),
+                                        source_rootfs,
+                                        output_root: test_content_dir.join("cca-fvp-host-rootfs"),
+                                    },
+                                output: v,
+                            });
+                    let rootfs = rootfs_output.map(ctx, |output| output.image);
+                    let preflight = ctx.reqv(|v| crate::build_kvm_cca_preflight::Request {
+                        params: crate::build_kvm_cca_preflight::KvmCcaPreflightBuildParams {
+                            profile: CommonProfile::Debug,
+                            target: CommonTriple::Common {
+                                arch: CommonArch::Aarch64,
+                                platform: CommonPlatform::LinuxMusl,
+                            },
+                        },
+                        preflight: v,
+                    });
+                    let (staged_preflight, write_staged_preflight) = ctx.new_var();
+                    ctx.emit_rust_step("stage FVP CCA preflight", |ctx| {
+                        let preflight = preflight.claim(ctx);
+                        let write_staged_preflight = write_staged_preflight.claim(ctx);
+                        let destination = runtime_content_dir.join("kvm_cca_preflight");
+                        move |rt| {
+                            let source = rt.read(preflight).bin;
+                            fs_err::copy(&source, &destination)?;
+                            destination.make_executable()?;
+                            rt.write(write_staged_preflight, &destination);
+                            Ok(())
+                        }
+                    });
+                    (
+                        kernel,
+                        None,
+                        None,
+                        Some(rootfs),
+                        None,
+                        Some(platform_root),
+                        Some(ReadVar::from_static(
+                            openvmm_root.join("build_support/cca/run-fvp-incubator-probe.py"),
+                        )),
+                        vec![staged_preflight],
+                    )
+                }
+            };
             let extra_env = ctx.reqv(|v| crate::write_incubator_target_runner::Request {
                 incubator_bin,
                 profile_path: ReadVar::from_static(profile_path),
@@ -1025,11 +1133,12 @@ impl SimpleFlowNode for Node {
                 initrd,
                 firmware,
                 rootfs,
-                repo_root: openvmm_repo_path.clone(),
-                test_content_dir: ReadVar::from_static(test_content_dir.clone()),
-                extra_share_paths,
+                fvp_platform_root,
+                fvp_launcher,
+                test_content_dir: ReadVar::from_static(runtime_content_dir.clone()),
+                required_share_files,
                 extra_env: Some(extra_env),
-                qemu_binary: Some(qemu_binary),
+                qemu_binary,
                 target: target_triple.clone(),
                 nextest_env: v,
             });
@@ -1043,6 +1152,10 @@ impl SimpleFlowNode for Node {
             anyhow::ensure!(
                 cca_kernel_src.is_none(),
                 "QEMU CCA kernel source was provided without an incubator profile"
+            );
+            anyhow::ensure!(
+                fvp_platform_root.is_none(),
+                "FVP platform root was provided without an incubator profile"
             );
             ctx.emit_side_effect_step(side_effects, [done]);
             if let Some((prep_steps, _)) = register_prep_steps {
@@ -1095,6 +1208,11 @@ impl SimpleFlowNode for Node {
             nextest_config_file: Some(ReadVar::from_static(nextest_config_file)),
             nextest_bin,
             target: nextest_target,
+            test_threads: matches!(
+                incubator_platform,
+                Some(crate::write_incubator_target_runner::IncubatorPlatform::FvpCca)
+            )
+            .then_some(1),
             extra_env,
             pre_run_deps: side_effects,
             results: v,

@@ -624,23 +624,48 @@ pass through the actual incubator API.
 
 ## Phase 3: Typed Flowey Artifact Wiring
 
+### Implemented results
+
+- [x] Added `FvpCca` platform classification and an explicit canonical
+      `--fvp-platform-root` / `OPENVMM_FVP_CCA_PLATFORM_ROOT` input.
+- [x] Added a typed local platform resolver for the selected Shrinkwrap
+      executable, CCA overlay, and Buildroot source image. Hashing and broader
+      platform metadata remain follow-up work.
+- [x] Reused the typed v15 host kernel, shared host rootfs, preflight, pipette,
+      OpenVMM, incubator, and nextest archive builds.
+- [x] Added FVP-specific target-runner environment generation.
+- [x] Added nextest thread-count plumbing and serialized FVP execution with
+      `--test-threads 1`.
+- [x] Retained the backend-owned platform lock, durable lease state, and exact
+      platform-label container cleanup for independent xflowey invocations.
+      Full ambiguous-owner and leftover-process reconciliation remains
+      incomplete.
+- [x] Use a unique per-xflowey guest share containing only staged runtime
+      artifacts, extracted test binaries, and test output. The repository,
+      host-side nextest archive/configuration, and licensed FVP platform root
+      are not shared with the guest.
+- [x] Extended the parent readiness deadline to include bounded lock waiting.
+- [x] The existing capability-gated, QEMU-named CCA Realm test passes through
+      FVP Flowey and QEMU CCA, and the generic AArch64 TCG regression remains
+      passing. Backend-neutral test naming remains Phase 4 work.
+
 ### Platform selection
 
-- [ ] Extend
+- [x] Extend
       `flowey_lib_hvlite::write_incubator_target_runner::IncubatorPlatform`
       with `FvpCca`.
-- [ ] Classify `type = "fvp-cca"` by parsing the profile at graph construction
+- [x] Classify `type = "fvp-cca"` by parsing the profile at graph construction
       time.
-- [ ] Keep QEMU TCG and QEMU CCA resolution unchanged.
-- [ ] Update `--cca-kernel-src` validation in
+- [x] Keep QEMU TCG and QEMU CCA resolution unchanged.
+- [x] Update `--cca-kernel-src` validation in
       `flowey/flowey_hvlite/src/pipelines/vmm_tests_run.rs` so it is accepted
       by both `QemuCca` and `FvpCca`.
-- [ ] Update CLI error text and target checks for an AArch64-only FVP backend.
-- [ ] Add `--fvp-platform-root` with
+- [x] Update CLI error text and target checks for an AArch64-only FVP backend.
+- [x] Add `--fvp-platform-root` with
       `OPENVMM_FVP_CCA_PLATFORM_ROOT` fallback.
-- [ ] Require this input only for `FvpCca`; reject it for QEMU profiles.
-- [ ] Resolve relative values against the OpenVMM repository root.
-- [ ] Validate the directory before emitting the Flowey graph.
+- [x] Require this input only for `FvpCca`; reject it for QEMU profiles.
+- [x] Resolve relative values against the OpenVMM repository root.
+- [x] Validate and canonicalize the directory before emitting the Flowey graph.
 
 ### Typed FVP platform artifacts
 
@@ -679,35 +704,34 @@ licensed FVP acquisition without an approved licensing/distribution design.
 Do not continue the `$HOME/.shrinkwrap/...` lookup used by current local
 tooling.
 
-- [ ] Add a typed FVP CCA host-rootfs source output to the local Shrinkwrap/FVP
+- [x] Add a typed FVP CCA host-rootfs source output to the local Shrinkwrap/FVP
       platform resolver.
 - [ ] Report the exact Buildroot image path and its hash.
-- [ ] Feed that `ReadVar<PathBuf>` into the generalized host-rootfs builder.
-- [ ] Validate that the source belongs to the selected installed platform.
+- [x] Feed that `ReadVar<PathBuf>` into the generalized host-rootfs builder.
+- [x] Validate that the source belongs to the selected installed platform.
 
 ### FVP execution lease
 
-- [ ] Add a typed lease/lock node or backend-owned cross-process lock rooted at
+- [x] Add a typed lease/lock node or backend-owned cross-process lock rooted at
       `<FVP_PLATFORM_ROOT>/.openvmm-fvp-cca.lock`.
-- [ ] Hold the lock across Shrinkwrap launch, pipette execution, poweroff,
+- [x] Hold the lock across Shrinkwrap launch, pipette execution, poweroff,
       container removal, process cleanup, and log extraction.
-- [ ] Make lock contention visible in logs.
-- [ ] Use a bounded lock-acquisition timeout.
+- [x] Use a bounded lock-acquisition timeout.
 - [ ] Add a test proving two target-runner invocations cannot launch FVP
       concurrently.
 - [ ] Do not enable parallel FVP nextest execution unless multiple concurrent
       licensed-model runs are separately proven safe.
-- [ ] Configure the FVP CCA `vmm-tests-run` invocation itself with one nextest
+- [x] Configure the FVP CCA `vmm-tests-run` invocation itself with one nextest
       test thread (for example, the equivalent of `--test-threads 1`) so
       target-runner processes are not created concurrently and left waiting on
       the lease.
-- [ ] Add a thread-count option through the existing execution chain:
+- [x] Add a thread-count option through the existing execution chain:
   - `test_nextest_vmm_tests_archive::Request`;
   - both `run_cargo_nextest_run` request layers; and
   - `gen_cargo_nextest_run_cmd`.
-- [ ] Set that option only for `IncubatorPlatform::FvpCca`; preserve current
+- [x] Set that option only for `IncubatorPlatform::FvpCca`; preserve current
       concurrency for QEMU and non-incubator test runs.
-- [ ] Keep the lease as defense in depth for separate xflowey invocations.
+- [x] Keep the lease as defense in depth for separate xflowey invocations.
 - [ ] Test both same-nextest-run serialization and two independent xflowey
       processes.
 
@@ -840,7 +864,7 @@ cargo xflowey vmm-tests-run \
   --target linux-aarch64-musl \
   --incubator petri/incubator/profiles/aarch64-fvp-cca.toml \
   --fvp-platform-root target/cca-test \
-  --filter 'test(cca) & !binary(cca)' \
+  --filter 'test(qemu_cca) & !binary(cca)' \
   --skip-vhd-prompt
 ```
 
@@ -851,9 +875,10 @@ The final filter depends on the test naming decision below.
 Commit Flowey wiring after:
 
 - the durable standalone probe executes `/bin/true`;
-- a concrete capability-gated `fvp_cca_incubator_smoke` target-runner test is
-  added in the same commit or earlier; and
-- that test runs through `cargo xflowey vmm-tests-run`.
+- the existing capability-gated CCA Realm test runs through
+  `cargo xflowey vmm-tests-run` with the FVP profile;
+- the same test remains passing with the QEMU CCA profile; and
+- an existing generic AArch64 TCG test remains passing.
 
 ## Phase 4: Share the Normal CCA Realm Test
 
@@ -896,10 +921,11 @@ The shared test must continue to require:
 
 ### Validation matrix
 
-- [ ] Shared test passes under QEMU CCA.
-- [ ] Shared test passes under FVP CCA.
+- [ ] Rename/generalize the QEMU-named CCA test.
+- [x] Existing capability-gated CCA test passes under QEMU CCA.
+- [x] Existing capability-gated CCA test passes under FVP CCA.
 - [ ] Shared test skips under generic QEMU TCG.
-- [ ] Existing `test(aarch64_tcg)` tests pass.
+- [x] Existing `test(aarch64_tcg)` tests pass.
 - [ ] Existing FVP/TMK `cca_runtime` test passes.
 - [ ] Existing SNP compile/regression gate remains unchanged.
 
@@ -1102,3 +1128,12 @@ manifest must use separate paths so renaming state cannot invalidate
 cross-process exclusion. The plan now requires a stable
 `.openvmm-fvp-cca.lock` inode and a separate atomically published
 `.openvmm-fvp-cca-lease.json` manifest.
+
+**Phase 3 implementation review verdict: Minor revisions — addressed.**
+
+The implementation review corrected the CCA kernel-source error text and
+narrowed the completed claims around the typed resolver, stale-state
+reconciliation, and the still-QEMU-named Realm test. Buildroot hashing,
+ambiguous-owner and leftover-process reconciliation, backend-neutral test
+naming, and a two-independent-xflowey concurrency test remain explicit
+follow-up work.

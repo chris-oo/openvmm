@@ -27,6 +27,8 @@ flowey_request! {
         pub nextest_filter_expr: Option<String>,
         /// Whether to run ignored tests
         pub run_ignored: bool,
+        /// Override the number of test threads.
+        pub test_threads: Option<usize>,
         /// Override fail fast setting
         pub fail_fast: Option<bool>,
         /// Additional env vars set when executing the tests.
@@ -91,6 +93,7 @@ impl FlowNode for Node {
             extra_commands,
             nextest_filter_expr,
             run_ignored,
+            test_threads,
             fail_fast,
             portable,
             command,
@@ -328,6 +331,10 @@ impl FlowNode for Node {
                     if run_ignored {
                         args.push("--run-ignored".into());
                         args.push("all".into());
+                    }
+                    if let Some(test_threads) = test_threads {
+                        args.push("--test-threads".into());
+                        args.push(test_threads.to_string().into());
                     }
 
                     if let Some(fail_fast) = fail_fast {

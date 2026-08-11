@@ -324,10 +324,6 @@ impl SimpleFlowNode for Node {
                 o.profiles.join(format!("{profile_name}.toml"))
             });
 
-            let nextest_archive = nextest_vmm_tests_archive
-                .clone()
-                .map(ctx, |x| x.archive_file);
-
             ctx.reqv(|v| crate::write_incubator_target_runner::Request {
                 incubator_bin,
                 profile_path,
@@ -335,9 +331,10 @@ impl SimpleFlowNode for Node {
                 initrd: Some(initrd),
                 firmware: None,
                 rootfs: None,
-                repo_root: openvmm_repo_path.clone(),
+                fvp_platform_root: None,
+                fvp_launcher: None,
                 test_content_dir: test_content_dir.clone(),
-                extra_share_paths: vec![nextest_archive, nextest_config_file.clone()],
+                required_share_files: Vec::new(),
                 extra_env: Some(extra_env),
                 qemu_binary: Some(qemu_binary),
                 target: target.clone(),
@@ -396,6 +393,7 @@ impl SimpleFlowNode for Node {
                 nextest_config_file: Some(nextest_config_file.clone()),
                 nextest_bin: None,
                 target: None,
+                test_threads: None,
                 extra_env: extra_env.clone(),
                 pre_run_deps: pre_run_deps_iteration,
                 results: v,
