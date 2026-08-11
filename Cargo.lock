@@ -9110,6 +9110,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "blocking",
  "chipset_device",
  "guestmem",
  "inspect",

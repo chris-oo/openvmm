@@ -19,6 +19,7 @@ use pal_async::timer::PolledTimer;
 use std::ffi::CString;
 use std::fs;
 use std::fs::File;
+use std::future::Future;
 use std::io::BufRead;
 use std::io::BufReader;
 use std::os::unix::prelude::*;
@@ -382,6 +383,41 @@ impl<'a> VfioRetry<'a> {
         let mut attempt = 0;
         loop {
             match op() {
+                Ok(val) => return Ok(val),
+                Err(err) => {
+                    if attempt >= self.max_retries || !should_retry(&err) {
+                        return Err(err);
+                    }
+                    attempt += 1;
+                    tracelimit::warn_ratelimited!(
+                        device_id = self.device_id,
+                        operation = context,
+                        attempt,
+                        "retrying after transient error: {err}"
+                    );
+                }
+            }
+            PolledTimer::new(self.driver)
+                .sleep(self.sleep_duration)
+                .await;
+        }
+    }
+
+    /// Retry an asynchronous `op` when `should_retry` returns true for the
+    /// error, up to `max_retries` times with a sleep between attempts.
+    pub async fn retry_async<T, E, F>(
+        &self,
+        mut op: impl FnMut() -> F,
+        should_retry: impl Fn(&E) -> bool,
+        context: &str,
+    ) -> Result<T, E>
+    where
+        E: std::fmt::Display,
+        F: Future<Output = Result<T, E>>,
+    {
+        let mut attempt = 0;
+        loop {
+            match op().await {
                 Ok(val) => return Ok(val),
                 Err(err) => {
                     if attempt >= self.max_retries || !should_retry(&err) {

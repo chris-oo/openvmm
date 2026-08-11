@@ -289,8 +289,40 @@ impl VfioAssignedPciDevice {
         };
         let open_start = Instant::now();
         let vfio_device = retry
-            .retry(
-                || binding.group().open_device(&pci_id),
+            .retry_async(
+                || {
+                    let group = binding.group_handle();
+                    let worker_pci_id = pci_id.clone();
+                    let log_pci_id = pci_id.clone();
+                    let submitted = Instant::now();
+                    async move {
+                        let result = blocking::unblock(move || {
+                            tracing::info!(
+                                pci_id = worker_pci_id.as_str(),
+                                queue_duration = ?submitted.elapsed(),
+                                "VFIO device open blocking worker started"
+                            );
+
+                            let attempt_start = Instant::now();
+                            let result = group.open_device(&worker_pci_id);
+                            tracing::info!(
+                                pci_id = worker_pci_id.as_str(),
+                                duration = ?attempt_start.elapsed(),
+                                success = result.is_ok(),
+                                "VFIO device open attempt complete"
+                            );
+                            result
+                        })
+                        .await;
+                        tracing::info!(
+                            pci_id = log_pci_id.as_str(),
+                            duration = ?submitted.elapsed(),
+                            success = result.is_ok(),
+                            "VFIO device open blocking operation complete"
+                        );
+                        result
+                    }
+                },
                 &is_enodev,
                 "open_device",
             )
@@ -396,8 +428,7 @@ impl VfioAssignedPciDevice {
             }
 
             let config_read_start = Instant::now();
-            let config_read =
-                vfio_device.read_config_u32(HeaderType00::BAR0.0 + (i as u16) * 4);
+            let config_read = vfio_device.read_config_u32(HeaderType00::BAR0.0 + (i as u16) * 4);
             tracing::info!(
                 pci_id = pci_id.as_str(),
                 bar = i,

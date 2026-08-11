@@ -122,8 +122,8 @@ impl Drop for VfioDeviceBinding {
 }
 
 impl VfioDeviceBinding {
-    pub fn group(&self) -> &vfio_sys::Group {
-        &self.group
+    pub fn group_handle(&self) -> Arc<vfio_sys::Group> {
+        self.group.clone()
     }
 }
 
@@ -662,9 +662,9 @@ impl IoasManager {
                     smmu_id,
                     respond,
                 } => {
-                     let start = Instant::now();
-                     let result = self.prepare_device(pci_id.clone(), cdev, smmu_id);
-                     tracing::info!(
+                    let start = Instant::now();
+                    let result = self.prepare_device(pci_id.clone(), cdev, smmu_id);
+                    tracing::info!(
                          pci_id,
                         iommu_id = self.iommu_id,
                         duration = ?start.elapsed(),
