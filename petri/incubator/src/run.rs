@@ -3,6 +3,7 @@
 
 //! Top-level API to run a command inside an incubator.
 
+use crate::fvp;
 use crate::profile::IncubatorBackend;
 use crate::profile::IncubatorProfile;
 use crate::qemu;
@@ -86,19 +87,49 @@ pub struct QemuCcaIncubatorConfig {
     pub allocate_pty: bool,
 }
 
-struct RuntimeConfig {
-    profile: IncubatorProfile,
+/// Configuration for an Arm FVP CCA incubator run.
+pub struct FvpCcaIncubatorConfig {
+    /// The parsed FVP CCA profile.
+    pub profile: IncubatorProfile,
+    /// Path to the FVP lifecycle launcher.
+    pub launcher: PathBuf,
+    /// Root of the locally provisioned Shrinkwrap/FVP platform.
+    pub platform_root: PathBuf,
+    /// Path to the host kernel image.
+    pub kernel: PathBuf,
+    /// Path to the base writable host rootfs image.
+    pub rootfs: PathBuf,
+    /// Directory to share into the VM at [`crate::GUEST_SHARE_ROOT`].
+    pub share_dir: PathBuf,
+    /// Host directory where command output and logs should be written.
+    pub output_dir: PathBuf,
+    /// Path to the pipette binary inside the guest.
+    pub guest_pipette_path: String,
+    /// The command to run inside the VM.
+    pub guest_command: Vec<String>,
+    /// Environment variables to set for the guest command.
+    pub guest_env: BTreeMap<String, String>,
+    /// Working directory for the guest command.
+    pub guest_current_dir: Option<String>,
+    /// Timeout for FVP boot and the guest command.
+    pub timeout: Duration,
+    /// Whether to allocate a PTY for the guest command.
+    pub allocate_pty: bool,
+}
+
+pub(crate) struct RuntimeConfig {
+    pub(crate) profile: IncubatorProfile,
     kernel: Option<PathBuf>,
     initrd: Option<PathBuf>,
     firmware: Option<PathBuf>,
     rootfs: Option<PathBuf>,
-    share_dir: PathBuf,
-    output_dir: PathBuf,
-    guest_pipette_path: String,
-    guest_command: Vec<String>,
-    guest_env: BTreeMap<String, String>,
-    guest_current_dir: Option<String>,
-    timeout: Duration,
+    pub(crate) share_dir: PathBuf,
+    pub(crate) output_dir: PathBuf,
+    pub(crate) guest_pipette_path: String,
+    pub(crate) guest_command: Vec<String>,
+    pub(crate) guest_env: BTreeMap<String, String>,
+    pub(crate) guest_current_dir: Option<String>,
+    pub(crate) timeout: Duration,
     qemu_binary_override: Option<PathBuf>,
     allocate_pty: bool,
 }
@@ -163,6 +194,52 @@ pub fn run_in_qemu_cca_incubator(
         timeout: config.timeout,
         qemu_binary_override: config.qemu_binary_override,
         allocate_pty: config.allocate_pty,
+    })
+}
+
+/// Run a command inside an Arm FVP CCA incubator.
+pub fn run_in_fvp_cca_incubator(config: FvpCcaIncubatorConfig) -> anyhow::Result<IncubatorOutput> {
+    let (capabilities, consoles, primary_console) = match &config.profile.incubator {
+        IncubatorBackend::FvpCca(config) => (
+            config.capabilities.clone(),
+            config.consoles.clone(),
+            config.primary_console.clone(),
+        ),
+        _ => anyhow::bail!("run_in_fvp_cca_incubator requires an FVP CCA profile"),
+    };
+    let start = Instant::now();
+    let runtime = RuntimeConfig {
+        profile: config.profile,
+        kernel: None,
+        initrd: None,
+        firmware: None,
+        rootfs: None,
+        share_dir: config.share_dir,
+        output_dir: config.output_dir,
+        guest_pipette_path: config.guest_pipette_path,
+        guest_command: config.guest_command,
+        guest_env: config.guest_env,
+        guest_current_dir: config.guest_current_dir,
+        timeout: config.timeout,
+        qemu_binary_override: None,
+        allocate_pty: config.allocate_pty,
+    };
+    let exit_code = fvp::run(
+        &runtime,
+        fvp::FvpRunConfig {
+            launcher: &config.launcher,
+            platform_root: &config.platform_root,
+            kernel: &config.kernel,
+            rootfs: &config.rootfs,
+            guest_pipette_path: &runtime.guest_pipette_path,
+            consoles: &consoles,
+            primary_console: &primary_console,
+        },
+        &capabilities,
+    )?;
+    Ok(IncubatorOutput {
+        exit_code,
+        elapsed: start.elapsed(),
     })
 }
 
@@ -403,14 +480,30 @@ async fn run_via_pipette(
     qemu::wait_for_pipette_ready(driver, config.timeout, qemu_child, ready_rx).await?;
 
     tracing::info!("pipette ready, connecting");
+    connect_and_run_via_pipette(
+        driver,
+        addr,
+        config,
+        backend_capabilities,
+        &config.output_dir,
+    )
+    .await
+}
+
+pub(crate) async fn connect_and_run_via_pipette(
+    driver: &pal_async::DefaultDriver,
+    addr: std::net::SocketAddr,
+    config: &RuntimeConfig,
+    backend_capabilities: &[String],
+    output_dir: &std::path::Path,
+) -> anyhow::Result<i32> {
     let conn = pal_async::socket::PolledSocket::connect_tcp(driver, addr)
         .await
         .context("failed to connect to pipette")?;
 
-    let output_dir = config.output_dir.clone();
-    std::fs::create_dir_all(&output_dir).context("failed to create test results dir")?;
+    std::fs::create_dir_all(output_dir).context("failed to create test results dir")?;
 
-    let client = pipette_client::PipetteClient::new(&driver, conn, &output_dir)
+    let client = pipette_client::PipetteClient::new(&driver, conn, output_dir)
         .await
         .context("failed to connect to pipette")?;
 

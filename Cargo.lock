@@ -3912,6 +3912,7 @@ dependencies = [
  "petri_artifacts_common",
  "pipette_client",
  "serde",
+ "serde_json",
  "tempfile",
  "toml_edit",
  "tracing",

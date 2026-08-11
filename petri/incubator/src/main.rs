@@ -34,6 +34,12 @@ struct Args {
     /// Path to the writable host rootfs image.
     #[clap(long, env = "INCUBATOR_ROOTFS")]
     rootfs: Option<PathBuf>,
+    /// Root of the locally provisioned FVP CCA platform.
+    #[clap(long, env = "INCUBATOR_FVP_PLATFORM_ROOT")]
+    fvp_platform_root: Option<PathBuf>,
+    /// Path to the FVP lifecycle launcher.
+    #[clap(long, env = "INCUBATOR_FVP_LAUNCHER")]
+    fvp_launcher: Option<PathBuf>,
     /// Directory to share with the guest.
     #[clap(long, env = "INCUBATOR_SHARE")]
     share: String,
@@ -118,9 +124,18 @@ fn main() -> anyhow::Result<()> {
                     .context("--rootfs or INCUBATOR_ROOTFS is required for QEMU CCA")?,
             ),
         ),
-        incubator::IncubatorBackend::FvpCca(_) => {
-            anyhow::bail!("FVP CCA incubator runtime support is not implemented")
-        }
+        incubator::IncubatorBackend::FvpCca(_) => (
+            Some(
+                args.kernel
+                    .context("--kernel or INCUBATOR_KERNEL is required for FVP CCA")?,
+            ),
+            None,
+            None,
+            Some(
+                args.rootfs
+                    .context("--rootfs or INCUBATOR_ROOTFS is required for FVP CCA")?,
+            ),
+        ),
     };
 
     tracing::info!(profile = %args.profile, "profile");
@@ -191,7 +206,27 @@ fn main() -> anyhow::Result<()> {
                 allocate_pty,
             })?
         }
-        incubator::IncubatorBackend::FvpCca(_) => unreachable!(),
+        incubator::IncubatorBackend::FvpCca(_) => {
+            incubator::run_in_fvp_cca_incubator(incubator::FvpCcaIncubatorConfig {
+                profile,
+                launcher: args
+                    .fvp_launcher
+                    .context("--fvp-launcher or INCUBATOR_FVP_LAUNCHER is required")?,
+                platform_root: args
+                    .fvp_platform_root
+                    .context("--fvp-platform-root or INCUBATOR_FVP_PLATFORM_ROOT is required")?,
+                kernel: kernel.unwrap(),
+                rootfs: rootfs.unwrap(),
+                share_dir,
+                output_dir,
+                guest_pipette_path: guest_pipette,
+                guest_command: command,
+                guest_env,
+                guest_current_dir: args.guest_current_dir,
+                timeout,
+                allocate_pty,
+            })?
+        }
     };
 
     tracing::info!(

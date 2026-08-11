@@ -486,6 +486,21 @@ Commit the shared host-rootfs/init generalization separately after:
 
 ## Phase 2: Add the FVP CCA Incubator Backend
 
+### Phase 2 result
+
+- [x] Added the strict portable `FvpCca` profile.
+- [x] Added backend-specific launcher/platform/kernel/rootfs runtime inputs.
+- [x] Reused Rust incubator path mapping, guest environment, current directory,
+      capability publishing, command execution, and poweroff.
+- [x] Reused the durable Python FVP lifecycle helper in launch-only mode.
+- [x] Added unique run directories and endpoint run-ID validation.
+- [x] Passed profile console names, primary console, and guest pipette/preflight
+      paths into the generated FVP contract.
+- [x] Added Rust-owned host-port collision retry.
+- [x] `/bin/true`, `PETRI_CAPABILITIES=cca`, custom pipette paths, and nonzero
+      command cleanup pass.
+- [x] Generic QEMU TCG and QEMU CCA incubator smoke commands remain passing.
+
 ### Profile
 
 - [ ] Add `IncubatorBackend::FvpCca(FvpCcaConfig)` in

@@ -25,6 +25,7 @@
 
 #![forbid(unsafe_code)]
 
+mod fvp;
 mod path_mapping;
 mod profile;
 mod qemu;
@@ -38,8 +39,10 @@ pub use path_mapping::guest_env_from_incubator_env;
 pub use profile::Arch;
 pub use profile::IncubatorBackend;
 pub use profile::IncubatorProfile;
+pub use run::FvpCcaIncubatorConfig;
 pub use run::IncubatorConfig;
 pub use run::IncubatorOutput;
 pub use run::QemuCcaIncubatorConfig;
+pub use run::run_in_fvp_cca_incubator;
 pub use run::run_in_incubator;
 pub use run::run_in_qemu_cca_incubator;

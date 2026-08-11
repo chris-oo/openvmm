@@ -54,6 +54,7 @@ def docker_containers(label: str) -> set[str]:
     output = subprocess.check_output(
         ["docker", "ps", "-q", "--filter", f"label={label}"],
         text=True,
+        timeout=10,
     )
     return set(output.split())
 
@@ -64,6 +65,7 @@ def stop_container(container: str) -> None:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         check=False,
+        timeout=10,
     )
 
 
@@ -132,7 +134,7 @@ def main() -> int:
     parser.add_argument("--host-kernel", required=True, type=Path)
     parser.add_argument("--host-rootfs", required=True, type=Path)
     parser.add_argument("--share-dir", required=True, type=Path)
-    parser.add_argument("--pipette-probe", required=True, type=Path)
+    parser.add_argument("--pipette-probe", type=Path)
     parser.add_argument("--readiness-timeout", type=int, default=300)
     parser.add_argument("--ready-marker", default="PIPETTE READY")
     parser.add_argument("--launch-only", action="store_true")
@@ -143,7 +145,29 @@ def main() -> int:
     parser.add_argument("--consoles", default="host,edk2,rmm")
     parser.add_argument("--primary-console", default="host")
     parser.add_argument("--internal-attempt", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--run-id", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.launch_only and args.endpoint_file is None:
+        parser.error("--launch-only requires --endpoint-file")
+    if not args.launch_only and args.pipette_probe is None:
+        parser.error("probe mode requires --pipette-probe")
+    consoles = args.consoles.split(",")
+    if (
+        not consoles
+        or len(consoles) > 3
+        or len(set(consoles)) != len(consoles)
+        or args.primary_console not in consoles
+        or any(not name.replace("-", "").replace("_", "").isalnum() for name in consoles)
+    ):
+        parser.error("invalid FVP console configuration")
+    if (
+        not args.guest_pipette_path.startswith("/share/")
+        or any(character.isspace() or character == "=" for character in args.guest_pipette_path)
+    ):
+        parser.error("invalid guest pipette path")
+    guest_preflight_path = str(
+        Path(args.guest_pipette_path).with_name("kvm_cca_preflight")
+    )
 
     if not args.internal_attempt:
         environment = os.environ.copy()
@@ -170,7 +194,11 @@ def main() -> int:
     host_kernel = regular_file(args.host_kernel, "CCA host kernel")
     host_rootfs = regular_file(args.host_rootfs, "CCA host rootfs")
     share_dir = directory(args.share_dir, "CCA share")
-    pipette_probe = regular_file(args.pipette_probe, "pipette TCP probe")
+    pipette_probe = (
+        regular_file(args.pipette_probe, "pipette TCP probe")
+        if args.pipette_probe is not None
+        else None
+    )
     shrinkwrap_root = directory(platform_root / "shrinkwrap", "Shrinkwrap checkout")
     shrinkwrap = regular_file(
         shrinkwrap_root / "venv/bin/shrinkwrap", "Shrinkwrap executable"
@@ -196,6 +224,8 @@ def main() -> int:
         (output_root / name).unlink(missing_ok=True)
     status_path = output_root / "status.txt"
     status_path.write_text("running\n")
+    if args.endpoint_file is not None:
+        args.endpoint_file.resolve().unlink(missing_ok=True)
 
     lock_path = platform_root / ".openvmm-fvp-cca.lock"
     lease_path = platform_root / ".openvmm-fvp-cca-lease.json"
@@ -221,7 +251,7 @@ def main() -> int:
             raise RuntimeError("stale FVP CCA containers could not be removed")
         remove_durable(lease_path)
 
-        run_id = uuid.uuid4().hex
+        run_id = args.run_id or uuid.uuid4().hex
         run_label = f"openvmm.fvp-cca-run={run_id}"
         process_start = Path("/proc/self/stat").read_text().split()[21]
 
@@ -254,23 +284,20 @@ def main() -> int:
             else pipette_reservation.getsockname()[1]
         )
         generated_overlay = output_root / "probe-overlay.yaml"
+        terminal_ids = [0, 1, 3]
+        terminal_config = "\n".join(
+            f"""    bp.terminal_{terminal_id}:
+      friendly: {name}
+      type: stdout
+      logfile: {logs / f"{name}.log"}"""
+            for terminal_id, name in zip(terminal_ids, consoles)
+        )
         generated_overlay.write_text(
             f"""%YAML 1.2
 ---
 run:
   terminals:
-    bp.terminal_0:
-      friendly: host
-      type: stdout
-      logfile: {logs / "host.log"}
-    bp.terminal_1:
-      friendly: edk2
-      type: stdout
-      logfile: {logs / "edk2.log"}
-    bp.terminal_3:
-      friendly: rmm
-      type: stdout
-      logfile: {logs / "rmm.log"}
+{terminal_config}
   params:
     -C bp.hostbridge.userNetPorts: 127.0.0.1:{ssh_port}=22,127.0.0.1:{pipette_port}={PIPETTE_PORT}
 """
@@ -295,7 +322,9 @@ run:
             f"SHARE={share_dir}",
             "--rtvar",
             "CMDLINE=console=ttyAMA0 earlycon=pl011,0x1c090000 root=/dev/vda "
-            "ip=dhcp incubator.mount_tag=FM incubator.network=dhcp",
+            "ip=dhcp incubator.mount_tag=FM incubator.network=dhcp "
+            f"incubator.pipette={args.guest_pipette_path} "
+            f"incubator.preflight={guest_preflight_path}",
         ]
         environment = os.environ.copy()
         environment["VIRTUAL_ENV"] = str(shrinkwrap_root / "venv")
@@ -364,26 +393,34 @@ run:
             write_lease("container-started", container)
 
             wait_for_marker(
-                logs / "host.log",
+                logs / f"{args.primary_console}.log",
                 args.ready_marker,
                 process,
                 args.readiness_timeout,
             )
             assert_loopback_listener(pipette_port)
-            subprocess.run(
-                [
-                    str(pipette_probe),
-                    "--port",
-                    str(pipette_port),
-                    "--output-dir",
-                    str(output_root / "pipette"),
-                    "/bin/true",
-                ],
-                check=True,
-                timeout=120,
-            )
+            if args.launch_only:
+                atomic_write(
+                    args.endpoint_file.resolve(),
+                    json.dumps({"port": pipette_port, "run_id": run_id}) + "\n",
+                )
+            else:
+                subprocess.run(
+                    [
+                        str(pipette_probe),
+                        "--port",
+                        str(pipette_port),
+                        "--output-dir",
+                        str(output_root / "pipette"),
+                        "/bin/true",
+                    ],
+                    check=True,
+                    timeout=120,
+                )
             try:
-                return_code = process.wait(timeout=60)
+                return_code = process.wait(
+                    timeout=args.session_timeout if args.launch_only else 60
+                )
             except subprocess.TimeoutExpired as error:
                 raise RuntimeError("Shrinkwrap did not exit after L1 poweroff") from error
             if return_code != 0:
