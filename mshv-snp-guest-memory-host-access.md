@@ -69,6 +69,65 @@ Consequently, an object such as `LockedIoBuffers` provides an RAII lifetime
 at the device layer, but regular membacking does not use that lifetime to
 prevent SNP host-access revocation.
 
+### Why `lock_gpns` Alone Is Insufficient
+
+Implementing `lock_gpns` and rejecting a shared-to-private transition whenever
+one of the requested pages is locked is necessary, but it does not by itself
+close every host-access race.
+
+First, locks protect only callers that use the locking API. Ordinary
+`GuestMemory` reads and writes, fault-driven host-access acquisition, and
+device DMA mappings do not automatically create a GPN lock. A transition
+could therefore observe no locks even though:
+
+- A CPU thread is executing a short guest-memory copy.
+- A host-access fault is about to reacquire the page.
+- A network or storage backend retained a GPA without using
+  `LockedIoBuffers`.
+- VFIO or another direct-DMA backend still has the page mapped in an IOMMU.
+
+Second, a check followed by release has a time-of-check/time-of-use race:
+
+1. The transition checks that the pages are unlocked.
+2. A new I/O operation locks or faults one of the pages.
+3. The transition releases MSHV host access.
+4. The new operation accesses a page that is becoming private.
+
+The transition must first mark the pages `Revoking`. Both `lock_gpns` and the
+host-access fault path must reject pages in that state. Only after new users
+are excluded is it meaningful to check the existing lock count.
+
+Third, short accesses that do not retain a lock still need to drain. Clearing
+the guest-memory access bitmap prevents new accesses, but an access that
+passed its bitmap check may still be executing. The transition must wait for
+the guest-memory RCU read-side domain before releasing host access. This is
+why Underhill uses visibility bitmaps and RCU synchronization in addition to
+locked-GPN tracking:
+
+- `vm/vmcore/guestmem/src/lib.rs:1715-1789`
+- `openhcl/underhill_mem/src/lib.rs:535-655`
+
+Finally, locks do not represent DMA mappings. VFIO and other direct-DMA users
+need separate mapping or DMA reference tracking, and their IOMMU mappings must
+be removed before a page can become private. Treating an IOMMU mapping as an
+indefinite lock could provide a common policy interface, but the mapper still
+needs explicit synchronous unmap and failure handling.
+
+A minimal safe software-virtio policy can nevertheless be built around
+`lock_gpns`:
+
+1. Require every asynchronous guest-buffer user to retain an RAII GPN lock
+   until completion or cancellation.
+2. Mark a transition range `Revoking` before checking its locks.
+3. Block new locks and host-access faults for revoking pages.
+4. Clear access bitmap entries and drain existing RCU readers.
+5. Reject the transition as busy if any page remains locked.
+6. Release MSHV host access only after all of those checks succeed.
+
+This policy is sufficient only for audited software devices. VFIO, direct
+hardware DMA, DAX, and backends that retain GPAs without locks must remain
+unsupported until their lifetimes participate in the same coordinator.
+
 ## Underhill/OpenHCL Model
 
 Underhill already implements most of the required synchronization model:
