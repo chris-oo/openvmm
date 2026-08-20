@@ -4,7 +4,13 @@ Snapshot:
 
 - Upstream `main`: `b6d6e0c15fef2f7219eaf48c2a3f65963ab2ac33`
 - `chris-oo:mshv-snp-core`: `da4628d98ede680fd46fc6a560da529847160aa6`
+- Latest #4260 head checked: 2026-08-20
 - Primary PRs reviewed: [#3939](https://github.com/microsoft/openvmm/pull/3939), [#3970](https://github.com/microsoft/openvmm/pull/3970), [#4233](https://github.com/microsoft/openvmm/pull/4233), [#4237](https://github.com/microsoft/openvmm/pull/4237), [#4257](https://github.com/microsoft/openvmm/pull/4257), and [#4260](https://github.com/microsoft/openvmm/pull/4260)
+
+PR #4260 will be squash-merged. Its head commit IDs and line numbers are
+temporary. Until merge, treat each #4260 reference as a file path plus a nearby
+symbol or comment. After merge, replace those links with permalinks to the
+squash commit and refresh the line ranges.
 
 The `mshv-snp-core` diff contains 15 added `TODO`, `HACK`, or explicit
 workaround markers. The tables below combine closely related markers into
@@ -69,19 +75,51 @@ the PR descriptions and review discussions.
 | Follow-up | Evidence | Status |
 |---|---|---|
 | Make isolation capability/config validation canonical and type-driven instead of maintaining overlapping checks in CLI/entry and worker dispatch. | [scalability review](https://github.com/microsoft/openvmm/pull/3970#discussion_r3624476128), [canonical-validation review](https://github.com/microsoft/openvmm/pull/3970#discussion_r3624164192), [entry validation](https://github.com/microsoft/openvmm/blob/b6d6e0c15fef2f7219eaf48c2a3f65963ab2ac33/openvmm/openvmm_entry/src/lib.rs#L2048-L2091), [worker validation](https://github.com/microsoft/openvmm/blob/b6d6e0c15fef2f7219eaf48c2a3f65963ab2ac33/openvmm/openvmm_core/src/worker/dispatch.rs#L1177-L1222) | Still present, but not tagged TODO. |
+| Split the large `virt_mshv::ErrorInner` into smaller typed errors at subsystem boundaries. | PR #4260, `vmm_core/virt_mshv/src/lib.rs`, near `ErrorInner` and its `TODO: Chunk this up into smaller types`; [review comment](https://github.com/microsoft/openvmm/pull/4260#discussion_r3798761101) | The TODO was present in the reviewed diff but was missing from this inventory. Keep this separate from the KVM error-enum cleanup completed by #4257. |
 
-## 8. Fresh #4260 review findings
+## 8. Proposed GitHub issue filing plan
 
-These are correctness findings in the associated changes, not intentional
-TODOs or hacks:
+File one umbrella issue for each open top-level section, not one issue for each
+table row. Use each row as a checklist item in its umbrella issue. This keeps
+related design choices together without losing independently closable work.
 
-| Finding | Evidence |
-|---|---|
-| `hv1_reference_tsc_page` is forced on whenever Hyper-V is configured, which can undermine the deliberate reference-TSC advertisement HACK and re-enable handling through a second capability path. | [code](https://github.com/microsoft/openvmm/blob/da4628d98ede680fd46fc6a560da529847160aa6/vmm_core/virt_mshv/src/x86_64/mod.rs#L426-L430), [review comment](https://github.com/microsoft/openvmm/pull/4260#discussion_r3787086262) |
-| MSHV tracked-range unmap validation uses unchecked `addr + size` and PFN-end additions; overflow can make overlap checks incorrect. | [code](https://github.com/microsoft/openvmm/blob/da4628d98ede680fd46fc6a560da529847160aa6/vmm_core/virt_mshv/src/lib.rs#L979-L1000), [review comment](https://github.com/microsoft/openvmm/pull/4260#discussion_r3787086324) |
+| Section | Proposed title | Labels | Body scope |
+|---|---|---|---|
+| 1 | `MSHV SNP: complete guest-memory ownership and host-access lifecycle` | `snp`, `bug` | Include both host-access lifecycle rows. State the concurrency and release-success invariants explicitly. Separate MSHV implementation work from the related KVM guestmemfd design decision in the checklist. |
+| 2 | `SNP: finish launch policy, measurement, and loader architecture` | `snp`, `enhancement` | Include all launch, policy, VMSA, ordering, and generic-loader rows. Call out which work is MSHV-only, KVM-only, or backend-neutral. |
+| 3 | `MSHV SNP: remove direct-boot kernel and platform compatibility hacks` | `snp`, `enhancement` | Include chipset, RTC, reference-TSC, ECAM, and LINT rows. Record the guest-kernel version or behavior that permits removal of each workaround. |
+| 4 | `MSHV SNP: define the CPUID and Hyper-V guest contract` | `snp`, `enhancement` | Include all five contract rows. Require a documented source of truth for measured CPUID, runtime CPUID, XSS, isolation leaves, and StartVP behavior. |
+| 5 | `MSHV SNP: complete VP lifecycle and reset semantics` | `snp`, `enhancement` | Include AP lifecycle and reset work. Keep the VMSA alignment check as a verification item, not removal work, unless MSHV or AMD documentation disproves the need. |
+| 6 | `SNP: track unsupported OpenVMM configuration surfaces` | `snp`, `enhancement` | Convert the KVM and MSHV constrained-surface rows into separate checklists. Add support only with a test and remove the matching validation rejection in the same change. |
+| 7 | `SNP: consolidate isolation validation and backend error architecture` | `snp`, `enhancement` | Include canonical type-driven validation and the `virt_mshv::ErrorInner` split. Link the relevant review discussions and avoid making this a general unrelated refactor. |
+
+For each issue body:
+
+1. Link PR #4260 and this inventory.
+2. Copy the section rows as task-list items, preserving priority.
+3. Cite the file path and nearby symbol or comment instead of a temporary PR
+   head commit.
+4. Add acceptance criteria and tests for each checked item.
+5. Note dependencies on MSHV kernel ABI, guest-kernel fixes, or KVM support.
+6. After #4260 merges, replace relative locations with squash-commit
+   permalinks.
 
 ## Already resolved or superseded follow-ups
 
+- The two correctness findings from the first #4260 review are fixed in the
+  current PR head.
+  `hv1_reference_tsc_page` now follows the SNP feature policy near
+  `hv1_reference_tsc_page_supported` in
+  `vmm_core/virt_mshv/src/x86_64/mod.rs`, and tracked-range end calculations
+  use checked addition in `MshvPartitionInner::unmap_range` in
+  `vmm_core/virt_mshv/src/lib.rs`. See
+  [reference-TSC review](https://github.com/microsoft/openvmm/pull/4260#discussion_r3787086262)
+  and
+  [range-overflow review](https://github.com/microsoft/openvmm/pull/4260#discussion_r3787086324).
+- The latest #4260 updates also moved the CPUID-offload diagnostic into
+  MSHV-specific configuration, introduced `MshvIsolationState`, and moved the
+  imported-initial-register decision to the partition boundary. These resolve
+  the associated placement review comments and do not need separate issues.
 - The request to split the large KVM SNP/memory error enum was handled by
   [#4257](https://github.com/microsoft/openvmm/pull/4257).
 - The earlier closed foundation PRs
