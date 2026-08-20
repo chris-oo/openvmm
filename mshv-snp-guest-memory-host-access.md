@@ -2,15 +2,26 @@
 
 ## Summary
 
-MSHV SNP needs one coordinator for guest visibility, host access, software
-I/O, and device DMA. The coordinator must block new users before it makes a
-page private. It must then drain current users, remove DMA mappings, and
-release MSHV host access.
+MSHV SNP needs one coordinator for guest visibility, host access, and
+zero-copy software I/O. The coordinator must prevent a guest visibility
+transition while a host operation holds a guest page.
 
-Start with bounded bounce buffers for software virtio devices. Add page leases
-only after each backend has a proven completion and cancellation lifetime.
-Keep direct device DMA unsupported until the coordinator can synchronously
-remove every DMA mapping.
+Use the existing `lock_gpns` lifetime as the ownership contract. Store active
+locks in a bounded sparse registry instead of allocating state for every 4 KiB
+page in the VM. Keep direct device DMA unsupported until DMA mappings
+participate in the same ownership model.
+
+This design makes the following working assumption:
+
+> The hypervisor revokes host access synchronously. A later userspace access
+> to the revoked page causes a recoverable fault that OpenVMM's `trycopy`
+> handling can observe and return as a memory-access failure.
+
+This assumption lets ordinary short `GuestMemory` accesses fail without a
+separate reference count or RCU drain. Operations that retain a raw pointer
+across an asynchronous boundary must hold a `lock_gpns` lease. The MSHV and
+hypervisor follow-up questions at the end of this document must confirm the
+assumption.
 
 This document uses these terms:
 
@@ -20,6 +31,7 @@ This document uses these terms:
   backing of a shared page.
 - **Lease** is an RAII object that keeps host access active for a software
   operation.
+- **Lease registry** is the bounded list of active leases and their GPNs.
 - **DMA reference** records that a device or IOMMU can still access a page.
 
 ## Problem
@@ -90,81 +102,110 @@ An object such as `LockedIoBuffers` provides an RAII lifetime at the device
 layer. Regular membacking does not use that lifetime to prevent SNP
 host-access revocation.
 
-### Why `lock_gpns` Alone Is Insufficient
+### What `lock_gpns` Must Guarantee
 
-OpenVMM must implement `lock_gpns` and reject a shared-to-private transition
-when a requested page is locked. This change alone does not close every
-host-access race.
+OpenVMM must reject a shared-to-private transition when a requested page has
+an active lease. It does not need to preserve a guest that changes visibility
+while a device owns the buffer. OpenVMM can deny the transition or stop the
+guest. It must only ensure that the bad request cannot crash the host.
 
-First, locks protect only callers that use the locking API. Ordinary
-`GuestMemory` reads and writes, fault-driven host-access acquisition, and
-device DMA mappings do not automatically create a GPN lock. A transition
-can observe no locks in these cases:
+The current generic lock order has a race:
 
-- A CPU thread is executing a short guest-memory copy.
-- A host-access fault is about to reacquire the page.
-- A network or storage backend retained a GPA without using
-  `LockedIoBuffers`.
-- VFIO or another direct-DMA backend still has the page mapped in an IOMMU.
+1. `GuestMemory::lock_gpns` or `GuestMemory::lock_range` probes each page and
+   obtains its host pointer.
+2. The backing records the lock through its `lock_gpns` callback.
+3. The method returns the RAII object.
 
-Second, a check followed by release has a time-of-check/time-of-use race:
+A visibility transition can occur between steps 1 and 2. The relevant code is
+near `GuestMemory::lock_gpns`, `GuestMemory::lock_range`, and
+`probe_page_for_lock` in `vm/vmcore/guestmem/src/lib.rs`.
 
-1. The transition checks that the pages are unlocked.
-2. A new I/O operation locks or faults one of the pages.
-3. The transition releases MSHV host access.
-4. The new operation accesses a page that is becoming private.
+The lock path must reserve the lease before it exposes the pointer:
 
-The transition must first mark the pages `Revoking`. Both `lock_gpns` and the
-host-access fault path must reject pages in that state. Only after new users
-are excluded is it meaningful to check the existing lock count.
+1. Lock the host-access coordinator.
+2. Validate and deduplicate the requested GPNs.
+3. Reject a page that is not shared or is blocked for a guest transition.
+4. Insert a lease record.
+5. Acquire MSHV host access if the page does not already have it.
+6. Probe the mapping and expose the pointer.
+7. Remove the lease record if acquisition or probing fails.
 
-Third, the coordinator must drain short accesses that do not retain a lock.
-Clearing the guest-memory access bitmap prevents new accesses. An access that
-passed its bitmap check can still be active. The transition must wait for the
-guest-memory RCU read-side domain before it releases host access. Underhill
-combines visibility bitmaps and RCU synchronization with locked-GPN tracking:
+This order requires a new pre-lock callback or another change to the
+`GuestMemoryAccess` locking interface. The current callback runs too late.
 
-- `vm/vmcore/guestmem/src/lib.rs:1715-1789`
-- `openhcl/underhill_mem/src/lib.rs:535-655`
+All asynchronous zero-copy users must retain the returned RAII object until
+completion or cancellation. Backends that retain a GPA or pointer without a
+lease remain unsupported.
 
-Finally, locks do not represent DMA mappings. VFIO and other direct-DMA users
-need separate DMA reference tracking. The coordinator must remove their IOMMU
-mappings before it makes a page private. An indefinite lock can represent an
-IOMMU mapping in a common policy interface. The mapper still needs explicit
-synchronous unmap and failure handling.
+Under the working hypervisor assumption, ordinary `GuestMemory` reads and
+writes do not need leases. A revoked access faults through `trycopy` and
+returns an error. Fault-driven acquisition must use the same coordinator as
+visibility transitions. It must fail while the coordinator has blocked the
+page for a pending guest transition.
 
-A minimal safe software-virtio policy can use `lock_gpns`:
-
-1. Require every asynchronous guest-buffer user to retain an RAII GPN lock
-   until completion or cancellation.
-2. Mark a transition range `Revoking` before checking its locks.
-3. Block new locks and host-access faults for revoking pages.
-4. Clear access bitmap entries and drain existing RCU readers.
-5. Reject the transition as busy if any page remains locked.
-6. Release MSHV host access only after all of those checks succeed.
-
-The minimal policy supports only audited software devices. Keep VFIO, direct
-hardware DMA, DAX, and backends that retain unlocked GPAs unsupported. Enable
-them only after they report their lifetimes to the same coordinator.
+Locks do not represent DMA mappings. Keep VFIO, direct hardware DMA, DAX, and
+similar paths unsupported until they use the same coordinator and can remove
+their mappings synchronously.
 
 ## Underhill/OpenHCL Model
 
-Underhill already implements most of the required synchronization model:
+Underhill does not use one lock bit or one integer reference count per page.
+It stores one boxed GPN slice for each successful lock operation in
+`HardwareIsolatedMemoryProtectorInner::locked_pages`:
 
-- Visibility bitmaps gate guest-memory access.
-- Lock and unlock callbacks record and remove locked GPNs.
-- Visibility transitions reject locked pages.
-- The transition clears access bitmaps before it changes visibility.
-- The transition drains existing accesses through the guest-memory RCU domain.
+- `lock_gpns` appends the complete slice. It allows overlapping locks.
+- `unlock_gpns` removes one matching slice.
+- A visibility transition rejects a GPN if any stored slice contains it.
+- `LockedPages` and `LockedRangeImpl` call `unlock_gpns` when their RAII
+  lifetime ends.
 
 Relevant implementation:
 
-- `openhcl/underhill_mem/src/mapping.rs:100-260`
-- `openhcl/underhill_mem/src/lib.rs:535-655`
-- `openhcl/underhill_mem/src/lib.rs:1108-1143`
+- `openhcl/underhill_mem/src/lib.rs`, near
+  `HardwareIsolatedMemoryProtectorInner`, `check_gpn_not_locked`,
+  `lock_gpns`, and `unlock_gpns`
+- `openhcl/underhill_mem/src/mapping.rs`, in the `GuestMemoryAccess`
+  implementation for `GuestMemoryView`
+- `vm/vmcore/guestmem/src/lib.rs`, near `LockedPages` and `LockedRangeImpl`
 
-Adapting this model to regular OpenVMM is the most direct route to safe MSHV
-SNP host-access transitions.
+The `valid_shared` and `valid_encrypted` bitmaps have a separate purpose. They
+gate ordinary mapped accesses. They do not record lock ownership.
+
+Underhill's sparse representation fits the expected OpenVMM workload better
+than a dense `u32` array. A dense counter costs 1 MiB for each GiB of guest
+RAM, even when no page is locked. A 1 TiB VM would require 1 GiB of counters.
+
+A regular OpenVMM implementation can use a bounded vector of lease records:
+
+```rust
+struct LeaseRecord {
+    id: LeaseId,
+    gpns: Box<[u64]>,
+}
+
+struct LeaseRegistry {
+    leases: Vec<LeaseRecord>,
+    total_gpn_references: usize,
+}
+```
+
+Each overlapping lease remains a separate record. Removing one lease does not
+remove another lease on the same page. A visibility transition scans the
+bounded records and rejects any overlap.
+
+The registry must cap both the number of lease records and the total number
+of stored GPN references. Exceeding either limit fails the lock request. This
+prevents an untrusted guest from using large or fragmented descriptors to
+force unbounded host allocation. The limits should be policy values based on
+the maximum supported in-flight device work, not on total VM memory.
+
+Contiguous GPNs can later use range records to reduce storage. A bounded
+`Vec<Box<[u64]>>` is the simplest first implementation when the number of
+shared, actively locked pages is expected to stay small.
+
+Underhill still has the generic probe-before-lock gap described above.
+OpenVMM can reuse its sparse ownership model, but it must not copy that lock
+ordering.
 
 ## VFIO and DMA
 
@@ -188,52 +229,11 @@ Structural teardown removes DMA mappings before memory mappings. No visibility
 event synchronously removes a page from every DMA target before MSHV makes it
 private.
 
-## Design Options
+## Proposed Lease Design
 
-### 1. Bounce-buffer-only software virtio
-
-Copy request data into bounded host buffers before asynchronous I/O. For
-reads, put host I/O data in a host buffer. Acquire guest access only while
-copying the result to guest memory.
-
-Advantages:
-
-- Smallest trust boundary.
-- Simple cancellation and teardown.
-- No guest page remains referenced while host I/O is pending.
-- Existing block and network implementations provide useful examples.
-
-Disadvantages:
-
-- Additional copies.
-- Buffer allocations must be strictly capped against malicious descriptor
-  sizes.
-- Does not support direct device DMA, DAX, or other zero-copy paths.
-
-This is the safest first supported mode for virtio-blk and copy-based
-networking.
-
-### 2. Page-level host-access leases
-
-Implement real `lock_gpns` and `unlock_gpns` callbacks in membacking. Every
-asynchronous operation retains an RAII lease for its guest pages until
-completion or cancellation.
-
-A possible page state is:
-
-```rust
-enum PageState {
-    Private,
-    Acquiring,
-    Shared {
-        host_refs: u32,
-        dma_refs: u32,
-    },
-    Revoking,
-}
-```
-
-An operation must acquire and retain a lease:
+Implement pre-probe `lock_gpns` and `unlock_gpns` callbacks in membacking.
+Every asynchronous zero-copy operation retains an RAII lease until completion
+or cancellation:
 
 ```rust
 let lease = guest_memory.lock_range(range, access)?;
@@ -241,49 +241,26 @@ backend.submit(request).await?;
 drop(lease);
 ```
 
-The lock path must:
+The coordinator contains:
 
-1. Validate, page-align, and deduplicate the requested GPNs.
-2. Reject pages in `Revoking`.
-3. Acquire MSHV host access for private pages.
-4. Enable the appropriate guest-memory access bitmap.
-5. Increment each page's host reference count.
-6. Return an RAII object that decrements the count on drop.
+- The bounded sparse lease registry.
+- A sparse set or range map for pages where OpenVMM acquired host access, if
+  the hypervisor contract requires OpenVMM to cache that state.
+- A sparse set of pages blocked for a pending guest private transition.
+- One mutex that orders lease reservation, fault-driven acquisition, and host
+  access release.
 
-Existing `LockedIoBuffers` users can gain these semantics without changing
-their outer I/O lifetime. Other zero-copy backends must retain an equivalent
-lease until their actual completion event.
+A dedicated `Revoking` state is not required while the coordinator holds the
+mutex across the synchronous release ioctl. The coordinator must still keep a
+page blocked after release because the intercepted guest visibility hypercall
+has not completed yet. Otherwise, another thread could reacquire host access
+before the guest re-executes that hypercall.
 
-Advantages:
+Existing `LockedIoBuffers` users can retain their current outer I/O lifetime
+after the generic lock order is fixed. Other zero-copy backends must retain an
+equivalent lease until their actual completion event.
 
-- Builds on existing `GuestMemory` APIs.
-- Closely follows the proven Underhill design.
-- Allows selected zero-copy paths.
-
-Disadvantages:
-
-- Requires auditing every backend that retains GPAs or guest buffers.
-- Cancellation, reset, save, unmap, and teardown must all drain leases.
-- Needs a serialized per-page state machine shared with memory faults and
-  guest visibility requests.
-
-### 3. Permanently shared I/O aperture
-
-Reserve a guest region that remains shared and use it for queue data, bounce
-buffers, and device DMA.
-
-Advantages:
-
-- Simple visibility and lifetime rules.
-- Can provide a controlled DMA region for assigned devices.
-
-Disadvantages:
-
-- Requires guest cooperation.
-- Reduces flexibility and private memory.
-- Usually requires copies between private guest memory and the aperture.
-
-### 4. Visibility-aware VFIO mappings
+### Deferred visibility-aware VFIO mappings
 
 Map only shared pages into each VFIO IOAS and synchronously remove those
 mappings before completing a private transition.
@@ -304,25 +281,37 @@ correctness and security risk.
 
 When the guest requests that pages become private:
 
-1. Validate the complete range without changing state.
-2. Mark every page `Revoking`, blocking new leases and fault-driven
-   acquisition.
-3. Clear guest-memory access bitmap entries.
-4. Drain the guest-memory RCU domain so accesses that began before the bitmap
-   change have completed.
-5. Check host and DMA reference counts.
-6. If references remain, cancel revocation and report a retryable busy status.
-7. Remove all DMA mappings.
-8. Release MSHV host access.
-9. Mark the pages `Private`.
+1. Validate the complete range.
+2. Lock the host-access coordinator.
+3. Scan the bounded lease registry for an overlap.
+4. If a lease overlaps, deny the transition. Do not wait for device
+   completion.
+5. Mark the pages as blocked for the pending guest transition.
+6. Release MSHV host access while holding the coordinator mutex.
+7. If release fails, restore the previous coordinator state and fail the
+   guest operation.
+8. If release succeeds, keep the pages blocked while the VP resumes and
+   re-executes its visibility hypercall.
 
-Initially, return a retryable busy result instead of blocking a VP while a
-device completes an operation. Underhill uses a similar policy when a
-transition includes locked pages.
+This protocol does not drain ordinary short `GuestMemory` accesses. Under the
+working assumption, an access that loses host permission faults through
+`trycopy` and returns an error. Only a zero-copy operation with an exposed
+pointer needs a lease.
 
-Host-access faults must use the same coordinator. A fault must not invoke MSHV
-while a page is `Revoking`. Otherwise, the fault can reacquire access during
-the release sequence.
+Fault-driven acquisition uses the same coordinator mutex. It fails without
+calling MSHV when a page is blocked for a pending private transition. For
+other pages, an MSHV acquisition failure becomes a normal guest-memory access
+failure.
+
+The design must define when to clear the pending-transition marker. Possible
+signals include the next shared-visibility intercept or an authoritative
+hypervisor visibility query. The hypervisor contract must define this point.
+
+MSHV can complete only part of a repeated host-access hypercall before it
+returns an error. The current kernel reports the failure but does not return
+the completed count to userspace. Until MSHV provides an atomic operation,
+completed-count output, or an authoritative query, OpenVMM must use a batch
+size and failure policy that cannot silently treat a mixed result as success.
 
 ## Device Teardown
 
@@ -341,20 +330,23 @@ This is not universal:
   `vm/devices/pci/vfio_assigned_device/src/lib.rs:1571-1582`.
 
 The host-access coordinator must participate in reset, unmap, save, and device
-removal. It must not assume that stopping a transport drains every memory
-user.
+removal. These operations must reject or drain active lease records before
+they remove memory mappings. They must not assume that stopping a transport
+drains every memory user.
 
 ## Recommended Staging
 
-1. Add a shared page-state coordinator to membacking.
-2. Port Underhill-style visibility bitmaps, GPN lock tracking, and RCU
-   draining to regular OpenVMM.
-3. Route MSHV acquisition faults and guest visibility requests through that
+1. Add a host-access coordinator with a bounded sparse lease registry.
+2. Change `GuestMemory` locking so the backing reserves a lease before pointer
+   probing and exposure.
+3. Route MSHV acquisition faults and guest visibility requests through the
    coordinator.
-4. Enable bounded bounce-buffer virtio-blk and copy-based networking first.
-5. Add leases to selected zero-copy software backends after their completion
-   and cancellation lifetimes are audited.
-6. Add visibility-aware DMA mapping only after transitions can synchronously
+4. Audit each supported software backend. Require it to retain a lease across
+   every zero-copy asynchronous operation.
+5. Add tests for overlapping leases, failed lock rollback, visibility
+   rejection, concurrent faults, cancellation, reset, and teardown.
+6. Confirm the working trycopy-fault assumption in the hypervisor.
+7. Add visibility-aware DMA mapping only after transitions can synchronously
    drain and unmap every DMA target.
 
 Initially keep these configurations unsupported:
@@ -363,18 +355,69 @@ Initially keep these configurations unsupported:
 - Direct MANA or NVMe guest DMA.
 - vhost-user and virtio-fs DAX.
 - Hot memory unmap/remap during active device I/O.
-- Save, migration, or reset while page leases or DMA mappings are active.
+- Save, migration, or reset while leases or DMA mappings are active.
 
-## Open Questions
+## Confirmed MSHV Kernel Behavior
 
-- What retryable status should the MSHV GPA visibility protocol return for a
-  page that is still in use?
-- Can read-only host access be made reliable, or must every lease request
+The MSHV partition fd serializes all partition ioctls with
+`mshv_partition::pt_mutex`. Two `MSHV_MODIFY_GPA_HOST_ACCESS` ioctls for one
+partition do not execute concurrently:
+
+- `drivers/hv/mshv_root.h`, near `struct mshv_partition`
+- `drivers/hv/mshv_root_main.c`, near `mshv_partition_ioctl`
+  in `~/ai/leafeon/LSG-linux-rolling`
+
+The host-access ioctl does not track OpenVMM users or leases. It converts the
+guest GPA list to host PFNs and calls
+`hv_call_modify_spa_host_access`:
+
+- `drivers/hv/mshv_root_main.c`, near
+  `mshv_partition_ioctl_modify_gpa_host_access`
+- `drivers/hv/mshv_root_hv_call.c`, near
+  `hv_call_modify_spa_host_access`
+
+The partition mutex orders the ioctls, but it cannot know that
+`LockedIoBuffers`, io_uring, or another OpenVMM component still owns a host
+pointer. OpenVMM must provide that ownership policy.
+
+## Hypervisor Follow-up
+
+Review the Microsoft Hypervisor implementation of
+`HVCALL_ACQUIRE_SPARSE_SPA_PAGE_HOST_ACCESS` and
+`HVCALL_RELEASE_SPARSE_SPA_PAGE_HOST_ACCESS`. Confirm these points:
+
+1. Release completes synchronously and invalidates root mappings and TLB
+   entries before it returns.
+2. A userspace load or store after release causes a recoverable fault that
+   `trycopy` reports as an access failure. It must not cause a host bugcheck or
+   expose memory after ownership changes.
+3. An access already executing during release either completes safely or
+   faults safely.
+4. Acquire fails when the guest has not made the page shared.
+5. Acquire and release are state-setting operations, not reference-counted
+   operations that require balanced calls.
+6. The hypervisor defines ordering for overlapping acquire and release calls.
+   The MSHV partition mutex serializes ioctls, but other root or hypervisor
+   paths may still act on the same SPA.
+7. After OpenVMM releases access for a GPA attribute intercept, a fault cannot
+   reacquire the page before the guest re-executes and completes its pending
+   visibility hypercall. If it can, OpenVMM must retain the sparse blocked-page
+   state described above.
+8. The hypervisor defines the final state after partial completion of a
+   repeated acquire or release hypercall.
+9. Kernel users such as io_uring receive safe failure behavior if they touch a
+   page after release. If not, every such operation must remain covered by a
+   lease until kernel completion.
+
+Until this review is complete, treat the recoverable-trycopy-fault behavior as
+an explicit design assumption, not a verified contract.
+
+## Remaining Design Questions
+
+- What error should OpenVMM return when a guest requests a private transition
+  for a leased page?
+- What limits should apply to lease records and total stored GPN references?
+- Should the first implementation store GPNs or coalesced ranges?
+- Can read-only host access work correctly, or must every lease request
   read-write access?
-- Should leases be page-granular or coalesced into ranges internally?
-- How should reference counts interact with large-page visibility requests?
-- Which existing virtio backends can be proven copy-only without additional
-  leases?
-- Can a permanently shared aperture provide an acceptable first VFIO model,
-  or should assigned devices remain unsupported until dynamic DMA mapping is
-  complete?
+- What event authoritatively clears a pending guest-transition marker?
