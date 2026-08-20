@@ -1,24 +1,46 @@
 # MSHV SNP Guest-Memory Host Access
 
+## Summary
+
+MSHV SNP needs one coordinator for guest visibility, host access, software
+I/O, and device DMA. The coordinator must block new users before it makes a
+page private. It must then drain current users, remove DMA mappings, and
+release MSHV host access.
+
+Start with bounded bounce buffers for software virtio devices. Add page leases
+only after each backend has a proven completion and cancellation lifetime.
+Keep direct device DMA unsupported until the coordinator can synchronously
+remove every DMA mapping.
+
+This document uses these terms:
+
+- **Guest visibility** is the guest-controlled private or shared state of a
+  page.
+- **Host access** is the MSHV permission that lets OpenVMM access the existing
+  backing of a shared page.
+- **Lease** is an RAII object that keeps host access active for a software
+  operation.
+- **DMA reference** records that a device or IOMMU can still access a page.
+
 ## Problem
 
-MSHV SNP requires OpenVMM to coordinate guest page visibility with every host
-and device user of guest memory. A page must not become private while
-userspace, an asynchronous virtio operation, or an assigned device can still
-access it.
+MSHV SNP requires OpenVMM to coordinate guest visibility with every host and
+device user of guest memory. OpenVMM must not make a page private while
+userspace, an asynchronous virtio operation, or an assigned device can access
+it.
 
-The current MSHV SNP implementation is sufficient for bring-up, but it does
-not provide this lifetime coordination. Host access can be acquired in
-response to a memory fault, while release assumes that no virtstack component
-is using the affected pages:
+The current MSHV SNP implementation supports bring-up, but it does not
+coordinate these lifetimes. The fault handler can acquire host access.
+The release path assumes that no virtstack component uses the affected pages:
 
 - `vmm_core/virt/src/generic/partition_memory_map.rs:39-52`
 - `vmm_core/virt_mshv/src/lib.rs:875-889`
 - `vmm_core/virt_mshv/src/x86_64/snp.rs:286-335`
 - `vmm_core/virt_mshv/src/x86_64/snp.rs:923-952`
 
-This creates races between access faults, guest visibility transitions,
-asynchronous I/O completion, memory unmapping, reset, and device teardown.
+The missing coordination creates races between access faults, guest visibility
+transitions, asynchronous I/O completion, memory unmapping, reset, and device
+teardown.
 
 ## Current Virtio Buffer Lifetimes
 
@@ -48,8 +70,7 @@ guest pages referenced by each operation:
 - `vm/devices/virtio/virtio/src/queue.rs:129-156`
 - `vm/devices/virtio/virtio/src/queue.rs:341-367`
 
-There is therefore no central answer to "which guest pages are currently in
-use by virtio?"
+No central component can identify all guest pages that virtio currently uses.
 
 ## Existing Guest-Memory Locking
 
@@ -58,27 +79,27 @@ use by virtio?"
 - `vm/vmcore/guestmem/src/lib.rs:2078-2131`
 - `vm/vmcore/guestmem/src/lib.rs:2303-2485`
 
-However, the default `lock_gpns` implementation does not record page
-references. Regular OpenVMM membacking currently relies on stable mappings
-and does not override these callbacks with page-level tracking:
+The default `lock_gpns` implementation does not record page references.
+Regular OpenVMM membacking relies on stable mappings. It does not override
+these callbacks with page-level tracking:
 
 - `vm/vmcore/guestmem/src/lib.rs:616-685`
 - `openvmm/membacking/src/mapping_manager/va_mapper.rs:853-963`
 
-Consequently, an object such as `LockedIoBuffers` provides an RAII lifetime
-at the device layer, but regular membacking does not use that lifetime to
-prevent SNP host-access revocation.
+An object such as `LockedIoBuffers` provides an RAII lifetime at the device
+layer. Regular membacking does not use that lifetime to prevent SNP
+host-access revocation.
 
 ### Why `lock_gpns` Alone Is Insufficient
 
-Implementing `lock_gpns` and rejecting a shared-to-private transition whenever
-one of the requested pages is locked is necessary, but it does not by itself
-close every host-access race.
+OpenVMM must implement `lock_gpns` and reject a shared-to-private transition
+when a requested page is locked. This change alone does not close every
+host-access race.
 
 First, locks protect only callers that use the locking API. Ordinary
 `GuestMemory` reads and writes, fault-driven host-access acquisition, and
 device DMA mappings do not automatically create a GPN lock. A transition
-could therefore observe no locks even though:
+can observe no locks in these cases:
 
 - A CPU thread is executing a short guest-memory copy.
 - A host-access fault is about to reacquire the page.
@@ -97,24 +118,22 @@ The transition must first mark the pages `Revoking`. Both `lock_gpns` and the
 host-access fault path must reject pages in that state. Only after new users
 are excluded is it meaningful to check the existing lock count.
 
-Third, short accesses that do not retain a lock still need to drain. Clearing
-the guest-memory access bitmap prevents new accesses, but an access that
-passed its bitmap check may still be executing. The transition must wait for
-the guest-memory RCU read-side domain before releasing host access. This is
-why Underhill uses visibility bitmaps and RCU synchronization in addition to
-locked-GPN tracking:
+Third, the coordinator must drain short accesses that do not retain a lock.
+Clearing the guest-memory access bitmap prevents new accesses. An access that
+passed its bitmap check can still be active. The transition must wait for the
+guest-memory RCU read-side domain before it releases host access. Underhill
+combines visibility bitmaps and RCU synchronization with locked-GPN tracking:
 
 - `vm/vmcore/guestmem/src/lib.rs:1715-1789`
 - `openhcl/underhill_mem/src/lib.rs:535-655`
 
 Finally, locks do not represent DMA mappings. VFIO and other direct-DMA users
-need separate mapping or DMA reference tracking, and their IOMMU mappings must
-be removed before a page can become private. Treating an IOMMU mapping as an
-indefinite lock could provide a common policy interface, but the mapper still
-needs explicit synchronous unmap and failure handling.
+need separate DMA reference tracking. The coordinator must remove their IOMMU
+mappings before it makes a page private. An indefinite lock can represent an
+IOMMU mapping in a common policy interface. The mapper still needs explicit
+synchronous unmap and failure handling.
 
-A minimal safe software-virtio policy can nevertheless be built around
-`lock_gpns`:
+A minimal safe software-virtio policy can use `lock_gpns`:
 
 1. Require every asynchronous guest-buffer user to retain an RAII GPN lock
    until completion or cancellation.
@@ -124,20 +143,19 @@ A minimal safe software-virtio policy can nevertheless be built around
 5. Reject the transition as busy if any page remains locked.
 6. Release MSHV host access only after all of those checks succeed.
 
-This policy is sufficient only for audited software devices. VFIO, direct
-hardware DMA, DAX, and backends that retain GPAs without locks must remain
-unsupported until their lifetimes participate in the same coordinator.
+The minimal policy supports only audited software devices. Keep VFIO, direct
+hardware DMA, DAX, and backends that retain unlocked GPAs unsupported. Enable
+them only after they report their lifetimes to the same coordinator.
 
 ## Underhill/OpenHCL Model
 
 Underhill already implements most of the required synchronization model:
 
 - Visibility bitmaps gate guest-memory access.
-- Locked GPNs are recorded and removed by lock/unlock callbacks.
+- Lock and unlock callbacks record and remove locked GPNs.
 - Visibility transitions reject locked pages.
-- Access bitmaps are cleared before a transition.
-- Existing accesses are drained through the guest-memory RCU domain before
-  visibility changes.
+- The transition clears access bitmaps before it changes visibility.
+- The transition drains existing accesses through the guest-memory RCU domain.
 
 Relevant implementation:
 
@@ -156,8 +174,7 @@ OpenVMM already tracks the lifetime and ordering of structural DMA mappings:
 - `openvmm/membacking/src/region_manager.rs:408-484`
 - `openvmm/membacking/src/region_manager.rs:853-889`
 
-VFIO mappings are nevertheless incompatible with arbitrary SNP
-private/shared transitions today:
+Current VFIO mappings do not support arbitrary SNP private/shared transitions:
 
 - VFIO type1 maps ranges by host VA, allowing the kernel to pin pages for the
   lifetime of the IOMMU mapping:
@@ -167,17 +184,17 @@ private/shared transitions today:
 - Current mappings cover active RAM ranges rather than following individual
   SNP shared-page transitions.
 
-Structural teardown correctly removes DMA mappings before memory mappings,
-but there is no visibility event that synchronously removes a page from every
-DMA target before MSHV makes it private.
+Structural teardown removes DMA mappings before memory mappings. No visibility
+event synchronously removes a page from every DMA target before MSHV makes it
+private.
 
 ## Design Options
 
 ### 1. Bounce-buffer-only software virtio
 
 Copy request data into bounded host buffers before asynchronous I/O. For
-reads, perform host I/O into a host buffer and acquire guest access only while
-copying the result back.
+reads, put host I/O data in a host buffer. Acquire guest access only while
+copying the result to guest memory.
 
 Advantages:
 
@@ -216,7 +233,7 @@ enum PageState {
 }
 ```
 
-An operation would acquire and retain a lease:
+An operation must acquire and retain a lease:
 
 ```rust
 let lease = guest_memory.lock_range(range, access)?;
@@ -224,7 +241,7 @@ backend.submit(request).await?;
 drop(lease);
 ```
 
-The lock path would:
+The lock path must:
 
 1. Validate, page-align, and deduplicate the requested GPNs.
 2. Reject pages in `Revoking`.
@@ -233,9 +250,9 @@ The lock path would:
 5. Increment each page's host reference count.
 6. Return an RAII object that decrements the count on drop.
 
-Existing `LockedIoBuffers` users could gain these semantics without changing
-their outer I/O lifetime. Other zero-copy backends would need to retain an
-equivalent lease until their real completion event.
+Existing `LockedIoBuffers` users can gain these semantics without changing
+their outer I/O lifetime. Other zero-copy backends must retain an equivalent
+lease until their actual completion event.
 
 Advantages:
 
@@ -271,7 +288,7 @@ Disadvantages:
 Map only shared pages into each VFIO IOAS and synchronously remove those
 mappings before completing a private transition.
 
-This requires:
+Visibility-aware VFIO mappings require:
 
 - Per-page or coalesced-range DMA reference tracking.
 - Device quiescing before unmap.
@@ -280,8 +297,8 @@ This requires:
 - Correct handling of reset, hot-unplug, and process teardown.
 - A policy for ATS-capable devices and device-side translation caches.
 
-This provides the best direct-DMA performance but has the highest correctness
-and security risk.
+This option provides the best direct-DMA performance. It also has the highest
+correctness and security risk.
 
 ## Proposed Transition Protocol
 
@@ -299,12 +316,12 @@ When the guest requests that pages become private:
 8. Release MSHV host access.
 9. Mark the pages `Private`.
 
-Returning a retryable busy result is safer initially than blocking a VP
-indefinitely while waiting for device completion. It also resembles
-Underhill's current rejection of transitions involving locked pages.
+Initially, return a retryable busy result instead of blocking a VP while a
+device completes an operation. Underhill uses a similar policy when a
+transition includes locked pages.
 
-Host-access faults must enter the same coordinator. A fault must not invoke
-MSHV directly while a page is `Revoking`, or it could reacquire access during
+Host-access faults must use the same coordinator. A fault must not invoke MSHV
+while a page is `Revoking`. Otherwise, the fault can reacquire access during
 the release sequence.
 
 ## Device Teardown
@@ -323,9 +340,9 @@ This is not universal:
 - VFIO save/restore is unsupported:
   `vm/devices/pci/vfio_assigned_device/src/lib.rs:1571-1582`.
 
-The host-access coordinator must therefore participate explicitly in reset,
-unmap, save, and device removal instead of assuming that stopping a transport
-has drained every memory user.
+The host-access coordinator must participate in reset, unmap, save, and device
+removal. It must not assume that stopping a transport drains every memory
+user.
 
 ## Recommended Staging
 
