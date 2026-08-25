@@ -70,8 +70,35 @@ pub trait PartitionMemoryMap: Send + Sync {
 pub trait PartitionHostAccess: Send + Sync {
     /// Acquires host access without changing guest visibility.
     ///
+    /// `addr` and `size` are byte offsets in the guest physical address space.
+    ///
     /// TODO: This trait is sufficient for MSHV bring-up, but a redesign is
     /// required to safely lower host access and track that pages are not
     /// currently in use before revoking access.
     fn acquire_host_access(&self, addr: u64, size: u64, write: bool) -> anyhow::Result<()>;
+
+    /// Reserves host access to guest pages before their host virtual addresses
+    /// are exposed to a caller.
+    ///
+    /// `gpns` contains guest page numbers in the partition GPA space. `write`
+    /// specifies whether the caller will write through the mapping.
+    ///
+    /// Returns whether [`unlock_gpns`](Self::unlock_gpns) must be called. If
+    /// this returns an error, the implementation must release every
+    /// reservation it made during the call. Repeated GPNs are permitted and
+    /// represent repeated reservations.
+    ///
+    /// The implementation must remain alive until the caller releases every
+    /// reservation for which this method returned `true`.
+    fn lock_gpns(&self, gpns: &[u64], write: bool) -> anyhow::Result<bool> {
+        let _ = (gpns, write);
+        Ok(false)
+    }
+
+    /// Releases a reservation created by [`lock_gpns`](Self::lock_gpns).
+    ///
+    /// The caller supplies the same GPNs in the same order as the lock call.
+    fn unlock_gpns(&self, gpns: &[u64]) {
+        let _ = gpns;
+    }
 }

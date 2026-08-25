@@ -721,6 +721,13 @@ impl MapperInner {
 }
 
 impl VaMapper {
+    fn host_access(&self) -> Option<Arc<dyn virt::PartitionHostAccess>> {
+        self.inner
+            .host_access
+            .get()
+            .and_then(|host_access| host_access.0.upgrade())
+    }
+
     pub(crate) async fn new(
         req_send: mesh::Sender<MappingRequest>,
         len: u64,
@@ -824,8 +831,10 @@ impl VaMapper {
         self.inner.mapping.as_ptr().cast()
     }
 
-    /// Installs the callback used to recover eager-mapper faults caused by
-    /// missing host permission.
+    /// Installs the callback used to recover eager-mapper faults and reserve
+    /// host access for guest-memory locks.
+    ///
+    /// The callback must outlive every lock reservation it grants.
     pub(crate) fn install_host_access(&self, host_access: Arc<dyn virt::PartitionHostAccess>) {
         assert!(
             self.inner
@@ -910,12 +919,7 @@ unsafe impl GuestMemoryAccess for VaMapper {
             // The guest-memory VA is already mapped for an eager mapper. For
             // isolated guests, a fault can instead mean that the hypervisor has
             // not granted userspace access to a shared page.
-            if let Some(host_access) = self
-                .inner
-                .host_access
-                .get()
-                .and_then(|host_access| host_access.0.upgrade())
-            {
+            if let Some(host_access) = self.host_access() {
                 let start = address & !(hvdef::HV_PAGE_SIZE - 1);
                 let end = address
                     .checked_add(len as u64)
@@ -956,6 +960,38 @@ unsafe impl GuestMemoryAccess for VaMapper {
             ));
         }
         PageFaultAction::Retry
+    }
+
+    fn lock_gpns(
+        &self,
+        access: guestmem::AccessType,
+        gpns: &[u64],
+    ) -> Result<bool, GuestMemoryBackingError> {
+        let Some(host_access) = self.host_access() else {
+            return Ok(false);
+        };
+        host_access
+            .lock_gpns(gpns, access == guestmem::AccessType::Write)
+            .map_err(|err| {
+                let gpa = gpns
+                    .first()
+                    .copied()
+                    .and_then(|gpn| gpn.checked_mul(hvdef::HV_PAGE_SIZE))
+                    .unwrap_or(0);
+                GuestMemoryBackingError::new(GuestMemoryErrorKind::Other, gpa, err)
+            })
+    }
+
+    fn unlock_gpns(&self, gpns: &[u64]) {
+        let host_access = self
+            .inner
+            .host_access
+            .get()
+            .expect("host access must be installed before it can request unlock")
+            .0
+            .upgrade()
+            .expect("host access must outlive its outstanding guest-memory locks");
+        host_access.unlock_gpns(gpns);
     }
 
     fn sharing(&self) -> Option<GuestMemorySharing> {

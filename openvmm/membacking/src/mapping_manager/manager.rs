@@ -854,9 +854,31 @@ impl ProvideShareableRegions for DmaRegionProvider {
 mod tests {
     use super::*;
     use crate::region_manager::MappingType;
+    use guestmem::AccessType;
     use guestmem::GuestMemoryAccess;
     use guestmem::ProvideShareableRegions;
     use memory_range::MemoryRange;
+    use parking_lot::Mutex;
+
+    #[derive(Default)]
+    struct TestHostAccess {
+        events: Mutex<Vec<(&'static str, Vec<u64>, bool)>>,
+    }
+
+    impl virt::PartitionHostAccess for TestHostAccess {
+        fn acquire_host_access(&self, _addr: u64, _size: u64, _write: bool) -> anyhow::Result<()> {
+            unreachable!("the lock bridge must not use the fault path")
+        }
+
+        fn lock_gpns(&self, gpns: &[u64], write: bool) -> anyhow::Result<bool> {
+            self.events.lock().push(("lock", gpns.to_vec(), write));
+            Ok(true)
+        }
+
+        fn unlock_gpns(&self, gpns: &[u64]) {
+            self.events.lock().push(("unlock", gpns.to_vec(), false));
+        }
+    }
 
     #[pal_async::async_test]
     async fn test_dma_target_regions_returned(spawn: impl Spawn) {
@@ -1515,6 +1537,128 @@ mod tests {
             matches!(action, guestmem::PageFaultAction::Fail(_)),
             "eager mapper should fail page faults on unmapped file-backed ranges"
         );
+    }
+
+    #[pal_async::async_test]
+    async fn test_va_mapper_forwards_host_access_locks(_spawn: impl Spawn) {
+        let (req_send, mut req_recv) = mesh::channel::<MappingRequest>();
+        let mapper_future = VaMapper::new(
+            req_send,
+            0x10000,
+            None,
+            None,
+            true,
+            MapperRole::Primary {
+                supports_memory_fault_resolution: false,
+            },
+        );
+        let (mapper, mapper_req_send) = futures::join!(mapper_future, async {
+            let msg = req_recv.recv().await.unwrap();
+            match msg {
+                MappingRequest::AddMapper(rpc) => {
+                    let (params, rpc) = rpc.split();
+                    rpc.complete(Ok(MapperId(0)));
+                    params.send
+                }
+                _ => panic!("expected AddMapper"),
+            }
+        });
+        let mapper = mapper.unwrap();
+        let host_access = Arc::new(TestHostAccess::default());
+        mapper.install_host_access(host_access.clone());
+
+        assert!(GuestMemoryAccess::lock_gpns(&mapper, AccessType::Write, &[1, 3]).unwrap());
+        GuestMemoryAccess::unlock_gpns(&mapper, &[1, 3]);
+        assert_eq!(
+            *host_access.events.lock(),
+            [("lock", vec![1, 3], true), ("unlock", vec![1, 3], false)]
+        );
+
+        drop(mapper);
+        match req_recv.recv().await.unwrap() {
+            MappingRequest::RemoveMapper(id) => assert_eq!(id, MapperId(0)),
+            _ => panic!("expected RemoveMapper"),
+        }
+        drop(mapper_req_send);
+    }
+
+    #[pal_async::async_test]
+    async fn test_va_mapper_without_host_access_does_not_track_locks(_spawn: impl Spawn) {
+        let (req_send, mut req_recv) = mesh::channel::<MappingRequest>();
+        let mapper_future = VaMapper::new(
+            req_send,
+            0x10000,
+            None,
+            None,
+            true,
+            MapperRole::Primary {
+                supports_memory_fault_resolution: false,
+            },
+        );
+        let (mapper, mapper_req_send) = futures::join!(mapper_future, async {
+            let msg = req_recv.recv().await.unwrap();
+            match msg {
+                MappingRequest::AddMapper(rpc) => {
+                    let (params, rpc) = rpc.split();
+                    rpc.complete(Ok(MapperId(0)));
+                    params.send
+                }
+                _ => panic!("expected AddMapper"),
+            }
+        });
+        let mapper = mapper.unwrap();
+
+        assert!(!GuestMemoryAccess::lock_gpns(&mapper, AccessType::Read, &[1]).unwrap());
+
+        drop(mapper);
+        match req_recv.recv().await.unwrap() {
+            MappingRequest::RemoveMapper(id) => assert_eq!(id, MapperId(0)),
+            _ => panic!("expected RemoveMapper"),
+        }
+        drop(mapper_req_send);
+    }
+
+    #[pal_async::async_test]
+    async fn test_va_mapper_requires_host_access_to_outlive_lock(_spawn: impl Spawn) {
+        let (req_send, mut req_recv) = mesh::channel::<MappingRequest>();
+        let mapper_future = VaMapper::new(
+            req_send,
+            0x10000,
+            None,
+            None,
+            true,
+            MapperRole::Primary {
+                supports_memory_fault_resolution: false,
+            },
+        );
+        let (mapper, mapper_req_send) = futures::join!(mapper_future, async {
+            let msg = req_recv.recv().await.unwrap();
+            match msg {
+                MappingRequest::AddMapper(rpc) => {
+                    let (params, rpc) = rpc.split();
+                    rpc.complete(Ok(MapperId(0)));
+                    params.send
+                }
+                _ => panic!("expected AddMapper"),
+            }
+        });
+        let mapper = mapper.unwrap();
+        let host_access = Arc::new(TestHostAccess::default());
+        mapper.install_host_access(host_access.clone());
+        assert!(GuestMemoryAccess::lock_gpns(&mapper, AccessType::Read, &[1]).unwrap());
+        drop(host_access);
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            GuestMemoryAccess::unlock_gpns(&mapper, &[1]);
+        }));
+        assert!(panic.is_err());
+
+        drop(mapper);
+        match req_recv.recv().await.unwrap() {
+            MappingRequest::RemoveMapper(id) => assert_eq!(id, MapperId(0)),
+            _ => panic!("expected RemoveMapper"),
+        }
+        drop(mapper_req_send);
     }
 
     #[pal_async::async_test]
