@@ -834,7 +834,7 @@ impl VaMapper {
     /// Installs the callback used to recover eager-mapper faults and reserve
     /// host access for guest-memory locks.
     ///
-    /// The callback must outlive every lock reservation it grants.
+    /// The callback normally outlives every lock reservation it grants.
     pub(crate) fn install_host_access(&self, host_access: Arc<dyn virt::PartitionHostAccess>) {
         assert!(
             self.inner
@@ -983,14 +983,18 @@ unsafe impl GuestMemoryAccess for VaMapper {
     }
 
     fn unlock_gpns(&self, gpns: &[u64]) {
-        let host_access = self
+        let Some(host_access) = self
             .inner
             .host_access
             .get()
             .expect("host access must be installed before it can request unlock")
             .0
             .upgrade()
-            .expect("host access must outlive its outstanding guest-memory locks");
+        else {
+            // The partition and its reservation state are already gone.
+            tracing::debug!("host-access reservation outlived its partition coordinator");
+            return;
+        };
         host_access.unlock_gpns(gpns);
     }
 

@@ -5,9 +5,19 @@
 
 use super::*;
 use crate::KernelError;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::io;
 
 pub(super) const SNP_IMPORT_CHUNK_PAGES: usize = 256;
+const HOST_ACCESS_BATCH_PAGES: usize = 256;
+const MAX_HOST_ACCESS_LEASES: usize = 65_536;
+const MAX_HOST_ACCESS_GPNS_PER_LEASE: usize = 65_536;
+const MAX_HOST_ACCESS_GPN_REFERENCES: usize = 1_048_576;
+const MAX_CACHED_HOST_ACCESS_GPNS: usize = 1_048_576;
+// Bound the time spent holding the coordinator mutex while accepting the
+// largest 2 MiB-granular range that one intercept entry can encode.
+const MAX_HOST_ACCESS_INTERCEPT_PAGES: u64 = 1_048_576;
 
 #[derive(Debug, Error)]
 pub(crate) enum SnpError {
@@ -158,6 +168,8 @@ pub(crate) struct SnpPartitionState {
     pub(super) sev_features: Mutex<Option<u64>>,
     pub(super) cpuid_offloads_enabled: bool,
     config: Option<Box<MshvSnpConfig>>,
+    #[inspect(skip)]
+    host_access: Mutex<SnpHostAccessState>,
 }
 
 impl SnpPartitionState {
@@ -167,6 +179,7 @@ impl SnpPartitionState {
             sev_features: Mutex::new(None),
             cpuid_offloads_enabled: !disable_cpuid_offload,
             config: None,
+            host_access: Mutex::new(SnpHostAccessState::new(SnpHostAccessLimits::default())),
         }
     }
 
@@ -177,6 +190,160 @@ impl SnpPartitionState {
         let mut state = Self::new(disable_cpuid_offload);
         state.config = config;
         state
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+struct SnpHostAccessLimits {
+    max_leases: usize,
+    max_gpns_per_lease: usize,
+    max_gpn_references: usize,
+    max_cached_gpns: usize,
+}
+
+impl Default for SnpHostAccessLimits {
+    fn default() -> Self {
+        Self {
+            max_leases: MAX_HOST_ACCESS_LEASES,
+            max_gpns_per_lease: MAX_HOST_ACCESS_GPNS_PER_LEASE,
+            max_gpn_references: MAX_HOST_ACCESS_GPN_REFERENCES,
+            max_cached_gpns: MAX_CACHED_HOST_ACCESS_GPNS,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SnpHostAccessState {
+    leases: BTreeMap<Box<[u64]>, usize>,
+    lease_count: usize,
+    locked_gpns: BTreeMap<u64, usize>,
+    acquired_gpns: BTreeSet<u64>,
+    gpn_references: usize,
+    limits: SnpHostAccessLimits,
+}
+
+fn normalize_host_access_ranges(mut ranges: Vec<MemoryRange>) -> Vec<MemoryRange> {
+    ranges.sort_unstable_by_key(MemoryRange::start);
+    let mut merged: Vec<MemoryRange> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if let Some(previous) = merged.last_mut()
+            && previous.end() >= range.start()
+        {
+            *previous = MemoryRange::new(previous.start()..previous.end().max(range.end()));
+            continue;
+        }
+        merged.push(range);
+    }
+    merged
+}
+
+impl SnpHostAccessState {
+    fn new(limits: SnpHostAccessLimits) -> Self {
+        Self {
+            leases: BTreeMap::new(),
+            lease_count: 0,
+            locked_gpns: BTreeMap::new(),
+            acquired_gpns: BTreeSet::new(),
+            gpn_references: 0,
+            limits,
+        }
+    }
+
+    fn reserve(&mut self, gpns: &[u64]) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            gpns.len() <= self.limits.max_gpns_per_lease,
+            "too many GPNs in one SNP host-access lease"
+        );
+        anyhow::ensure!(
+            self.lease_count < self.limits.max_leases,
+            "too many active SNP host-access leases"
+        );
+        let gpn_references = self
+            .gpn_references
+            .checked_add(gpns.len())
+            .ok_or_else(|| anyhow::anyhow!("SNP host-access lease count overflow"))?;
+        anyhow::ensure!(
+            gpn_references <= self.limits.max_gpn_references,
+            "too many active SNP host-access GPN references"
+        );
+        *self
+            .leases
+            .entry(gpns.to_vec().into_boxed_slice())
+            .or_default() += 1;
+        self.lease_count += 1;
+        for &gpn in gpns {
+            *self.locked_gpns.entry(gpn).or_default() += 1;
+        }
+        self.gpn_references = gpn_references;
+        Ok(())
+    }
+
+    fn release(&mut self, gpns: &[u64]) {
+        let remove = {
+            let Some(count) = self.leases.get_mut(gpns) else {
+                tracelimit::error_ratelimited!("ignored unmatched SNP host-access lease release");
+                return;
+            };
+            *count -= 1;
+            *count == 0
+        };
+        if remove {
+            self.leases.remove(gpns);
+        }
+        self.lease_count -= 1;
+        for &gpn in gpns {
+            let Some(count) = self.locked_gpns.get_mut(&gpn) else {
+                tracelimit::error_ratelimited!(
+                    gpn,
+                    "SNP host-access lease is missing its GPN reference"
+                );
+                continue;
+            };
+            *count -= 1;
+            if *count == 0 {
+                self.locked_gpns.remove(&gpn);
+            }
+        }
+        self.gpn_references -= gpns.len();
+    }
+
+    fn first_lease_overlap(&self, ranges: &[MemoryRange]) -> Option<u64> {
+        ranges.iter().find_map(|range| {
+            self.locked_gpns
+                .range(range.start_4k_gpn()..range.end_4k_gpn())
+                .next()
+                .map(|(&gpn, _)| gpn)
+        })
+    }
+
+    fn uncached_gpns(&self, gpns: &[u64]) -> Vec<u64> {
+        let mut gpns = gpns.to_vec();
+        gpns.sort_unstable();
+        gpns.dedup();
+        gpns.retain(|gpn| !self.acquired_gpns.contains(gpn));
+        gpns
+    }
+
+    fn cache_acquired(&mut self, gpns: impl IntoIterator<Item = u64>) {
+        for gpn in gpns {
+            if self.acquired_gpns.len() >= self.limits.max_cached_gpns {
+                break;
+            }
+            self.acquired_gpns.insert(gpn);
+        }
+    }
+
+    fn invalidate_acquired(&mut self, ranges: &[MemoryRange]) {
+        for range in ranges {
+            let gpns = self
+                .acquired_gpns
+                .range(range.start_4k_gpn()..range.end_4k_gpn())
+                .copied()
+                .collect::<Vec<_>>();
+            for gpn in gpns {
+                self.acquired_gpns.remove(&gpn);
+            }
+        }
     }
 }
 
@@ -427,17 +594,56 @@ pub(super) fn vp_index_for_apic_id(
 }
 
 pub(super) fn snp_host_access_flags(visibility: u32) -> Option<u8> {
-    let acquire = 1 << mshv_bindings::MSHV_GPA_HOST_ACCESS_BIT_ACQUIRE;
-    let readable = 1 << mshv_bindings::MSHV_GPA_HOST_ACCESS_BIT_READABLE;
-    let writable = 1 << mshv_bindings::MSHV_GPA_HOST_ACCESS_BIT_WRITABLE;
     match visibility {
         0 => Some(0),
         // The current MSHV kernel tests the readable flag when setting
         // writable access, so a read-only request would become read-write.
         1 => None,
-        3 => Some(acquire | readable | writable),
+        3 => Some(snp_acquire_host_access_flags()),
         _ => None,
     }
+}
+
+fn snp_gpa_attribute_host_access_flags(
+    flags: hvdef::HvX64GpaAttributeInterceptMessageFlags,
+) -> Option<u8> {
+    // HcpHvModifySparseGpaPageHostVisibility passes TRUE for Adjust when it
+    // constructs this intercept. Other attribute intercepts are not handled
+    // by the SNP host-visibility path.
+    if !flags.adjust() || flags.memory_type() != 0 {
+        return None;
+    }
+    snp_host_access_flags(flags.host_visibility())
+}
+
+fn snp_acquire_host_access_flags() -> u8 {
+    (1 << mshv_bindings::MSHV_GPA_HOST_ACCESS_BIT_ACQUIRE)
+        | (1 << mshv_bindings::MSHV_GPA_HOST_ACCESS_BIT_READABLE)
+        | (1 << mshv_bindings::MSHV_GPA_HOST_ACCESS_BIT_WRITABLE)
+}
+
+fn modify_snp_host_access(vmfd: &mshv_ioctls::VmFd, gpas: &[u64], flags: u8) -> anyhow::Result<()> {
+    if gpas.is_empty() {
+        return Ok(());
+    }
+
+    let mut buf = HeaderVec::<ModifyGpaHostAccessHeader, u64, 0>::new(ModifyGpaHostAccessHeader {
+        flags,
+        rsvd: [0; 7],
+        page_count: gpas.len() as u64,
+    });
+    buf.extend_tail_from_slice(gpas);
+    // SAFETY: The custom header matches `mshv_modify_gpa_host_access`
+    // followed by `page_count` contiguous GPA values. Despite the UAPI
+    // field name `guest_pfns`, the kernel converts each entry with
+    // `HVPFN_DOWN`, so the variable array contains byte GPAs.
+    let args = unsafe {
+        &*buf
+            .as_ptr()
+            .cast::<mshv_bindings::mshv_modify_gpa_host_access>()
+    };
+    vmfd.modify_gpa_host_access(args)?;
+    Ok(())
 }
 
 pub(crate) fn acquire_snp_host_access(
@@ -445,12 +651,9 @@ pub(crate) fn acquire_snp_host_access(
     addr: u64,
     size: u64,
 ) -> anyhow::Result<()> {
-    // TODO: The current prototype implementation does not coordinate
-    // acquisition with guest visibility changes. In particular, there is no
-    // per-page state preventing a fault on another thread from acquiring
-    // access while a GPA attribute intercept is revoking it. A complete
-    // implementation must serialize acquisition with revocation and block or
-    // fail this request if the guest is making the page private.
+    // The page-fault path retries the userspace access after this returns
+    // success. This relies on the hypervisor rejecting acquisition unless the
+    // guest has completed the corresponding shared transition.
     anyhow::ensure!(
         addr.is_multiple_of(hvdef::HV_PAGE_SIZE)
             && size.is_multiple_of(hvdef::HV_PAGE_SIZE)
@@ -458,27 +661,75 @@ pub(crate) fn acquire_snp_host_access(
         "host-access range must be page aligned and nonempty"
     );
     let page_count = size / hvdef::HV_PAGE_SIZE;
-    let flags = (1 << mshv_bindings::MSHV_GPA_HOST_ACCESS_BIT_ACQUIRE)
-        | (1 << mshv_bindings::MSHV_GPA_HOST_ACCESS_BIT_READABLE)
-        | (1 << mshv_bindings::MSHV_GPA_HOST_ACCESS_BIT_WRITABLE);
-    let mut buf = HeaderVec::<ModifyGpaHostAccessHeader, u64, 0>::new(ModifyGpaHostAccessHeader {
-        flags,
-        rsvd: [0; 7],
-        page_count,
-    });
-    let gpas = (0..page_count)
-        .map(|page| addr + page * hvdef::HV_PAGE_SIZE)
-        .collect::<Vec<_>>();
-    buf.extend_tail_from_slice(&gpas);
-    // SAFETY: The custom header matches `mshv_modify_gpa_host_access`,
-    // followed by `page_count` contiguous GPA values.
-    let args = unsafe {
-        &*buf
-            .as_ptr()
-            .cast::<mshv_bindings::mshv_modify_gpa_host_access>()
-    };
-    partition.vmfd.modify_gpa_host_access(args)?;
+    anyhow::ensure!(
+        page_count <= MAX_HOST_ACCESS_INTERCEPT_PAGES,
+        "SNP host-access fault range is too large"
+    );
+    let snp = partition
+        .isolation
+        .snp()
+        .ok_or_else(|| anyhow::anyhow!("partition is not SNP isolated"))?;
+    let mut state = snp.host_access.lock();
+
+    let mut gpas = Vec::with_capacity(HOST_ACCESS_BATCH_PAGES);
+    for page in 0..page_count {
+        gpas.push(addr + page * hvdef::HV_PAGE_SIZE);
+        if gpas.len() == HOST_ACCESS_BATCH_PAGES {
+            modify_snp_host_access(&partition.vmfd, &gpas, snp_acquire_host_access_flags())?;
+            state.cache_acquired(gpas.iter().map(|gpa| gpa / hvdef::HV_PAGE_SIZE));
+            gpas.clear();
+        }
+    }
+    modify_snp_host_access(&partition.vmfd, &gpas, snp_acquire_host_access_flags())?;
+    state.cache_acquired(gpas.iter().map(|gpa| gpa / hvdef::HV_PAGE_SIZE));
     Ok(())
+}
+
+pub(crate) fn lock_snp_host_access(
+    partition: &MshvPartitionInner,
+    gpns: &[u64],
+) -> anyhow::Result<bool> {
+    if gpns.is_empty() {
+        return Ok(false);
+    }
+    let snp = partition
+        .isolation
+        .snp()
+        .ok_or_else(|| anyhow::anyhow!("partition is not SNP isolated"))?;
+    let mut state = snp.host_access.lock();
+    state.reserve(gpns)?;
+
+    let uncached_gpns = state.uncached_gpns(gpns);
+    let result = uncached_gpns
+        .chunks(HOST_ACCESS_BATCH_PAGES)
+        .try_for_each(|gpns| {
+            let gpas = gpns
+                .iter()
+                .map(|&gpn| {
+                    gpn.checked_mul(hvdef::HV_PAGE_SIZE)
+                        .ok_or_else(|| anyhow::anyhow!("host-access GPN overflow"))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            modify_snp_host_access(&partition.vmfd, &gpas, snp_acquire_host_access_flags())?;
+            state.cache_acquired(gpns.iter().copied());
+            Ok(())
+        });
+    if let Err(err) = result {
+        // An earlier batch may have acquired host permission. No pointer has
+        // been exposed yet, so remove the software lease and return failure.
+        // A later guest private transition will release any acquired prefix.
+        state.release(gpns);
+        return Err(err);
+    }
+    Ok(true)
+}
+
+pub(crate) fn unlock_snp_host_access(partition: &MshvPartitionInner, gpns: &[u64]) {
+    let snp = partition
+        .isolation
+        .snp()
+        .expect("only SNP partitions grant host-access leases");
+    snp.host_access.lock().release(gpns);
 }
 
 pub(super) fn parse_snp_gpa_range(
@@ -1233,39 +1484,18 @@ impl MshvProcessor<'_> {
         gpas: &[u64],
         flags: u8,
     ) -> Result<(), VpHaltReason> {
-        if gpas.is_empty() {
-            return Ok(());
-        }
-
-        let mut buf =
-            HeaderVec::<ModifyGpaHostAccessHeader, u64, 0>::new(ModifyGpaHostAccessHeader {
-                flags,
-                rsvd: [0; 7],
-                page_count: gpas.len() as u64,
-            });
-        buf.extend_tail_from_slice(gpas);
-        // SAFETY: The custom header matches `mshv_modify_gpa_host_access`
-        // followed by `page_count` contiguous GPA values. Despite the UAPI
-        // field name `guest_pfns`, the kernel converts each entry with
-        // `HVPFN_DOWN`, so the variable array contains byte GPAs.
-        let args = unsafe {
-            &*buf
-                .as_ptr()
-                .cast::<mshv_bindings::mshv_modify_gpa_host_access>()
-        };
-        self.partition
-            .vmfd
-            .modify_gpa_host_access(args)
-            .map_err(|err| {
+        modify_snp_host_access(&self.partition.vmfd, gpas, flags).map_err(|err| {
+            if let Some(&first_gpa) = gpas.first() {
                 tracelimit::error_ratelimited!(
-                    error = &err as &dyn std::error::Error,
-                    first_gpa = gpas[0],
+                    error = %err,
+                    first_gpa,
                     page_count = gpas.len(),
                     flags,
                     "failed to modify SNP GPA host access"
                 );
-                VpHaltReason::TripleFault { vtl: Vtl::Vtl0 }
-            })
+            }
+            VpHaltReason::TripleFault { vtl: Vtl::Vtl0 }
+        })
     }
 
     pub(super) fn handle_snp_gpa_attribute_intercept(
@@ -1277,43 +1507,97 @@ impl MshvProcessor<'_> {
         let range_count = info.flags.range_count() as usize;
         let ranges = &info.ranges;
         if range_count == 0 || range_count > ranges.len() {
+            tracelimit::warn_ratelimited!(
+                range_count,
+                "invalid SNP GPA attribute intercept range count"
+            );
             return Err(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 });
         }
 
-        let flags = snp_host_access_flags(info.flags.host_visibility())
-            .ok_or(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 })?;
-        if info.flags.adjust() || info.flags.memory_type() != 0 {
+        let Some(flags) = snp_gpa_attribute_host_access_flags(info.flags) else {
+            tracelimit::warn_ratelimited!(
+                flags = info.flags.into_bits(),
+                "invalid SNP GPA attribute intercept flags"
+            );
             return Err(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 });
-        }
+        };
 
-        // TODO: The current prototype implementation assumes that no
-        // virtstack component is using these pages. Before revoking host
-        // access, mark the ranges as revoking so that new GuestMemory faults
-        // cannot reacquire them, then drain active GuestMemory accesses,
-        // acquisitions already in progress, locked ranges, and device/DMA
-        // users. Only after the release ioctl succeeds should the ranges be
-        // marked private and the VP resumed, allowing the pending guest
-        // visibility hypercall to be re-executed. If the accesses cannot be
-        // drained, deny the intercept instead of reporting success.
-        let mut gpas = Vec::with_capacity(BATCH_PAGES);
+        let mut gpa_ranges = Vec::with_capacity(range_count);
         for range in &ranges[..range_count] {
             let (start_pfn, page_count) = parse_snp_gpa_range(*range)?;
             let end_pfn = start_pfn
                 .checked_add(page_count)
                 .ok_or(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 })?;
+            let start = start_pfn
+                .checked_mul(hvdef::HV_PAGE_SIZE)
+                .ok_or(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 })?;
+            let end = end_pfn
+                .checked_mul(hvdef::HV_PAGE_SIZE)
+                .ok_or(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 })?;
+            gpa_ranges.push(MemoryRange::new(start..end));
+        }
+        let gpa_ranges = normalize_host_access_ranges(gpa_ranges);
+        let total_pages = gpa_ranges.iter().try_fold(0u64, |total, range| {
+            total.checked_add(range.page_count_4k())
+        });
+        if total_pages.is_none_or(|total| total > MAX_HOST_ACCESS_INTERCEPT_PAGES) {
+            tracelimit::warn_ratelimited!(
+                total_pages,
+                "denied oversized SNP GPA attribute intercept"
+            );
+            return Err(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 });
+        }
 
-            for pfn in start_pfn..end_pfn {
-                gpas.push(
-                    pfn.checked_mul(hvdef::HV_PAGE_SIZE)
-                        .ok_or(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 })?,
+        let acquiring = flags & (1 << mshv_bindings::MSHV_GPA_HOST_ACCESS_BIT_ACQUIRE) != 0;
+        let snp = self
+            .partition
+            .isolation
+            .snp()
+            .expect("SNP intercepts require an SNP partition");
+        let mut host_access = snp.host_access.lock();
+        if !acquiring {
+            if let Some(gpn) = host_access.first_lease_overlap(&gpa_ranges) {
+                tracelimit::warn_ratelimited!(
+                    first_range = %gpa_ranges[0],
+                    gpn,
+                    lease_count = host_access.lease_count,
+                    "denied SNP private transition for a host-access lease"
                 );
-                if gpas.len() == BATCH_PAGES {
-                    self.modify_gpa_host_access(&gpas, flags)?;
-                    gpas.clear();
+                return Err(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 });
+            }
+            // Prevent a new lock from skipping acquisition based on stale
+            // cache state while the release ioctl is in progress.
+            host_access.invalidate_acquired(&gpa_ranges);
+        }
+
+        let mut gpas = Vec::with_capacity(BATCH_PAGES);
+        let result: Result<(), VpHaltReason> = (|| {
+            for range in &gpa_ranges {
+                for gpa in (range.start()..range.end()).step_by(hvdef::HV_PAGE_SIZE as usize) {
+                    gpas.push(gpa);
+                    if gpas.len() == BATCH_PAGES {
+                        self.modify_gpa_host_access(&gpas, flags)?;
+                        if acquiring {
+                            host_access
+                                .cache_acquired(gpas.iter().map(|gpa| gpa / hvdef::HV_PAGE_SIZE));
+                        }
+                        gpas.clear();
+                    }
                 }
             }
-        }
-        self.modify_gpa_host_access(&gpas, flags)
+            self.modify_gpa_host_access(&gpas, flags)?;
+            if acquiring {
+                host_access.cache_acquired(gpas.iter().map(|gpa| gpa / hvdef::HV_PAGE_SIZE));
+            }
+            Ok(())
+        })();
+        result?;
+        // The VP re-executes its visibility hypercall after resume. If another
+        // thread reacquires access first, the hypervisor intercepts that
+        // re-execution again. A zero-copy user then has a lease that denies the
+        // second transition; a short access relies on recoverable trycopy
+        // faults if the second release wins the race.
+        Ok(())
     }
 
     pub(super) fn sev_set_reg(
@@ -1833,6 +2117,86 @@ mod tests {
     use super::*;
     use test_with_tracing::test;
 
+    fn test_host_access_state() -> SnpHostAccessState {
+        SnpHostAccessState::new(SnpHostAccessLimits {
+            max_leases: 2,
+            max_gpns_per_lease: 2,
+            max_gpn_references: 3,
+            max_cached_gpns: 2,
+        })
+    }
+
+    #[test]
+    fn host_access_leases_are_bounded_and_reference_counted() {
+        let mut state = test_host_access_state();
+        state.reserve(&[1, 1]).unwrap();
+        state.reserve(&[2]).unwrap();
+        assert!(state.reserve(&[3]).is_err());
+        assert_eq!(state.gpn_references, 3);
+
+        state.release(&[1, 1]);
+        assert_eq!(state.gpn_references, 1);
+        state.release(&[2]);
+        assert!(state.leases.is_empty());
+        assert!(state.locked_gpns.is_empty());
+    }
+
+    #[test]
+    fn nested_host_access_ranges_detect_lease_overlap() {
+        let mut state = test_host_access_state();
+        state.reserve(&[7]).unwrap();
+        assert_eq!(
+            state.first_lease_overlap(&[
+                MemoryRange::from_4k_gpn_range(0..10),
+                MemoryRange::from_4k_gpn_range(5..6),
+            ]),
+            Some(7)
+        );
+        assert_eq!(
+            state.first_lease_overlap(&[MemoryRange::from_4k_gpn_range(0..7)]),
+            None
+        );
+    }
+
+    #[test]
+    fn overlapping_leases_keep_gpn_locked_until_last_release() {
+        let mut state = test_host_access_state();
+        state.reserve(&[1]).unwrap();
+        state.reserve(&[1]).unwrap();
+        state.release(&[1]);
+        assert_eq!(
+            state.first_lease_overlap(&[MemoryRange::from_4k_gpn_range(1..2)]),
+            Some(1)
+        );
+        state.release(&[1]);
+        assert_eq!(
+            state.first_lease_overlap(&[MemoryRange::from_4k_gpn_range(1..2)]),
+            None
+        );
+    }
+
+    #[test]
+    fn acquired_gpn_cache_is_invalidated_by_range() {
+        let mut state = test_host_access_state();
+        state.cache_acquired([1, 2, 3]);
+        assert!(state.uncached_gpns(&[1, 2]).is_empty());
+        assert_eq!(state.uncached_gpns(&[3]), [3]);
+        state.invalidate_acquired(&[MemoryRange::from_4k_gpn_range(2..3)]);
+        assert_eq!(state.uncached_gpns(&[1, 2, 3]), [2, 3]);
+    }
+
+    #[test]
+    fn normalizes_overlapping_and_adjacent_host_access_ranges() {
+        assert_eq!(
+            normalize_host_access_ranges(vec![
+                MemoryRange::from_4k_gpn_range(0..10),
+                MemoryRange::from_4k_gpn_range(5..6),
+                MemoryRange::from_4k_gpn_range(10..12),
+            ]),
+            [MemoryRange::from_4k_gpn_range(0..12)]
+        );
+    }
+
     #[test]
     fn snp_hypercall_requires_valid_consistent_registers() {
         let mut ghcb = x86defs::snp::GhcbPage::new_zeroed();
@@ -2173,6 +2537,22 @@ mod tests {
             )
         );
         assert_eq!(snp_host_access_flags(2), None);
+    }
+
+    #[test]
+    fn validates_snp_gpa_attribute_intercept_flags() {
+        let flags = hvdef::HvX64GpaAttributeInterceptMessageFlags::new()
+            .with_adjust(true)
+            .with_host_visibility(0);
+        assert_eq!(snp_gpa_attribute_host_access_flags(flags), Some(0));
+        assert_eq!(
+            snp_gpa_attribute_host_access_flags(flags.with_adjust(false)),
+            None
+        );
+        assert_eq!(
+            snp_gpa_attribute_host_access_flags(flags.with_memory_type(1)),
+            None
+        );
     }
 
     #[test]

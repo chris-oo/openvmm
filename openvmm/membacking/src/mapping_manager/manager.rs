@@ -1619,7 +1619,7 @@ mod tests {
     }
 
     #[pal_async::async_test]
-    async fn test_va_mapper_requires_host_access_to_outlive_lock(_spawn: impl Spawn) {
+    async fn test_va_mapper_ignores_unlock_after_host_access_is_destroyed(_spawn: impl Spawn) {
         let (req_send, mut req_recv) = mesh::channel::<MappingRequest>();
         let mapper_future = VaMapper::new(
             req_send,
@@ -1648,10 +1648,7 @@ mod tests {
         assert!(GuestMemoryAccess::lock_gpns(&mapper, AccessType::Read, &[1]).unwrap());
         drop(host_access);
 
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            GuestMemoryAccess::unlock_gpns(&mapper, &[1]);
-        }));
-        assert!(panic.is_err());
+        GuestMemoryAccess::unlock_gpns(&mapper, &[1]);
 
         drop(mapper);
         match req_recv.recv().await.unwrap() {

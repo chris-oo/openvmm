@@ -88,8 +88,9 @@ pub trait PartitionHostAccess: Send + Sync {
     /// reservation it made during the call. Repeated GPNs are permitted and
     /// represent repeated reservations.
     ///
-    /// The implementation must remain alive until the caller releases every
-    /// reservation for which this method returned `true`.
+    /// The caller probes each page after this method returns and before it
+    /// exposes the page's virtual address. The reservation prevents a
+    /// concurrent visibility transition during that probe.
     fn lock_gpns(&self, gpns: &[u64], write: bool) -> anyhow::Result<bool> {
         let _ = (gpns, write);
         Ok(false)
