@@ -64,7 +64,7 @@ pub trait PartitionMemoryMap: Send + Sync {
 
 /// Interface for acquiring host access to guest memory.
 ///
-/// Some isolated hypervisors do not make a guest page accessible to userspace
+/// Some hypervisors do not make a guest page accessible to userspace
 /// merely because the guest marked it shared. The VMM must also ask the
 /// hypervisor to grant the host permission to touch the existing backing.
 pub trait PartitionHostAccess: Send + Sync {
@@ -83,23 +83,24 @@ pub trait PartitionHostAccess: Send + Sync {
     /// `gpns` contains guest page numbers in the partition GPA space. `write`
     /// specifies whether the caller will write through the mapping.
     ///
-    /// Returns whether [`unlock_gpns`](Self::unlock_gpns) must be called. If
+    /// Returns an owned reservation that releases the pages when dropped. If
     /// this returns an error, the implementation must release every
     /// reservation it made during the call. Repeated GPNs are permitted and
-    /// represent repeated reservations.
+    /// represent repeated reservations. `None` means no reservation was
+    /// needed.
     ///
     /// The caller probes each page after this method returns and before it
     /// exposes the page's virtual address. The reservation prevents a
     /// concurrent visibility transition during that probe.
-    fn lock_gpns(&self, gpns: &[u64], write: bool) -> anyhow::Result<bool> {
-        let _ = (gpns, write);
-        Ok(false)
-    }
-
-    /// Releases a reservation created by [`lock_gpns`](Self::lock_gpns).
     ///
-    /// The caller supplies the same GPNs in the same order as the lock call.
-    fn unlock_gpns(&self, gpns: &[u64]) {
-        let _ = gpns;
+    /// The returned reservation must own everything needed to release the
+    /// pages and must remain valid after this interface is dropped.
+    fn lock_gpns(
+        &self,
+        gpns: &[u64],
+        write: bool,
+    ) -> anyhow::Result<Option<Box<dyn guestmem::GuestMemoryBackingLock>>> {
+        let _ = (gpns, write);
+        Ok(None)
     }
 }

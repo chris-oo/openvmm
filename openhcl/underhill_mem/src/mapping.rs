@@ -83,6 +83,20 @@ pub struct GuestMemoryView {
     vtl: GuestVtl,
 }
 
+struct GuestMemoryViewLock {
+    protector: Arc<dyn ProtectIsolatedMemory>,
+    vtl: GuestVtl,
+    gpns: Box<[u64]>,
+}
+
+impl guestmem::GuestMemoryBackingLock for GuestMemoryViewLock {}
+
+impl Drop for GuestMemoryViewLock {
+    fn drop(&mut self) {
+        self.protector.unlock_gpns(self.vtl, &self.gpns);
+    }
+}
+
 impl GuestMemoryView {
     pub fn new(
         protector: Option<Arc<dyn ProtectIsolatedMemory>>,
@@ -271,18 +285,19 @@ unsafe impl GuestMemoryAccess for GuestMemoryView {
         &self,
         _access: guestmem::AccessType,
         gpns: &[u64],
-    ) -> Result<bool, GuestMemoryBackingError> {
+    ) -> Result<Option<Box<dyn guestmem::GuestMemoryBackingLock>>, GuestMemoryBackingError> {
+        // Underhill locks visibility and permissions identically for reads and
+        // writes. GuestMemory still uses the access type when probing the
+        // mapping, and MSHV can use it for minimum host permissions later.
         if let Some(protector) = self.protector.as_ref() {
             protector.lock_gpns(self.vtl, gpns)?;
-            Ok(true)
+            Ok(Some(Box::new(GuestMemoryViewLock {
+                protector: protector.clone(),
+                vtl: self.vtl,
+                gpns: gpns.into(),
+            })))
         } else {
-            Ok(false)
-        }
-    }
-
-    fn unlock_gpns(&self, gpns: &[u64]) {
-        if let Some(protector) = self.protector.as_ref() {
-            protector.unlock_gpns(self.vtl, gpns)
+            Ok(None)
         }
     }
 }

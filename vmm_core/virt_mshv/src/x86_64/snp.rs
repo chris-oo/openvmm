@@ -169,7 +169,7 @@ pub(crate) struct SnpPartitionState {
     pub(super) cpuid_offloads_enabled: bool,
     config: Option<Box<MshvSnpConfig>>,
     #[inspect(skip)]
-    host_access: Mutex<SnpHostAccessState>,
+    host_access: Arc<Mutex<SnpHostAccessState>>,
 }
 
 impl SnpPartitionState {
@@ -179,7 +179,9 @@ impl SnpPartitionState {
             sev_features: Mutex::new(None),
             cpuid_offloads_enabled: !disable_cpuid_offload,
             config: None,
-            host_access: Mutex::new(SnpHostAccessState::new(SnpHostAccessLimits::default())),
+            host_access: Arc::new(Mutex::new(SnpHostAccessState::new(
+                SnpHostAccessLimits::default(),
+            ))),
         }
     }
 
@@ -220,6 +222,19 @@ struct SnpHostAccessState {
     acquired_gpns: BTreeSet<u64>,
     gpn_references: usize,
     limits: SnpHostAccessLimits,
+}
+
+struct SnpHostAccessLease {
+    state: Arc<Mutex<SnpHostAccessState>>,
+    gpns: Box<[u64]>,
+}
+
+impl guestmem::GuestMemoryBackingLock for SnpHostAccessLease {}
+
+impl Drop for SnpHostAccessLease {
+    fn drop(&mut self) {
+        self.state.lock().release(&self.gpns);
+    }
 }
 
 fn normalize_host_access_ranges(mut ranges: Vec<MemoryRange>) -> Vec<MemoryRange> {
@@ -622,6 +637,10 @@ fn snp_acquire_host_access_flags() -> u8 {
         | (1 << mshv_bindings::MSHV_GPA_HOST_ACCESS_BIT_WRITABLE)
 }
 
+/// Modifies MSHV SNP host access without changing guest visibility.
+///
+/// For acquire operations, the hypervisor rejects access that exceeds the
+/// maximum host access established by the guest's visibility transition.
 fn modify_snp_host_access(vmfd: &mshv_ioctls::VmFd, gpas: &[u64], flags: u8) -> anyhow::Result<()> {
     if gpas.is_empty() {
         return Ok(());
@@ -651,9 +670,6 @@ pub(crate) fn acquire_snp_host_access(
     addr: u64,
     size: u64,
 ) -> anyhow::Result<()> {
-    // The page-fault path retries the userspace access after this returns
-    // success. This relies on the hypervisor rejecting acquisition unless the
-    // guest has completed the corresponding shared transition.
     anyhow::ensure!(
         addr.is_multiple_of(hvdef::HV_PAGE_SIZE)
             && size.is_multiple_of(hvdef::HV_PAGE_SIZE)
@@ -688,15 +704,16 @@ pub(crate) fn acquire_snp_host_access(
 pub(crate) fn lock_snp_host_access(
     partition: &MshvPartitionInner,
     gpns: &[u64],
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<Option<Box<dyn guestmem::GuestMemoryBackingLock>>> {
     if gpns.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
     let snp = partition
         .isolation
         .snp()
         .ok_or_else(|| anyhow::anyhow!("partition is not SNP isolated"))?;
-    let mut state = snp.host_access.lock();
+    let host_access = snp.host_access.clone();
+    let mut state = host_access.lock();
     state.reserve(gpns)?;
 
     let uncached_gpns = state.uncached_gpns(gpns);
@@ -721,15 +738,11 @@ pub(crate) fn lock_snp_host_access(
         state.release(gpns);
         return Err(err);
     }
-    Ok(true)
-}
-
-pub(crate) fn unlock_snp_host_access(partition: &MshvPartitionInner, gpns: &[u64]) {
-    let snp = partition
-        .isolation
-        .snp()
-        .expect("only SNP partitions grant host-access leases");
-    snp.host_access.lock().release(gpns);
+    drop(state);
+    Ok(Some(Box::new(SnpHostAccessLease {
+        state: host_access,
+        gpns: gpns.into(),
+    })))
 }
 
 pub(super) fn parse_snp_gpa_range(

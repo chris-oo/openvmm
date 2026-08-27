@@ -3222,6 +3222,7 @@ dependencies = [
  "inspect",
  "minircu",
  "pal_event",
+ "parking_lot",
  "sparse_mmap",
  "thiserror 2.0.16",
  "trycopy",

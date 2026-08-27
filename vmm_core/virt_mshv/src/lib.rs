@@ -948,7 +948,11 @@ impl virt::PartitionHostAccess for MshvPartitionInner {
         anyhow::bail!("acquiring host access is not supported")
     }
 
-    fn lock_gpns(&self, gpns: &[u64], _write: bool) -> anyhow::Result<bool> {
+    fn lock_gpns(
+        &self,
+        gpns: &[u64],
+        _write: bool,
+    ) -> anyhow::Result<Option<Box<dyn guestmem::GuestMemoryBackingLock>>> {
         let _ = gpns;
         // TODO: Investigate whether MSHV supports read-only host-access
         // requests and use `_write` to avoid granting write access for reads.
@@ -957,15 +961,6 @@ impl virt::PartitionHostAccess for MshvPartitionInner {
             return arch::lock_snp_host_access(self, gpns);
         }
         anyhow::bail!("locking host access is not supported")
-    }
-
-    fn unlock_gpns(&self, gpns: &[u64]) {
-        let _ = gpns;
-        #[cfg(guest_arch = "x86_64")]
-        if self.isolation.snp().is_some() {
-            return arch::unlock_snp_host_access(self, gpns);
-        }
-        tracelimit::error_ratelimited!("ignored host-access unlock for a non-SNP partition");
     }
 }
 

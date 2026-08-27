@@ -862,7 +862,22 @@ mod tests {
 
     #[derive(Default)]
     struct TestHostAccess {
-        events: Mutex<Vec<(&'static str, Vec<u64>, bool)>>,
+        events: Arc<Mutex<Vec<(&'static str, Vec<u64>, bool)>>>,
+    }
+
+    struct TestHostAccessLock {
+        events: Arc<Mutex<Vec<(&'static str, Vec<u64>, bool)>>>,
+        gpns: Box<[u64]>,
+    }
+
+    impl guestmem::GuestMemoryBackingLock for TestHostAccessLock {}
+
+    impl Drop for TestHostAccessLock {
+        fn drop(&mut self) {
+            self.events
+                .lock()
+                .push(("unlock", self.gpns.to_vec(), false));
+        }
     }
 
     impl virt::PartitionHostAccess for TestHostAccess {
@@ -870,13 +885,16 @@ mod tests {
             unreachable!("the lock bridge must not use the fault path")
         }
 
-        fn lock_gpns(&self, gpns: &[u64], write: bool) -> anyhow::Result<bool> {
+        fn lock_gpns(
+            &self,
+            gpns: &[u64],
+            write: bool,
+        ) -> anyhow::Result<Option<Box<dyn guestmem::GuestMemoryBackingLock>>> {
             self.events.lock().push(("lock", gpns.to_vec(), write));
-            Ok(true)
-        }
-
-        fn unlock_gpns(&self, gpns: &[u64]) {
-            self.events.lock().push(("unlock", gpns.to_vec(), false));
+            Ok(Some(Box::new(TestHostAccessLock {
+                events: self.events.clone(),
+                gpns: gpns.into(),
+            })))
         }
     }
 
@@ -1567,8 +1585,10 @@ mod tests {
         let host_access = Arc::new(TestHostAccess::default());
         mapper.install_host_access(host_access.clone());
 
-        assert!(GuestMemoryAccess::lock_gpns(&mapper, AccessType::Write, &[1, 3]).unwrap());
-        GuestMemoryAccess::unlock_gpns(&mapper, &[1, 3]);
+        let lock = GuestMemoryAccess::lock_gpns(&mapper, AccessType::Write, &[1, 3])
+            .unwrap()
+            .unwrap();
+        drop(lock);
         assert_eq!(
             *host_access.events.lock(),
             [("lock", vec![1, 3], true), ("unlock", vec![1, 3], false)]
@@ -1608,7 +1628,11 @@ mod tests {
         });
         let mapper = mapper.unwrap();
 
-        assert!(!GuestMemoryAccess::lock_gpns(&mapper, AccessType::Read, &[1]).unwrap());
+        assert!(
+            GuestMemoryAccess::lock_gpns(&mapper, AccessType::Read, &[1])
+                .unwrap()
+                .is_none()
+        );
 
         drop(mapper);
         match req_recv.recv().await.unwrap() {
@@ -1619,7 +1643,7 @@ mod tests {
     }
 
     #[pal_async::async_test]
-    async fn test_va_mapper_ignores_unlock_after_host_access_is_destroyed(_spawn: impl Spawn) {
+    async fn test_va_mapper_lock_outlives_host_access_callback(_spawn: impl Spawn) {
         let (req_send, mut req_recv) = mesh::channel::<MappingRequest>();
         let mapper_future = VaMapper::new(
             req_send,
@@ -1644,11 +1668,17 @@ mod tests {
         });
         let mapper = mapper.unwrap();
         let host_access = Arc::new(TestHostAccess::default());
+        let events = host_access.events.clone();
         mapper.install_host_access(host_access.clone());
-        assert!(GuestMemoryAccess::lock_gpns(&mapper, AccessType::Read, &[1]).unwrap());
+        let lock = GuestMemoryAccess::lock_gpns(&mapper, AccessType::Read, &[1])
+            .unwrap()
+            .unwrap();
         drop(host_access);
-
-        GuestMemoryAccess::unlock_gpns(&mapper, &[1]);
+        drop(lock);
+        assert_eq!(
+            *events.lock(),
+            [("lock", vec![1], false), ("unlock", vec![1], false)]
+        );
 
         drop(mapper);
         match req_recv.recv().await.unwrap() {

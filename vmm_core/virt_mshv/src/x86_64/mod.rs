@@ -80,7 +80,6 @@ use snp::prepare_snp_config;
 use snp::snp_cpuid_overrides;
 use snp::snp_hv_cpuid_overrides;
 use snp::snp_start_vp_vmsa_gpa;
-pub(crate) use snp::unlock_snp_host_access;
 
 pub(crate) enum MshvProtoPartitionIsolation {
     None,

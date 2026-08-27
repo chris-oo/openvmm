@@ -25,6 +25,7 @@ harness = false
 
 [dev-dependencies]
 criterion.workspace = true
+parking_lot.workspace = true
 
 [lints]
 workspace = true
