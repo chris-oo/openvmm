@@ -11,8 +11,8 @@ use std::io;
 
 pub(super) const SNP_IMPORT_CHUNK_PAGES: usize = 256;
 const HOST_ACCESS_BATCH_PAGES: usize = 256;
-const MAX_HOST_ACCESS_LEASES: usize = 65_536;
-const MAX_HOST_ACCESS_GPNS_PER_LEASE: usize = 65_536;
+const MAX_HOST_ACCESS_LOCKS: usize = 65_536;
+const MAX_HOST_ACCESS_GPNS_PER_LOCK: usize = 65_536;
 const MAX_HOST_ACCESS_GPN_REFERENCES: usize = 1_048_576;
 const MAX_CACHED_HOST_ACCESS_GPNS: usize = 1_048_576;
 // Bound the time spent holding the coordinator mutex while accepting the
@@ -168,7 +168,6 @@ pub(crate) struct SnpPartitionState {
     pub(super) sev_features: Mutex<Option<u64>>,
     pub(super) cpuid_offloads_enabled: bool,
     config: Option<Box<MshvSnpConfig>>,
-    #[inspect(skip)]
     host_access: Arc<Mutex<SnpHostAccessState>>,
 }
 
@@ -195,10 +194,10 @@ impl SnpPartitionState {
     }
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, inspect::Inspect)]
 struct SnpHostAccessLimits {
-    max_leases: usize,
-    max_gpns_per_lease: usize,
+    max_locks: usize,
+    max_gpns_per_lock: usize,
     max_gpn_references: usize,
     max_cached_gpns: usize,
 }
@@ -206,37 +205,55 @@ struct SnpHostAccessLimits {
 impl Default for SnpHostAccessLimits {
     fn default() -> Self {
         Self {
-            max_leases: MAX_HOST_ACCESS_LEASES,
-            max_gpns_per_lease: MAX_HOST_ACCESS_GPNS_PER_LEASE,
+            max_locks: MAX_HOST_ACCESS_LOCKS,
+            max_gpns_per_lock: MAX_HOST_ACCESS_GPNS_PER_LOCK,
             max_gpn_references: MAX_HOST_ACCESS_GPN_REFERENCES,
             max_cached_gpns: MAX_CACHED_HOST_ACCESS_GPNS,
         }
     }
 }
 
-#[derive(Debug)]
+/// Coordinates MSHV SNP host-access locks for one partition.
+///
+/// All fields are protected by the containing mutex. The state tracks owned
+/// zero-copy locks separately from the cache of GPAs where MSHV has already
+/// granted host access.
+#[derive(Debug, inspect::Inspect)]
 struct SnpHostAccessState {
-    leases: BTreeMap<Box<[u64]>, usize>,
-    lease_count: usize,
-    locked_gpns: BTreeMap<u64, usize>,
+    /// Exact lock sets and the number of active locks with each set.
+    #[inspect(with = "|x| x.len()")]
+    distinct_lock_sets: BTreeMap<Box<[u64]>, usize>,
+    /// Total number of active host-access locks.
+    lock_count: usize,
+    /// Per-GPN lock reference counts used for visibility-overlap checks.
+    #[inspect(with = "|x| x.len()")]
+    locked_gpn_count: BTreeMap<u64, usize>,
+    /// GPNs where MSHV host access was acquired successfully.
+    #[inspect(with = "|x| x.len()")]
     acquired_gpns: BTreeSet<u64>,
+    /// Total GPN references across all active locks, including duplicates.
     gpn_references: usize,
+    /// Bounds for guest-influenced lock and cache state.
     limits: SnpHostAccessLimits,
 }
 
-struct SnpHostAccessLease {
+struct SnpHostAccessLock {
     state: Arc<Mutex<SnpHostAccessState>>,
     gpns: Box<[u64]>,
 }
 
-impl guestmem::GuestMemoryBackingLock for SnpHostAccessLease {}
+impl guestmem::GuestMemoryBackingLock for SnpHostAccessLock {}
 
-impl Drop for SnpHostAccessLease {
+impl Drop for SnpHostAccessLock {
     fn drop(&mut self) {
         self.state.lock().release(&self.gpns);
     }
 }
 
+/// Produces a sorted, disjoint union of GPA ranges.
+///
+/// This removes duplicate work from overlapping, nested, or adjacent guest
+/// ranges and makes subsequent range searches valid.
 fn normalize_host_access_ranges(mut ranges: Vec<MemoryRange>) -> Vec<MemoryRange> {
     ranges.sort_unstable_by_key(MemoryRange::start);
     let mut merged: Vec<MemoryRange> = Vec::with_capacity(ranges.len());
@@ -253,84 +270,94 @@ fn normalize_host_access_ranges(mut ranges: Vec<MemoryRange>) -> Vec<MemoryRange
 }
 
 impl SnpHostAccessState {
+    // Call these methods only while holding `SnpPartitionState::host_access`.
+
+    /// Creates empty host-access lock and acquisition state.
     fn new(limits: SnpHostAccessLimits) -> Self {
         Self {
-            leases: BTreeMap::new(),
-            lease_count: 0,
-            locked_gpns: BTreeMap::new(),
+            distinct_lock_sets: BTreeMap::new(),
+            lock_count: 0,
+            locked_gpn_count: BTreeMap::new(),
             acquired_gpns: BTreeSet::new(),
             gpn_references: 0,
             limits,
         }
     }
 
+    /// Records a bounded host-access lock before guest pointers are exposed.
+    ///
+    /// Duplicate GPNs represent repeated references and remain in the exact
+    /// lock key.
     fn reserve(&mut self, gpns: &[u64]) -> anyhow::Result<()> {
         anyhow::ensure!(
-            gpns.len() <= self.limits.max_gpns_per_lease,
-            "too many GPNs in one SNP host-access lease"
+            gpns.len() <= self.limits.max_gpns_per_lock,
+            "too many GPNs in one SNP host-access lock"
         );
         anyhow::ensure!(
-            self.lease_count < self.limits.max_leases,
-            "too many active SNP host-access leases"
+            self.lock_count < self.limits.max_locks,
+            "too many active SNP host-access locks"
         );
         let gpn_references = self
             .gpn_references
             .checked_add(gpns.len())
-            .ok_or_else(|| anyhow::anyhow!("SNP host-access lease count overflow"))?;
+            .ok_or_else(|| anyhow::anyhow!("SNP host-access lock count overflow"))?;
         anyhow::ensure!(
             gpn_references <= self.limits.max_gpn_references,
             "too many active SNP host-access GPN references"
         );
         *self
-            .leases
+            .distinct_lock_sets
             .entry(gpns.to_vec().into_boxed_slice())
             .or_default() += 1;
-        self.lease_count += 1;
+        self.lock_count += 1;
         for &gpn in gpns {
-            *self.locked_gpns.entry(gpn).or_default() += 1;
+            *self.locked_gpn_count.entry(gpn).or_default() += 1;
         }
         self.gpn_references = gpn_references;
         Ok(())
     }
 
+    /// Removes one exact host-access lock and its per-GPN references.
     fn release(&mut self, gpns: &[u64]) {
         let remove = {
-            let Some(count) = self.leases.get_mut(gpns) else {
-                tracelimit::error_ratelimited!("ignored unmatched SNP host-access lease release");
+            let Some(count) = self.distinct_lock_sets.get_mut(gpns) else {
+                tracelimit::error_ratelimited!("ignored unmatched SNP host-access lock release");
                 return;
             };
             *count -= 1;
             *count == 0
         };
         if remove {
-            self.leases.remove(gpns);
+            self.distinct_lock_sets.remove(gpns);
         }
-        self.lease_count -= 1;
+        self.lock_count -= 1;
         for &gpn in gpns {
-            let Some(count) = self.locked_gpns.get_mut(&gpn) else {
+            let Some(count) = self.locked_gpn_count.get_mut(&gpn) else {
                 tracelimit::error_ratelimited!(
                     gpn,
-                    "SNP host-access lease is missing its GPN reference"
+                    "SNP host-access lock is missing its GPN reference"
                 );
                 continue;
             };
             *count -= 1;
             if *count == 0 {
-                self.locked_gpns.remove(&gpn);
+                self.locked_gpn_count.remove(&gpn);
             }
         }
         self.gpn_references -= gpns.len();
     }
 
-    fn first_lease_overlap(&self, ranges: &[MemoryRange]) -> Option<u64> {
+    /// Returns the first locked GPN in the normalized ranges.
+    fn first_lock_overlap(&self, ranges: &[MemoryRange]) -> Option<u64> {
         ranges.iter().find_map(|range| {
-            self.locked_gpns
+            self.locked_gpn_count
                 .range(range.start_4k_gpn()..range.end_4k_gpn())
                 .next()
                 .map(|(&gpn, _)| gpn)
         })
     }
 
+    /// Returns sorted unique GPNs that are not in the acquired-access cache.
     fn uncached_gpns(&self, gpns: &[u64]) -> Vec<u64> {
         let mut gpns = gpns.to_vec();
         gpns.sort_unstable();
@@ -339,6 +366,7 @@ impl SnpHostAccessState {
         gpns
     }
 
+    /// Adds successfully acquired GPNs until the bounded cache is full.
     fn cache_acquired(&mut self, gpns: impl IntoIterator<Item = u64>) {
         for gpn in gpns {
             if self.acquired_gpns.len() >= self.limits.max_cached_gpns {
@@ -348,6 +376,7 @@ impl SnpHostAccessState {
         }
     }
 
+    /// Removes cached acquisition state before host access is released.
     fn invalidate_acquired(&mut self, ranges: &[MemoryRange]) {
         for range in ranges {
             let gpns = self
@@ -642,9 +671,7 @@ fn snp_acquire_host_access_flags() -> u8 {
 /// For acquire operations, the hypervisor rejects access that exceeds the
 /// maximum host access established by the guest's visibility transition.
 fn modify_snp_host_access(vmfd: &mshv_ioctls::VmFd, gpas: &[u64], flags: u8) -> anyhow::Result<()> {
-    if gpas.is_empty() {
-        return Ok(());
-    }
+    anyhow::ensure!(!gpas.is_empty(), "host-access GPA list must not be empty");
 
     let mut buf = HeaderVec::<ModifyGpaHostAccessHeader, u64, 0>::new(ModifyGpaHostAccessHeader {
         flags,
@@ -665,6 +692,22 @@ fn modify_snp_host_access(vmfd: &mshv_ioctls::VmFd, gpas: &[u64], flags: u8) -> 
     Ok(())
 }
 
+/// Applies a host-access operation to non-empty batches from a GPA iterator.
+fn try_for_each_host_access_batch<E>(
+    gpas: impl IntoIterator<Item = u64>,
+    mut f: impl FnMut(&[u64]) -> Result<(), E>,
+) -> Result<(), E> {
+    let mut gpas = gpas.into_iter().peekable();
+    while gpas.peek().is_some() {
+        let batch = gpas
+            .by_ref()
+            .take(HOST_ACCESS_BATCH_PAGES)
+            .collect::<Vec<_>>();
+        f(&batch)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn acquire_snp_host_access(
     partition: &MshvPartitionInner,
     addr: u64,
@@ -681,24 +724,22 @@ pub(crate) fn acquire_snp_host_access(
         page_count <= MAX_HOST_ACCESS_INTERCEPT_PAGES,
         "SNP host-access fault range is too large"
     );
+    addr.checked_add(size)
+        .ok_or_else(|| anyhow::anyhow!("host-access GPA range overflow"))?;
     let snp = partition
         .isolation
         .snp()
         .ok_or_else(|| anyhow::anyhow!("partition is not SNP isolated"))?;
     let mut state = snp.host_access.lock();
 
-    let mut gpas = Vec::with_capacity(HOST_ACCESS_BATCH_PAGES);
-    for page in 0..page_count {
-        gpas.push(addr + page * hvdef::HV_PAGE_SIZE);
-        if gpas.len() == HOST_ACCESS_BATCH_PAGES {
-            modify_snp_host_access(&partition.vmfd, &gpas, snp_acquire_host_access_flags())?;
+    try_for_each_host_access_batch(
+        (0..page_count).map(|page| addr + page * hvdef::HV_PAGE_SIZE),
+        |gpas| {
+            modify_snp_host_access(&partition.vmfd, gpas, snp_acquire_host_access_flags())?;
             state.cache_acquired(gpas.iter().map(|gpa| gpa / hvdef::HV_PAGE_SIZE));
-            gpas.clear();
-        }
-    }
-    modify_snp_host_access(&partition.vmfd, &gpas, snp_acquire_host_access_flags())?;
-    state.cache_acquired(gpas.iter().map(|gpa| gpa / hvdef::HV_PAGE_SIZE));
-    Ok(())
+            Ok(())
+        },
+    )
 }
 
 pub(crate) fn lock_snp_host_access(
@@ -733,13 +774,13 @@ pub(crate) fn lock_snp_host_access(
         });
     if let Err(err) = result {
         // An earlier batch may have acquired host permission. No pointer has
-        // been exposed yet, so remove the software lease and return failure.
+        // been exposed yet, so remove the software lock and return failure.
         // A later guest private transition will release any acquired prefix.
         state.release(gpns);
         return Err(err);
     }
     drop(state);
-    Ok(Some(Box::new(SnpHostAccessLease {
+    Ok(Some(Box::new(SnpHostAccessLock {
         state: host_access,
         gpns: gpns.into(),
     })))
@@ -1498,15 +1539,13 @@ impl MshvProcessor<'_> {
         flags: u8,
     ) -> Result<(), VpHaltReason> {
         modify_snp_host_access(&self.partition.vmfd, gpas, flags).map_err(|err| {
-            if let Some(&first_gpa) = gpas.first() {
-                tracelimit::error_ratelimited!(
-                    error = %err,
-                    first_gpa,
-                    page_count = gpas.len(),
-                    flags,
-                    "failed to modify SNP GPA host access"
-                );
-            }
+            tracelimit::error_ratelimited!(
+                error = %err,
+                first_gpa = gpas.first().copied().unwrap_or_default(),
+                page_count = gpas.len(),
+                flags,
+                "failed to modify SNP GPA host access"
+            );
             VpHaltReason::TripleFault { vtl: Vtl::Vtl0 }
         })
     }
@@ -1515,7 +1554,6 @@ impl MshvProcessor<'_> {
         &self,
         message: &HvMessage,
     ) -> Result<(), VpHaltReason> {
-        const BATCH_PAGES: usize = 256;
         let info = message.as_message::<hvdef::HvX64GpaAttributeInterceptMessage>();
         let range_count = info.flags.range_count() as usize;
         let ranges = &info.ranges;
@@ -1569,12 +1607,12 @@ impl MshvProcessor<'_> {
             .expect("SNP intercepts require an SNP partition");
         let mut host_access = snp.host_access.lock();
         if !acquiring {
-            if let Some(gpn) = host_access.first_lease_overlap(&gpa_ranges) {
+            if let Some(gpn) = host_access.first_lock_overlap(&gpa_ranges) {
                 tracelimit::warn_ratelimited!(
                     first_range = %gpa_ranges[0],
                     gpn,
-                    lease_count = host_access.lease_count,
-                    "denied SNP private transition for a host-access lease"
+                    lock_count = host_access.lock_count,
+                    "denied SNP private transition for a host-access lock"
                 );
                 return Err(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 });
             }
@@ -1583,31 +1621,21 @@ impl MshvProcessor<'_> {
             host_access.invalidate_acquired(&gpa_ranges);
         }
 
-        let mut gpas = Vec::with_capacity(BATCH_PAGES);
-        let result: Result<(), VpHaltReason> = (|| {
-            for range in &gpa_ranges {
-                for gpa in (range.start()..range.end()).step_by(hvdef::HV_PAGE_SIZE as usize) {
-                    gpas.push(gpa);
-                    if gpas.len() == BATCH_PAGES {
-                        self.modify_gpa_host_access(&gpas, flags)?;
-                        if acquiring {
-                            host_access
-                                .cache_acquired(gpas.iter().map(|gpa| gpa / hvdef::HV_PAGE_SIZE));
-                        }
-                        gpas.clear();
-                    }
+        try_for_each_host_access_batch(
+            gpa_ranges.iter().flat_map(|range| {
+                (range.start()..range.end()).step_by(hvdef::HV_PAGE_SIZE as usize)
+            }),
+            |gpas| {
+                self.modify_gpa_host_access(gpas, flags)?;
+                if acquiring {
+                    host_access.cache_acquired(gpas.iter().map(|gpa| gpa / hvdef::HV_PAGE_SIZE));
                 }
-            }
-            self.modify_gpa_host_access(&gpas, flags)?;
-            if acquiring {
-                host_access.cache_acquired(gpas.iter().map(|gpa| gpa / hvdef::HV_PAGE_SIZE));
-            }
-            Ok(())
-        })();
-        result?;
+                Ok::<_, VpHaltReason>(())
+            },
+        )?;
         // The VP re-executes its visibility hypercall after resume. If another
         // thread reacquires access first, the hypervisor intercepts that
-        // re-execution again. A zero-copy user then has a lease that denies the
+        // re-execution again. A zero-copy user then has a lock that denies the
         // second transition; a short access relies on recoverable trycopy
         // faults if the second release wins the race.
         Ok(())
@@ -2132,15 +2160,15 @@ mod tests {
 
     fn test_host_access_state() -> SnpHostAccessState {
         SnpHostAccessState::new(SnpHostAccessLimits {
-            max_leases: 2,
-            max_gpns_per_lease: 2,
+            max_locks: 2,
+            max_gpns_per_lock: 2,
             max_gpn_references: 3,
             max_cached_gpns: 2,
         })
     }
 
     #[test]
-    fn host_access_leases_are_bounded_and_reference_counted() {
+    fn host_access_locks_are_bounded_and_reference_counted() {
         let mut state = test_host_access_state();
         state.reserve(&[1, 1]).unwrap();
         state.reserve(&[2]).unwrap();
@@ -2150,40 +2178,40 @@ mod tests {
         state.release(&[1, 1]);
         assert_eq!(state.gpn_references, 1);
         state.release(&[2]);
-        assert!(state.leases.is_empty());
-        assert!(state.locked_gpns.is_empty());
+        assert!(state.distinct_lock_sets.is_empty());
+        assert!(state.locked_gpn_count.is_empty());
     }
 
     #[test]
-    fn nested_host_access_ranges_detect_lease_overlap() {
+    fn nested_host_access_ranges_detect_lock_overlap() {
         let mut state = test_host_access_state();
         state.reserve(&[7]).unwrap();
         assert_eq!(
-            state.first_lease_overlap(&[
+            state.first_lock_overlap(&[
                 MemoryRange::from_4k_gpn_range(0..10),
                 MemoryRange::from_4k_gpn_range(5..6),
             ]),
             Some(7)
         );
         assert_eq!(
-            state.first_lease_overlap(&[MemoryRange::from_4k_gpn_range(0..7)]),
+            state.first_lock_overlap(&[MemoryRange::from_4k_gpn_range(0..7)]),
             None
         );
     }
 
     #[test]
-    fn overlapping_leases_keep_gpn_locked_until_last_release() {
+    fn overlapping_locks_keep_gpn_locked_until_last_release() {
         let mut state = test_host_access_state();
         state.reserve(&[1]).unwrap();
         state.reserve(&[1]).unwrap();
         state.release(&[1]);
         assert_eq!(
-            state.first_lease_overlap(&[MemoryRange::from_4k_gpn_range(1..2)]),
+            state.first_lock_overlap(&[MemoryRange::from_4k_gpn_range(1..2)]),
             Some(1)
         );
         state.release(&[1]);
         assert_eq!(
-            state.first_lease_overlap(&[MemoryRange::from_4k_gpn_range(1..2)]),
+            state.first_lock_overlap(&[MemoryRange::from_4k_gpn_range(1..2)]),
             None
         );
     }
@@ -2196,6 +2224,28 @@ mod tests {
         assert_eq!(state.uncached_gpns(&[3]), [3]);
         state.invalidate_acquired(&[MemoryRange::from_4k_gpn_range(2..3)]);
         assert_eq!(state.uncached_gpns(&[1, 2, 3]), [2, 3]);
+    }
+
+    #[test]
+    fn host_access_iterator_uses_nonempty_bounded_batches() {
+        let mut batches = Vec::new();
+        try_for_each_host_access_batch(0..HOST_ACCESS_BATCH_PAGES as u64 * 2 + 1, |batch| {
+            batches.push(batch.len());
+            Ok::<_, std::convert::Infallible>(())
+        })
+        .unwrap();
+        assert_eq!(
+            batches,
+            [HOST_ACCESS_BATCH_PAGES, HOST_ACCESS_BATCH_PAGES, 1]
+        );
+
+        let mut called = false;
+        try_for_each_host_access_batch([], |_| {
+            called = true;
+            Ok::<_, std::convert::Infallible>(())
+        })
+        .unwrap();
+        assert!(!called);
     }
 
     #[test]

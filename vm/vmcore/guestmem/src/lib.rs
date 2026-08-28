@@ -664,7 +664,14 @@ pub unsafe trait GuestMemoryAccess: 'static + Send + Sync {
 /// Dropping the object releases the backing lock.
 pub trait GuestMemoryBackingLock: Send + Sync {}
 
-impl GuestMemoryBackingLock for Vec<Box<dyn GuestMemoryBackingLock>> {}
+/// Holds the backing locks for all regions in a multi-region lock request.
+///
+/// Dropping the aggregate releases every contained backing lock.
+struct GuestMemoryBackingLocks {
+    _locks: Vec<Box<dyn GuestMemoryBackingLock>>,
+}
+
+impl GuestMemoryBackingLock for GuestMemoryBackingLocks {}
 
 trait DynGuestMemoryAccess: 'static + Send + Sync + Any {
     fn subrange(
@@ -1234,7 +1241,9 @@ impl<T: GuestMemoryAccess> DynGuestMemoryAccess for MultiRegionGuestMemoryAccess
                 locks.push(lock);
             }
         }
-        Ok((!locks.is_empty()).then(|| Box::new(locks) as Box<dyn GuestMemoryBackingLock>))
+        Ok((!locks.is_empty()).then(|| {
+            Box::new(GuestMemoryBackingLocks { _locks: locks }) as Box<dyn GuestMemoryBackingLock>
+        }))
     }
 
     fn sharing(&self) -> Option<GuestMemorySharing> {

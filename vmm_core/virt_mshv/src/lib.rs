@@ -247,9 +247,12 @@ pub struct MshvPartition {
     synic_ports: Arc<virt::synic::SynicPorts<MshvPartitionInner>>,
 }
 
+#[derive(Inspect)]
+#[inspect(external_tag)]
 enum MshvIsolationState {
     None,
     #[cfg(guest_arch = "x86_64")]
+    #[inspect(transparent)]
     Snp(arch::SnpPartitionState),
 }
 
@@ -323,7 +326,6 @@ struct MshvPartitionInner {
     synic_ports: virt::synic::SynicPortMap,
     #[cfg(guest_arch = "x86_64")]
     software_devices: virt::x86::apic_software_device::ApicSoftwareDevices,
-    #[inspect(skip)]
     isolation: MshvIsolationState,
     /// Set to `true` when partition time is frozen (e.g. during reset).
     /// The first VP to enter `run_vp` after a freeze will thaw time.
@@ -938,6 +940,7 @@ impl virt::PartitionMemoryMapper for MshvPartition {
 // TODO: figure out a better abstraction that also works for KVM and WHP.
 impl virt::PartitionHostAccess for MshvPartitionInner {
     fn acquire_host_access(&self, addr: u64, size: u64, _write: bool) -> anyhow::Result<()> {
+        #[cfg(not(guest_arch = "x86_64"))]
         let _ = (addr, size);
         // TODO: Investigate whether MSHV supports read-only host-access
         // requests and use `_write` to avoid granting write access for reads.
@@ -953,6 +956,7 @@ impl virt::PartitionHostAccess for MshvPartitionInner {
         gpns: &[u64],
         _write: bool,
     ) -> anyhow::Result<Option<Box<dyn guestmem::GuestMemoryBackingLock>>> {
+        #[cfg(not(guest_arch = "x86_64"))]
         let _ = gpns;
         // TODO: Investigate whether MSHV supports read-only host-access
         // requests and use `_write` to avoid granting write access for reads.
