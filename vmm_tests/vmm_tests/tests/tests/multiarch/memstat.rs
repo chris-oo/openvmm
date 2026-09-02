@@ -389,7 +389,7 @@ async fn idle_test<T: PetriVmmBackend>(
             (None | Some(IsolationType::Vbs), MachineArch::X86_64) => 32,
             // SNP, TDX, and ARM runners have at least 64 VPs
             (Some(IsolationType::Snp | IsolationType::Tdx), MachineArch::X86_64)
-            | (None | Some(IsolationType::Cca), MachineArch::Aarch64) => 64,
+            | (None, MachineArch::Aarch64) => 64,
             _ => unreachable!("invalid isolation configuration"),
         },
     };
