@@ -8,6 +8,8 @@
 pub mod capabilities {
     /// Software VPCI device emulation support.
     pub const VPCI: &str = "vpci";
+    /// Arm Confidential Compute Architecture support.
+    pub const CCA: &str = "cca";
 
     /// Support for resetting a partition running Windows.
     pub const WINDOWS_PARTITION_RESET: &str = "windows_partition_reset";
@@ -19,6 +21,7 @@ pub mod capabilities {
     /// tests.
     pub const KNOWN_CAPABILITIES: &[&str] = &[
         VPCI,
+        CCA,
         WINDOWS_PARTITION_RESET,
         NESTED_VIRT,
         "test_disk",
