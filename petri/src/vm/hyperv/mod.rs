@@ -363,7 +363,7 @@ impl PetriVmmBackend for HyperVPetriBackend {
         let supports_com3 = {
             // Hyper-V VBS VMs don't work with COM3 enabled.
             // Hypervisor support is needed for this to work.
-            let is_not_vbs = !matches!(config.firmware.isolation(), Some(IsolationType::Vbs));
+            let is_not_vbs = !matches!(config.isolation, Some(IsolationType::Vbs));
 
             let current_winver = windows_version::OsVersion::current();
             tracing::debug!(?current_winver, "host windows version");

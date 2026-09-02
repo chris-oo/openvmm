@@ -231,6 +231,8 @@ pub struct PetriVmConfig {
     pub host_log_levels: Option<OpenvmmLogConfig>,
     /// Firmware and/or OS to load into the VM and associated settings
     pub firmware: Firmware,
+    /// Isolation applied to the VM partition.
+    pub isolation: Option<IsolationType>,
     /// The amount of memory, in bytes, to assign to the VM
     pub memory: MemoryConfig,
     /// The processor topology for the VM
@@ -434,6 +436,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
         driver: &DefaultDriver,
     ) -> anyhow::Result<Self> {
         let (guest_quirks, vmm_quirks) = T::quirks(&artifacts.firmware);
+        let isolation = artifacts.firmware.isolation();
         let expected_boot_event = artifacts.firmware.expected_boot_event();
         let boot_device_type = match artifacts.firmware {
             Firmware::LinuxDirect { .. } => BootDeviceType::None,
@@ -458,6 +461,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
                 arch: artifacts.arch,
                 host_log_levels: None,
                 firmware: artifacts.firmware,
+                isolation,
                 memory: Default::default(),
                 proc_topology: Default::default(),
 
@@ -515,6 +519,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
         driver: &DefaultDriver,
     ) -> anyhow::Result<Self> {
         let (guest_quirks, vmm_quirks) = T::quirks(&artifacts.firmware);
+        let isolation = artifacts.firmware.isolation();
         let expected_boot_event = artifacts.firmware.expected_boot_event();
         let boot_device_type = match artifacts.firmware {
             Firmware::LinuxDirect { .. } => BootDeviceType::None,
@@ -539,6 +544,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
                 arch: artifacts.arch,
                 host_log_levels: None,
                 firmware: artifacts.firmware,
+                isolation,
                 memory: Default::default(),
                 proc_topology: Default::default(),
 
@@ -1029,7 +1035,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
     pub fn properties(&self) -> PetriVmProperties {
         PetriVmProperties {
             is_openhcl: self.config.firmware.is_openhcl(),
-            is_isolated: self.config.firmware.isolation().is_some(),
+            is_isolated: self.config.isolation.is_some(),
             is_pcat: self.config.firmware.is_pcat(),
             is_linux_direct: self.config.firmware.is_linux_direct(),
             using_vtl0_pipette: self.using_vtl0_pipette(),
@@ -1360,6 +1366,36 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
     /// Set the VM to use the specified memory config.
     pub fn with_memory(mut self, memory: MemoryConfig) -> Self {
         self.config.memory = memory;
+        self
+    }
+
+    /// Set the VM partition isolation type.
+    pub fn with_isolation(mut self, isolation: IsolationType) -> Self {
+        if isolation == IsolationType::Cca {
+            assert_eq!(
+                self.config.arch,
+                MachineArch::Aarch64,
+                "CCA isolation requires an AArch64 VM"
+            );
+            assert!(
+                matches!(self.config.firmware, Firmware::LinuxDirect { .. }),
+                "CCA isolation requires Linux-direct firmware"
+            );
+            assert_ne!(
+                self.config.memory.private_memory,
+                Some(true),
+                "CCA isolation requires shared userspace memory backing"
+            );
+            self.config.memory.private_memory = Some(false);
+            self = self.with_no_hv();
+        } else {
+            assert_eq!(
+                self.config.firmware.isolation(),
+                Some(isolation),
+                "VM isolation must match firmware isolation"
+            );
+        }
+        self.config.isolation = Some(isolation);
         self
     }
 
@@ -1752,7 +1788,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
 
     /// Get the isolation type of the VM
     pub fn isolation(&self) -> Option<IsolationType> {
-        self.config.firmware.isolation()
+        self.config.isolation
     }
 
     /// Get the machine architecture
@@ -3242,7 +3278,7 @@ impl BootImageConfig<boot_image_type::Iso> {
 }
 
 /// Isolation type
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IsolationType {
     /// VBS
     Vbs,
@@ -3250,6 +3286,8 @@ pub enum IsolationType {
     Snp,
     /// TDX
     Tdx,
+    /// Arm CCA
+    Cca,
 }
 
 /// Flags controlling servicing behavior.
