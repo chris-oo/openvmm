@@ -453,6 +453,7 @@ pub fn build_qemu_command(
         arch,
         host_log_levels,
         firmware,
+        isolation: _,
         hibernation_enabled,
         ipmi_enabled,
         memory:

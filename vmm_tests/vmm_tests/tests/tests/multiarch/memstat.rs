@@ -362,6 +362,7 @@ fn get_arch_str(isolation_type: Option<IsolationType>, machine_arch: MachineArch
             IsolationType::Vbs => "vbs-x64",
             IsolationType::Snp => "amd-snp",
             IsolationType::Tdx => "intel-tdx",
+            IsolationType::Cca => "arm-cca",
         })
         .unwrap_or_else(|| match machine_arch {
             MachineArch::Aarch64 => "aarch64",
@@ -388,7 +389,7 @@ async fn idle_test<T: PetriVmmBackend>(
             (None | Some(IsolationType::Vbs), MachineArch::X86_64) => 32,
             // SNP, TDX, and ARM runners have at least 64 VPs
             (Some(IsolationType::Snp | IsolationType::Tdx), MachineArch::X86_64)
-            | (None, MachineArch::Aarch64) => 64,
+            | (None | Some(IsolationType::Cca), MachineArch::Aarch64) => 64,
             _ => unreachable!("invalid isolation configuration"),
         },
     };
