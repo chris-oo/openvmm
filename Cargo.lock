@@ -2355,6 +2355,7 @@ dependencies = [
  "serde_json",
  "target-lexicon",
  "test_with_tracing",
+ "toml_edit",
 ]
 
 [[package]]
@@ -3965,14 +3966,17 @@ dependencies = [
  "anyhow",
  "clap",
  "crossterm",
+ "ctrlc",
  "fs-err",
  "futures",
  "futures-concurrency",
  "initrd_cpio",
  "mesh",
  "pal_async",
+ "petri_artifacts_common",
  "pipette_client",
  "serde",
+ "signal-hook",
  "tempfile",
  "toml_edit",
  "tracing",
