@@ -10,13 +10,16 @@ rust-version.workspace = true
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
 crossterm = { workspace = true, features = ["windows"] }
+ctrlc.workspace = true
 futures.workspace = true
 futures-concurrency.workspace = true
 initrd_cpio.workspace = true
 mesh.workspace = true
 pal_async.workspace = true
+petri_artifacts_common.workspace = true
 pipette_client.workspace = true
 serde = { workspace = true, features = ["derive"] }
+signal-hook = { workspace = true, features = ["iterator"] }
 tempfile.workspace = true
 toml_edit = { workspace = true, features = ["serde"] }
 tracing.workspace = true

@@ -5,6 +5,8 @@
 
 use crate::GUEST_SHARE_ROOT;
 use crate::profile::DeviceConfig;
+use crate::profile::QemuCcaConfig;
+use crate::profile::QemuCcaExtraArg;
 use crate::profile::QemuTcgConfig;
 use anyhow::Context;
 use futures::AsyncReadExt;
@@ -16,14 +18,79 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 /// Filename of the injected init script, run by the kernel as `rdinit`.
 const INIT_SCRIPT_NAME: &str = "tcg-init.sh";
+const CCA_INIT_SCRIPT_NAME: &str = "cca-init.sh";
 /// Filename of the host CA bundle injected into the initrd.
 const CA_CERTIFICATES_NAME: &str = "incubator-ca-certificates.crt";
+static ACTIVE_QEMU_PID: AtomicU32 = AtomicU32::new(0);
+static TERMINATION_REQUESTED: AtomicBool = AtomicBool::new(false);
+static TERMINATION_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
+
+/// Install process-termination handling that also kills the active QEMU group.
+pub fn install_termination_handler() -> anyhow::Result<()> {
+    TERMINATION_HANDLER
+        .get_or_init(|| {
+            ctrlc::set_handler(|| {
+                TERMINATION_REQUESTED.store(true, Ordering::SeqCst);
+                let pid = ACTIVE_QEMU_PID.load(Ordering::SeqCst);
+                if pid != 0 {
+                    terminate_process_tree(pid, true);
+                }
+            })
+            .map_err(|err| err.to_string())?;
+            #[cfg(unix)]
+            {
+                let mut signals = signal_hook::iterator::Signals::new([
+                    signal_hook::consts::SIGTERM,
+                    signal_hook::consts::SIGHUP,
+                ])
+                .map_err(|err| err.to_string())?;
+                std::thread::Builder::new()
+                    .name("incubator-signal".into())
+                    .spawn(move || {
+                        if signals.forever().next().is_some() {
+                            TERMINATION_REQUESTED.store(true, Ordering::SeqCst);
+                            let pid = ACTIVE_QEMU_PID.load(Ordering::SeqCst);
+                            if pid != 0 {
+                                terminate_process_tree(pid, true);
+                            }
+                        }
+                    })
+                    .map_err(|err| err.to_string())?;
+            }
+            Ok(())
+        })
+        .as_ref()
+        .map_err(|err| anyhow::anyhow!("failed to install incubator termination handler: {err}"))
+        .copied()
+}
+
+/// Returns whether process termination was requested.
+pub fn termination_requested() -> bool {
+    TERMINATION_REQUESTED.load(Ordering::SeqCst)
+}
+
+/// Set the QEMU process group terminated by the signal handler.
+pub fn set_active_qemu_pid(pid: u32) {
+    ACTIVE_QEMU_PID.store(pid, Ordering::SeqCst);
+    if TERMINATION_REQUESTED.load(Ordering::SeqCst) {
+        terminate_process_tree(pid, true);
+    }
+}
+
+/// Clear the active QEMU process group.
+pub fn clear_active_qemu_pid(pid: u32) {
+    let _ = ACTIVE_QEMU_PID.compare_exchange(pid, 0, Ordering::SeqCst, Ordering::SeqCst);
+}
 
 /// Build the QEMU command line for a TCG launch.
 pub fn build_qemu_command(
@@ -57,7 +124,7 @@ pub fn build_qemu_command(
 
     // User-mode networking with port forwarding for pipette TCP
     cmd.arg("-netdev").arg(format!(
-        "user,id=net0,hostfwd=tcp::{host_pipette_port}-:{guest_port}",
+        "user,id=net0,hostfwd=tcp:127.0.0.1:{host_pipette_port}-:{guest_port}",
         guest_port = pipette_client::PIPETTE_PORT,
     ));
     cmd.arg("-device")
@@ -118,6 +185,124 @@ pub fn build_qemu_command(
     }
 
     Ok(cmd)
+}
+
+/// A QEMU CCA command and the log path for each named serial console.
+pub struct QemuCcaCommand {
+    /// Configured QEMU command.
+    pub command: Command,
+    /// Console name to host log path.
+    pub console_logs: BTreeMap<String, PathBuf>,
+}
+
+/// Build the QEMU command line for an Arm CCA L1 host.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the arguments are the complete QEMU CCA boot artifact contract"
+)]
+pub fn build_qemu_cca_command(
+    config: &QemuCcaConfig,
+    firmware: &Path,
+    kernel: &Path,
+    initrd: &Path,
+    share_dir: &Path,
+    host_pipette_port: u16,
+    output_dir: &Path,
+    instance_id: u64,
+) -> anyhow::Result<QemuCcaCommand> {
+    let share_dir = qemu_option_path(share_dir, "QEMU CCA share directory")?;
+    let mut cmd = Command::new(&config.binary);
+
+    cmd.arg("-nodefaults");
+    cmd.arg("-accel").arg("tcg");
+    cmd.arg("-machine").arg(&config.machine);
+    cmd.arg("-cpu").arg(&config.cpu);
+    cmd.arg("-m").arg(&config.memory);
+    cmd.arg("-smp").arg(&config.smp);
+    cmd.arg("-bios").arg(firmware);
+    cmd.arg("-kernel").arg(kernel);
+    if let Some(address) = config.kernel_load_address {
+        let kernel = qemu_option_path(kernel, "QEMU CCA kernel")?;
+        cmd.arg("-device").arg(format!(
+            "loader,file={kernel},addr={address:#x},force-raw=on"
+        ));
+    }
+    let initrd_address = config
+        .initrd_load_address
+        .context("QEMU CCA initrd load address is missing")?;
+    let initrd = qemu_option_path(initrd, "QEMU CCA initrd")?;
+    let initrd_size = std::fs::metadata(initrd)
+        .context("failed to read QEMU CCA initrd metadata")?
+        .len();
+    let initrd_end = initrd_address
+        .checked_add(initrd_size)
+        .context("QEMU CCA initrd address overflow")?;
+    let kernel_address = config
+        .kernel_load_address
+        .context("QEMU CCA kernel load address is missing")?;
+    anyhow::ensure!(
+        initrd_end <= kernel_address,
+        "QEMU CCA initrd range {initrd_address:#x}..{initrd_end:#x} overlaps \
+         the raw kernel at {kernel_address:#x}"
+    );
+    cmd.arg("-device").arg(format!(
+        "loader,file={initrd},addr={initrd_address:#x},force-raw=on"
+    ));
+    cmd.arg("-virtfs").arg(format!(
+        "local,path={share_dir},mount_tag=host,security_model=none,readonly=off"
+    ));
+    cmd.arg("-netdev").arg(format!(
+        "user,id=net0,hostfwd=tcp:127.0.0.1:{host_pipette_port}-:{guest_port}",
+        guest_port = pipette_client::PIPETTE_PORT,
+    ));
+    cmd.arg("-device")
+        .arg("virtio-net-pci,netdev=net0,romfile=");
+    cmd.arg("-append").arg(format!(
+        "nokaslr console=ttyAMA0 rdinit=/{CCA_INIT_SCRIPT_NAME} \
+         initrd={initrd_address:#x},{initrd_size:#x}"
+    ));
+    cmd.arg("-display").arg("none");
+    cmd.arg("-monitor").arg("none");
+    cmd.arg("-no-reboot");
+
+    for extra_arg in &config.extra_args {
+        match extra_arg {
+            QemuCcaExtraArg::Trace { value } => {
+                cmd.arg("-d").arg(value);
+            }
+            QemuCcaExtraArg::Global { value } => {
+                cmd.arg("-global").arg(value);
+            }
+        }
+    }
+
+    let mut console_logs = BTreeMap::new();
+    for console in &config.consoles {
+        let log_path = output_dir.join(format!("incubator-{console}.{instance_id}.log"));
+        if console == &config.primary_console {
+            cmd.arg("-serial").arg("stdio");
+        } else {
+            let log_path_arg = qemu_option_path(&log_path, "QEMU CCA console log")?;
+            cmd.arg("-serial").arg(format!("file:{log_path_arg}"));
+        }
+        console_logs.insert(console.clone(), log_path);
+    }
+
+    Ok(QemuCcaCommand {
+        command: cmd,
+        console_logs,
+    })
+}
+
+fn qemu_option_path<'a>(path: &'a Path, label: &str) -> anyhow::Result<&'a str> {
+    let path = path
+        .to_str()
+        .with_context(|| format!("{label} is not valid UTF-8"))?;
+    anyhow::ensure!(
+        !path.contains([',', '\n', '\r']),
+        "{label} contains a character that cannot be represented in a QEMU option"
+    );
+    Ok(path)
 }
 
 /// First PCI device number (`addr=`) used for extra-device root ports.
@@ -197,6 +382,52 @@ fn build_init_script(guest_pipette_path: &str) -> String {
     )
 }
 
+fn build_cca_init_script(guest_pipette_path: &str) -> String {
+    let guest_pipette_path = shell_single_quote(guest_pipette_path);
+    let guest_share_root = shell_single_quote(GUEST_SHARE_ROOT);
+    let host_epoch_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("host clock is before the Unix epoch")
+        .as_secs();
+
+    format!(
+        "\
+        #!/bin/sh\n\
+        set -eu\n\
+        shutdown() {{\n\
+            status=$?\n\
+            trap - EXIT\n\
+            sync\n\
+            poweroff -f\n\
+            exit \"$status\"\n\
+        }}\n\
+        trap shutdown EXIT\n\
+        /bin/busybox --install /bin 2>/dev/null\n\
+        mountpoint -q /dev || mount -t devtmpfs none /dev\n\
+        mountpoint -q /proc || mount -t proc none /proc\n\
+        mountpoint -q /sys || mount -t sysfs none /sys\n\
+        mkdir -p /dev/pts {guest_share_root} /root /tmp /etc\n\
+        mountpoint -q /dev/pts || mount -t devpts devpts /dev/pts\n\
+        date -u -s @{host_epoch_seconds}\n\
+        mount -t 9p -o trans=virtio,version=9p2000.L,msize=512000 host {guest_share_root}\n\
+        log_dir=\"$(dirname {guest_pipette_path})/cca-logs\"\n\
+        mkdir -p \"$log_dir\"\n\
+        ip link set lo up\n\
+        ip link set eth0 up\n\
+        ip addr replace 10.0.2.15/24 dev eth0\n\
+        ip route replace default via 10.0.2.2\n\
+        echo 'nameserver 10.0.2.3' > /etc/resolv.conf\n\
+        {{\n\
+            ip address show\n\
+            ip route show\n\
+        }} > \"$log_dir/incubator-network.log\" 2>&1\n\
+        export HOME=/root\n\
+        export SSL_CERT_FILE=/{CA_CERTIFICATES_NAME}\n\
+        cd {guest_share_root}\n\
+        {guest_pipette_path} --transport tcp\n"
+    )
+}
+
 fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
@@ -217,12 +448,40 @@ pub fn prepare_initrd(
     scratch_dir: &Path,
     guest_pipette_path: &str,
 ) -> anyhow::Result<tempfile::TempPath> {
+    prepare_initrd_with_script(
+        base_initrd,
+        scratch_dir,
+        INIT_SCRIPT_NAME,
+        build_init_script(guest_pipette_path),
+    )
+}
+
+/// Prepare the CCA host initrd with its pipette startup contract.
+pub fn prepare_cca_initrd(
+    base_initrd: &Path,
+    scratch_dir: &Path,
+    guest_pipette_path: &str,
+) -> anyhow::Result<tempfile::TempPath> {
+    prepare_initrd_with_script(
+        base_initrd,
+        scratch_dir,
+        CCA_INIT_SCRIPT_NAME,
+        build_cca_init_script(guest_pipette_path),
+    )
+}
+
+fn prepare_initrd_with_script(
+    base_initrd: &Path,
+    scratch_dir: &Path,
+    script_name: &str,
+    script: String,
+) -> anyhow::Result<tempfile::TempPath> {
     let initrd_data = std::fs::read(base_initrd).context("failed to read initrd")?;
 
     let patched_initrd = initrd_cpio::inject_into_initrd(
         &initrd_data,
-        INIT_SCRIPT_NAME,
-        build_init_script(guest_pipette_path).as_bytes(),
+        script_name,
+        script.as_bytes(),
         0o100755, // regular file, rwxr-xr-x
     )
     .context("failed to inject init script into initrd")?;
@@ -321,6 +580,61 @@ pub async fn wait_for_pipette_ready(
         Event::Timeout => {
             anyhow::bail!("timed out waiting for pipette ready signal");
         }
+    }
+}
+
+/// Wait for QEMU to exit, bounded by `timeout`.
+pub async fn wait_for_qemu_exit(
+    driver: &impl pal_async::driver::Driver,
+    timeout: Duration,
+    qemu_child: &mut PolledChild<std::process::Child>,
+) -> anyhow::Result<std::process::ExitStatus> {
+    enum Event {
+        Exited(std::io::Result<std::process::ExitStatus>),
+        Timeout,
+    }
+
+    let event = (async { Event::Exited(qemu_child.wait().await) }, async {
+        pal_async::timer::PolledTimer::new(driver)
+            .sleep(timeout)
+            .await;
+        Event::Timeout
+    })
+        .race()
+        .await;
+
+    match event {
+        Event::Exited(status) => status.context("failed to wait for QEMU"),
+        Event::Timeout => anyhow::bail!("timed out waiting for QEMU to exit"),
+    }
+}
+
+/// Configure QEMU to run in an isolated process group where supported.
+pub fn configure_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+}
+
+/// Terminate QEMU and any helper processes it started.
+pub fn terminate_process_tree(pid: u32, force: bool) {
+    #[cfg(unix)]
+    {
+        let signal = if force { "-KILL" } else { "-TERM" };
+        let _ = Command::new("kill")
+            .args([signal, "--", &format!("-{pid}")])
+            .status();
+    }
+    #[cfg(windows)]
+    {
+        let mut command = Command::new("taskkill");
+        command.args(["/PID", &pid.to_string(), "/T"]);
+        if force {
+            command.arg("/F");
+        }
+        let _ = command.status();
     }
 }
 
@@ -497,20 +811,177 @@ pub async fn setup_vfio_devices(
         capabilities.push(device.capability());
     }
 
-    // Advertise all provisioned capabilities to the guest command via
-    // PETRI_CAPABILITIES (comma-separated), which petri's requirement
-    // evaluation reads. Augment any capabilities already present in the
-    // incubator's environment rather than overwriting them, so that
-    // host-provided capabilities are preserved.
-    if !capabilities.is_empty() {
-        let mut value = capabilities.join(",");
-        if let Ok(existing) = std::env::var("PETRI_CAPABILITIES") {
-            if !existing.is_empty() {
-                value = format!("{existing},{value}");
-            }
-        }
-        env.insert("PETRI_CAPABILITIES".to_string(), value);
-    }
+    publish_capabilities(&mut env, &capabilities);
 
     Ok(env)
+}
+
+/// Add runtime capabilities to the guest command environment.
+pub fn publish_capabilities(env: &mut BTreeMap<String, String>, capabilities: &[String]) {
+    let mut values = std::env::var("PETRI_CAPABILITIES")
+        .ok()
+        .into_iter()
+        .flat_map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .chain(capabilities.iter().cloned())
+        .collect::<std::collections::BTreeSet<_>>();
+    if let Some(existing) = env.get("PETRI_CAPABILITIES") {
+        values.extend(
+            existing
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+        );
+    }
+    if !values.is_empty() {
+        env.insert(
+            "PETRI_CAPABILITIES".to_string(),
+            values.into_iter().collect::<Vec<_>>().join(","),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn qemu_cca_config() -> QemuCcaConfig {
+        QemuCcaConfig {
+            binary: "qemu-system-aarch64".into(),
+            machine: "virt,secure=on,virtualization=on,gic-version=3,acpi=off".into(),
+            cpu: "max,x-rme=on,lpa2=off,sme=off,pauth-impdef=on".into(),
+            memory: "2G".into(),
+            smp: "1".into(),
+            kernel_load_address: Some(0x50080000),
+            initrd_load_address: Some(0x48000000),
+            consoles: vec!["host".into(), "secure".into()],
+            primary_console: "host".into(),
+            capabilities: vec!["cca".into()],
+            extra_args: vec![QemuCcaExtraArg::Trace {
+                value: "guest_errors".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn builds_qemu_cca_command_with_named_consoles() {
+        let initrd = tempfile::NamedTempFile::new().unwrap();
+        let built = build_qemu_cca_command(
+            &qemu_cca_config(),
+            Path::new("/artifacts/flash.bin"),
+            Path::new("/artifacts/host-Image"),
+            initrd.path(),
+            Path::new("/share"),
+            50000,
+            Path::new("/logs"),
+            42,
+        )
+        .unwrap();
+        let args: Vec<_> = built
+            .command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(
+            built.command.get_program(),
+            std::ffi::OsStr::new("qemu-system-aarch64")
+        );
+        assert!(
+            args.windows(2)
+                .any(|args| args == ["-bios", "/artifacts/flash.bin"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|args| args == ["-kernel", "/artifacts/host-Image"])
+        );
+        assert!(args.iter().any(|arg| {
+            arg == &format!(
+                "loader,file={},addr=0x48000000,force-raw=on",
+                initrd.path().display()
+            )
+        }));
+        assert!(!args.iter().any(|arg| arg.contains("id=rootfs")));
+        assert!(args.iter().any(|arg| {
+            arg == &format!(
+                "user,id=net0,hostfwd=tcp:127.0.0.1:50000-:{}",
+                pipette_client::PIPETTE_PORT
+            )
+        }));
+        assert!(args.windows(2).any(|args| args == ["-serial", "stdio"]));
+        assert!(
+            args.windows(2)
+                .any(|args| args == ["-serial", "file:/logs/incubator-secure.42.log"])
+        );
+        assert!(args.windows(2).any(|args| args == ["-d", "guest_errors"]));
+        assert!(args.iter().any(|arg| arg.contains("rdinit=/cca-init.sh")));
+        assert_eq!(
+            built.console_logs["host"],
+            PathBuf::from("/logs/incubator-host.42.log")
+        );
+        assert_eq!(
+            built.console_logs["secure"],
+            PathBuf::from("/logs/incubator-secure.42.log")
+        );
+    }
+
+    #[test]
+    fn rejects_unrepresentable_qemu_cca_option_path() {
+        let error = build_qemu_cca_command(
+            &qemu_cca_config(),
+            Path::new("/artifacts/flash.bin"),
+            Path::new("/artifacts/host-Image"),
+            Path::new("/artifacts/initrd"),
+            Path::new("/share,unsafe"),
+            50000,
+            Path::new("/logs"),
+            42,
+        )
+        .err()
+        .unwrap();
+
+        assert!(error.to_string().contains("cannot be represented"));
+    }
+
+    #[test]
+    fn rejects_qemu_cca_initrd_overlapping_kernel() {
+        let initrd = tempfile::NamedTempFile::new().unwrap();
+        initrd.as_file().set_len(0x08080001).unwrap();
+        let result = build_qemu_cca_command(
+            &qemu_cca_config(),
+            Path::new("/artifacts/flash.bin"),
+            Path::new("/artifacts/host-Image"),
+            initrd.path(),
+            Path::new("/share"),
+            50000,
+            Path::new("/logs"),
+            42,
+        );
+        let error = match result {
+            Ok(_) => panic!("oversized initrd was accepted"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("overlaps the raw kernel"));
+    }
+
+    #[test]
+    fn preserves_explicit_capabilities_without_runtime_capabilities() {
+        let mut env = BTreeMap::from([("PETRI_CAPABILITIES".to_string(), "explicit".to_string())]);
+
+        publish_capabilities(&mut env, &[]);
+
+        assert!(
+            env["PETRI_CAPABILITIES"]
+                .split(',')
+                .any(|capability| capability == "explicit")
+        );
+    }
 }

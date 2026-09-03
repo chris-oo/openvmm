@@ -58,6 +58,28 @@ pub struct BuildSelections {
     pub test_igvm_agent_rpc_server: bool,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum CcaPlatformSource {
+    Release {
+        version: String,
+        kernel_archive_sha256: String,
+        rmm_archive_sha256: String,
+        tfa_archive_sha256: String,
+        initrd_archive_sha256: String,
+    },
+    Local {
+        version: String,
+        kernel_archive: PathBuf,
+        kernel_archive_sha256: String,
+        rmm_archive: PathBuf,
+        rmm_archive_sha256: String,
+        tfa_archive: PathBuf,
+        tfa_archive_sha256: String,
+        initrd_archive: PathBuf,
+        initrd_archive_sha256: String,
+    },
+}
+
 flowey_request! {
     pub struct Params {
         pub target: CommonTriple,
@@ -97,6 +119,11 @@ flowey_request! {
         /// Optional: incubator profile path. When set, tests run inside
         /// an emulated VM instead of on the host.
         pub incubator_profile: Option<PathBuf>,
+        /// Incubator platform selected before the Flowey graph is emitted.
+        pub incubator_platform:
+            Option<crate::write_incubator_target_runner::IncubatorPlatform>,
+        /// Coherent CCA platform artifact source.
+        pub cca_platform_source: Option<CcaPlatformSource>,
 
         pub done: WriteVar<SideEffect>,
     }
@@ -134,6 +161,7 @@ impl SimpleFlowNode for Node {
         ctx.import::<crate::resolve_openvmm_test_initrd::Node>();
         ctx.import::<crate::resolve_openvmm_test_linux_kernel::Node>();
         ctx.import::<crate::resolve_openvmm_qemu::Node>();
+        ctx.import::<crate::resolve_cca_platform::Node>();
         ctx.import::<crate::run_prep_steps::Node>();
         ctx.import::<crate::build_vmgstool::Node>();
         ctx.import::<crate::write_incubator_target_runner::Node>();
@@ -155,8 +183,60 @@ impl SimpleFlowNode for Node {
             reuse_prepped_vhds,
             disable_secure_avic,
             incubator_profile,
+            incubator_platform,
+            cca_platform_source,
             done,
         } = request;
+
+        if let Some(source) = &cca_platform_source {
+            let config = match source {
+                CcaPlatformSource::Release {
+                    version,
+                    kernel_archive_sha256,
+                    rmm_archive_sha256,
+                    tfa_archive_sha256,
+                    initrd_archive_sha256,
+                } => crate::resolve_cca_platform::Config {
+                    version: Some(version.clone()),
+                    kernel_archive_sha256: Some(kernel_archive_sha256.clone()),
+                    rmm_archive_sha256: Some(rmm_archive_sha256.clone()),
+                    tfa_archive_sha256: Some(tfa_archive_sha256.clone()),
+                    initrd_archive_sha256: Some(initrd_archive_sha256.clone()),
+                    ..Default::default()
+                },
+                CcaPlatformSource::Local {
+                    version,
+                    kernel_archive,
+                    kernel_archive_sha256,
+                    rmm_archive,
+                    rmm_archive_sha256,
+                    tfa_archive,
+                    tfa_archive_sha256,
+                    initrd_archive,
+                    initrd_archive_sha256,
+                } => crate::resolve_cca_platform::Config {
+                    version: Some(version.clone()),
+                    kernel_archive_sha256: Some(kernel_archive_sha256.clone()),
+                    rmm_archive_sha256: Some(rmm_archive_sha256.clone()),
+                    tfa_archive_sha256: Some(tfa_archive_sha256.clone()),
+                    initrd_archive_sha256: Some(initrd_archive_sha256.clone()),
+                    local_kernel_archive: Some(ConfigVar(ReadVar::from_static(
+                        kernel_archive.clone(),
+                    ))),
+                    local_rmm_archive: Some(ConfigVar(ReadVar::from_static(rmm_archive.clone()))),
+                    local_tfa_archive: Some(ConfigVar(ReadVar::from_static(tfa_archive.clone()))),
+                    local_initrd_archive: Some(ConfigVar(ReadVar::from_static(
+                        initrd_archive.clone(),
+                    ))),
+                },
+            };
+            ctx.config(config);
+        }
+        let cca_platform = matches!(
+            incubator_platform,
+            Some(crate::write_incubator_target_runner::IncubatorPlatform::QemuCca)
+        )
+        .then(|| ctx.reqv(crate::resolve_cca_platform::Request::Get));
 
         let test_content_dir = test_content_dir.absolute()?;
         let custom_kernel_modules_abs = custom_kernel_modules.map(|p| p.absolute()).transpose()?;
@@ -368,28 +448,31 @@ impl SimpleFlowNode for Node {
             output
         });
 
-        let register_pipette_linux_musl = build.pipette_linux.then(|| {
-            let output = ctx.reqv(|v| crate::build_pipette::Request {
-                target: CommonTriple::Common {
-                    arch,
-                    platform: CommonPlatform::LinuxMusl,
-                },
-                profile: CommonProfile::from_release(release),
-                pipette: v,
+        let register_pipette_linux_musl = (build.pipette_linux || incubator_profile.is_some())
+            .then(|| {
+                let output = ctx.reqv(|v| crate::build_pipette::Request {
+                    target: CommonTriple::Common {
+                        arch,
+                        platform: CommonPlatform::LinuxMusl,
+                    },
+                    profile: CommonProfile::from_release(release),
+                    pipette: v,
+                });
+                if copy_extras {
+                    copy_to_dir.push((
+                        extras_dir.to_owned(),
+                        output.map(ctx, |x| {
+                            Some(match x {
+                                crate::build_pipette::PipetteOutput::LinuxBin { bin: _, dbg } => {
+                                    dbg
+                                }
+                                _ => unreachable!(),
+                            })
+                        }),
+                    ));
+                }
+                output
             });
-            if copy_extras {
-                copy_to_dir.push((
-                    extras_dir.to_owned(),
-                    output.map(ctx, |x| {
-                        Some(match x {
-                            crate::build_pipette::PipetteOutput::LinuxBin { bin: _, dbg } => dbg,
-                            _ => unreachable!(),
-                        })
-                    }),
-                ));
-            }
-            output
-        });
 
         let register_guest_test_uefi = build.guest_test_uefi.then(|| {
             let output = ctx.reqv(|v| crate::build_guest_test_uefi::Request {
@@ -704,6 +787,12 @@ impl SimpleFlowNode for Node {
             )
         });
 
+        let cca_realm_kernel = cca_platform
+            .clone()
+            .map(|platform| platform.map(ctx, |output| output.realm_kernel));
+        let cca_realm_initrd = cca_platform
+            .clone()
+            .map(|platform| platform.map(ctx, |output| output.host_initrd));
         let extra_env = ctx.reqv(|v| crate::init_vmm_tests_env::Request {
             test_content_dir: ReadVar::from_static(test_content_dir.clone()),
             vmm_tests_target: target_triple.clone(),
@@ -719,6 +808,8 @@ impl SimpleFlowNode for Node {
             register_vmgstool_dev,
             register_tpm_guest_tests_windows,
             register_tpm_guest_tests_linux,
+            test_linux_kernel_override: cca_realm_kernel,
+            test_linux_initrd_override: cca_realm_initrd,
             register_test_igvm_agent_rpc_server,
             disk_images_dir: Some(test_artifacts_dir),
             register_openhcl_igvm_files,
@@ -829,6 +920,8 @@ impl SimpleFlowNode for Node {
         let (extra_env, nextest_bin, nextest_target, stop_rpc_server) = if let Some(profile_path) =
             incubator_profile
         {
+            let incubator_platform = incubator_platform
+                .context("incubator profile was provided without a platform classification")?;
             // Incubator mode: host nextest drives the archive, and invokes
             // the generated target runner for each guest test binary.
             if let Some((prep_steps, _)) = register_prep_steps {
@@ -862,35 +955,80 @@ impl SimpleFlowNode for Node {
 
             let incubator_bin = incubator_bin.map(ctx, |o| o.bin);
 
-            let kernel = ctx.reqv(|v| {
-                crate::resolve_openvmm_test_linux_kernel::Request::Get(
-                    crate::resolve_openvmm_test_linux_kernel::OpenvmmTestKernelFile::Kernel,
-                    arch,
-                    crate::resolve_openvmm_test_linux_kernel::INCUBATOR_LINUX_TEST_KERNEL_VERSION,
-                    v,
-                )
-            });
-            let initrd = ctx.reqv(|v| crate::resolve_openvmm_test_initrd::Request::Get(arch, v));
+            let (kernel, initrd, firmware, qemu_binary, mut extra_share_paths) =
+                match incubator_platform {
+                    crate::write_incubator_target_runner::IncubatorPlatform::QemuTcg => {
+                        let kernel = ctx.reqv(|v| {
+                            crate::resolve_openvmm_test_linux_kernel::Request::Get(
+                                crate::resolve_openvmm_test_linux_kernel::OpenvmmTestKernelFile::Kernel,
+                                arch,
+                                crate::resolve_openvmm_test_linux_kernel::INCUBATOR_LINUX_TEST_KERNEL_VERSION,
+                                v,
+                            )
+                        });
+                        let initrd =
+                            ctx.reqv(|v| crate::resolve_openvmm_test_initrd::Request::Get(arch, v));
+                        let qemu_binary = ctx.reqv(|v| {
+                            crate::resolve_openvmm_qemu::Request::Get(
+                                crate::resolve_openvmm_qemu::QemuFile::SystemAarch64,
+                                host_arch,
+                                v,
+                            )
+                        });
+                        (kernel, Some(initrd), None, qemu_binary, Vec::new())
+                    }
+                    crate::write_incubator_target_runner::IncubatorPlatform::QemuCca => {
+                        anyhow::ensure!(
+                            arch == CommonArch::Aarch64,
+                            "QEMU CCA incubator requires an AArch64 target"
+                        );
+                        anyhow::ensure!(
+                            cca_platform_source.is_some(),
+                            "QEMU CCA requires configured platform artifacts"
+                        );
+                        anyhow::ensure!(
+                            crate::_jobs::cfg_versions::OPENVMM_DEPS
+                                == crate::cca_pins::QEMU_OPENVMM_DEPS_RELEASE,
+                            "configured QEMU release does not match the CCA platform contract"
+                        );
+                        let platform = cca_platform
+                            .clone()
+                            .context("QEMU CCA platform artifacts were not requested")?;
+                        let kernel = platform.clone().map(ctx, |output| output.host_kernel);
+                        let firmware = platform.clone().map(ctx, |output| output.firmware);
+                        let initrd = platform.clone().map(ctx, |output| output.host_initrd);
 
-            let qemu_binary = ctx.reqv(|v| {
-                crate::resolve_openvmm_qemu::Request::Get(
-                    crate::resolve_openvmm_qemu::QemuFile::SystemAarch64,
-                    host_arch,
-                    v,
-                )
-            });
+                        let qemu_binary = ctx.reqv(|v| {
+                            crate::resolve_openvmm_qemu::Request::Get(
+                                crate::resolve_openvmm_qemu::QemuFile::SystemAarch64,
+                                host_arch,
+                                v,
+                            )
+                        });
+
+                        (
+                            kernel,
+                            Some(initrd),
+                            Some(firmware),
+                            qemu_binary,
+                            Vec::new(),
+                        )
+                    }
+                };
+            extra_share_paths.extend([
+                ReadVar::from_static(nextest_archive_file.clone()),
+                ReadVar::from_static(nextest_config_file.clone()),
+            ]);
 
             let extra_env = ctx.reqv(|v| crate::write_incubator_target_runner::Request {
                 incubator_bin,
                 profile_path: ReadVar::from_static(profile_path),
                 kernel: Some(kernel),
-                initrd: Some(initrd),
+                initrd,
+                firmware,
                 repo_root: openvmm_repo_path.clone(),
                 test_content_dir: ReadVar::from_static(test_content_dir.clone()),
-                extra_share_paths: vec![
-                    ReadVar::from_static(nextest_archive_file.clone()),
-                    ReadVar::from_static(nextest_config_file.clone()),
-                ],
+                extra_share_paths,
                 extra_env: Some(extra_env),
                 qemu_binary: Some(qemu_binary),
                 target: target_triple.clone(),
@@ -899,6 +1037,14 @@ impl SimpleFlowNode for Node {
 
             (extra_env, None, None, false)
         } else if build_only {
+            anyhow::ensure!(
+                incubator_platform.is_none(),
+                "incubator platform was provided without a profile"
+            );
+            anyhow::ensure!(
+                cca_platform_source.is_none(),
+                "CCA platform artifacts were provided without an incubator profile"
+            );
             ctx.emit_side_effect_step(side_effects, [done]);
             if let Some((prep_steps, _)) = register_prep_steps {
                 prep_steps.claim_unused(ctx);

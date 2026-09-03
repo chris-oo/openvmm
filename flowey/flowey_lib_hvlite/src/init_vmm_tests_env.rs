@@ -53,6 +53,10 @@ flowey_request! {
         pub register_tpm_guest_tests_windows: Option<ReadVar<TpmGuestTestsOutput>>,
         /// Register a Linux tpm_guest_tests binary
         pub register_tpm_guest_tests_linux: Option<ReadVar<TpmGuestTestsOutput>>,
+        /// Override the Linux test kernel staged for Petri artifact resolution.
+        pub test_linux_kernel_override: Option<ReadVar<PathBuf>>,
+        /// Override the Linux test initrd staged for Petri artifact resolution.
+        pub test_linux_initrd_override: Option<ReadVar<PathBuf>>,
         /// Register a Windows test_igvm_agent_rpc_server binary
         pub register_test_igvm_agent_rpc_server: Option<ReadVar<TestIgvmAgentRpcServerOutput>>,
 
@@ -103,6 +107,8 @@ impl SimpleFlowNode for Node {
             register_vmgstool_dev,
             register_tpm_guest_tests_windows,
             register_tpm_guest_tests_linux,
+            test_linux_kernel_override,
+            test_linux_initrd_override,
             register_test_igvm_agent_rpc_server,
             disk_images_dir,
             register_openhcl_igvm_files,
@@ -117,15 +123,18 @@ impl SimpleFlowNode for Node {
 
         let arch = CommonArch::from_architecture(vmm_tests_target.architecture)?;
 
-        let test_linux_initrd =
-            ctx.reqv(|v| crate::resolve_openvmm_test_initrd::Request::Get(arch, v));
-        let test_linux_kernel = ctx.reqv(|v| {
-            crate::resolve_openvmm_test_linux_kernel::Request::Get(
-                crate::resolve_openvmm_test_linux_kernel::OpenvmmTestKernelFile::Kernel,
-                arch,
-                crate::resolve_openvmm_test_linux_kernel::DEFAULT_LINUX_TEST_KERNEL_VERSION,
-                v,
-            )
+        let test_linux_initrd = test_linux_initrd_override.unwrap_or_else(|| {
+            ctx.reqv(|v| crate::resolve_openvmm_test_initrd::Request::Get(arch, v))
+        });
+        let test_linux_kernel = test_linux_kernel_override.unwrap_or_else(|| {
+            ctx.reqv(|v| {
+                crate::resolve_openvmm_test_linux_kernel::Request::Get(
+                    crate::resolve_openvmm_test_linux_kernel::OpenvmmTestKernelFile::Kernel,
+                    arch,
+                    crate::resolve_openvmm_test_linux_kernel::DEFAULT_LINUX_TEST_KERNEL_VERSION,
+                    v,
+                )
+            })
         });
         let test_linux_bzimage =
             crate::resolve_openvmm_test_linux_kernel::OpenvmmTestKernelFile::BzImage

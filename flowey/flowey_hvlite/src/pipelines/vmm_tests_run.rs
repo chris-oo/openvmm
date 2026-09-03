@@ -23,6 +23,8 @@ use petri_artifacts_core::ArtifactId;
 use petri_artifacts_core::ArtifactListOutput;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
@@ -129,6 +131,42 @@ pub struct VmmTestsRunCli {
     #[clap(long, num_args = 0..=1)]
     #[expect(clippy::option_option)]
     incubator: Option<Option<PathBuf>>,
+
+    /// Published openvmm-deps release containing the CCA platform artifacts.
+    #[clap(long)]
+    cca_deps_version: Option<String>,
+
+    /// Expected SHA-256 of the CCA kernel archive.
+    #[clap(long)]
+    cca_kernel_archive_sha256: Option<String>,
+
+    /// Local unified CCA v15 kernel archive.
+    #[clap(long)]
+    cca_kernel_archive: Option<PathBuf>,
+
+    /// Expected SHA-256 of the TF-RMM archive.
+    #[clap(long)]
+    cca_rmm_archive_sha256: Option<String>,
+
+    /// Local TF-RMM archive.
+    #[clap(long)]
+    cca_rmm_archive: Option<PathBuf>,
+
+    /// Expected SHA-256 of the TF-A archive.
+    #[clap(long)]
+    cca_tfa_archive_sha256: Option<String>,
+
+    /// Local Linux-direct TF-A archive.
+    #[clap(long)]
+    cca_tfa_archive: Option<PathBuf>,
+
+    /// Expected SHA-256 of the AArch64 test-initrd archive.
+    #[clap(long)]
+    cca_initrd_archive_sha256: Option<String>,
+
+    /// Local AArch64 test-initrd archive.
+    #[clap(long)]
+    cca_initrd_archive: Option<PathBuf>,
 }
 
 struct CargoNextestListRequest<'a> {
@@ -137,6 +175,13 @@ struct CargoNextestListRequest<'a> {
     filter: &'a str,
     release: bool,
     include_ignored: bool,
+    target_runner: Option<&'a TargetRunner>,
+}
+
+struct TargetRunner {
+    program: OsString,
+    args: Vec<OsString>,
+    cargo_value: OsString,
 }
 
 struct RustSuite {
@@ -186,6 +231,15 @@ impl IntoPipeline for VmmTestsRunCli {
             no_reuse_prepped_vhds,
             disable_secure_avic,
             incubator,
+            cca_deps_version,
+            cca_kernel_archive_sha256,
+            cca_kernel_archive,
+            cca_rmm_archive_sha256,
+            cca_rmm_archive,
+            cca_tfa_archive_sha256,
+            cca_tfa_archive,
+            cca_initrd_archive_sha256,
+            cca_initrd_archive,
         } = self;
 
         // When --incubator is set, --target must also be specified
@@ -228,6 +282,98 @@ impl IntoPipeline for VmmTestsRunCli {
                 },
             )?),
         };
+        let incubator_platform = incubator_profile
+            .as_deref()
+            .map(classify_incubator_platform)
+            .transpose()?;
+        let cca_platform_source = match incubator_platform {
+            Some(flowey_lib_hvlite::write_incubator_target_runner::IncubatorPlatform::QemuCca) => {
+                let version =
+                    cca_deps_version.context("--cca-deps-version is required for QEMU CCA")?;
+                let kernel_archive_sha256 = cca_kernel_archive_sha256
+                    .context("--cca-kernel-archive-sha256 is required for QEMU CCA")?;
+                let rmm_archive_sha256 = cca_rmm_archive_sha256
+                    .context("--cca-rmm-archive-sha256 is required for QEMU CCA")?;
+                let tfa_archive_sha256 = cca_tfa_archive_sha256
+                    .context("--cca-tfa-archive-sha256 is required for QEMU CCA")?;
+                let initrd_archive_sha256 = cca_initrd_archive_sha256
+                    .context("--cca-initrd-archive-sha256 is required for QEMU CCA")?;
+                let local_archives = [
+                    cca_kernel_archive,
+                    cca_rmm_archive,
+                    cca_tfa_archive,
+                    cca_initrd_archive,
+                ];
+                let local_count = local_archives
+                    .iter()
+                    .filter(|archive| archive.is_some())
+                    .count();
+                anyhow::ensure!(
+                    local_count == 0 || local_count == local_archives.len(),
+                    "specify all local CCA archives or none"
+                );
+                if local_count == 0 {
+                    Some(
+                        flowey_lib_hvlite::_jobs::local_build_and_run_nextest_vmm_tests::CcaPlatformSource::Release {
+                            version,
+                            kernel_archive_sha256,
+                            rmm_archive_sha256,
+                            tfa_archive_sha256,
+                            initrd_archive_sha256,
+                        },
+                    )
+                } else {
+                    let [kernel, rmm, tfa, initrd] = local_archives.map(|archive| {
+                        let path = archive.unwrap();
+                        if path.is_absolute() {
+                            path
+                        } else {
+                            repo_root.join(path)
+                        }
+                    });
+                    for (label, path) in [
+                        ("CCA kernel", &kernel),
+                        ("CCA TF-RMM", &rmm),
+                        ("CCA TF-A", &tfa),
+                        ("CCA initrd", &initrd),
+                    ] {
+                        anyhow::ensure!(
+                            path.is_file(),
+                            "{label} archive not found at {}",
+                            path.display()
+                        );
+                    }
+                    Some(
+                        flowey_lib_hvlite::_jobs::local_build_and_run_nextest_vmm_tests::CcaPlatformSource::Local {
+                            version,
+                            kernel_archive: kernel,
+                            kernel_archive_sha256,
+                            rmm_archive: rmm,
+                            rmm_archive_sha256,
+                            tfa_archive: tfa,
+                            tfa_archive_sha256,
+                            initrd_archive: initrd,
+                            initrd_archive_sha256,
+                        },
+                    )
+                }
+            }
+            _ => {
+                anyhow::ensure!(
+                    cca_deps_version.is_none()
+                        && cca_kernel_archive_sha256.is_none()
+                        && cca_kernel_archive.is_none()
+                        && cca_rmm_archive_sha256.is_none()
+                        && cca_rmm_archive.is_none()
+                        && cca_tfa_archive_sha256.is_none()
+                        && cca_tfa_archive.is_none()
+                        && cca_initrd_archive_sha256.is_none()
+                        && cca_initrd_archive.is_none(),
+                    "CCA artifact options require a QEMU CCA incubator profile"
+                );
+                None
+            }
+        };
 
         // Artifact discovery only needs to execute the test binary far enough
         // to dump its static artifact metadata (`--list-required-artifacts`),
@@ -251,6 +397,7 @@ impl IntoPipeline for VmmTestsRunCli {
         );
 
         // Determine which tests match the filter
+        let target_runner = cross_target_list_runner(&target_str)?;
         let suites = run_cargo_nextest_list(CargoNextestListRequest {
             repo_root: &repo_root,
             target: &target_str,
@@ -261,6 +408,7 @@ impl IntoPipeline for VmmTestsRunCli {
             // petri marks incompatible tests as ignored.
             //
             include_ignored,
+            target_runner: target_runner.as_ref(),
         })?;
 
         if suites.is_empty() {
@@ -270,7 +418,10 @@ impl IntoPipeline for VmmTestsRunCli {
         // Query for the required artifacts
         let mut artifacts = Vec::new();
         for suite in suites.values() {
-            artifacts.append(&mut query_test_binary_artifacts(suite)?);
+            artifacts.append(&mut query_test_binary_artifacts(
+                suite,
+                target_runner.as_ref(),
+            )?);
         }
 
         // Resolve to build selections
@@ -317,10 +468,13 @@ impl IntoPipeline for VmmTestsRunCli {
 
                 if !hyperv_testcases.is_empty() {
                     hyperv_tests += hyperv_testcases.len();
-                    hyperv_artifacts.append(&mut query_test_binary_artifacts(&RustSuite {
-                        binary_path: suite.binary_path.clone(),
-                        testcases: hyperv_testcases,
-                    })?);
+                    hyperv_artifacts.append(&mut query_test_binary_artifacts(
+                        &RustSuite {
+                            binary_path: suite.binary_path.clone(),
+                            testcases: hyperv_testcases,
+                        },
+                        target_runner.as_ref(),
+                    )?);
                 }
             }
 
@@ -375,7 +529,7 @@ impl IntoPipeline for VmmTestsRunCli {
         std::fs::create_dir_all(&test_content_dir).context("failed to create output directory")?;
 
         let openvmm_repo = flowey_lib_common::git_checkout::RepoSource::ExistingClone(
-            ReadVar::from_static(repo_root),
+            ReadVar::from_static(repo_root.clone()),
         );
 
         let mut pipeline = Pipeline::new();
@@ -449,6 +603,8 @@ impl IntoPipeline for VmmTestsRunCli {
                     reuse_prepped_vhds: !no_reuse_prepped_vhds,
                     disable_secure_avic,
                     incubator_profile,
+                    incubator_platform,
+                    cca_platform_source,
                     done: ctx.new_done_handle(),
                 }
             });
@@ -471,6 +627,7 @@ fn run_cargo_nextest_list<'a>(
         filter,
         release,
         include_ignored,
+        target_runner,
     } = req;
 
     // Check that cargo-nextest is available
@@ -508,12 +665,56 @@ fn run_cargo_nextest_list<'a>(
     if include_ignored {
         cmd.args(["--run-ignored", "all"]);
     }
+    if let Some(target_runner) = target_runner {
+        cmd.env(
+            "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUNNER",
+            &target_runner.cargo_value,
+        );
+    }
     let nextest_output = cmd.output().context("failed to run cargo nextest list")?;
     anyhow::ensure!(nextest_output.status.success(), "cargo nextest list failed",);
     let nextest_stdout = String::from_utf8(nextest_output.stdout)
         .map_err(|e| anyhow::anyhow!("nextest output is not valid UTF-8: {}", e))?;
 
     parse_nextest_output(&nextest_stdout)
+}
+
+fn cross_target_list_runner(target: &str) -> anyhow::Result<Option<TargetRunner>> {
+    const AARCH64_MUSL: &str = "aarch64-unknown-linux-musl";
+    const RUNNER_ENV: &str = "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUNNER";
+
+    if target != AARCH64_MUSL || std::env::consts::ARCH == "aarch64" {
+        return Ok(None);
+    }
+    if let Some(runner) = std::env::var_os(RUNNER_ENV) {
+        return Ok(Some(parse_target_runner(&runner)?));
+    }
+
+    let runner = std::env::var_os("PATH")
+        .and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|directory| directory.join("qemu-aarch64"))
+                .find(|candidate| candidate.is_file())
+        })
+        .map(|runner| TargetRunner {
+            cargo_value: runner.as_os_str().to_owned(),
+            program: runner.into_os_string(),
+            args: Vec::new(),
+        });
+    Ok(runner)
+}
+
+fn parse_target_runner(value: &OsStr) -> anyhow::Result<TargetRunner> {
+    let value = value.to_str().context("target runner is not valid UTF-8")?;
+    let words = value.split_ascii_whitespace().collect::<Vec<_>>();
+    let (program, args) = words
+        .split_first()
+        .context("target runner must not be empty")?;
+    Ok(TargetRunner {
+        program: program.into(),
+        args: args.iter().map(Into::into).collect(),
+        cargo_value: value.into(),
+    })
 }
 
 /// Parse `cargo nextest list --message-format json` output to extract test
@@ -568,11 +769,21 @@ fn parse_nextest_output(stdout: &str) -> anyhow::Result<BTreeMap<String, RustSui
 /// Runs the test binary with `--list-required-artifacts --tests-from-stdin`
 /// and returns all the required and optional artifacts for all test defined
 /// in the RustSuite.
-fn query_test_binary_artifacts(suite: &RustSuite) -> anyhow::Result<Vec<String>> {
+fn query_test_binary_artifacts(
+    suite: &RustSuite,
+    target_runner: Option<&TargetRunner>,
+) -> anyhow::Result<Vec<String>> {
     log::info!("Using test binary: {}", suite.binary_path.display());
     log::info!("Querying artifacts for {} tests", suite.testcases.len());
 
-    let mut command = Command::new(&suite.binary_path);
+    let mut command = if let Some(target_runner) = target_runner {
+        let mut command = Command::new(&target_runner.program);
+        command.args(&target_runner.args);
+        command.arg(&suite.binary_path);
+        command
+    } else {
+        Command::new(&suite.binary_path)
+    };
     command.arg("--list-required-artifacts");
     command.arg("--tests-from-stdin").stdin(Stdio::piped());
 
@@ -669,6 +880,59 @@ fn default_incubator_profile(repo_root: &Path, target: &CommonTriple) -> Option<
             .join("petri/incubator/profiles")
             .join(format!("{name}.toml")),
     )
+}
+
+fn classify_incubator_platform(
+    profile: &Path,
+) -> anyhow::Result<flowey_lib_hvlite::write_incubator_target_runner::IncubatorPlatform> {
+    let contents = std::fs::read_to_string(profile)
+        .with_context(|| format!("failed to read incubator profile {}", profile.display()))?;
+    let document = contents
+        .parse::<toml_edit::DocumentMut>()
+        .with_context(|| format!("failed to parse incubator profile {}", profile.display()))?;
+    let incubator = document
+        .get("incubator")
+        .context("incubator profile is missing incubator table")?;
+    let backend = incubator
+        .get("type")
+        .and_then(toml_edit::Item::as_str)
+        .context("incubator profile is missing incubator.type")?;
+    match backend {
+        "qemu-cca" => {
+            for (name, expected) in [
+                ("machine", flowey_lib_hvlite::cca_pins::QEMU_MACHINE),
+                ("cpu", flowey_lib_hvlite::cca_pins::QEMU_CPU),
+            ] {
+                let actual = incubator
+                    .get(name)
+                    .and_then(toml_edit::Item::as_str)
+                    .with_context(|| format!("QEMU CCA profile is missing incubator.{name}"))?;
+                anyhow::ensure!(
+                    actual == expected,
+                    "QEMU CCA profile {name} does not match the pinned platform"
+                );
+            }
+            anyhow::ensure!(
+                incubator
+                    .get("kernel-load-address")
+                    .and_then(toml_edit::Item::as_integer)
+                    == Some(flowey_lib_hvlite::cca_pins::QEMU_KERNEL_LOAD_ADDRESS),
+                "QEMU CCA profile kernel-load-address does not match Linux-direct TF-A"
+            );
+            anyhow::ensure!(
+                incubator
+                    .get("initrd-load-address")
+                    .and_then(toml_edit::Item::as_integer)
+                    == Some(flowey_lib_hvlite::cca_pins::QEMU_INITRD_LOAD_ADDRESS),
+                "QEMU CCA profile initrd-load-address does not match the pinned platform"
+            );
+            Ok(flowey_lib_hvlite::write_incubator_target_runner::IncubatorPlatform::QemuCca)
+        }
+        "qemu-tcg" => {
+            Ok(flowey_lib_hvlite::write_incubator_target_runner::IncubatorPlatform::QemuTcg)
+        }
+        other => anyhow::bail!("unsupported incubator backend type: {other}"),
+    }
 }
 
 /// Validate the output directory path based on the current platform.
@@ -958,5 +1222,36 @@ impl ResolvedArtifactSelections {
             _ => anyhow::bail!("unknown artifact: {id}"),
         };
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_target_runner_with_arguments() {
+        let runner = parse_target_runner(OsStr::new("qemu-aarch64 -L '/sys root'")).unwrap();
+
+        assert_eq!(runner.program, "qemu-aarch64");
+        assert_eq!(runner.args, ["-L", "'/sys", "root'"]);
+    }
+
+    #[test]
+    fn classifies_incubator_profile_backend() {
+        assert_eq!(
+            classify_incubator_platform(
+                &crate::repo_root().join("petri/incubator/profiles/aarch64-qemu-cca.toml")
+            )
+            .unwrap(),
+            flowey_lib_hvlite::write_incubator_target_runner::IncubatorPlatform::QemuCca
+        );
+        assert_eq!(
+            classify_incubator_platform(
+                &crate::repo_root().join("petri/incubator/profiles/aarch64-tcg-pcie.toml")
+            )
+            .unwrap(),
+            flowey_lib_hvlite::write_incubator_target_runner::IncubatorPlatform::QemuTcg
+        );
     }
 }
