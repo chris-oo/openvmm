@@ -988,7 +988,7 @@ impl SimpleFlowNode for Node {
                         );
                         anyhow::ensure!(
                             crate::_jobs::cfg_versions::OPENVMM_DEPS
-                                == crate::cca_pins::QEMU_OPENVMM_DEPS_RELEASE,
+                                == crate::cca_pins::OPENVMM_DEPS_RELEASE,
                             "configured QEMU release does not match the CCA platform contract"
                         );
                         let platform = cca_platform

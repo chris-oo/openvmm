@@ -15,7 +15,15 @@ pub const TF_RMM_IMAGE_SHA256: &str =
 pub const TF_A_REVISION: &str = "da738d5eae93af342fdc4995dd3c05acb4c9d757";
 pub const TF_A_FLASH_SHA256: &str =
     "a9a1d7b0c7d331062a93e0f152ffd856f7e72ad51efcd29b3065c9a8e0f3c4dd";
-pub const QEMU_OPENVMM_DEPS_RELEASE: &str = "0.3.0-116";
+pub const OPENVMM_DEPS_RELEASE: &str = "0.3.0-139";
+pub const KERNEL_ARCHIVE_SHA256: &str =
+    "852e5b6edf09b1e54ac39ba50f34cbe502b24f03b4598a5bc26db29d138217eb";
+pub const RMM_ARCHIVE_SHA256: &str =
+    "f63d24ec820f5ff80fcf9f4191380f7980baedafd4cb14ea3dd0abc045c64502";
+pub const TFA_ARCHIVE_SHA256: &str =
+    "480e79a32c9bc46f75120b840b8aeb454696bf5b64d8c3968d2e67a3e6eb900c";
+pub const INITRD_ARCHIVE_SHA256: &str =
+    "132b4b4e66b032ee108cd06fc17aee5660b930aade9a3dace4525709a5fbf344";
 pub const QEMU_MACHINE: &str = "virt,secure=on,virtualization=on,gic-version=3,acpi=off";
 pub const QEMU_CPU: &str = "max,x-rme=on,lpa2=off,sme=off,pauth-impdef=on";
 pub const QEMU_KERNEL_LOAD_ADDRESS: i64 = 0x50080000;

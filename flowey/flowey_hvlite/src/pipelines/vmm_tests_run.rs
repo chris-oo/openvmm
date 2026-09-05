@@ -288,16 +288,16 @@ impl IntoPipeline for VmmTestsRunCli {
             .transpose()?;
         let cca_platform_source = match incubator_platform {
             Some(flowey_lib_hvlite::write_incubator_target_runner::IncubatorPlatform::QemuCca) => {
-                let version =
-                    cca_deps_version.context("--cca-deps-version is required for QEMU CCA")?;
+                let version = cca_deps_version
+                    .unwrap_or_else(|| flowey_lib_hvlite::cca_pins::OPENVMM_DEPS_RELEASE.into());
                 let kernel_archive_sha256 = cca_kernel_archive_sha256
-                    .context("--cca-kernel-archive-sha256 is required for QEMU CCA")?;
+                    .unwrap_or_else(|| flowey_lib_hvlite::cca_pins::KERNEL_ARCHIVE_SHA256.into());
                 let rmm_archive_sha256 = cca_rmm_archive_sha256
-                    .context("--cca-rmm-archive-sha256 is required for QEMU CCA")?;
+                    .unwrap_or_else(|| flowey_lib_hvlite::cca_pins::RMM_ARCHIVE_SHA256.into());
                 let tfa_archive_sha256 = cca_tfa_archive_sha256
-                    .context("--cca-tfa-archive-sha256 is required for QEMU CCA")?;
+                    .unwrap_or_else(|| flowey_lib_hvlite::cca_pins::TFA_ARCHIVE_SHA256.into());
                 let initrd_archive_sha256 = cca_initrd_archive_sha256
-                    .context("--cca-initrd-archive-sha256 is required for QEMU CCA")?;
+                    .unwrap_or_else(|| flowey_lib_hvlite::cca_pins::INITRD_ARCHIVE_SHA256.into());
                 let local_archives = [
                     cca_kernel_archive,
                     cca_rmm_archive,
