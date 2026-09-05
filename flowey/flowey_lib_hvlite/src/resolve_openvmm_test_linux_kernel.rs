@@ -25,7 +25,7 @@ use std::collections::BTreeSet;
 pub enum LinuxTestKernelVersion {
     Linux6_1,
     Linux6_18,
-    /// The `cca-v15` kernel (Linux 7.2.0-rc1 at time of writing).
+    /// The unified CCA v15 kernel.
     ///
     /// Published **aarch64-only**. Beyond the ARM CCA host bits it is built
     /// for, it also enables the P2PDMA / vfio-dmabuf / iommufd config

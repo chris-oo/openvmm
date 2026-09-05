@@ -43,10 +43,20 @@ flowey_request! {
     pub enum Request {
         /// Get the path to a QEMU binary for the given host architecture.
         Get(QemuFile, CommonArch, WriteVar<PathBuf>),
+        /// Get the qualified CCA QEMU release, independent of global test dependencies.
+        GetCcaPinned(QemuFile, CommonArch, WriteVar<PathBuf>),
     }
 }
 
 new_flow_node_with_config!(struct Node);
+
+fn qemu_release_version(cca: bool, configured: Option<&str>) -> anyhow::Result<&str> {
+    if cca {
+        Ok(crate::cca_pins::OPENVMM_DEPS_RELEASE)
+    } else {
+        configured.context("missing QEMU package version")
+    }
+}
 
 impl FlowNodeWithConfig for Node {
     type Request = Request;
@@ -66,12 +76,24 @@ impl FlowNodeWithConfig for Node {
             version,
             local_paths,
         } = config;
-        let mut deps: BTreeMap<(QemuFile, CommonArch), Vec<WriteVar<PathBuf>>> = BTreeMap::new();
+        let mut deps: BTreeMap<(QemuFile, CommonArch, String), Vec<WriteVar<PathBuf>>> =
+            BTreeMap::new();
+        let mut local_deps: BTreeMap<(QemuFile, CommonArch), Vec<WriteVar<PathBuf>>> =
+            BTreeMap::new();
 
         for req in requests {
             match req {
                 Request::Get(file, arch, var) => {
-                    deps.entry((file, arch)).or_default().push(var);
+                    if local_paths.is_empty() {
+                        let version = qemu_release_version(false, version.as_deref())?.to_owned();
+                        deps.entry((file, arch, version)).or_default().push(var);
+                    } else {
+                        local_deps.entry((file, arch)).or_default().push(var);
+                    }
+                }
+                Request::GetCcaPinned(file, arch, var) => {
+                    let version = qemu_release_version(true, version.as_deref())?.to_owned();
+                    deps.entry((file, arch, version)).or_default().push(var);
                 }
             }
         }
@@ -80,19 +102,15 @@ impl FlowNodeWithConfig for Node {
             anyhow::bail!("Cannot specify both Version and LocalPath requests");
         }
 
-        if version.is_none() && local_paths.is_empty() {
-            anyhow::bail!("Must specify a Version or LocalPath request");
-        }
-
         // -- end of req processing -- //
 
-        if deps.is_empty() {
+        if deps.is_empty() && local_deps.is_empty() {
             return Ok(());
         }
 
-        if !local_paths.is_empty() {
+        if !local_deps.is_empty() {
             ctx.emit_rust_step("use local QEMU", |ctx| {
-                let deps = deps.claim(ctx);
+                let deps = local_deps.claim(ctx);
                 let local_paths: BTreeMap<_, _> = local_paths
                     .into_iter()
                     .map(|(key, var)| (key, var.claim(ctx)))
@@ -114,17 +132,20 @@ impl FlowNodeWithConfig for Node {
                     Ok(())
                 }
             });
+        }
 
+        if deps.is_empty() {
             return Ok(());
         }
 
-        let version = version.context("missing QEMU package version")?;
-
-        // Deduplicate downloads per host architecture.
-        let needed_archives: BTreeSet<CommonArch> = deps.keys().map(|(_, arch)| *arch).collect();
+        // Deduplicate downloads per host architecture and qualified release.
+        let needed_archives: BTreeSet<_> = deps
+            .keys()
+            .map(|(_, arch, version)| (*arch, version.clone()))
+            .collect();
 
         let mut archives = BTreeMap::new();
-        for arch in needed_archives {
+        for (arch, version) in needed_archives {
             let arch_str = match arch {
                 CommonArch::X86_64 => "x86_64",
                 CommonArch::Aarch64 => "aarch64",
@@ -137,7 +158,7 @@ impl FlowNodeWithConfig for Node {
                 file_name: format!("qemu-linux-static.{arch_str}.{version}.tar.gz"),
                 path: v,
             });
-            archives.insert(arch, archive);
+            archives.insert((arch, version), archive);
         }
 
         let persistent_dir = ctx.persistent_dir();
@@ -146,12 +167,11 @@ impl FlowNodeWithConfig for Node {
             let persistent_dir = persistent_dir.claim(ctx);
             let archives = archives.claim(ctx);
             let deps = deps.claim(ctx);
-            let version = version.clone();
             move |rt| {
                 let persistent_dir = persistent_dir.map(|d| rt.read(d));
 
                 let mut extract_dirs = BTreeMap::new();
-                for (arch, archive) in archives {
+                for ((arch, version), archive) in archives {
                     let file = rt.read(archive);
                     let dir = flowey_lib_common::_util::extract::extract_tar_gz_if_new(
                         rt,
@@ -159,12 +179,12 @@ impl FlowNodeWithConfig for Node {
                         &file,
                         &version,
                     )?;
-                    extract_dirs.insert(arch, dir);
+                    extract_dirs.insert((arch, version), dir);
                 }
 
-                for ((file, arch), vars) in deps {
+                for ((file, arch, version), vars) in deps {
                     let extract_dir = extract_dirs
-                        .get(&arch)
+                        .get(&(arch, version))
                         .with_context(|| format!("missing extracted QEMU archive for {arch:?}"))?;
                     let path = extract_dir.join(file.filename());
                     if !path.exists() {
@@ -183,5 +203,27 @@ impl FlowNodeWithConfig for Node {
         });
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    #[test]
+    fn cca_qemu_pin_does_not_change_the_global_release() {
+        let configured = crate::_jobs::cfg_versions::OPENVMM_DEPS;
+        assert_eq!(
+            qemu_release_version(false, Some(configured)).unwrap(),
+            configured
+        );
+        for version in [Some(configured), Some("custom-release"), None] {
+            assert_eq!(
+                qemu_release_version(true, version).unwrap(),
+                crate::cca_pins::OPENVMM_DEPS_RELEASE
+            );
+        }
+        assert!(qemu_release_version(false, None).is_err());
     }
 }
