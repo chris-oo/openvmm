@@ -30,6 +30,48 @@ use std::time::Instant;
 #[derive(Clone, Copy, Debug)]
 pub struct Deadline(Instant);
 
+/// A supervised host helper did not finish cleanup before its budget expired.
+/// Callers must retain durable in-flight intent when this appears in an error
+/// chain, even though the reaper retains responsibility for the child.
+#[derive(Debug)]
+pub struct UnresolvedProcess {
+    pid: u32,
+    source: anyhow::Error,
+}
+
+impl std::fmt::Display for UnresolvedProcess {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "FVP helper {} has unresolved cleanup: {}",
+            self.pid, self.source
+        )
+    }
+}
+
+impl std::error::Error for UnresolvedProcess {}
+
+/// A started command was interrupted before a complete response was observed.
+/// A remote operation (for example a Docker request) can remain in flight even
+/// after its local helper was reaped, so callback intent must remain durable.
+#[derive(Debug)]
+pub struct InterruptedCommand(anyhow::Error);
+
+impl InterruptedCommand {
+    /// Mark a mutating external operation whose completion cannot be proven.
+    pub fn new(error: anyhow::Error) -> Self {
+        Self(error)
+    }
+}
+
+impl std::fmt::Display for InterruptedCommand {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "FVP command interrupted: {}", self.0)
+    }
+}
+
+impl std::error::Error for InterruptedCommand {}
+
 impl Deadline {
     /// Start a phase budget.
     pub fn new(duration: Duration) -> anyhow::Result<Self> {
@@ -119,8 +161,14 @@ fn child_reaper() -> anyhow::Result<Arc<ChildReaper>> {
 impl ManagedChild {
     /// Launch into a fresh process group without inheriting terminal input.
     pub fn spawn(command: &mut Command) -> anyhow::Result<Self> {
+        Self::spawn_with_stdin(command, Stdio::null())
+    }
+
+    /// Launch with caller-owned input, for tools that require a pollable stdin.
+    /// The caller must keep any writer alive and never pass the user's terminal.
+    pub fn spawn_with_stdin(command: &mut Command, stdin: Stdio) -> anyhow::Result<Self> {
         let reaper = child_reaper()?;
-        command.process_group(0).stdin(Stdio::null());
+        command.process_group(0).stdin(stdin);
         let mut child = command.spawn().context("failed to start FVP subprocess")?;
         let pid = match i32::try_from(child.id()) {
             Ok(pid) => Pid::from_raw(pid),
@@ -306,10 +354,14 @@ fn run_command_inner(
                 Some(deadline) => *deadline,
                 None => Deadline::new(Duration::from_secs(10))?,
             };
-            child
-                .terminate(&cleanup)
-                .context("FVP command failed and owned process cleanup failed")?;
-            return Err(error).context("FVP command failed under phase supervision");
+            if let Err(source) = child.terminate(&cleanup) {
+                return Err(UnresolvedProcess {
+                    pid: child.id(),
+                    source,
+                }
+                .into());
+            }
+            return Err(InterruptedCommand(error).into());
         }
     };
     let read = |file: &mut std::fs::File| -> anyhow::Result<Vec<u8>> {
@@ -342,7 +394,36 @@ fn run_command_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::process::ExitStatusExt;
     use test_with_tracing::test;
+
+    #[test]
+    fn signaled_status_is_available_for_command_specific_classification() {
+        let output = run_command(
+            Command::new("sh").args(["-c", "kill -TERM $$"]),
+            &Deadline::new(Duration::from_secs(5)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(output.status.signal(), Some(15));
+    }
+
+    #[test]
+    fn launcher_input_is_pollable_without_a_user_terminal() {
+        let (input, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut child = ManagedChild::spawn_with_stdin(
+            Command::new("python3").args([
+                "-I", "-B", "-c",
+                "import selectors,sys; s=selectors.DefaultSelector(); s.register(sys.stdin,selectors.EVENT_READ); assert not s.select(0.01)",
+            ]),
+            Stdio::from(std::os::fd::OwnedFd::from(input)),
+        ).unwrap();
+        assert!(
+            child
+                .wait(&Deadline::new(Duration::from_secs(5)).unwrap())
+                .unwrap()
+                .success()
+        );
+    }
 
     #[test]
     fn cancellation_interrupts_an_in_flight_command() {

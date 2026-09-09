@@ -102,6 +102,45 @@ struct RuntimeConfig {
     allocate_pty: bool,
 }
 
+/// Runtime inputs for an opt-in licensed FVP CCA incubator.
+pub struct FvpCcaIncubatorConfig {
+    /// Validated typed FVP profile.
+    pub profile: IncubatorProfile,
+    /// Unified official CCA kernel used by the L1 host.
+    pub kernel: PathBuf,
+    /// Immutable official base initrd.
+    pub initrd: PathBuf,
+    /// Prepared guest input tree; snapshotted before launch.
+    pub share_dir: PathBuf,
+    /// Durable host-side results directory, not a Shrinkwrap workspace.
+    pub output_dir: PathBuf,
+    /// Pipette location under the guest share.
+    pub guest_pipette_path: String,
+    /// Guest command and arguments, already mapped under `/share`.
+    pub guest_command: Vec<String>,
+    /// Mapped per-command guest environment.
+    pub guest_env: BTreeMap<String, String>,
+    /// Guest working directory.
+    pub guest_current_dir: Option<String>,
+    /// User-provisioned Shrinkwrap checkout and overlay root.
+    pub platform_root: PathBuf,
+    /// User-provisioned pinned FVP firmware package root.
+    pub shrinkwrap_package_root: PathBuf,
+}
+
+/// Run a command in a validated FVP host, without a block root filesystem.
+pub fn run_in_fvp_cca_incubator(config: FvpCcaIncubatorConfig) -> anyhow::Result<IncubatorOutput> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::fvp::runtime::run(config)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = config;
+        anyhow::bail!("FVP CCA incubators require a Linux host")
+    }
+}
+
 /// Result of an incubator run.
 pub struct IncubatorOutput {
     /// The guest command's exit code, if it was captured.

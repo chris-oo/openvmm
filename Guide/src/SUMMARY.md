@@ -36,6 +36,7 @@
 - [Testing](./dev_guide/tests.md)
   - [Unit Tests](./dev_guide/tests/unit.md)
   - [VMM Tests](./dev_guide/tests/vmm.md)
+    - [CCA Incubator Tests](./dev_guide/tests/vmm/qemu_cca.md)
     - [Azure-hosted Test Images](./dev_guide/tests/vmm/azure_images.md)
     - [Pipette Guest Agent](./dev_guide/tests/pipette.md)
     - [Windows Test Image Preparation](./dev_guide/tests/prep_steps.md)

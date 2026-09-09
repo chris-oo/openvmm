@@ -16,7 +16,9 @@ use super::process::run_command_with_cleanup;
 use anyhow::Context;
 use serde::Deserialize;
 use serde::Serialize;
+use sha2::Digest;
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Read;
@@ -24,6 +26,8 @@ use std::io::Write;
 use std::net::Ipv4Addr;
 use std::net::SocketAddr;
 use std::net::TcpListener;
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::MetadataExt;
@@ -47,6 +51,10 @@ const RUN_LABEL: &str = "io.openvmm.fvp.run-id";
 const SCHEMA_LABEL: &str = "io.openvmm.fvp.schema-version";
 const IMAGE_LABEL: &str = "io.openvmm.fvp.expected-image";
 const ROLE_LABEL: &str = "io.openvmm.fvp.role";
+pub(super) const WORKSPACE_MARKER: &str = ".openvmm-fvp-workspace.json";
+const OUTPUT_MARKER: &str = ".openvmm-fvp-outputs.json";
+const TREE_ENTRY_LIMIT: usize = 4096;
+const TREE_BYTE_LIMIT: u64 = 1024 * 1024 * 1024;
 
 /// A cryptographically random identity, not a PID or timestamp.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -359,7 +367,7 @@ fn canonical(path: &Path) -> anyhow::Result<PathBuf> {
         .with_context(|| format!("failed to resolve FVP path {}", path.display()))
 }
 
-fn resolve_existing_ancestor(path: &Path) -> anyhow::Result<PathBuf> {
+pub(crate) fn resolve_existing_ancestor(path: &Path) -> anyhow::Result<PathBuf> {
     anyhow::ensure!(path.is_absolute(), "FVP root must be absolute");
     anyhow::ensure!(
         !path
@@ -449,6 +457,11 @@ impl RuntimeLock {
             "FVP state ownership changed; preserving it"
         );
         state.validate()?;
+        let bytes = serde_json::to_vec(state)?;
+        anyhow::ensure!(
+            (bytes.len() as u64) < STATE_LIMIT,
+            "FVP state exceeds the bounded state format"
+        );
         let path = self
             .directory
             .path
@@ -459,7 +472,7 @@ impl RuntimeLock {
             .mode(0o600)
             .open(&path)?;
         let result = (|| {
-            serde_json::to_writer(&mut file, state)?;
+            file.write_all(&bytes)?;
             file.write_all(b"\n")?;
             file.sync_all()?;
             std::fs::rename(&path, self.state_path())?;
@@ -488,6 +501,8 @@ impl RuntimeLock {
     /// validated tuple, not the state file. Foreign, newer, corrupt, reused-PID,
     /// or still-live-owner state remains untouched.
     /// Earlier-boot identities never authorize current-boot PID or group probes.
+    /// Process cleanup, output preservation, and filesystem retirement each use
+    /// one non-resetting `timeout` budget, as in normal finalization.
     pub fn recover(
         &self,
         docker: &Docker,
@@ -498,7 +513,7 @@ impl RuntimeLock {
     ) -> anyhow::Result<()> {
         let deadline = Deadline::new(timeout)?;
         cancellation.check()?;
-        let Some(state) = self.read_state()? else {
+        let Some(mut state) = self.read_state()? else {
             return Ok(());
         };
         anyhow::ensure!(
@@ -510,6 +525,10 @@ impl RuntimeLock {
         anyhow::ensure!(
             state.owner.observe()? == ProcessObservation::Gone,
             "FVP state owner is live or its PID was reused; preserving it"
+        );
+        anyhow::ensure!(
+            state.post_verification != PostVerification::InFlight,
+            "FVP owner died during post-verification; preserving recovery state"
         );
         anyhow::ensure!(
             !state.launch_pending,
@@ -576,6 +595,45 @@ impl RuntimeLock {
         deadline
             .remaining()
             .context("FVP recovery deadline exceeded; preserving state")?;
+        let output_deadline = Deadline::new(timeout)?;
+        let mut recovered = state.clone();
+        recovered.resources_stopped = true;
+        if let Some(workspace) = &mut recovered.workspace
+            && workspace.outputs.is_none()
+        {
+            workspace.outputs = Some(workspace.seal_outputs(&output_deadline, true)?);
+        }
+        if recovered.post_verification == PostVerification::Pending {
+            recovered.post_verification = PostVerification::Failed;
+            tracing::warn!(
+                run_id = state.run_id.as_str(),
+                "recovering interrupted FVP resources; the previous run was not qualified"
+            );
+        }
+        if recovered != state {
+            self.write_state(Some(&state), &recovered)?;
+            state = recovered;
+        }
+        output_deadline.remaining()?;
+        let deadline = Deadline::new(timeout)?;
+        if let Some(workspace) = state.workspace.clone() {
+            workspace.preflight(&deadline)?;
+            if !workspace.removal_started {
+                let mut next = state.clone();
+                next.resources_stopped = true;
+                next.workspace
+                    .as_mut()
+                    .context("missing FVP workspace")?
+                    .removal_started = true;
+                self.write_state(Some(&state), &next)?;
+                state = next;
+            }
+            workspace.remove(&deadline)?;
+            let mut next = state.clone();
+            next.workspace = None;
+            self.write_state(Some(&state), &next)?;
+            state = next;
+        }
         self.remove_state(&state)
     }
 }
@@ -780,6 +838,753 @@ enum CallbackPhase {
     ShutdownRequest,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PostVerification {
+    #[default]
+    NotRequired,
+    Pending,
+    InFlight,
+    Complete,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DirectoryStamp {
+    device: u64,
+    inode: u64,
+    uid: u32,
+    mode: u32,
+}
+
+impl DirectoryStamp {
+    fn read(file: &File) -> anyhow::Result<Self> {
+        let metadata = file.metadata()?;
+        anyhow::ensure!(metadata.is_dir(), "FVP ownership path is not a directory");
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            uid: metadata.uid(),
+            mode: metadata.mode() & 0o7777,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnedDirectory {
+    path: PathBuf,
+    ancestors: Vec<DirectoryStamp>,
+}
+
+struct DirectoryHandle {
+    file: File,
+    parent: File,
+    name: OsString,
+}
+
+fn fd_path(file: &File) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+fn directory_components(path: &Path) -> anyhow::Result<Vec<OsString>> {
+    anyhow::ensure!(path.is_absolute(), "FVP ownership path must be absolute");
+    let components = path
+        .components()
+        .skip(1)
+        .map(|component| match component {
+            std::path::Component::Normal(name) => Ok(name.to_owned()),
+            _ => anyhow::bail!("FVP ownership path contains traversal"),
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    anyhow::ensure!(
+        !components.is_empty() && components.len() < 64,
+        "FVP ownership path is a root or is too deep"
+    );
+    Ok(components)
+}
+
+fn open_directory(path: &Path) -> anyhow::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| {
+            format!(
+                "cannot open FVP directory without following links: {}",
+                path.display()
+            )
+        })
+}
+
+impl OwnedDirectory {
+    fn capture(path: &Path) -> anyhow::Result<Self> {
+        let components = directory_components(path)?;
+        anyhow::ensure!(
+            canonical(path)? == path,
+            "FVP ownership path has symlink parents"
+        );
+        path.to_str().context("FVP ownership path is not UTF-8")?;
+        let mut file = open_directory(Path::new("/"))?;
+        let mut ancestors = vec![DirectoryStamp::read(&file)?];
+        for name in components {
+            file = open_directory(&fd_path(&file).join(name))?;
+            ancestors.push(DirectoryStamp::read(&file)?);
+        }
+        validate_private_metadata(&file.metadata()?)?;
+        Ok(Self {
+            path: path.to_owned(),
+            ancestors,
+        })
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        let components = directory_components(&self.path)?;
+        anyhow::ensure!(
+            self.ancestors.len() == components.len() + 1,
+            "invalid FVP directory ancestry record"
+        );
+        let leaf = self
+            .ancestors
+            .last()
+            .context("missing FVP directory identity")?;
+        anyhow::ensure!(leaf.mode & 0o077 == 0, "FVP owned directory is not private");
+        Ok(())
+    }
+
+    fn open(&self, allow_missing_leaf: bool) -> anyhow::Result<Option<DirectoryHandle>> {
+        self.validate()?;
+        let components = directory_components(&self.path)?;
+        let mut file = open_directory(Path::new("/"))?;
+        anyhow::ensure!(
+            self.ancestors.first() == Some(&DirectoryStamp::read(&file)?),
+            "FVP directory root identity changed; preserving resources"
+        );
+        let mut parent = file.try_clone()?;
+        let mut leaf_name = OsString::new();
+        for (index, name) in components.iter().enumerate() {
+            let next = match open_directory(&fd_path(&file).join(name)) {
+                Ok(next) => next,
+                Err(error)
+                    if allow_missing_leaf
+                        && index + 1 == components.len()
+                        && error
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+            anyhow::ensure!(
+                self.ancestors.get(index + 1) == Some(&DirectoryStamp::read(&next)?),
+                "FVP directory identity or parent changed; preserving resources: {}",
+                self.path.display()
+            );
+            parent = file;
+            file = next;
+            leaf_name = name.clone();
+        }
+        validate_private_metadata(&file.metadata()?)?;
+        Ok(Some(DirectoryHandle {
+            file,
+            parent,
+            name: leaf_name,
+        }))
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DirectoryMarker {
+    schema_version: u32,
+    kind: String,
+    run_id: RunId,
+    directory: OwnedDirectory,
+}
+
+fn directory_marker(directory: &OwnedDirectory, run_id: &RunId, kind: &str) -> DirectoryMarker {
+    DirectoryMarker {
+        schema_version: SCHEMA_VERSION,
+        kind: kind.to_owned(),
+        run_id: run_id.clone(),
+        directory: directory.clone(),
+    }
+}
+
+fn write_directory_marker(
+    handle: &DirectoryHandle,
+    name: &str,
+    marker: &DirectoryMarker,
+) -> anyhow::Result<()> {
+    let bytes = serde_json::to_vec(marker)?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= STATE_LIMIT,
+        "FVP directory marker is too large"
+    );
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(fd_path(&handle.file).join(name))?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    handle.file.sync_all()?;
+    Ok(())
+}
+
+fn verify_directory_marker(
+    handle: &DirectoryHandle,
+    name: &str,
+    expected: &DirectoryMarker,
+) -> anyhow::Result<()> {
+    let identity = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_PATH | nix::libc::O_NOFOLLOW)
+        .open(fd_path(&handle.file).join(name))
+        .context("FVP owner marker is missing or inaccessible; preserving directory")?;
+    validate_private_file(&identity)?;
+    let file = File::open(fd_path(&identity))?;
+    let mut bytes = Vec::new();
+    file.take(STATE_LIMIT + 1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= STATE_LIMIT,
+        "FVP owner marker is too large"
+    );
+    let marker: DirectoryMarker = serde_json::from_slice(&bytes)?;
+    anyhow::ensure!(
+        marker == *expected,
+        "foreign, changed, or newer FVP directory marker; preserving directory"
+    );
+    Ok(())
+}
+
+fn mount_id(file: &File) -> anyhow::Result<u64> {
+    let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))?;
+    info.lines()
+        .find_map(|line| line.strip_prefix("mnt_id:"))
+        .context("missing Linux mount identity")?
+        .trim()
+        .parse()
+        .context("invalid Linux mount identity")
+}
+
+fn ensure_persistent_output(
+    directory: &OwnedDirectory,
+    handle: &DirectoryHandle,
+) -> anyhow::Result<()> {
+    ensure_persistent_filesystem(&directory.path, &handle.file)
+}
+
+/// Check an output location before creating session state or directories.
+pub(crate) fn validate_output_location(path: &Path) -> anyhow::Result<()> {
+    let mut ancestor = path;
+    loop {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(_) => return ensure_persistent_filesystem(path, &open_directory(ancestor)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ancestor = ancestor
+                    .parent()
+                    .context("FVP output has no existing ancestor")?;
+            }
+            Err(error) => return Err(error).context("cannot inspect FVP output location"),
+        }
+    }
+}
+
+fn ensure_persistent_filesystem(path: &Path, file: &File) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !path.starts_with("/tmp") && !path.starts_with("/run"),
+        "FVP outputs require a persistent destination outside /tmp and /run"
+    );
+    let prefix = format!("{} ", mount_id(file)?);
+    let mounts = std::fs::read_to_string("/proc/self/mountinfo")?;
+    let filesystem = mounts
+        .lines()
+        .find(|line| line.starts_with(&prefix))
+        .and_then(|line| line.split_once(" - "))
+        .and_then(|(_, fields)| fields.split_whitespace().next())
+        .context("cannot prove FVP output filesystem identity")?;
+    anyhow::ensure!(
+        !matches!(
+            filesystem,
+            "tmpfs" | "ramfs" | "devtmpfs" | "proc" | "sysfs"
+        ),
+        "FVP output destination is on a volatile filesystem"
+    );
+    Ok(())
+}
+
+fn validate_workspace_name(path: &Path) -> anyhow::Result<()> {
+    let suffix = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("openvmm-fvp-"))
+        .context("FVP workspace must have an allocated openvmm-fvp- name")?;
+    anyhow::ensure!(
+        (6..=128).contains(&suffix.len())
+            && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric()),
+        "invalid allocated FVP workspace name"
+    );
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TreeEntry {
+    relative: PathBuf,
+    parents: Vec<(OsString, DirectoryStamp)>,
+    device: u64,
+    inode: u64,
+    directory: bool,
+    length: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+}
+
+#[derive(Debug)]
+struct TreeSnapshot {
+    entries: Vec<TreeEntry>,
+    digest: String,
+    regular_files: usize,
+}
+
+/// Original identity and contents of an allocation not yet handed to a session.
+#[derive(Debug)]
+pub(super) struct WorkspaceAllocation {
+    directory: OwnedDirectory,
+    scaffold: TreeSnapshot,
+}
+
+impl WorkspaceAllocation {
+    pub(super) fn capture(path: &Path, deadline: &Deadline) -> anyhow::Result<Self> {
+        let directory = OwnedDirectory::capture(path)?;
+        let handle = directory
+            .open(false)?
+            .context("missing new FVP allocation")?;
+        let scaffold = snapshot_tree(&handle.file, deadline, false)?;
+        anyhow::ensure!(
+            scaffold.regular_files == 0,
+            "new FVP allocation is not empty"
+        );
+        Ok(Self {
+            directory,
+            scaffold,
+        })
+    }
+
+    fn verify_empty(&self, deadline: &Deadline) -> anyhow::Result<DirectoryHandle> {
+        let handle = self
+            .directory
+            .open(false)?
+            .context("FVP allocation disappeared")?;
+        let current = snapshot_tree(&handle.file, deadline, false)?;
+        anyhow::ensure!(
+            current.regular_files == 0
+                && current.digest == self.scaffold.digest
+                && current.entries == self.scaffold.entries,
+            "FVP allocation contents changed; preserving it"
+        );
+        Ok(handle)
+    }
+
+    pub(super) fn verify(&self, deadline: &Deadline) -> anyhow::Result<()> {
+        self.verify_empty(deadline).map(|_| ())
+    }
+
+    pub(super) fn discard(&self, deadline: &Deadline) -> anyhow::Result<()> {
+        let handle = self.verify_empty(deadline)?;
+        remove_tree_entries(&self.directory, &handle, &self.scaffold, None, deadline)?;
+        self.directory
+            .open(false)?
+            .context("FVP allocation changed before removal")?;
+        // No recursive deletion: new or unexpected contents stop retirement.
+        std::fs::remove_dir(fd_path(&handle.parent).join(&handle.name))?;
+        handle.parent.sync_all()?;
+        Ok(())
+    }
+}
+
+fn snapshot_tree(root: &File, deadline: &Deadline, sync: bool) -> anyhow::Result<TreeSnapshot> {
+    struct Scan<'a> {
+        deadline: &'a Deadline,
+        mount: u64,
+        sync: bool,
+        entries: Vec<TreeEntry>,
+        hasher: sha2::Sha256,
+        bytes: u64,
+        regular_files: usize,
+    }
+    impl Scan<'_> {
+        fn walk(
+            &mut self,
+            directory: &File,
+            relative: &Path,
+            parents: &mut Vec<(OsString, DirectoryStamp)>,
+        ) -> anyhow::Result<()> {
+            anyhow::ensure!(parents.len() < 32, "FVP directory tree is too deep");
+            let mut names = Vec::new();
+            for entry in std::fs::read_dir(fd_path(directory))? {
+                self.deadline.remaining()?;
+                anyhow::ensure!(
+                    names.len() + self.entries.len() < TREE_ENTRY_LIMIT,
+                    "FVP directory tree exceeds the entry limit"
+                );
+                names.push(entry?.file_name());
+            }
+            names.sort();
+            for name in names {
+                self.deadline.remaining()?;
+                let identity = OpenOptions::new()
+                    .read(true)
+                    .custom_flags(nix::libc::O_PATH | nix::libc::O_NOFOLLOW)
+                    .open(fd_path(directory).join(&name))
+                    .context("FVP tree contains an inaccessible entry or symlink; preserving it")?;
+                let metadata = identity.metadata()?;
+                anyhow::ensure!(
+                    mount_id(&identity)? == self.mount,
+                    "FVP tree contains a nested mount; preserving it"
+                );
+                anyhow::ensure!(
+                    metadata.is_dir() || (metadata.is_file() && metadata.nlink() == 1),
+                    "FVP tree contains a special file or hard link; preserving it"
+                );
+                let file = File::open(fd_path(&identity))?;
+                let child_relative = relative.join(&name);
+                let path_bytes = child_relative.as_os_str().as_bytes();
+                self.hasher.update((path_bytes.len() as u64).to_le_bytes());
+                self.hasher.update(path_bytes);
+                self.hasher.update(metadata.mode().to_le_bytes());
+                if metadata.is_dir() {
+                    parents.push((name.clone(), DirectoryStamp::read(&file)?));
+                    self.walk(&file, &child_relative, parents)?;
+                    parents.pop();
+                } else {
+                    self.regular_files += 1;
+                    self.bytes = self
+                        .bytes
+                        .checked_add(metadata.len())
+                        .context("FVP tree size overflow")?;
+                    anyhow::ensure!(self.bytes <= TREE_BYTE_LIMIT, "FVP tree exceeds one GiB");
+                    self.hasher.update(metadata.len().to_le_bytes());
+                    let mut reader = &file;
+                    let mut count = 0u64;
+                    let mut buffer = [0; 65536];
+                    loop {
+                        self.deadline.remaining()?;
+                        let read = reader.read(&mut buffer)?;
+                        if read == 0 {
+                            break;
+                        }
+                        count += read as u64;
+                        anyhow::ensure!(
+                            count <= metadata.len(),
+                            "FVP file grew during verification"
+                        );
+                        self.hasher.update(&buffer[..read]);
+                    }
+                    anyhow::ensure!(
+                        count == metadata.len(),
+                        "FVP file changed during verification"
+                    );
+                }
+                if self.sync {
+                    file.sync_all()?;
+                }
+                let current = std::fs::symlink_metadata(fd_path(directory).join(&name))?;
+                anyhow::ensure!(
+                    current.dev() == metadata.dev() && current.ino() == metadata.ino(),
+                    "FVP tree entry was replaced during verification"
+                );
+                anyhow::ensure!(
+                    self.entries.len() < TREE_ENTRY_LIMIT,
+                    "FVP tree exceeds the entry limit"
+                );
+                self.entries.push(TreeEntry {
+                    relative: child_relative,
+                    parents: parents.clone(),
+                    device: metadata.dev(),
+                    inode: metadata.ino(),
+                    directory: metadata.is_dir(),
+                    length: metadata.len(),
+                    modified_seconds: metadata.mtime(),
+                    modified_nanoseconds: metadata.mtime_nsec(),
+                });
+            }
+            Ok(())
+        }
+    }
+    let mut scan = Scan {
+        deadline,
+        mount: mount_id(root)?,
+        sync,
+        entries: Vec::new(),
+        hasher: sha2::Sha256::new(),
+        bytes: 0,
+        regular_files: 0,
+    };
+    scan.walk(root, Path::new(""), &mut Vec::new())?;
+    if sync {
+        root.sync_all()?;
+    }
+    deadline.remaining()?;
+    Ok(TreeSnapshot {
+        entries: scan.entries,
+        digest: hex::encode(scan.hasher.finalize()),
+        regular_files: scan.regular_files,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreservedOutputs {
+    directory: OwnedDirectory,
+    digest: String,
+    workspace_digest: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceRecord {
+    directory: OwnedDirectory,
+    run_id: RunId,
+    destination: Option<OwnedDirectory>,
+    outputs: Option<PreservedOutputs>,
+    removal_started: bool,
+}
+
+impl WorkspaceRecord {
+    fn validate(&self, run_id: &RunId) -> anyhow::Result<()> {
+        self.directory.validate()?;
+        validate_workspace_name(&self.directory.path)?;
+        anyhow::ensure!(
+            self.run_id == *run_id,
+            "FVP workspace run identity mismatch"
+        );
+        if let Some(destination) = &self.destination {
+            destination.validate()?;
+            anyhow::ensure!(
+                !destination.path.starts_with(&self.directory.path)
+                    && !self.directory.path.starts_with(&destination.path),
+                "FVP output destination overlaps its workspace"
+            );
+        }
+        if let Some(outputs) = &self.outputs {
+            outputs.directory.validate()?;
+            anyhow::ensure!(
+                is_hex_id(&outputs.digest)
+                    && is_hex_id(&outputs.workspace_digest)
+                    && !outputs.directory.path.starts_with(&self.directory.path)
+                    && !self.directory.path.starts_with(&outputs.directory.path),
+                "invalid FVP output preservation record"
+            );
+            anyhow::ensure!(
+                self.destination
+                    .as_ref()
+                    .is_none_or(|destination| *destination == outputs.directory),
+                "preserved FVP outputs do not match the registered destination"
+            );
+        }
+        anyhow::ensure!(
+            !self.removal_started || self.outputs.is_some(),
+            "FVP workspace removal has no output preservation proof"
+        );
+        Ok(())
+    }
+
+    fn seal_outputs(
+        &self,
+        deadline: &Deadline,
+        copy_outputs: bool,
+    ) -> anyhow::Result<PreservedOutputs> {
+        let source = self
+            .directory
+            .open(false)?
+            .context("missing FVP workspace")?;
+        verify_directory_marker(
+            &source,
+            WORKSPACE_MARKER,
+            &directory_marker(&self.directory, &self.run_id, "openvmm-fvp-workspace"),
+        )?;
+        let directory = self.destination.as_ref().context(
+            "FVP workspace outputs were not durably preserved or registered; retaining workspace",
+        )?;
+        let output = directory
+            .open(false)?
+            .context("missing FVP output destination")?;
+        ensure_persistent_output(directory, &output)?;
+        verify_directory_marker(
+            &output,
+            OUTPUT_MARKER,
+            &directory_marker(directory, &self.run_id, "openvmm-fvp-outputs"),
+        )?;
+        if copy_outputs {
+            super::staging::persist_outputs(
+                &fd_path(&source.file),
+                &fd_path(&output.file),
+                deadline,
+            )?;
+        }
+        let source_snapshot = snapshot_tree(&source.file, deadline, false)?;
+        let before = snapshot_tree(&output.file, deadline, false)?;
+        anyhow::ensure!(
+            before.regular_files > 1 || source_snapshot.regular_files == 1,
+            "FVP output destination is empty while workspace data remains"
+        );
+        let output_snapshot = snapshot_tree(&output.file, deadline, true)?;
+        anyhow::ensure!(
+            snapshot_tree(&source.file, deadline, false)?.digest == source_snapshot.digest,
+            "FVP workspace changed while sealing preserved outputs"
+        );
+        Ok(PreservedOutputs {
+            directory: directory.clone(),
+            digest: output_snapshot.digest,
+            workspace_digest: source_snapshot.digest,
+        })
+    }
+
+    fn verify_outputs(&self, deadline: &Deadline) -> anyhow::Result<()> {
+        let outputs = self.outputs.as_ref().with_context(|| {
+            format!(
+                "FVP workspace outputs were not durably preserved; retaining {} for manual recovery",
+                self.directory.path.display()
+            )
+        })?;
+        let handle = outputs
+            .directory
+            .open(false)?
+            .context("missing FVP output directory")?;
+        ensure_persistent_output(&outputs.directory, &handle)?;
+        verify_directory_marker(
+            &handle,
+            OUTPUT_MARKER,
+            &directory_marker(&outputs.directory, &self.run_id, "openvmm-fvp-outputs"),
+        )?;
+        anyhow::ensure!(
+            snapshot_tree(&handle.file, deadline, false)?.digest == outputs.digest,
+            "preserved FVP outputs changed; retaining workspace"
+        );
+        Ok(())
+    }
+
+    fn preflight(&self, deadline: &Deadline) -> anyhow::Result<()> {
+        self.verify_outputs(deadline)?;
+        let Some(handle) = self.directory.open(self.removal_started)? else {
+            return Ok(());
+        };
+        verify_directory_marker(
+            &handle,
+            WORKSPACE_MARKER,
+            &directory_marker(&self.directory, &self.run_id, "openvmm-fvp-workspace"),
+        )?;
+        anyhow::ensure!(
+            Some(
+                snapshot_tree(&handle.file, deadline, false)?
+                    .digest
+                    .as_str()
+            ) == self
+                .outputs
+                .as_ref()
+                .map(|outputs| outputs.workspace_digest.as_str()),
+            "FVP workspace changed or removal was interrupted; retaining it"
+        );
+        Ok(())
+    }
+
+    fn remove(&self, deadline: &Deadline) -> anyhow::Result<()> {
+        self.verify_outputs(deadline)?;
+        let Some(handle) = self.directory.open(self.removal_started)? else {
+            return Ok(());
+        };
+        verify_directory_marker(
+            &handle,
+            WORKSPACE_MARKER,
+            &directory_marker(&self.directory, &self.run_id, "openvmm-fvp-workspace"),
+        )?;
+        let snapshot = snapshot_tree(&handle.file, deadline, false)?;
+        anyhow::ensure!(
+            Some(snapshot.digest.as_str())
+                == self
+                    .outputs
+                    .as_ref()
+                    .map(|outputs| outputs.workspace_digest.as_str()),
+            "FVP workspace changed or removal was interrupted; retaining it"
+        );
+        remove_tree_entries(
+            &self.directory,
+            &handle,
+            &snapshot,
+            Some(Path::new(WORKSPACE_MARKER)),
+            deadline,
+        )?;
+        deadline.remaining()?;
+        self.directory
+            .open(false)?
+            .context("FVP workspace disappeared before removal")?;
+        verify_directory_marker(
+            &handle,
+            WORKSPACE_MARKER,
+            &directory_marker(&self.directory, &self.run_id, "openvmm-fvp-workspace"),
+        )?;
+        std::fs::remove_file(fd_path(&handle.file).join(WORKSPACE_MARKER))?;
+        handle.file.sync_all()?;
+        std::fs::remove_dir(fd_path(&handle.parent).join(&handle.name))?;
+        handle.parent.sync_all()?;
+        Ok(())
+    }
+}
+
+fn remove_tree_entries(
+    directory: &OwnedDirectory,
+    handle: &DirectoryHandle,
+    snapshot: &TreeSnapshot,
+    skip: Option<&Path>,
+    deadline: &Deadline,
+) -> anyhow::Result<()> {
+    let root_mount = mount_id(&handle.file)?;
+    for entry in snapshot
+        .entries
+        .iter()
+        .filter(|entry| Some(entry.relative.as_path()) != skip)
+    {
+        deadline.remaining()?;
+        directory
+            .open(false)?
+            .context("FVP workspace disappeared during removal")?;
+        let mut parent = handle.file.try_clone()?;
+        for (name, expected) in &entry.parents {
+            parent = open_directory(&fd_path(&parent).join(name))?;
+            anyhow::ensure!(
+                DirectoryStamp::read(&parent)? == *expected && mount_id(&parent)? == root_mount,
+                "FVP workspace descendant changed; preserving remaining data"
+            );
+        }
+        let name = entry
+            .relative
+            .file_name()
+            .context("invalid FVP tree entry")?;
+        let path = fd_path(&parent).join(name);
+        let metadata = std::fs::symlink_metadata(&path)?;
+        anyhow::ensure!(
+            metadata.dev() == entry.device
+                && metadata.ino() == entry.inode
+                && (entry.directory
+                    || (metadata.len() == entry.length
+                        && metadata.mtime() == entry.modified_seconds
+                        && metadata.mtime_nsec() == entry.modified_nanoseconds)),
+            "FVP workspace entry changed; preserving remaining data"
+        );
+        if entry.directory {
+            std::fs::remove_dir(&path)?;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+    }
+    deadline.remaining()?;
+    Ok(())
+}
+
 /// One atomic, versioned record. Its fields are not cleanup authority by
 /// themselves: recovery also checks the trusted tuple and live identities.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -795,6 +1600,11 @@ pub struct RunState {
     model: Option<ProcessIdentity>,
     launch_pending: bool,
     callback_phase: CallbackPhase,
+    #[serde(default)]
+    resources_stopped: bool,
+    #[serde(default)]
+    post_verification: PostVerification,
+    workspace: Option<WorkspaceRecord>,
 }
 
 impl RunState {
@@ -803,6 +1613,10 @@ impl RunState {
         anyhow::ensure!(
             value.get("schema_version").and_then(|v| v.as_u64()) == Some(u64::from(SCHEMA_VERSION)),
             "unsupported FVP state schema version"
+        );
+        anyhow::ensure!(
+            value.get("workspace").is_some(),
+            "FVP state has no workspace ownership declaration; preserving older state"
         );
         // Parse the original bytes again so duplicate fields remain errors.
         let state: Self = serde_json::from_slice(bytes)?;
@@ -817,6 +1631,13 @@ impl RunState {
         );
         self.run_id.validate()?;
         self.docker.validate()?;
+        if let Some(workspace) = &self.workspace {
+            workspace.validate(&self.run_id)?;
+            anyhow::ensure!(
+                self.post_verification != PostVerification::NotRequired,
+                "registered FVP workspace has no post-verification requirement"
+            );
+        }
         validate_image(&self.expected_image)?;
         anyhow::ensure!(
             self.owner.pid > 1
@@ -845,6 +1666,21 @@ impl RunState {
     /// The identity that must label containers and endpoint records.
     pub fn run_id(&self) -> &RunId {
         &self.run_id
+    }
+
+    /// Registered writable workspace, if this run has one.
+    pub fn workspace_path(&self) -> Option<&Path> {
+        self.workspace
+            .as_ref()
+            .map(|workspace| workspace.directory.path.as_path())
+    }
+
+    /// Persistent output root registered before workspace use.
+    pub fn output_path(&self) -> Option<&Path> {
+        self.workspace
+            .as_ref()
+            .and_then(|workspace| workspace.destination.as_ref())
+            .map(|destination| destination.path.as_path())
     }
 
     /// Pin every Docker command issued by preparation to this recorded daemon.
@@ -1064,10 +1900,9 @@ impl Docker {
         .context("FVP Docker command could not complete")?;
         anyhow::ensure!(
             output.status.success(),
-            "FVP Docker command {:?} failed ({}): {}",
+            "FVP Docker command {:?} failed ({})",
             args.first(),
             output.status,
-            String::from_utf8_lossy(&output.stderr)
         );
         deadline.remaining()?;
         Ok(output.stdout)
@@ -1143,11 +1978,17 @@ impl Docker {
         // Validate the entire inventory first. A foreign/newer record prevents
         // any removal, even when an earlier entry happens to be ours.
         for id in &containers {
-            let output = self.invoke(&["inspect", "--type", "container", "--", id], deadline)?;
-            validate_container(&output, id, state)?;
+            if let Some(output) = self.invoke_or_confirm_removed(
+                &["inspect", "--type", "container", "--", id],
+                id,
+                state,
+                deadline,
+            )? {
+                validate_container(&output, id, state)?;
+            }
         }
         for id in &containers {
-            self.invoke(&["rm", "--force", "--", id], deadline)?;
+            self.invoke_or_confirm_removed(&["rm", "--force", "--", id], id, state, deadline)?;
         }
         anyhow::ensure!(
             self.containers(state, deadline)?.is_empty(),
@@ -1155,6 +1996,39 @@ impl Docker {
         );
         self.verify_binding(state, deadline, None)?;
         Ok(containers)
+    }
+
+    fn invoke_or_confirm_removed(
+        &self,
+        args: &[&str],
+        id: &str,
+        state: &RunState,
+        deadline: &Deadline,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        match self.invoke(args, deadline) {
+            Ok(output) => Ok(Some(output)),
+            Err(error) => {
+                if error.is::<super::process::UnresolvedProcess>()
+                    || error.is::<super::process::InterruptedCommand>()
+                {
+                    return Err(error);
+                }
+                // Shrinkwrap can remove its --rm container after our inventory.
+                // Query the full immutable ID, without relying on ownership labels.
+                self.verify_binding(state, deadline, None)?;
+                let filter = format!("id={id}");
+                let output = self.invoke(
+                    &["ps", "--all", "--quiet", "--no-trunc", "--filter", &filter],
+                    deadline,
+                )?;
+                self.verify_binding(state, deadline, None)?;
+                if output.is_empty() {
+                    Ok(None)
+                } else {
+                    Err(error.context("FVP container absence could not be confirmed"))
+                }
+            }
+        }
     }
 }
 
@@ -1427,6 +2301,9 @@ pub struct Session {
     model_confirmed: bool,
     ready: bool,
     cleaned: bool,
+    defer_retirement: bool,
+    retirement_deadline: Option<Deadline>,
+    input_writer: Option<std::os::unix::net::UnixStream>,
     // Keep signal ownership alive through cleanup and every other field's drop.
     _signal_guard: SignalGuard,
 }
@@ -1462,6 +2339,9 @@ impl Session {
             model: None,
             launch_pending: false,
             callback_phase: CallbackPhase::Idle,
+            resources_stopped: false,
+            post_verification: PostVerification::NotRequired,
+            workspace: None,
         };
         lock.write_state(None, &state)?;
         Ok(Self {
@@ -1477,6 +2357,9 @@ impl Session {
             model_confirmed: false,
             ready: false,
             cleaned: false,
+            defer_retirement: false,
+            retirement_deadline: None,
+            input_writer: None,
             _signal_guard: signal_guard,
         })
     }
@@ -1490,6 +2373,272 @@ impl Session {
     /// Execute it inside a supervised callback and finish its helpers in scope.
     pub fn docker_command(&self) -> Command {
         self.docker.command()
+    }
+
+    /// Register a newly allocated private workspace before copying inputs or
+    /// launching anything that can use it. Only empty directory scaffolding is
+    /// accepted; the allocation must have an `openvmm-fvp-` generated name.
+    ///
+    /// The journal and an exclusive owner marker bind the canonical path, every
+    /// parent directory identity, and the workspace inode to this run. Registering
+    /// a workspace requires explicit post-verification and retirement afterward.
+    /// Callers must not remove or rename the registered directory themselves.
+    pub fn register_workspace(&mut self, path: &Path, deadline: &Deadline) -> anyhow::Result<()> {
+        self.register_workspace_inner(path, None, deadline)
+    }
+
+    /// Validate both roots and publish their ownership in one journal update.
+    /// Cancellation cannot leave a durable workspace without its destination.
+    pub fn register_workspace_with_output(
+        &mut self,
+        path: &Path,
+        destination: &Path,
+        deadline: &Deadline,
+    ) -> anyhow::Result<()> {
+        self.register_workspace_inner(path, Some(destination), deadline)
+    }
+
+    fn register_workspace_inner(
+        &mut self,
+        path: &Path,
+        destination: Option<&Path>,
+        deadline: &Deadline,
+    ) -> anyhow::Result<()> {
+        self.cancellation.check()?;
+        deadline.remaining()?;
+        anyhow::ensure!(
+            self.lock.read_state()?.as_ref() == Some(&self.state),
+            "FVP state changed before workspace registration"
+        );
+        anyhow::ensure!(
+            !self.cleaned
+                && !self.state.resources_stopped
+                && self.child.is_none()
+                && self.phases.is_none()
+                && self.state.callback_phase == CallbackPhase::Idle
+                && self.state.workspace.is_none(),
+            "FVP workspace registration must precede input preparation and launch"
+        );
+        validate_workspace_name(path)?;
+        let directory = OwnedDirectory::capture(path)?;
+        anyhow::ensure!(
+            !directory.path.starts_with(&self.lock.directory.path)
+                && !self.lock.directory.path.starts_with(&directory.path),
+            "FVP workspace overlaps persistent runtime storage"
+        );
+        let handle = directory
+            .open(false)?
+            .context("missing allocated FVP workspace")?;
+        anyhow::ensure!(
+            snapshot_tree(&handle.file, deadline, false)?.regular_files == 0,
+            "FVP workspace must be registered before writing files"
+        );
+        let destination = destination
+            .map(|path| self.capture_output_destination(&directory, path, deadline))
+            .transpose()?;
+        self.cancellation.check()?;
+        deadline.remaining()?;
+        write_directory_marker(
+            &handle,
+            WORKSPACE_MARKER,
+            &directory_marker(&directory, &self.state.run_id, "openvmm-fvp-workspace"),
+        )?;
+        if let Some((directory, handle)) = &destination {
+            write_directory_marker(
+                handle,
+                OUTPUT_MARKER,
+                &directory_marker(directory, &self.state.run_id, "openvmm-fvp-outputs"),
+            )?;
+        }
+        let mut state = self.state.clone();
+        state.workspace = Some(WorkspaceRecord {
+            directory,
+            run_id: self.state.run_id.clone(),
+            destination: destination.map(|(directory, _)| directory),
+            outputs: None,
+            removal_started: false,
+        });
+        state.post_verification = PostVerification::Pending;
+        self.lock.write_state(Some(&self.state), &state)?;
+        self.state = state;
+        self.defer_retirement = true;
+        self.cancellation.check()?;
+        deadline.remaining()?;
+        Ok(())
+    }
+
+    /// Register the private persistent output root before using the workspace.
+    /// Runtime must first exclude the platform/package input roots. This method
+    /// binds the root's inode, ancestry, and run-ID marker; it does not seal the
+    /// contents, which can continue receiving snapshots and live diagnostics.
+    pub fn register_output_destination(
+        &mut self,
+        path: &Path,
+        deadline: &Deadline,
+    ) -> anyhow::Result<()> {
+        self.cancellation.check()?;
+        deadline.remaining()?;
+        anyhow::ensure!(
+            !self.cleaned
+                && !self.state.resources_stopped
+                && self.child.is_none()
+                && self.phases.is_none()
+                && self.state.callback_phase == CallbackPhase::Idle,
+            "FVP output destination must be registered before workspace use"
+        );
+        anyhow::ensure!(
+            self.lock.read_state()?.as_ref() == Some(&self.state),
+            "FVP state changed before output registration"
+        );
+        let workspace = self
+            .state
+            .workspace
+            .as_ref()
+            .context("register the FVP workspace first")?;
+        anyhow::ensure!(
+            workspace.destination.is_none() && workspace.outputs.is_none(),
+            "FVP output destination is already registered"
+        );
+        let (destination, handle) =
+            self.capture_output_destination(&workspace.directory, path, deadline)?;
+        write_directory_marker(
+            &handle,
+            OUTPUT_MARKER,
+            &directory_marker(&destination, &self.state.run_id, "openvmm-fvp-outputs"),
+        )?;
+        let mut state = self.state.clone();
+        state
+            .workspace
+            .as_mut()
+            .context("missing FVP workspace")?
+            .destination = Some(destination);
+        self.lock.write_state(Some(&self.state), &state)?;
+        self.state = state;
+        deadline.remaining()?;
+        Ok(())
+    }
+
+    fn capture_output_destination(
+        &self,
+        workspace: &OwnedDirectory,
+        path: &Path,
+        deadline: &Deadline,
+    ) -> anyhow::Result<(OwnedDirectory, DirectoryHandle)> {
+        let destination = OwnedDirectory::capture(path)?;
+        anyhow::ensure!(
+            !destination.path.starts_with(&workspace.path)
+                && !workspace.path.starts_with(&destination.path)
+                && !self.lock.directory.path.starts_with(&destination.path),
+            "FVP output destination overlaps workspace or runtime state"
+        );
+        let handle = destination
+            .open(false)?
+            .context("missing FVP output destination")?;
+        ensure_persistent_output(&destination, &handle)?;
+        snapshot_tree(&handle.file, deadline, false)?;
+        match std::fs::symlink_metadata(fd_path(&handle.file).join(OUTPUT_MARKER)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("cannot inspect FVP output ownership marker"),
+            Ok(_) => anyhow::bail!("FVP output ownership marker already exists"),
+        }
+        Ok((destination, handle))
+    }
+
+    /// Preserve outputs through verified directory handles, then seal their receipt.
+    ///
+    /// Both registered roots and their markers are checked before any copying.
+    /// This also applies after cancellation or a completed failed verification.
+    pub fn preserve_outputs(
+        &mut self,
+        destination: &Path,
+        deadline: &Deadline,
+    ) -> anyhow::Result<()> {
+        self.seal_preserved_outputs(destination, deadline, true)
+    }
+
+    /// Seal a completed output copy after model cleanup, including on cancellation.
+    ///
+    /// The caller asserts that *all required logs and guest results* were copied
+    /// successfully (for example, by staging's output-preservation helper).
+    /// This method fsyncs the private persistent per-run destination and records content
+    /// digests for both trees. Any later output or workspace mutation prevents
+    /// automatic deletion. Recovery can create the receipt only when the output
+    /// destination was registered before workspace use; otherwise it preserves
+    /// the workspace for manual log recovery.
+    ///
+    /// Trees are limited to 4096 entries, 32 levels, and one GiB each. Symlinks,
+    /// hard links, special files, and nested mounts require manual preservation.
+    pub fn record_preserved_outputs(
+        &mut self,
+        destination: &Path,
+        deadline: &Deadline,
+    ) -> anyhow::Result<()> {
+        self.seal_preserved_outputs(destination, deadline, false)
+    }
+
+    fn seal_preserved_outputs(
+        &mut self,
+        destination: &Path,
+        deadline: &Deadline,
+        copy_outputs: bool,
+    ) -> anyhow::Result<()> {
+        deadline.remaining()?;
+        anyhow::ensure!(
+            self.lock.read_state()?.as_ref() == Some(&self.state),
+            "FVP state changed before preserving outputs"
+        );
+        anyhow::ensure!(
+            !self.cleaned && self.state.resources_stopped,
+            "FVP outputs can only be sealed after model cleanup"
+        );
+        let workspace = self
+            .state
+            .workspace
+            .as_ref()
+            .context("no registered FVP workspace")?;
+        anyhow::ensure!(
+            workspace.outputs.is_none() && !workspace.removal_started,
+            "FVP output preservation was already recorded"
+        );
+        let directory = OwnedDirectory::capture(destination)?;
+        anyhow::ensure!(
+            workspace.destination.as_ref() == Some(&directory),
+            "FVP output destination does not match its registered identity"
+        );
+        anyhow::ensure!(
+            !directory.path.starts_with(&workspace.directory.path)
+                && !workspace.directory.path.starts_with(&directory.path)
+                && !self.lock.directory.path.starts_with(&directory.path),
+            "FVP output destination overlaps workspace or runtime state"
+        );
+        let receipt = workspace.seal_outputs(deadline, copy_outputs)?;
+        let mut state = self.state.clone();
+        state
+            .workspace
+            .as_mut()
+            .context("missing registered FVP workspace")?
+            .outputs = Some(receipt);
+        self.lock.write_state(Some(&self.state), &state)?;
+        self.state = state;
+        deadline.remaining()?;
+        Ok(())
+    }
+
+    /// Prepare verified inputs before starting the port-allocation budget.
+    /// This callback follows the same owned-helper lifetime contract as launch
+    /// preparation and records durable intent before any external work.
+    pub fn prepare_inputs<T>(
+        &mut self,
+        deadline: &Deadline,
+        prepare: impl FnOnce(&Docker, &RunState) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        anyhow::ensure!(
+            self.child.is_none() && self.phases.is_none(),
+            "FVP input preparation must precede launch"
+        );
+        self.run_callback(CallbackPhase::Preparation, deadline, |session| {
+            prepare(&session.docker, &session.state)
+        })
     }
 
     /// Durable model/launcher output. Each retry appends to the same run log.
@@ -1507,7 +2656,9 @@ impl Session {
         action: impl FnOnce(&mut Self) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
         anyhow::ensure!(
-            !self.cleaned && self.state.callback_phase == CallbackPhase::Idle,
+            !self.cleaned
+                && !self.state.resources_stopped
+                && self.state.callback_phase == CallbackPhase::Idle,
             "FVP callback ownership is unresolved; preserving state"
         );
         self.cancellation.check()?;
@@ -1551,6 +2702,26 @@ impl Session {
         mut prepare: impl FnMut(u16, &RunState, &Deadline) -> anyhow::Result<Command>,
         mut confirm: impl FnMut(&mut ManagedChild, &Deadline) -> anyhow::Result<LaunchConfirmation>,
     ) -> anyhow::Result<u16> {
+        self.launch_with_ports_scoped(
+            budget,
+            model_start,
+            |port, state, deadline| prepare(port, state, deadline).map(Ok),
+            |child, deadline| confirm(child, deadline).map(Ok),
+        )
+    }
+
+    /// Launch with explicit helper-scope completion. Inner errors are safe to
+    /// report after clearing callback intent; outer errors retain ambiguity.
+    pub fn launch_with_ports_scoped(
+        &mut self,
+        budget: &mut PortBudget,
+        model_start: Duration,
+        mut prepare: impl FnMut(u16, &RunState, &Deadline) -> anyhow::Result<anyhow::Result<Command>>,
+        mut confirm: impl FnMut(
+            &mut ManagedChild,
+            &Deadline,
+        ) -> anyhow::Result<anyhow::Result<LaunchConfirmation>>,
+    ) -> anyhow::Result<u16> {
         anyhow::ensure!(
             self.child.is_none() && self.phases.is_none() && !self.cleaned,
             "FVP session already launched or cleaned"
@@ -1571,7 +2742,7 @@ impl Session {
             let mut command =
                 self.run_callback(CallbackPhase::Preparation, &budget.deadline, |session| {
                     prepare(port, &session.state, &budget.deadline)
-                })?;
+                })??;
             self.cancellation.check()?;
             self.docker
                 .verify_binding(&self.state, &budget.deadline, Some(&self.cancellation))?;
@@ -1595,7 +2766,13 @@ impl Session {
                 .stderr(log);
             let deadline = reservation.release(model_start)?;
             self.phases = Some(PhaseClock::model_start(deadline));
-            self.child = Some(ManagedChild::spawn(&mut command)?);
+            let (input, writer) = std::os::unix::net::UnixStream::pair()
+                .context("failed to create noninteractive FVP launcher input")?;
+            self.input_writer = Some(writer);
+            self.child = Some(ManagedChild::spawn_with_stdin(
+                &mut command,
+                std::process::Stdio::from(std::os::fd::OwnedFd::from(input)),
+            )?);
             let child = self.child.as_mut().context("missing owned FVP child")?;
             let identity = capture_owned_process(
                 child,
@@ -1615,7 +2792,7 @@ impl Session {
                         session.child.as_mut().context("missing owned FVP child")?,
                         &deadline,
                     )
-                })?;
+                })??;
             deadline.remaining()?;
             self.cancellation.check()?;
             if confirmation == LaunchConfirmation::Running {
@@ -1653,6 +2830,17 @@ impl Session {
         timeout: Duration,
         mut probe: impl FnMut(&Deadline) -> anyhow::Result<bool>,
     ) -> anyhow::Result<()> {
+        self.wait_ready_scoped(timeout, |deadline| probe(deadline).map(Ok))
+    }
+
+    /// Readiness with explicit helper-scope completion. An inner error reports
+    /// a failed probe whose host helpers are all finished; an outer error keeps
+    /// ambiguous helper ownership durable for recovery.
+    pub fn wait_ready_scoped(
+        &mut self,
+        timeout: Duration,
+        mut probe: impl FnMut(&Deadline) -> anyhow::Result<anyhow::Result<bool>>,
+    ) -> anyhow::Result<()> {
         anyhow::ensure!(self.model_confirmed, "FVP model start was not confirmed");
         let deadline = *self
             .phases
@@ -1667,8 +2855,10 @@ impl Session {
                 if let Err(error) = session.check_running(&deadline) {
                     return Ok(Err(error));
                 }
-                if probe(&deadline)? {
-                    return Ok(Ok(()));
+                match probe(&deadline)? {
+                    Ok(true) => return Ok(Ok(())),
+                    Ok(false) => {}
+                    Err(error) => return Ok(Err(error)),
                 }
                 if let Err(error) = pause(&deadline, &session.cancellation) {
                     return Ok(Err(error));
@@ -1723,6 +2913,16 @@ impl Session {
         timeout: Duration,
         request: impl FnOnce(&Deadline) -> anyhow::Result<()>,
     ) -> anyhow::Result<ExitStatus> {
+        self.shutdown_scoped(timeout, |deadline| request(deadline).map(Ok))
+    }
+
+    /// Shutdown with explicit helper-scope completion, as in
+    /// [`Self::wait_ready_scoped`].
+    pub fn shutdown_scoped(
+        &mut self,
+        timeout: Duration,
+        request: impl FnOnce(&Deadline) -> anyhow::Result<anyhow::Result<()>>,
+    ) -> anyhow::Result<ExitStatus> {
         anyhow::ensure!(self.ready, "FVP pipette readiness was not confirmed");
         let deadline = *self
             .phases
@@ -1732,7 +2932,7 @@ impl Session {
         self.cancellation.check()?;
         self.run_callback(CallbackPhase::ShutdownRequest, &deadline, |_| {
             request(&deadline)
-        })?;
+        })??;
         loop {
             self.cancellation.check()?;
             deadline.remaining()?;
@@ -1748,9 +2948,26 @@ impl Session {
         }
     }
 
-    /// Stop the owned child/group, prove and remove containers, then remove only
-    /// this state. Cancellation does not interrupt cleanup. Errors keep state.
-    pub fn cleanup(&mut self) -> anyhow::Result<()> {
+    /// Stop the registered model and containers without retiring their state.
+    ///
+    /// This selects explicit finalization: drop will not retire state afterward.
+    /// Run [`Self::post_verify`] and preserve workspace outputs before calling
+    /// [`Self::retire_state`]. Cancellation does not interrupt resource cleanup.
+    pub fn stop_resources(&mut self) -> anyhow::Result<()> {
+        self.defer_retirement = true;
+        if self.cleanup_deadline.is_none() {
+            self.cleanup_deadline = Some(Deadline::new(self.forced_cleanup)?);
+        }
+        if !self.cleaned && self.state.post_verification == PostVerification::NotRequired {
+            let mut state = self.state.clone();
+            state.post_verification = PostVerification::Pending;
+            self.lock.write_state(Some(&self.state), &state)?;
+            self.state = state;
+        }
+        self.stop_resources_inner()
+    }
+
+    fn stop_resources_inner(&mut self) -> anyhow::Result<()> {
         if self.cleaned {
             return Ok(());
         }
@@ -1766,10 +2983,142 @@ impl Session {
             self.lock.read_state()?.as_ref() == Some(&self.state),
             "FVP state changed before cleanup; preserving state and containers"
         );
+        if self.state.resources_stopped {
+            return Ok(());
+        }
+        self.input_writer.take();
         if let Some(child) = &mut self.child {
             child.terminate(&deadline)?;
         }
         self.docker.cleanup(&self.state, &deadline)?;
+        let mut state = self.state.clone();
+        state.resources_stopped = true;
+        self.lock.write_state(Some(&self.state), &state)?;
+        self.state = state;
+        Ok(())
+    }
+
+    /// Verify toolchain identity after stopping resources, even after cancellation.
+    ///
+    /// The callback receives a fresh, non-cancelled token and an explicit
+    /// verification deadline, independent of the completed cleanup budget.
+    /// Return an inner error for a completed verification that found drift;
+    /// an outer error means helper ownership remains unresolved. Both retain
+    /// the original run's callback intent. SIGKILL during verification leaves
+    /// durable in-flight state and cannot erase the recovery record.
+    pub fn post_verify<T>(
+        &mut self,
+        deadline: &Deadline,
+        verify: impl FnOnce(&Deadline, &Cancellation) -> anyhow::Result<anyhow::Result<T>>,
+    ) -> anyhow::Result<anyhow::Result<T>> {
+        anyhow::ensure!(
+            !self.cleaned && self.state.resources_stopped,
+            "FVP post-verification requires stopped model resources"
+        );
+        anyhow::ensure!(
+            self.state.post_verification == PostVerification::Pending,
+            "FVP post-verification was already attempted or not requested"
+        );
+        if let Err(error) = deadline.remaining() {
+            self.settle_post_verification(false)?;
+            return Err(error);
+        }
+        let mut state = self.state.clone();
+        state.post_verification = PostVerification::InFlight;
+        self.lock.write_state(Some(&self.state), &state)?;
+        self.state = state;
+        let verification_token = Cancellation::default();
+        if let Err(error) = deadline.remaining() {
+            self.settle_post_verification(false)?;
+            return Err(error);
+        }
+        let outcome = verify(deadline, &verification_token)?;
+        anyhow::ensure!(
+            self.state.owner.pid == std::process::id()
+                && self.state.owner.observe()? == ProcessObservation::Matching,
+            "FVP post-verification owner changed; preserving state"
+        );
+        self.settle_post_verification(outcome.is_ok() && deadline.remaining().is_ok())?;
+        let outcome = match (outcome, deadline.remaining()) {
+            (Ok(value), Ok(_)) => Ok(value),
+            (Err(error), Ok(_)) | (Ok(_), Err(error)) => Err(error),
+            (Err(error), Err(timeout)) => {
+                Err(error.context(format!("FVP verification also timed out: {timeout:#}")))
+            }
+        };
+        if outcome.is_err() && self.state.post_verification != PostVerification::Failed {
+            self.settle_post_verification(false)?;
+        }
+        Ok(outcome)
+    }
+
+    fn settle_post_verification(&mut self, succeeded: bool) -> anyhow::Result<()> {
+        let mut state = self.state.clone();
+        state.post_verification = if succeeded {
+            PostVerification::Complete
+        } else {
+            PostVerification::Failed
+        };
+        self.lock.write_state(Some(&self.state), &state)?;
+        self.state = state;
+        Ok(())
+    }
+
+    /// Retire state only after explicit post-verification has finished.
+    ///
+    /// Filesystem retirement has its own non-resetting budget, since toolchain
+    /// verification can outlast the process cleanup phase. Failed or incomplete
+    /// helper scopes remain recorded, even if the known model was stopped.
+    pub fn retire_state(&mut self) -> anyhow::Result<()> {
+        if self.cleaned {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            self.state.resources_stopped,
+            "FVP resources must be stopped before state retirement"
+        );
+        anyhow::ensure!(
+            matches!(
+                self.state.post_verification,
+                PostVerification::NotRequired
+                    | PostVerification::Complete
+                    | PostVerification::Failed
+            ),
+            "FVP post-verification is unfinished; preserving state"
+        );
+        let deadline = match self.retirement_deadline {
+            Some(deadline) => deadline,
+            None => {
+                let deadline = Deadline::new(self.forced_cleanup)?;
+                self.retirement_deadline = Some(deadline);
+                deadline
+            }
+        };
+        self.retire_state_inner(&deadline)
+    }
+
+    fn retire_state_inner(&mut self, deadline: &Deadline) -> anyhow::Result<()> {
+        if self.cleaned {
+            return Ok(());
+        }
+        deadline.remaining()?;
+        anyhow::ensure!(
+            self.lock.read_state()?.as_ref() == Some(&self.state),
+            "FVP state changed before retirement; preserving workspace and state"
+        );
+        anyhow::ensure!(
+            self.state.resources_stopped,
+            "FVP resources must be stopped before state retirement"
+        );
+        anyhow::ensure!(
+            matches!(
+                self.state.post_verification,
+                PostVerification::NotRequired
+                    | PostVerification::Complete
+                    | PostVerification::Failed
+            ),
+            "FVP post-verification is unfinished; preserving state"
+        );
         anyhow::ensure!(
             self.state.callback_phase == CallbackPhase::Idle,
             "FVP {:?} callback ownership is unresolved; preserving state; \
@@ -1781,15 +3130,56 @@ impl Session {
             self.state.owner.pid,
             self.state.owner.start_ticks,
         );
+        if let Some(workspace) = self.state.workspace.clone() {
+            workspace.preflight(deadline)?;
+            if !workspace.removal_started {
+                let mut state = self.state.clone();
+                state
+                    .workspace
+                    .as_mut()
+                    .context("missing FVP workspace")?
+                    .removal_started = true;
+                self.lock.write_state(Some(&self.state), &state)?;
+                self.state = state;
+            }
+            workspace.remove(deadline)?;
+            let mut state = self.state.clone();
+            state.workspace = None;
+            self.lock.write_state(Some(&self.state), &state)?;
+            self.state = state;
+        }
         self.lock.remove_state(&self.state)?;
         self.cleaned = true;
         Ok(())
+    }
+
+    /// Compatibility cleanup for callers without explicit post-verification.
+    /// Registered finalization requirements are never bypassed.
+    pub fn cleanup(&mut self) -> anyhow::Result<()> {
+        self.stop_resources_inner()?;
+        if self.cleaned {
+            return Ok(());
+        }
+        let deadline = self
+            .cleanup_deadline
+            .context("missing FVP cleanup deadline")?;
+        self.retire_state_inner(&deadline)
     }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        if let Err(error) = self.cleanup() {
+        let result = if self.defer_retirement && !self.cleaned {
+            self.stop_resources_inner().map(|()| {
+                tracing::warn!(
+                    run_id = self.state.run_id.as_str(),
+                    "FVP finalization unfinished; retaining recovery state"
+                );
+            })
+        } else {
+            self.cleanup()
+        };
+        if let Err(error) = result {
             tracing::error!(
                 run_id = self.state.run_id.as_str(),
                 error = %format!("{error:#}"),
@@ -1803,6 +3193,7 @@ impl Drop for Session {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::os::unix::fs::PermissionsExt;
     use std::rc::Rc;
     use test_with_tracing::test;
 
@@ -1837,6 +3228,9 @@ mod tests {
             model: None,
             launch_pending: false,
             callback_phase: CallbackPhase::Idle,
+            resources_stopped: false,
+            post_verification: PostVerification::NotRequired,
+            workspace: None,
         }
     }
 
@@ -1853,6 +3247,7 @@ mod tests {
         calls: Vec<Vec<String>>,
         daemon_id: String,
         switch_to_empty_daemon_on_ps: Option<String>,
+        fail_once: Option<(&'static str, bool)>,
     }
 
     fn fake_docker(records: Vec<serde_json::Value>) -> (Docker, Rc<RefCell<FakeDocker>>) {
@@ -1868,6 +3263,7 @@ mod tests {
             calls: Vec::new(),
             daemon_id: binding.daemon_id.clone(),
             switch_to_empty_daemon_on_ps: None,
+            fail_once: None,
         }));
         let shared = fixture.clone();
         let expected_endpoint = binding.endpoint.clone();
@@ -1894,6 +3290,17 @@ mod tests {
                     let mut fake = shared.borrow_mut();
                     fake.calls
                         .push(args.iter().map(|s| (*s).to_owned()).collect());
+                    if fake
+                        .fail_once
+                        .is_some_and(|(operation, _)| operation == args[0])
+                    {
+                        let (_, disappear) = fake.fail_once.take().unwrap();
+                        if disappear {
+                            let id = args.last().unwrap();
+                            fake.records.retain(|record| record["Id"] != *id);
+                        }
+                        anyhow::bail!("injected Docker command failure");
+                    }
                     match args[0] {
                         "info" => Ok(serde_json::to_vec(&fake.daemon_id).unwrap()),
                         "ps" => {
@@ -1906,6 +3313,11 @@ mod tests {
                             Ok(fake
                                 .records
                                 .iter()
+                                .filter(|record| {
+                                    args.last()
+                                        .and_then(|filter| filter.strip_prefix("id="))
+                                        .is_none_or(|id| record["Id"] == id)
+                                })
                                 .map(|record| format!("{}\n", record["Id"].as_str().unwrap()))
                                 .collect::<String>()
                                 .into_bytes())
@@ -1942,6 +3354,105 @@ mod tests {
     fn dead_owner(record: &mut RunState) {
         // Linux PID_MAX_LIMIT is below i32::MAX. No process is signalled.
         record.owner.pid = i32::MAX as u32;
+    }
+
+    #[test]
+    fn container_auto_removal_requires_exact_absence_and_preserves_foreign_records() {
+        for (operation, disappear, newer) in [
+            ("inspect", true, false),
+            ("rm", true, false),
+            ("inspect", false, false),
+            ("inspect", true, true),
+        ] {
+            let state = state();
+            let first = container(&state, 'a');
+            let mut second = container(&state, 'b');
+            if newer {
+                second["Config"]["Labels"][SCHEMA_LABEL] = serde_json::json!("999");
+            }
+            let (docker, fake) = fake_docker(vec![first, second]);
+            fake.borrow_mut().fail_once = Some((operation, disappear));
+            let result = docker.cleanup(&state, &Deadline::new(Duration::from_secs(5)).unwrap());
+            assert_eq!(
+                result.is_ok(),
+                disappear && !newer,
+                "{operation}: {result:?}"
+            );
+            let fake = fake.borrow();
+            if result.is_ok() {
+                assert!(fake.records.is_empty());
+            } else {
+                assert!(!fake.calls.iter().any(|call| call[0] == "rm"));
+                assert!(
+                    fake.records
+                        .iter()
+                        .any(|record| record["Id"] == "b".repeat(64))
+                );
+            }
+            assert!(
+                fake.calls
+                    .iter()
+                    .any(|call| call.last() == Some(&format!("id={}", "a".repeat(64))))
+            );
+        }
+    }
+
+    fn registered_workspace(root: &Path) -> (Session, PathBuf) {
+        let parent = root.join("workspace-parent");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&parent)
+            .unwrap();
+        let workspace = tempfile::Builder::new()
+            .prefix("openvmm-fvp-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in(&parent)
+            .unwrap()
+            .keep();
+        std::fs::create_dir(workspace.join("logs")).unwrap();
+        let (docker, _) = fake_docker(Vec::new());
+        let mut session = Session::new(
+            lock(root),
+            docker,
+            IMAGE.to_owned(),
+            &std::env::current_exe().unwrap(),
+            Duration::from_secs(10),
+            Cancellation::default(),
+        )
+        .unwrap();
+        session
+            .register_workspace(&workspace, &Deadline::new(Duration::from_secs(5)).unwrap())
+            .unwrap();
+        std::fs::write(workspace.join("logs/model.log"), b"retained log").unwrap();
+        (session, workspace)
+    }
+
+    fn sealed_workspace(root: &Path) -> (Session, PathBuf, PathBuf) {
+        let (mut session, workspace) = registered_workspace(root);
+        let output = root.join("outputs");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&output)
+            .unwrap();
+        session
+            .register_output_destination(&output, &Deadline::new(Duration::from_secs(5)).unwrap())
+            .unwrap();
+        session.stop_resources().unwrap();
+        session
+            .post_verify(
+                &Deadline::new(Duration::from_secs(5)).unwrap(),
+                |_, token| {
+                    token.check()?;
+                    Ok(Ok(()))
+                },
+            )
+            .unwrap()
+            .unwrap();
+        std::fs::copy(workspace.join("logs/model.log"), output.join("model.log")).unwrap();
+        session
+            .record_preserved_outputs(&output, &Deadline::new(Duration::from_secs(5)).unwrap())
+            .unwrap();
+        (session, workspace, output)
     }
 
     #[test]
@@ -3009,8 +4520,24 @@ mod tests {
             serde_json::from_slice(&std::fs::read(dir.path().join("orphan.json")).unwrap())
                 .unwrap();
         let deadline = Deadline::new(Duration::from_secs(1)).unwrap();
-        while identity.observe().unwrap() == ProcessObservation::Matching {
-            pause(&deadline, &Cancellation::default()).unwrap();
+        loop {
+            match identity.observe() {
+                Ok(ProcessObservation::Gone | ProcessObservation::Reused) => break,
+                Ok(ProcessObservation::Matching) => {
+                    pause(&deadline, &Cancellation::default()).unwrap();
+                }
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    // /proc/exe can disappear before stat reports a zombie.
+                    pause(&deadline, &Cancellation::default())
+                        .with_context(|| format!("orphan identity stayed unavailable: {error:#}"))
+                        .unwrap();
+                }
+                Err(error) => panic!("cannot observe fixture process: {error:#}"),
+            }
         }
     }
 
@@ -3809,5 +5336,915 @@ mod tests {
         let args: Vec<_> = command.get_args().collect();
         assert_eq!(args, ["--host", "unix:///fake/daemon-a.sock"]);
         session.cleanup().unwrap();
+    }
+
+    #[test]
+    fn split_cleanup_verifies_even_after_cancellation_and_retains_until_retirement() {
+        let dir = directory();
+        let cancellation = Cancellation::default();
+        let (docker, _) = fake_docker(Vec::new());
+        let mut session = Session::new(
+            lock(dir.path()),
+            docker,
+            IMAGE.to_owned(),
+            &std::env::current_exe().unwrap(),
+            Duration::from_secs(10),
+            cancellation.clone(),
+        )
+        .unwrap();
+        cancellation.cancel();
+        session.stop_resources().unwrap();
+        assert!(session.lock.read_state().unwrap().is_some());
+        assert_eq!(session.state.post_verification, PostVerification::Pending);
+        assert!(session.retire_state().is_err());
+        assert!(session.retirement_deadline.is_none());
+        let state_path = session.lock.state_path();
+        let result: anyhow::Result<()> = session
+            .post_verify(
+                &Deadline::new(Duration::from_secs(5)).unwrap(),
+                |_, token| {
+                    token.check()?;
+                    let record = RunState::parse(&std::fs::read(&state_path)?)?;
+                    assert_eq!(record.post_verification, PostVerification::InFlight);
+                    Ok(Err(anyhow::anyhow!("injected toolchain drift")))
+                },
+            )
+            .unwrap();
+        assert!(result.is_err());
+        assert_eq!(session.state.post_verification, PostVerification::Failed);
+        assert!(session.lock.read_state().unwrap().is_some());
+        session.retire_state().unwrap();
+        assert!(session.lock.read_state().unwrap().is_none());
+    }
+
+    #[test]
+    fn post_verification_does_not_erase_an_earlier_unresolved_callback() {
+        let dir = directory();
+        let (docker, _) = fake_docker(Vec::new());
+        let cancellation = Cancellation::default();
+        let mut session = Session::new(
+            lock(dir.path()),
+            docker,
+            IMAGE.to_owned(),
+            &std::env::current_exe().unwrap(),
+            Duration::from_secs(10),
+            cancellation.clone(),
+        )
+        .unwrap();
+        assert!(
+            session
+                .prepare_inputs::<()>(&Deadline::new(Duration::from_secs(1)).unwrap(), |_, _| {
+                    anyhow::bail!("injected unresolved helper failure")
+                })
+                .is_err()
+        );
+        cancellation.cancel();
+        session.stop_resources().unwrap();
+        session
+            .post_verify(
+                &Deadline::new(Duration::from_secs(5)).unwrap(),
+                |_, token| {
+                    token.check()?;
+                    Ok(Ok(()))
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.state.callback_phase, CallbackPhase::Preparation);
+        assert!(session.retire_state().is_err());
+        drop(session);
+        let retained = lock(dir.path()).read_state().unwrap().unwrap();
+        assert_eq!(retained.callback_phase, CallbackPhase::Preparation);
+        assert_eq!(retained.post_verification, PostVerification::Complete);
+    }
+
+    #[test]
+    fn runtime_finalization_matrix_uses_registered_staging() {
+        use super::super::runtime::finish_session;
+        use super::super::staging::PreparedFvpRun;
+
+        for (case, diagnostic) in [
+            ("ok", None),
+            ("drift", Some("toolchain drift")),
+            ("late", Some("deadline")),
+            ("expired", Some("deadline")),
+            ("cancelled", None),
+            ("output-symlink", Some("symlink")),
+            ("output-root-replaced", Some("symlink")),
+            ("output-ancestor-replaced", Some("symlink")),
+            ("unresolved", Some("unresolved verification helper")),
+        ] {
+            let dir = directory();
+            let (docker, fake) = fake_docker(Vec::new());
+            let cancellation = Cancellation::default();
+            let mut session = Session::new(
+                lock(dir.path()),
+                docker,
+                IMAGE.to_owned(),
+                &std::env::current_exe().unwrap(),
+                Duration::from_secs(10),
+                cancellation.clone(),
+            )
+            .unwrap();
+            let prepared = PreparedFvpRun::allocate(
+                dir.path(),
+                &Deadline::new(Duration::from_secs(5)).unwrap(),
+            )
+            .unwrap();
+            let workspace = prepared.root().to_owned();
+            let output_parent = dir.path().join("output-parent");
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&output_parent)
+                .unwrap();
+            let output = output_parent.join("run");
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&output)
+                .unwrap();
+            let deadline = Deadline::new(Duration::from_secs(5)).unwrap();
+            session
+                .register_workspace_with_output(&workspace, &output, &deadline)
+                .unwrap();
+            prepared
+                .set_run_identity(session.state().run_id().as_str())
+                .unwrap();
+            std::fs::write(prepared.logs().join("host.log"), b"retained console").unwrap();
+            std::fs::create_dir(prepared.share().join("test_results")).unwrap();
+            std::fs::write(
+                prepared.share().join("test_results/result"),
+                b"guest result",
+            )
+            .unwrap();
+            let foreign = dir.path().join("foreign");
+            std::fs::write(&foreign, b"untouched").unwrap();
+            let foreign_directory = dir.path().join("foreign-output");
+            std::fs::create_dir(&foreign_directory).unwrap();
+            std::fs::write(foreign_directory.join("sentinel"), b"untouched").unwrap();
+            if case == "output-symlink" {
+                std::os::unix::fs::symlink(&foreign, prepared.share().join("test_results/alias"))
+                    .unwrap();
+            }
+            if case == "cancelled" {
+                cancellation.cancel();
+            }
+            if case == "output-root-replaced" {
+                std::fs::rename(&output, dir.path().join("preserved-output")).unwrap();
+                std::os::unix::fs::symlink(&foreign_directory, &output).unwrap();
+            } else if case == "output-ancestor-replaced" {
+                std::fs::create_dir(foreign_directory.join("run")).unwrap();
+                std::fs::rename(&output_parent, dir.path().join("preserved-output-parent"))
+                    .unwrap();
+                std::os::unix::fs::symlink(&foreign_directory, &output_parent).unwrap();
+            }
+            let budget = match case {
+                "expired" => Duration::ZERO,
+                "late" => Duration::from_millis(20),
+                _ => Duration::from_secs(5),
+            };
+            let lock_inode = session.lock.file.metadata().unwrap().ino();
+            let started = std::time::Instant::now();
+            let result = finish_session(
+                &mut session,
+                Some(prepared),
+                &output,
+                budget,
+                Duration::from_secs(5),
+                |_, token| {
+                    assert_ne!(case, "expired");
+                    token.check().unwrap();
+                    if case == "cancelled" {
+                        cancellation.cancel();
+                        token.check().unwrap();
+                    }
+                    match case {
+                        "drift" => Ok(Err(anyhow::anyhow!("toolchain drift"))),
+                        "unresolved" => Err(anyhow::anyhow!("unresolved verification helper")),
+                        "late" => {
+                            std::thread::sleep(Duration::from_millis(30));
+                            Ok(Ok(()))
+                        }
+                        _ => Ok(Ok(())),
+                    }
+                },
+            );
+            assert_eq!(
+                result.is_ok(),
+                matches!(case, "ok" | "cancelled"),
+                "{case}: {result:?}"
+            );
+            assert!(started.elapsed() < Duration::from_secs(31), "{case}");
+            if let Some(diagnostic) = diagnostic {
+                assert!(
+                    format!("{:#}", result.as_ref().unwrap_err()).contains(diagnostic),
+                    "{case}: {result:?}"
+                );
+            }
+            let replaced = matches!(case, "output-root-replaced" | "output-ancestor-replaced");
+            let retained = replaced || matches!(case, "output-symlink" | "unresolved");
+            assert_eq!(workspace.exists(), retained, "{case}");
+            assert_eq!(
+                session.lock.read_state().unwrap().is_some(),
+                retained,
+                "{case}"
+            );
+            assert_eq!(std::fs::read(&foreign).unwrap(), b"untouched", "{case}");
+            if !replaced {
+                assert_eq!(
+                    std::fs::read(output.join("consoles/host.log")).unwrap(),
+                    b"retained console"
+                );
+            }
+            assert_eq!(
+                std::fs::read(foreign_directory.join("sentinel")).unwrap(),
+                b"untouched"
+            );
+            assert_eq!(
+                std::fs::read_dir(&foreign_directory).unwrap().count(),
+                if case == "output-ancestor-replaced" {
+                    2
+                } else {
+                    1
+                },
+                "{case}",
+            );
+            if case == "output-ancestor-replaced" {
+                assert_eq!(
+                    std::fs::read_dir(foreign_directory.join("run"))
+                        .unwrap()
+                        .count(),
+                    0
+                );
+            }
+            if !retained {
+                assert_eq!(
+                    std::fs::read(output.join("test_results/result")).unwrap(),
+                    b"guest result"
+                );
+            }
+            assert!(fake.borrow().records.is_empty(), "{case}");
+            drop(session);
+            let released = lock(dir.path());
+            assert_eq!(
+                released.file.metadata().unwrap().ino(),
+                lock_inode,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejected_or_cancelled_registration_allows_a_subsequent_valid_session() {
+        use super::super::runtime::finish_session;
+        use super::super::staging::PreparedFvpRun;
+
+        for cancelled in [false, true] {
+            let dir = directory();
+            let (docker, _) = fake_docker(Vec::new());
+            let cancellation = Cancellation::default();
+            let mut session = Session::new(
+                lock(dir.path()),
+                docker,
+                IMAGE.to_owned(),
+                &std::env::current_exe().unwrap(),
+                Duration::from_secs(10),
+                cancellation.clone(),
+            )
+            .unwrap();
+            let staging = PreparedFvpRun::allocate(
+                dir.path(),
+                &Deadline::new(Duration::from_secs(5)).unwrap(),
+            )
+            .unwrap();
+            let path = staging.root().to_owned();
+            let volatile = tempfile::Builder::new()
+                .permissions(std::fs::Permissions::from_mode(0o700))
+                .tempdir_in("/tmp")
+                .unwrap();
+            if cancelled {
+                cancellation.cancel();
+            }
+            let error = session
+                .register_workspace_with_output(
+                    staging.root(),
+                    volatile.path(),
+                    &Deadline::new(Duration::from_secs(5)).unwrap(),
+                )
+                .unwrap_err();
+            assert!(format!("{error:#}").contains(if cancelled {
+                "cancelled"
+            } else {
+                "persistent"
+            }));
+            assert!(session.state.workspace.is_none());
+            assert!(
+                session
+                    .lock
+                    .read_state()
+                    .unwrap()
+                    .unwrap()
+                    .workspace
+                    .is_none()
+            );
+            staging
+                .cleanup_unregistered(&Deadline::new(Duration::from_secs(5)).unwrap())
+                .unwrap();
+            assert!(!path.exists());
+            finish_session(
+                &mut session,
+                None,
+                volatile.path(),
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+                |_, token| {
+                    token.check()?;
+                    Ok(Ok(()))
+                },
+            )
+            .unwrap();
+            drop(session);
+
+            let (docker, _) = fake_docker(Vec::new());
+            let mut next = Session::new(
+                lock(dir.path()),
+                docker,
+                IMAGE.to_owned(),
+                &std::env::current_exe().unwrap(),
+                Duration::from_secs(10),
+                Cancellation::default(),
+            )
+            .unwrap();
+            let staging = PreparedFvpRun::allocate(
+                dir.path(),
+                &Deadline::new(Duration::from_secs(5)).unwrap(),
+            )
+            .unwrap();
+            let path = staging.root().to_owned();
+            let output = dir.path().join("valid-output");
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&output)
+                .unwrap();
+            next.register_workspace_with_output(
+                &path,
+                &output,
+                &Deadline::new(Duration::from_secs(5)).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(staging.logs().join("proof"), b"valid session").unwrap();
+            finish_session(
+                &mut next,
+                Some(staging),
+                &output,
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+                |_, _| Ok(Ok(())),
+            )
+            .unwrap();
+            assert!(!path.exists());
+            assert!(next.lock.read_state().unwrap().is_none());
+            assert_eq!(
+                std::fs::read(output.join("consoles/proof")).unwrap(),
+                b"valid session"
+            );
+        }
+    }
+
+    #[test]
+    fn rejected_registration_never_discards_replacement_or_unexpected_data() {
+        use super::super::staging::PreparedFvpRun;
+
+        for replacement in [false, true] {
+            let dir = directory();
+            let (docker, _) = fake_docker(Vec::new());
+            let mut session = Session::new(
+                lock(dir.path()),
+                docker,
+                IMAGE.to_owned(),
+                &std::env::current_exe().unwrap(),
+                Duration::from_secs(10),
+                Cancellation::default(),
+            )
+            .unwrap();
+            let deadline = Deadline::new(Duration::from_secs(5)).unwrap();
+            let staging = PreparedFvpRun::allocate(dir.path(), &deadline).unwrap();
+            let path = staging.root().to_owned();
+            let aside = dir.path().join("original-allocation");
+            if replacement {
+                std::fs::rename(&path, &aside).unwrap();
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&path)
+                    .unwrap();
+            }
+            let sentinel = path.join("sentinel");
+            std::fs::write(&sentinel, b"foreign data").unwrap();
+            let output = dir.path().join("output");
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&output)
+                .unwrap();
+            assert!(
+                session
+                    .register_workspace_with_output(&path, &output, &deadline)
+                    .is_err()
+            );
+            assert!(session.state.workspace.is_none());
+            assert!(staging.cleanup_unregistered(&deadline).is_err());
+            assert_eq!(std::fs::read(&sentinel).unwrap(), b"foreign data");
+            assert_eq!(
+                std::fs::read_dir(&path).unwrap().count(),
+                if replacement { 1 } else { 7 }
+            );
+            if replacement {
+                assert_eq!(std::fs::read_dir(&aside).unwrap().count(), 6);
+            }
+            session.cleanup().unwrap();
+        }
+    }
+
+    #[test]
+    fn owned_workspace_retirement_preserves_durable_outputs_and_lock_inode() {
+        let dir = directory();
+        let (mut session, workspace, output) = sealed_workspace(dir.path());
+        let inode = session.lock.file.metadata().unwrap().ino();
+        assert_eq!(session.state.workspace_path(), Some(workspace.as_path()));
+        session.retire_state().unwrap();
+        assert!(!workspace.exists());
+        assert_eq!(
+            std::fs::read(output.join("model.log")).unwrap(),
+            b"retained log"
+        );
+        assert!(session.lock.read_state().unwrap().is_none());
+        assert_eq!(session.lock.file.metadata().unwrap().ino(), inode);
+    }
+
+    #[test]
+    fn recovery_preserves_registered_outputs_before_retiring_an_unverified_run() {
+        let dir = directory();
+        let (mut session, workspace) = registered_workspace(dir.path());
+        let output = dir.path().join("output");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&output)
+            .unwrap();
+        session
+            .register_output_destination(&output, &Deadline::new(Duration::from_secs(5)).unwrap())
+            .unwrap();
+        session.stop_resources().unwrap();
+        drop(session);
+        let lock = lock(dir.path());
+        let original = lock.read_state().unwrap().unwrap();
+        assert_eq!(original.post_verification, PostVerification::Pending);
+        let mut stale = original.clone();
+        dead_owner(&mut stale);
+        lock.write_state(Some(&original), &stale).unwrap();
+        let (docker, _) = fake_docker(Vec::new());
+        lock.recover(
+            &docker,
+            IMAGE,
+            &stale.expected_model,
+            Duration::from_secs(5),
+            &Cancellation::default(),
+        )
+        .unwrap();
+        assert!(!workspace.exists());
+        assert!(lock.read_state().unwrap().is_none());
+        assert_eq!(
+            std::fs::read(output.join("consoles/model.log")).unwrap(),
+            b"retained log"
+        );
+    }
+
+    #[test]
+    fn interrupted_workspace_removal_preserves_the_remaining_tree() {
+        let dir = directory();
+        let (mut session, workspace, output) = sealed_workspace(dir.path());
+        let mut interrupted = session.state.clone();
+        interrupted.workspace.as_mut().unwrap().removal_started = true;
+        session
+            .lock
+            .write_state(Some(&session.state), &interrupted)
+            .unwrap();
+        session.state = interrupted;
+        std::fs::remove_file(workspace.join("logs/model.log")).unwrap();
+        drop(session);
+        let lock = lock(dir.path());
+        let original = lock.read_state().unwrap().unwrap();
+        let mut stale = original.clone();
+        dead_owner(&mut stale);
+        lock.write_state(Some(&original), &stale).unwrap();
+        let (docker, _) = fake_docker(Vec::new());
+        let error = lock
+            .recover(
+                &docker,
+                IMAGE,
+                &stale.expected_model,
+                Duration::from_secs(5),
+                &Cancellation::default(),
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("interrupted"));
+        assert_eq!(lock.read_state().unwrap(), Some(stale));
+        assert_eq!(
+            std::fs::read(output.join("model.log")).unwrap(),
+            b"retained log"
+        );
+        assert!(workspace.join("logs").is_dir());
+    }
+
+    #[test]
+    fn retirement_can_resume_when_the_complete_sealed_tree_is_unchanged() {
+        let dir = directory();
+        let (mut session, workspace, _) = sealed_workspace(dir.path());
+        let mut interrupted = session.state.clone();
+        interrupted.workspace.as_mut().unwrap().removal_started = true;
+        session
+            .lock
+            .write_state(Some(&session.state), &interrupted)
+            .unwrap();
+        session.state = interrupted;
+        drop(session);
+        let lock = lock(dir.path());
+        let original = lock.read_state().unwrap().unwrap();
+        let mut stale = original.clone();
+        dead_owner(&mut stale);
+        lock.write_state(Some(&original), &stale).unwrap();
+        let (docker, _) = fake_docker(Vec::new());
+        lock.recover(
+            &docker,
+            IMAGE,
+            &stale.expected_model,
+            Duration::from_secs(5),
+            &Cancellation::default(),
+        )
+        .unwrap();
+        assert!(!workspace.exists());
+        assert!(lock.read_state().unwrap().is_none());
+    }
+
+    #[test]
+    fn recovery_removes_only_a_verified_workspace_with_preserved_outputs() {
+        let dir = directory();
+        let (session, workspace, output) = sealed_workspace(dir.path());
+        drop(session);
+        let lock = lock(dir.path());
+        let original = lock.read_state().unwrap().unwrap();
+        let mut stale = original.clone();
+        dead_owner(&mut stale);
+        lock.write_state(Some(&original), &stale).unwrap();
+        let (docker, _) = fake_docker(Vec::new());
+        lock.recover(
+            &docker,
+            IMAGE,
+            &stale.expected_model,
+            Duration::from_secs(5),
+            &Cancellation::default(),
+        )
+        .unwrap();
+        assert!(!workspace.exists());
+        assert_eq!(
+            std::fs::read(output.join("model.log")).unwrap(),
+            b"retained log"
+        );
+        assert!(lock.read_state().unwrap().is_none());
+    }
+
+    #[test]
+    fn workspace_without_preserved_outputs_is_retained_with_state() {
+        let dir = directory();
+        let (mut session, workspace) = registered_workspace(dir.path());
+        session.stop_resources().unwrap();
+        session
+            .post_verify(&Deadline::new(Duration::from_secs(5)).unwrap(), |_, _| {
+                Ok(Ok(()))
+            })
+            .unwrap()
+            .unwrap();
+        let error = session.retire_state().unwrap_err();
+        assert!(format!("{error:#}").contains("not durably preserved"));
+        assert!(format!("{error:#}").contains(&workspace.display().to_string()));
+        drop(session);
+        let lock = lock(dir.path());
+        let original = lock.read_state().unwrap().unwrap();
+        let mut stale = original.clone();
+        dead_owner(&mut stale);
+        lock.write_state(Some(&original), &stale).unwrap();
+        let (docker, _) = fake_docker(Vec::new());
+        assert!(
+            lock.recover(
+                &docker,
+                IMAGE,
+                &stale.expected_model,
+                Duration::from_secs(5),
+                &Cancellation::default()
+            )
+            .is_err()
+        );
+        assert_eq!(lock.read_state().unwrap(), Some(stale));
+        assert_eq!(
+            std::fs::read(workspace.join("logs/model.log")).unwrap(),
+            b"retained log"
+        );
+    }
+
+    #[test]
+    fn workspace_mutation_matrix_preserves_foreign_or_unarchived_data() {
+        for mutation in [
+            "newer-marker",
+            "foreign-marker",
+            "source",
+            "output",
+            "symlink",
+            "replacement",
+            "parent",
+        ] {
+            let dir = directory();
+            let (mut session, workspace, output) = sealed_workspace(dir.path());
+            let original_state = std::fs::read(session.lock.state_path()).unwrap();
+            let foreign = dir.path().join("foreign");
+            std::fs::create_dir(&foreign).unwrap();
+            std::fs::write(foreign.join("keep"), b"foreign").unwrap();
+            let mut original_workspace = workspace.clone();
+            match mutation {
+                "newer-marker" | "foreign-marker" => {
+                    let path = workspace.join(WORKSPACE_MARKER);
+                    let mut marker: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                    if mutation == "newer-marker" {
+                        marker["schema_version"] = serde_json::json!(2);
+                    } else {
+                        marker["run_id"] = serde_json::json!(RunId::new().unwrap().as_str());
+                    }
+                    std::fs::write(path, serde_json::to_vec(&marker).unwrap()).unwrap();
+                }
+                "source" => {
+                    std::fs::write(workspace.join("logs/model.log"), b"unarchived log").unwrap();
+                }
+                "output" => {
+                    std::fs::write(output.join("model.log"), b"changed output").unwrap();
+                }
+                "symlink" => {
+                    std::os::unix::fs::symlink(&foreign, workspace.join("foreign-link")).unwrap();
+                }
+                "replacement" => {
+                    original_workspace = workspace.parent().unwrap().join("original");
+                    std::fs::rename(&workspace, &original_workspace).unwrap();
+                    std::fs::DirBuilder::new()
+                        .mode(0o700)
+                        .create(&workspace)
+                        .unwrap();
+                    std::fs::write(workspace.join("keep"), b"replacement").unwrap();
+                }
+                "parent" => {
+                    let parent = workspace.parent().unwrap();
+                    let moved = dir.path().join("moved-parent");
+                    std::fs::rename(parent, &moved).unwrap();
+                    std::os::unix::fs::symlink(&moved, parent).unwrap();
+                    original_workspace = moved.join(workspace.file_name().unwrap());
+                }
+                _ => unreachable!(),
+            }
+            assert!(session.retire_state().is_err(), "{mutation}");
+            assert_eq!(
+                std::fs::read(session.lock.state_path()).unwrap(),
+                original_state,
+                "{mutation}"
+            );
+            assert!(
+                original_workspace.join("logs/model.log").is_file(),
+                "{mutation}"
+            );
+            assert_eq!(std::fs::read(foreign.join("keep")).unwrap(), b"foreign");
+            if mutation == "source" {
+                assert_eq!(
+                    std::fs::read(workspace.join("logs/model.log")).unwrap(),
+                    b"unarchived log"
+                );
+            }
+            if mutation == "replacement" {
+                assert_eq!(
+                    std::fs::read(workspace.join("keep")).unwrap(),
+                    b"replacement"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn workspace_registration_rejects_existing_files_and_unsafe_roots() {
+        let dir = directory();
+        let (docker, _) = fake_docker(Vec::new());
+        let mut session = Session::new(
+            lock(dir.path()),
+            docker,
+            IMAGE.to_owned(),
+            &std::env::current_exe().unwrap(),
+            Duration::from_secs(10),
+            Cancellation::default(),
+        )
+        .unwrap();
+        let workspace = tempfile::Builder::new()
+            .prefix("openvmm-fvp-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in(dir.path())
+            .unwrap();
+        std::fs::write(workspace.path().join("existing"), b"preserve").unwrap();
+        assert!(
+            session
+                .register_workspace(
+                    workspace.path(),
+                    &Deadline::new(Duration::from_secs(1)).unwrap()
+                )
+                .is_err()
+        );
+        assert!(
+            session
+                .register_workspace(dir.path(), &Deadline::new(Duration::from_secs(1)).unwrap())
+                .is_err()
+        );
+        assert!(!workspace.path().join(WORKSPACE_MARKER).exists());
+        assert_eq!(
+            std::fs::read(workspace.path().join("existing")).unwrap(),
+            b"preserve"
+        );
+    }
+
+    #[test]
+    fn foreign_or_newer_state_prevents_workspace_retirement() {
+        for newer in [false, true] {
+            let dir = directory();
+            let (mut session, workspace, _) = sealed_workspace(dir.path());
+            let bytes = if newer {
+                let mut state = serde_json::to_value(&session.state).unwrap();
+                state["schema_version"] = serde_json::json!(2);
+                serde_json::to_vec(&state).unwrap()
+            } else {
+                b"{foreign or corrupt state".to_vec()
+            };
+            std::fs::write(session.lock.state_path(), &bytes).unwrap();
+            assert!(session.retire_state().is_err());
+            assert_eq!(std::fs::read(session.lock.state_path()).unwrap(), bytes);
+            assert_eq!(
+                std::fs::read(workspace.join("logs/model.log")).unwrap(),
+                b"retained log"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_state_without_workspace_declaration_is_preserved() {
+        let dir = directory();
+        let lock = lock(dir.path());
+        let record = state();
+        lock.write_state(None, &record).unwrap();
+        let mut legacy = serde_json::to_value(record).unwrap();
+        legacy.as_object_mut().unwrap().remove("workspace");
+        let bytes = serde_json::to_vec(&legacy).unwrap();
+        std::fs::write(lock.state_path(), &bytes).unwrap();
+        assert!(lock.read_state().is_err());
+        assert_eq!(std::fs::read(lock.state_path()).unwrap(), bytes);
+    }
+
+    #[test]
+    fn recovery_preserves_a_newer_workspace_marker() {
+        let dir = directory();
+        let (session, workspace, _) = sealed_workspace(dir.path());
+        let marker_path = workspace.join(WORKSPACE_MARKER);
+        let mut marker: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&marker_path).unwrap()).unwrap();
+        marker["schema_version"] = serde_json::json!(2);
+        let marker_bytes = serde_json::to_vec(&marker).unwrap();
+        std::fs::write(&marker_path, &marker_bytes).unwrap();
+        drop(session);
+        let lock = lock(dir.path());
+        let original = lock.read_state().unwrap().unwrap();
+        let mut stale = original.clone();
+        dead_owner(&mut stale);
+        lock.write_state(Some(&original), &stale).unwrap();
+        let (docker, _) = fake_docker(Vec::new());
+        assert!(
+            lock.recover(
+                &docker,
+                IMAGE,
+                &stale.expected_model,
+                Duration::from_secs(5),
+                &Cancellation::default()
+            )
+            .is_err()
+        );
+        assert_eq!(lock.read_state().unwrap(), Some(stale));
+        assert_eq!(std::fs::read(marker_path).unwrap(), marker_bytes);
+        assert_eq!(
+            std::fs::read(workspace.join("logs/model.log")).unwrap(),
+            b"retained log"
+        );
+    }
+
+    #[test]
+    fn recovery_finishes_retirement_when_the_verified_workspace_is_already_removed() {
+        let dir = directory();
+        let (mut session, workspace, output) = sealed_workspace(dir.path());
+        let registered = session.state.workspace.clone().unwrap();
+        let mut retiring = session.state.clone();
+        retiring.workspace.as_mut().unwrap().removal_started = true;
+        session
+            .lock
+            .write_state(Some(&session.state), &retiring)
+            .unwrap();
+        session.state = retiring;
+        registered
+            .remove(&Deadline::new(Duration::from_secs(5)).unwrap())
+            .unwrap();
+        assert!(!workspace.exists());
+        drop(session);
+        let lock = lock(dir.path());
+        let original = lock.read_state().unwrap().unwrap();
+        let mut stale = original.clone();
+        dead_owner(&mut stale);
+        lock.write_state(Some(&original), &stale).unwrap();
+        let (docker, _) = fake_docker(Vec::new());
+        lock.recover(
+            &docker,
+            IMAGE,
+            &stale.expected_model,
+            Duration::from_secs(5),
+            &Cancellation::default(),
+        )
+        .unwrap();
+        assert!(lock.read_state().unwrap().is_none());
+        assert_eq!(
+            std::fs::read(output.join("model.log")).unwrap(),
+            b"retained log"
+        );
+    }
+
+    #[test]
+    fn sigkill_during_post_verification_preserves_workspace_and_state() {
+        const CHILD: &str = "OPENVMM_FVP_POST_VERIFY_CRASH_CHILD";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let (mut session, workspace) = registered_workspace(Path::new(&root));
+            session.cancellation.cancel();
+            session.stop_resources().unwrap();
+            let state_path = session.lock.state_path();
+            let result = session.post_verify::<()>(
+                &Deadline::new(Duration::from_secs(2)).unwrap(),
+                |_, token| {
+                    token.check()?;
+                    let state = RunState::parse(&std::fs::read(&state_path)?)?;
+                    anyhow::ensure!(
+                        state.post_verification == PostVerification::InFlight,
+                        "post-verification intent was not persisted"
+                    );
+                    std::fs::write(workspace.join("logs/post-started"), b"verification began")?;
+                    signal_hook::low_level::raise(signal_hook::consts::SIGKILL)?;
+                    anyhow::bail!("SIGKILL did not terminate the verification owner")
+                },
+            );
+            panic!("verification owner survived: {result:?}");
+        }
+        let dir = directory();
+        let deadline = Deadline::new(Duration::from_secs(3)).unwrap();
+        let output = run_command_with_cleanup(
+            Command::new(std::env::current_exe().unwrap())
+                .arg("sigkill_during_post_verification_preserves_workspace_and_state")
+                .env(CHILD, dir.path()),
+            &deadline,
+            &deadline,
+        )
+        .unwrap();
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&output.status),
+            Some(signal_hook::consts::SIGKILL),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let lock = lock(dir.path());
+        let record = lock.read_state().unwrap().unwrap();
+        assert!(record.resources_stopped);
+        assert_eq!(record.post_verification, PostVerification::InFlight);
+        let workspace = record.workspace_path().unwrap().to_owned();
+        let original = std::fs::read(lock.state_path()).unwrap();
+        let (docker, fake) = fake_docker(Vec::new());
+        let error = lock
+            .recover(
+                &docker,
+                IMAGE,
+                &record.expected_model,
+                Duration::from_secs(1),
+                &Cancellation::default(),
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("post-verification"));
+        assert_eq!(std::fs::read(lock.state_path()).unwrap(), original);
+        assert!(fake.borrow().calls.is_empty());
+        assert_eq!(
+            std::fs::read(workspace.join("logs/post-started")).unwrap(),
+            b"verification began"
+        );
+        assert_eq!(
+            std::fs::read(workspace.join("logs/model.log")).unwrap(),
+            b"retained log"
+        );
     }
 }

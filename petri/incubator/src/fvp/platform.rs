@@ -359,7 +359,7 @@ impl PlatformSources {
 
     /// Build a Shrinkwrap command with the same isolated Python import policy
     /// used by inventory validation: the entry point's virtualenv Python with
-    /// `-I -B`, the canonical entry point, and normalized Python environment.
+    /// `-I -B -u`, the canonical entry point, and normalized Python environment.
     ///
     /// The launcher must use this builder instead of executing the raw entry
     /// point. Add Shrinkwrap arguments after construction; do not replace the
@@ -666,7 +666,7 @@ impl PlatformSources {
 
 fn isolated_python_command(python: &Path) -> Command {
     let mut command = Command::new(python);
-    command.args(["-I", "-B"]);
+    command.args(["-I", "-B", "-u"]);
     python_environment(&mut command);
     command
 }
@@ -945,6 +945,36 @@ struct TreeEntry {
 }
 
 impl ToolchainIdentity {
+    /// Stable digest of the observed paths, modes, symlink targets, and bytes.
+    /// This records the inventory without publishing its individual contents.
+    pub fn fingerprint(&self) -> String {
+        fn part(hash: &mut Sha256, bytes: &[u8]) {
+            hash.update((bytes.len() as u64).to_le_bytes());
+            hash.update(bytes);
+        }
+        let mut hash = Sha256::new();
+        for (path, entry) in &self.0 {
+            part(&mut hash, path.as_os_str().as_bytes());
+            hash.update(entry.mode.to_le_bytes());
+            part(&mut hash, entry.canonical.as_os_str().as_bytes());
+            match &entry.link {
+                Some(link) => {
+                    hash.update([1]);
+                    part(&mut hash, link.as_os_str().as_bytes());
+                }
+                None => hash.update([0]),
+            }
+            match &entry.sha256 {
+                Some(digest) => {
+                    hash.update([1]);
+                    part(&mut hash, digest.as_bytes());
+                }
+                None => hash.update([0]),
+            }
+        }
+        hex::encode(hash.finalize())
+    }
+
     /// Hash checkout and virtualenv files, modes, and link targets without writes.
     /// External file link targets, such as the Python interpreter, are hashed too.
     pub fn capture(root: &Path, deadline: &Deadline) -> anyhow::Result<Self> {
@@ -1315,6 +1345,7 @@ mod tests {
             [
                 std::ffi::OsStr::new("-I"),
                 std::ffi::OsStr::new("-B"),
+                std::ffi::OsStr::new("-u"),
                 sources.shrinkwrap_executable.as_os_str(),
             ]
         );
@@ -1342,8 +1373,20 @@ mod tests {
         fs::write(dir.path().join("venv/module.py"), b"approved").unwrap();
         let before = ToolchainIdentity::capture(dir.path(), &deadline()).unwrap();
         before.verify_unchanged(dir.path(), &deadline()).unwrap();
+        assert_eq!(
+            before.fingerprint(),
+            ToolchainIdentity::capture(dir.path(), &deadline())
+                .unwrap()
+                .fingerprint()
+        );
         fs::write(dir.path().join("venv/module.py"), b"modified").unwrap();
         assert!(before.verify_unchanged(dir.path(), &deadline()).is_err());
+        assert_ne!(
+            before.fingerprint(),
+            ToolchainIdentity::capture(dir.path(), &deadline())
+                .unwrap()
+                .fingerprint()
+        );
     }
 
     #[test]

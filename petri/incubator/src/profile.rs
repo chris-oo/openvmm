@@ -266,6 +266,8 @@ impl FvpConsole {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct FvpDeadlines {
+    /// Allowance for each input, locked inventory, or post-run validation phase.
+    pub validation: u64,
     /// Time from launching Shrinkwrap to observing the model process.
     pub model_start: u64,
     /// Time from observing the model to usable pipette.
@@ -287,6 +289,7 @@ pub struct FvpDeadlines {
 impl Default for FvpDeadlines {
     fn default() -> Self {
         Self {
+            validation: 300,
             model_start: 120,
             pipette_ready: 900,
             test_execution: 1800,
@@ -303,6 +306,7 @@ impl FvpDeadlines {
     /// Reject unreasonable phase budgets before starting external commands.
     pub fn validate(&self) -> anyhow::Result<()> {
         for (name, value, minimum, maximum) in [
+            ("validation", self.validation, 30, 1800),
             ("model-start", self.model_start, 30, 300),
             ("pipette-ready", self.pipette_ready, 120, 1800),
             ("test-execution", self.test_execution, 300, 7200),
@@ -530,16 +534,17 @@ mod tests {
     use test_with_tracing::test;
 
     #[test]
-    fn parses_fvp_profile_without_advertising_capabilities() {
+    fn parses_fvp_profile_with_declared_capabilities() {
         let profile =
             IncubatorProfile::from_toml(include_str!("../profiles/aarch64-fvp-cca.toml")).unwrap();
         assert_eq!(profile.incubator.arch(), Arch::Aarch64);
         let IncubatorBackend::FvpCca(config) = profile.incubator else {
             panic!("expected FVP profile");
         };
-        assert!(config.capabilities.is_empty());
+        assert_eq!(config.capabilities, ["cca"]);
         assert_eq!(config.primary_console, FvpConsole::Host);
         assert_eq!(config.deadlines.model_start, 120);
+        assert_eq!(config.deadlines.validation, 300);
         assert_eq!(config.deadlines.dhcp, 30);
         assert_eq!(config.port_retries, 20);
     }
@@ -582,6 +587,7 @@ mod tests {
     #[test]
     fn fvp_deadline_boundaries() {
         for (name, minimum, maximum) in [
+            ("validation", 30u64, 1800u64),
             ("model-start", 30u64, 300u64),
             ("pipette-ready", 120, 1800),
             ("test-execution", 300, 7200),

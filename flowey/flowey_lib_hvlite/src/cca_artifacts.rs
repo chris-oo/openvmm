@@ -139,4 +139,18 @@ mod tests {
         )
         .unwrap();
     }
+
+    #[test]
+    fn fvp_payload_rejects_altered_local_archive_bytes() {
+        let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        for (name, expected) in [
+            ("kernel.tar.gz", crate::cca_pins::KERNEL_ARCHIVE_SHA256),
+            ("initrd.tar.gz", crate::cca_pins::INITRD_ARCHIVE_SHA256),
+        ] {
+            let archive = directory.path().join(name);
+            fs::write(&archive, b"altered archive bytes").unwrap();
+            let error = verify_sha256(&archive, expected, name).unwrap_err();
+            assert!(error.to_string().contains("SHA-256 mismatch"), "{error:#}");
+        }
+    }
 }

@@ -98,6 +98,7 @@ fn dhcp_script(seconds: u64) -> String {
         : > \"$dhcp_dir/client.log\"\n\
         read dhcp_started dhcp_unused < /proc/uptime\n\
         dhcp_deadline=$((${{dhcp_started%.*}} * 100 + 1${{dhcp_started#*.}} - 100 + {seconds} * 100))\n\
+        echo 'INCUBATOR DHCP START'\n\
         setsid sh -c '\n\
             set +e\n\
             udhcpc -f -q -n -t 5 -T 3 -i eth0 > \"$1/client.log\" 2>&1\n\
@@ -141,7 +142,8 @@ fn dhcp_script(seconds: u64) -> String {
             echo \"CCA DHCP failed with status $dhcp_status\" >&2\n\
             cat \"$dhcp_log\" >&2\n\
             exit \"$dhcp_status\"\n\
-        fi\n",
+        fi\n\
+        echo 'INCUBATOR DHCP COMPLETE'\n",
         poll = dhcp_poll(),
     )
 }

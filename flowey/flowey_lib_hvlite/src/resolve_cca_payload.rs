@@ -140,6 +140,13 @@ impl FlowNodeWithConfig for Node {
 }
 
 impl CcaPayloadOutput {
+    /// Validate the qualified FVP payload, including cached extracted bytes.
+    /// QEMU may use a different local base initrd through [`Self::validate`].
+    pub fn validate_fvp(&self) -> anyhow::Result<()> {
+        self.validate()?;
+        validate_fvp_initrd(&self.initrd)
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
         validate_kernel_manifest(&crate::cca_artifacts::parse_manifest(
             &self.kernel_manifest,
@@ -160,6 +167,15 @@ impl CcaPayloadOutput {
         )?;
         validate_initrd(&self.initrd)
     }
+}
+
+fn validate_fvp_initrd(initrd: &Path) -> anyhow::Result<()> {
+    validate_initrd(initrd)?;
+    crate::cca_artifacts::verify_sha256(
+        initrd,
+        crate::cca_pins::BASE_INITRD_SHA256,
+        "FVP CCA base initrd",
+    )
 }
 
 fn validate_initrd(initrd: &Path) -> anyhow::Result<()> {
@@ -187,6 +203,56 @@ fn validate_kernel_manifest(manifest: &BTreeMap<String, String>) -> anyhow::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fvp_payload_rejects_tampered_cached_kernel() {
+        let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let root = directory.path();
+        fs_err::write(
+            root.join("manifest.txt"),
+            format!(
+                "architecture=aarch64\nrevision={}\nkernel_release={}\nconfig_sha256={}\nImage_sha256={}\n",
+                crate::cca_pins::LINUX_REVISION,
+                crate::cca_pins::LINUX_RELEASE,
+                crate::cca_pins::LINUX_CONFIG_SHA256,
+                crate::cca_pins::LINUX_IMAGE_SHA256,
+            ),
+        ).unwrap();
+        fs_err::write(root.join("Image"), b"modified cached Image").unwrap();
+        let payload = CcaPayloadOutput {
+            host_kernel: root.join("Image"),
+            realm_kernel: root.join("Image"),
+            kernel_config: root.join("config"),
+            kernel_manifest: root.join("manifest.txt"),
+            initrd: root.join("initrd"),
+        };
+        let error = payload.validate_fvp().unwrap_err();
+        assert!(
+            error.to_string().contains("CCA v15 Image SHA-256 mismatch"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn fvp_payload_rejects_tampered_cached_initrd_without_restricting_qemu() {
+        let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let initrd = directory.path().join("initrd");
+        for bytes in [
+            b"".as_slice(),
+            b"truncated initrd",
+            b"modified cached initrd",
+        ] {
+            fs_err::write(&initrd, bytes).unwrap();
+            validate_initrd(&initrd).unwrap();
+            let error = validate_fvp_initrd(&initrd).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("FVP CCA base initrd SHA-256 mismatch"),
+                "{error:#}"
+            );
+        }
+    }
 
     #[test]
     fn initrd_must_be_a_regular_file() {
