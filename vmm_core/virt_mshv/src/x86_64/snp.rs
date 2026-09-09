@@ -11,7 +11,6 @@ use std::io;
 
 pub(super) const SNP_IMPORT_CHUNK_PAGES: usize = 256;
 const HOST_ACCESS_BATCH_PAGES: usize = 256;
-const MAX_HOST_ACCESS_LOCKS: usize = 65_536;
 const MAX_HOST_ACCESS_GPNS_PER_LOCK: usize = 65_536;
 const MAX_HOST_ACCESS_GPN_REFERENCES: usize = 1_048_576;
 const MAX_CACHED_HOST_ACCESS_GPNS: usize = 1_048_576;
@@ -196,7 +195,6 @@ impl SnpPartitionState {
 
 #[derive(Debug, Copy, Clone, inspect::Inspect)]
 struct SnpHostAccessLimits {
-    max_locks: usize,
     max_gpns_per_lock: usize,
     max_gpn_references: usize,
     max_cached_gpns: usize,
@@ -205,7 +203,6 @@ struct SnpHostAccessLimits {
 impl Default for SnpHostAccessLimits {
     fn default() -> Self {
         Self {
-            max_locks: MAX_HOST_ACCESS_LOCKS,
             max_gpns_per_lock: MAX_HOST_ACCESS_GPNS_PER_LOCK,
             max_gpn_references: MAX_HOST_ACCESS_GPN_REFERENCES,
             max_cached_gpns: MAX_CACHED_HOST_ACCESS_GPNS,
@@ -289,18 +286,15 @@ impl SnpHostAccessState {
     /// Duplicate GPNs represent repeated references and remain in the exact
     /// lock key.
     fn reserve(&mut self, gpns: &[u64]) -> anyhow::Result<()> {
+        anyhow::ensure!(!gpns.is_empty(), "host-access lock must not be empty");
         anyhow::ensure!(
             gpns.len() <= self.limits.max_gpns_per_lock,
             "too many GPNs in one SNP host-access lock"
         );
-        anyhow::ensure!(
-            self.lock_count < self.limits.max_locks,
-            "too many active SNP host-access locks"
-        );
         let gpn_references = self
             .gpn_references
             .checked_add(gpns.len())
-            .ok_or_else(|| anyhow::anyhow!("SNP host-access lock count overflow"))?;
+            .ok_or_else(|| anyhow::anyhow!("SNP host-access GPN reference count overflow"))?;
         anyhow::ensure!(
             gpn_references <= self.limits.max_gpn_references,
             "too many active SNP host-access GPN references"
@@ -2160,7 +2154,6 @@ mod tests {
 
     fn test_host_access_state() -> SnpHostAccessState {
         SnpHostAccessState::new(SnpHostAccessLimits {
-            max_locks: 2,
             max_gpns_per_lock: 2,
             max_gpn_references: 3,
             max_cached_gpns: 2,
@@ -2168,7 +2161,7 @@ mod tests {
     }
 
     #[test]
-    fn host_access_locks_are_bounded_and_reference_counted() {
+    fn host_access_gpn_references_are_bounded_and_reference_counted() {
         let mut state = test_host_access_state();
         state.reserve(&[1, 1]).unwrap();
         state.reserve(&[2]).unwrap();
@@ -2180,6 +2173,24 @@ mod tests {
         state.release(&[2]);
         assert!(state.distinct_lock_sets.is_empty());
         assert!(state.locked_gpn_count.is_empty());
+    }
+
+    #[test]
+    fn host_access_lock_count_uses_gpn_reference_limit() {
+        let mut state = SnpHostAccessState::new(SnpHostAccessLimits {
+            max_gpns_per_lock: 1,
+            max_gpn_references: 4,
+            max_cached_gpns: 1,
+        });
+        state.reserve(&[1]).unwrap();
+        state.reserve(&[2]).unwrap();
+        state.reserve(&[3]).unwrap();
+        state.reserve(&[4]).unwrap();
+        assert_eq!(state.lock_count, 4);
+        assert!(state.reserve(&[5]).is_err());
+        assert!(state.reserve(&[]).is_err());
+        assert_eq!(state.gpn_references, 4);
+        assert_eq!(state.lock_count, 4);
     }
 
     #[test]
