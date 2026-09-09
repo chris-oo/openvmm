@@ -5,6 +5,8 @@
 
 #![forbid(unsafe_code)]
 
+pub use petri_artifacts_common::cca_payload;
+
 /// Artifact declarations
 pub mod artifacts {
     use petri_artifacts_core::declare_artifacts;

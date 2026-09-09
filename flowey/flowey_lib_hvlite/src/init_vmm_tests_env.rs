@@ -57,6 +57,8 @@ flowey_request! {
         pub test_linux_kernel_override: Option<ReadVar<PathBuf>>,
         /// Override the Linux test initrd staged for Petri artifact resolution.
         pub test_linux_initrd_override: Option<ReadVar<PathBuf>>,
+        /// Stage only the direct-boot payload; do not resolve unrelated firmware.
+        pub cca_payload_only: bool,
         /// Register a Windows test_igvm_agent_rpc_server binary
         pub register_test_igvm_agent_rpc_server: Option<ReadVar<TestIgvmAgentRpcServerOutput>>,
 
@@ -109,6 +111,7 @@ impl SimpleFlowNode for Node {
             register_tpm_guest_tests_linux,
             test_linux_kernel_override,
             test_linux_initrd_override,
+            cca_payload_only,
             register_test_igvm_agent_rpc_server,
             disk_images_dir,
             register_openhcl_igvm_files,
@@ -122,6 +125,14 @@ impl SimpleFlowNode for Node {
         } = request;
 
         let arch = CommonArch::from_architecture(vmm_tests_target.architecture)?;
+        if cca_payload_only {
+            anyhow::ensure!(
+                arch == CommonArch::Aarch64
+                    && test_linux_kernel_override.is_some()
+                    && test_linux_initrd_override.is_some(),
+                "CCA-only staging requires the common AArch64 kernel and initrd"
+            );
+        }
 
         let test_linux_initrd = test_linux_initrd_override.unwrap_or_else(|| {
             ctx.reqv(|v| crate::resolve_openvmm_test_initrd::Request::Get(arch, v))
@@ -150,10 +161,12 @@ impl SimpleFlowNode for Node {
                     })
                 });
 
-        let uefi =
-            ctx.reqv(|v| crate::download_uefi_mu_msvm::Request::GetMsvmFd { arch, msvm_fd: v });
+        let uefi = (!cca_payload_only).then(|| {
+            ctx.reqv(|v| crate::download_uefi_mu_msvm::Request::GetMsvmFd { arch, msvm_fd: v })
+        });
 
-        let virtio_win_dir = ctx.reqv(crate::resolve_openvmm_test_virtio_win::Request::Get);
+        let virtio_win_dir = (!cca_payload_only)
+            .then(|| ctx.reqv(crate::resolve_openvmm_test_virtio_win::Request::Get));
 
         // In CI, unstable test failures are non-gating and should be reported as
         // passing (with a warning). Outside of CI, unstable test failures are
@@ -506,19 +519,20 @@ impl SimpleFlowNode for Node {
                     )?;
                 }
 
-                let uefi_dir = test_content_dir.join(match arch {
-                    CommonArch::Aarch64 => {
-                        "hyperv.uefi.mscoreuefi.AARCH64.RELEASE/MsvmAARCH64/RELEASE_CLANGPDB/FV"
-                    }
-                    CommonArch::X86_64 => {
-                        "hyperv.uefi.mscoreuefi.x64.RELEASE/MsvmX64/RELEASE_VS2022/FV"
-                    }
-                });
-                fs_err::create_dir_all(&uefi_dir)?;
-                fs_err::copy(uefi, uefi_dir.join("MSVM.fd"))?;
+                if let Some(uefi) = uefi {
+                    let uefi_dir = test_content_dir.join(match arch {
+                        CommonArch::Aarch64 => {
+                            "hyperv.uefi.mscoreuefi.AARCH64.RELEASE/MsvmAARCH64/RELEASE_CLANGPDB/FV"
+                        }
+                        CommonArch::X86_64 => {
+                            "hyperv.uefi.mscoreuefi.x64.RELEASE/MsvmX64/RELEASE_VS2022/FV"
+                        }
+                    });
+                    fs_err::create_dir_all(&uefi_dir)?;
+                    fs_err::copy(uefi, uefi_dir.join("MSVM.fd"))?;
+                }
 
-                {
-                    let src = rt.read(virtio_win_dir);
+                if let Some(src) = rt.read(virtio_win_dir) {
                     let dst = test_content_dir.join("virtio-win");
                     let _ = fs_err::remove_dir_all(&dst);
                     flowey_lib_common::_util::copy_dir_all(&src, &dst)?;

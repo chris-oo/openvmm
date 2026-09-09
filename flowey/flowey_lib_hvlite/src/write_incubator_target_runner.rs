@@ -33,6 +33,10 @@ const INCUBATOR_ENV_POLICY: &[&str] = &[
 
 const NEXTEST_ARCHIVE_TMP_DIR: &str = "nextest-archive-tmp";
 const DEFAULT_INCUBATOR_RUST_LOG: &str = "info";
+// Incubator's FVP staging reads this inventory and adds the invoked nextest
+// binary in memory. Archives, cached files, and earlier outputs are not inputs.
+const FVP_SHARE_MANIFEST: &str = ".openvmm-fvp-share.json";
+const FVP_SHARE_INPUTS: &[&str] = &["pipette", "openvmm", "aarch64/Image", "aarch64/initrd"];
 
 /// Incubator platform selected at Flowey graph construction time.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,7 +45,81 @@ pub enum IncubatorPlatform {
     QemuTcg,
     /// QEMU Arm CCA L1 host platform.
     QemuCca,
+    /// Licensed Arm FVP CCA L1 host platform.
+    FvpCca,
 }
+
+/// Read-only local roots. Incubator validates their complete pinned inventory.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct FvpPlatformRoots {
+    pub platform: PathBuf,
+    pub package: PathBuf,
+}
+
+impl FvpPlatformRoots {
+    /// Resolve a writable output location without creating files in either
+    /// read-only input root, including when an ancestor is a symlink.
+    pub fn output_directory(&self, path: &Path) -> anyhow::Result<PathBuf> {
+        let roots = Self::resolve(Some(self.platform.clone()), Some(self.package.clone()))?;
+        let absolute = std::path::absolute(path)?;
+        anyhow::ensure!(
+            !absolute
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir)),
+            "FVP output directory must not contain parent traversal"
+        );
+        let mut existing = absolute.as_path();
+        let mut suffix = Vec::new();
+        loop {
+            match fs_err::symlink_metadata(existing) {
+                Ok(_) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    suffix.push(existing.file_name().context("invalid FVP output path")?);
+                    existing = existing.parent().context("invalid FVP output parent")?;
+                }
+                Err(error) => return Err(error).context("cannot inspect FVP output path"),
+            }
+        }
+        let mut output = fs_err::canonicalize(existing)?;
+        for part in suffix.into_iter().rev() {
+            output.push(part);
+        }
+        anyhow::ensure!(
+            !output.starts_with(&roots.platform) && !output.starts_with(&roots.package),
+            "FVP output directory must be outside the read-only platform and package roots"
+        );
+        Ok(output)
+    }
+
+    pub fn resolve(platform: Option<PathBuf>, package: Option<PathBuf>) -> anyhow::Result<Self> {
+        fn root(path: Option<PathBuf>, option: &str) -> anyhow::Result<PathBuf> {
+            let path = path.with_context(|| format!("FVP CCA requires {option}"))?;
+            anyhow::ensure!(!path.as_os_str().is_empty(), "{option} must not be empty");
+            let path = fs_err::canonicalize(&path)
+                .with_context(|| format!("cannot resolve {option}: {}", path.display()))?;
+            anyhow::ensure!(path.is_dir(), "{option} must name a directory");
+            Ok(path)
+        }
+        Ok(Self {
+            platform: root(platform, "--fvp-platform-root")?,
+            package: root(package, "--shrinkwrap-package-root")?,
+        })
+    }
+}
+
+// The verified FVP share contains guest artifacts, not a repository checkout.
+// In particular, nextest's host manifest and workspace paths cannot be mapped.
+const FVP_INCUBATOR_ENV_POLICY: &[&str] = &[
+    "RUST_LOG",
+    "RUST_BACKTRACE",
+    "OPENVMM_LOG",
+    "OPENVMM_SHOW_SPANS",
+    "OPENVMM_LOG_SPANS",
+    "PETRI_REMOTE_ARTIFACTS",
+    "PETRI_IGNORE_UNSTABLE_FAILURES",
+    "VMM_TESTS_CONTENT_DIR/p",
+    "TEST_OUTPUT_PATH/p",
+];
 
 fn cargo_target_runner_env_var(target: &target_lexicon::Triple) -> String {
     format!(
@@ -80,6 +158,8 @@ flowey_request! {
         pub initrd: Option<ReadVar<PathBuf>>,
         /// Path to the platform firmware image.
         pub firmware: Option<ReadVar<PathBuf>>,
+        /// FVP uses only the prepared content directory as its guest share.
+        pub fvp_roots: Option<FvpPlatformRoots>,
         /// Path to the OpenVMM repo root. Must contain any repo-relative paths
         /// referenced by the runner's environment (e.g. `NEXTEST_WORKSPACE_ROOT`,
         /// `CARGO_MANIFEST_DIR`) so they fall under the computed incubator share
@@ -118,6 +198,7 @@ impl SimpleFlowNode for Node {
             kernel,
             initrd,
             firmware,
+            fvp_roots,
             repo_root,
             test_content_dir,
             extra_share_paths,
@@ -162,7 +243,8 @@ impl SimpleFlowNode for Node {
                 if let Some(ref images_dir) = images_dir {
                     share_paths.push(images_dir.as_path());
                 }
-                let share_root = common_ancestor(&share_paths)?;
+                let share_root =
+                    incubator_share_root(fvp_roots.is_some(), &test_content_dir, &share_paths)?;
 
                 let guest_test_content_dir = guest_path(&share_root, &test_content_dir)?;
                 let output_dir = test_content_dir.join("test_results");
@@ -189,6 +271,19 @@ impl SimpleFlowNode for Node {
                     tmp_dir: &tmp_dir,
                 }));
                 add_incubator_target_runner_env(&mut nextest, &target, &incubator_bin);
+                if let Some(roots) = &fvp_roots {
+                    add_fvp_runner_env(&mut nextest, roots)?;
+                    for relative in FVP_SHARE_INPUTS {
+                        anyhow::ensure!(
+                            fs_err::symlink_metadata(test_content_dir.join(relative))?.is_file(),
+                            "FVP guest input must be a regular file: {relative}"
+                        );
+                    }
+                    fs_err::write(
+                        test_content_dir.join(FVP_SHARE_MANIFEST),
+                        serde_json::to_vec(FVP_SHARE_INPUTS)?,
+                    )?;
+                }
 
                 rt.write(nextest_env, &nextest);
 
@@ -198,6 +293,35 @@ impl SimpleFlowNode for Node {
 
         Ok(())
     }
+}
+
+fn incubator_share_root(fvp: bool, content: &Path, paths: &[&Path]) -> anyhow::Result<PathBuf> {
+    if fvp {
+        Ok(content.to_owned())
+    } else {
+        common_ancestor(paths)
+    }
+}
+
+fn add_fvp_runner_env(
+    env: &mut BTreeMap<String, String>,
+    roots: &FvpPlatformRoots,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !env.contains_key("INCUBATOR_QEMU_BINARY") && !env.contains_key("INCUBATOR_FIRMWARE"),
+        "FVP CCA does not accept QEMU binary or firmware overrides"
+    );
+    env.insert(
+        "INCUBATOR_FVP_PLATFORM_ROOT".into(),
+        roots.platform.display().to_string(),
+    );
+    env.insert(
+        "INCUBATOR_SHRINKWRAP_PACKAGE_ROOT".into(),
+        roots.package.display().to_string(),
+    );
+    env.insert("INCUBATOR_ENV".into(), FVP_INCUBATOR_ENV_POLICY.join(":"));
+    env.insert("PETRI_REMOTE_ARTIFACTS".into(), "0".into());
+    Ok(())
 }
 
 /// Inputs to [`incubator_runner_env`].
@@ -307,6 +431,87 @@ fn common_ancestor(paths: &[&Path]) -> anyhow::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validates_fvp_roots() {
+        let file = std::env::current_exe().unwrap();
+        let directory = file.parent().unwrap().to_path_buf();
+        let roots =
+            FvpPlatformRoots::resolve(Some(directory.clone()), Some(directory.clone())).unwrap();
+        assert!(roots.platform.is_absolute());
+        assert_eq!(roots.platform, roots.package);
+        assert!(
+            roots
+                .output_directory(&directory.join("generated-output"))
+                .is_err()
+        );
+        assert!(
+            roots
+                .output_directory(&directory.parent().unwrap().join("separate-output"))
+                .is_ok()
+        );
+        assert!(FvpPlatformRoots::resolve(None, Some(directory.clone())).is_err());
+        assert!(FvpPlatformRoots::resolve(Some(directory.clone()), None).is_err());
+        assert!(FvpPlatformRoots::resolve(Some(file), Some(directory.clone())).is_err());
+        assert!(
+            FvpPlatformRoots::resolve(
+                Some(directory.join("missing-root")),
+                Some(directory.clone())
+            )
+            .is_err()
+        );
+        assert!(FvpPlatformRoots::resolve(Some(PathBuf::new()), Some(directory)).is_err());
+    }
+
+    #[test]
+    fn fvp_share_excludes_repository_and_external_archives() {
+        let content = Path::new("/repo/target/content");
+        let paths = [Path::new("/repo"), content, Path::new("/external/archive")];
+        let share = incubator_share_root(true, content, &paths).unwrap();
+        assert_eq!(share, content);
+        assert_eq!(
+            guest_path(
+                &share,
+                &content.join("nextest-archive-tmp/unpacked/target/tests")
+            )
+            .unwrap(),
+            "/share/nextest-archive-tmp/unpacked/target/tests"
+        );
+        assert_eq!(
+            incubator_share_root(false, content, &paths).unwrap(),
+            Path::new("/")
+        );
+        assert_eq!(
+            serde_json::to_value(FVP_SHARE_INPUTS).unwrap(),
+            serde_json::json!(["pipette", "openvmm", "aarch64/Image", "aarch64/initrd"])
+        );
+    }
+
+    #[test]
+    fn fvp_runner_keeps_actual_backend_and_limits_guest_paths() {
+        let roots = FvpPlatformRoots {
+            platform: "/platform".into(),
+            package: "/package".into(),
+        };
+        let mut env = BTreeMap::new();
+        let target = target_lexicon::triple!("aarch64-unknown-linux-musl");
+        add_incubator_target_runner_env(&mut env, &target, Path::new("/incubator"));
+        add_fvp_runner_env(&mut env, &roots).unwrap();
+        assert_eq!(env[&cargo_target_runner_env_var(&target)], "/incubator");
+        assert_eq!(env["INCUBATOR_FVP_PLATFORM_ROOT"], "/platform");
+        assert_eq!(env["INCUBATOR_SHRINKWRAP_PACKAGE_ROOT"], "/package");
+        assert_eq!(env["PETRI_REMOTE_ARTIFACTS"], "0");
+        assert_eq!(env["INCUBATOR_ENV"], FVP_INCUBATOR_ENV_POLICY.join(":"));
+        assert!(!env["INCUBATOR_ENV"].contains("NEXTEST_WORKSPACE_ROOT"));
+        assert!(!env["INCUBATOR_ENV"].contains("CARGO_MANIFEST_DIR"));
+        assert!(!env["INCUBATOR_ENV"].contains("BIN_EXE"));
+        assert!(!env.contains_key("PETRI_CAPABILITIES"));
+        for key in ["INCUBATOR_QEMU_BINARY", "INCUBATOR_FIRMWARE"] {
+            let mut invalid = env.clone();
+            invalid.insert(key.into(), "/override".into());
+            assert!(add_fvp_runner_env(&mut invalid, &roots).is_err());
+        }
+    }
 
     #[test]
     fn maps_guest_share_paths() {

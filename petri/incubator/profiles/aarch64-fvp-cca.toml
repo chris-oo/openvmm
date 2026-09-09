@@ -1,9 +1,10 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-# Opt-in licensed FVP profile. Runtime integration is a separate stack layer.
-# Do not advertise cca until the platform has booted and pipette is ready.
+# Opt-in licensed FVP profile. The runtime publishes requested capabilities
+# only after platform validation, boot, and a pipette handshake.
 [incubator]
 type = "fvp-cca"
 consoles = ["host", "edk2", "rmm"]
 primary-console = "host"
+capabilities = ["cca"]

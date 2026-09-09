@@ -6,6 +6,8 @@
 #![forbid(unsafe_code)]
 
 use anyhow::Context;
+use clap::CommandFactory;
+use clap::FromArgMatches;
 use clap::Parser;
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
@@ -31,6 +33,12 @@ struct Args {
     /// Path to the platform firmware image.
     #[clap(long, env = "INCUBATOR_FIRMWARE")]
     firmware: Option<PathBuf>,
+    /// Root containing the provisioned Shrinkwrap checkout for FVP CCA.
+    #[clap(long, env = "INCUBATOR_FVP_PLATFORM_ROOT")]
+    fvp_platform_root: Option<PathBuf>,
+    /// Root containing the pinned Shrinkwrap FVP firmware package.
+    #[clap(long, env = "INCUBATOR_SHRINKWRAP_PACKAGE_ROOT")]
+    shrinkwrap_package_root: Option<PathBuf>,
     /// Directory to share with the guest.
     #[clap(long, env = "INCUBATOR_SHARE")]
     share: String,
@@ -61,6 +69,8 @@ struct Args {
     #[clap(long, env = "INCUBATOR_TIMEOUT", default_value_t = 1800)]
     timeout: u64,
     /// Command to run in the guest: the program followed by its arguments.
+    /// FVP requires a snapshotted program under the guest share; use
+    /// --map-command-path when supplying its host path.
     ///
     /// May be preceded by `--`, but it is not required, so that cargo-nextest
     /// can invoke us as `incubator <test-binary> <args>`.
@@ -78,19 +88,43 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let args = Args::parse();
+    let matches = Args::command().get_matches();
+    let args = Args::from_arg_matches(&matches)?;
     let share_dir = PathBuf::from(&args.share);
     let path_mapper = incubator::HostPathMapper::new(&share_dir, incubator::GUEST_SHARE_ROOT)?;
     let guest_pipette = args
         .guest_pipette
         .unwrap_or_else(|| format!("{}/pipette", incubator::GUEST_SHARE_ROOT));
 
-    let profile = incubator::IncubatorProfile::from_file(std::path::Path::new(&args.profile))?;
+    let mut profile = incubator::IncubatorProfile::from_file(std::path::Path::new(&args.profile))?;
+    if let incubator::IncubatorBackend::FvpCca(config) = &mut profile.incubator {
+        if matches.value_source("timeout") != Some(clap::parser::ValueSource::DefaultValue) {
+            config.deadlines.test_execution = args.timeout;
+            config.validate()?;
+        }
+        anyhow::ensure!(
+            args.firmware.is_none() && args.qemu_binary.is_none() && args.no_pty,
+            "FVP requires --no-pty and does not accept QEMU firmware or binary overrides"
+        );
+    } else {
+        anyhow::ensure!(
+            args.fvp_platform_root.is_none() && args.shrinkwrap_package_root.is_none(),
+            "FVP platform roots require an FVP CCA profile"
+        );
+    }
 
     let (kernel, initrd, firmware) = match &profile.incubator {
-        incubator::IncubatorBackend::FvpCca(_) => {
-            anyhow::bail!("FVP CCA launch integration is not enabled in this stack layer")
-        }
+        incubator::IncubatorBackend::FvpCca(_) => (
+            Some(
+                args.kernel
+                    .context("FVP requires --kernel or INCUBATOR_KERNEL")?,
+            ),
+            Some(
+                args.initrd
+                    .context("FVP requires --initrd or INCUBATOR_INITRD")?,
+            ),
+            None,
+        ),
         incubator::IncubatorBackend::QemuTcg(_) => {
             let arch = profile.incubator.arch();
             let kernel = match args.kernel {
@@ -152,7 +186,23 @@ fn main() -> anyhow::Result<()> {
     let allocate_pty = !args.no_pty && std::io::stdin().is_terminal();
     let output = match profile.incubator {
         incubator::IncubatorBackend::FvpCca(_) => {
-            anyhow::bail!("FVP CCA launch integration is not enabled in this stack layer")
+            incubator::run_in_fvp_cca_incubator(incubator::FvpCcaIncubatorConfig {
+                profile,
+                kernel: kernel.context("missing FVP kernel")?,
+                initrd: initrd.context("missing FVP initrd")?,
+                share_dir,
+                output_dir,
+                guest_pipette_path: guest_pipette,
+                guest_command: command,
+                guest_env,
+                guest_current_dir: args.guest_current_dir,
+                platform_root: args
+                    .fvp_platform_root
+                    .context("FVP requires --fvp-platform-root or INCUBATOR_FVP_PLATFORM_ROOT")?,
+                shrinkwrap_package_root: args.shrinkwrap_package_root.context(
+                    "FVP requires --shrinkwrap-package-root or INCUBATOR_SHRINKWRAP_PACKAGE_ROOT",
+                )?,
+            })?
         }
         incubator::IncubatorBackend::QemuTcg(_) => {
             incubator::run_in_incubator(incubator::IncubatorConfig {

@@ -22,6 +22,7 @@ use petri_artifacts_vmm_test::tags::IsHostedOnHvliteAzureBlobStore;
 
 pub use petri_artifacts_vmm_test::artifacts::CONTAINER;
 pub use petri_artifacts_vmm_test::artifacts::STORAGE_ACCOUNT;
+pub use petri_artifacts_vmm_test::cca_payload;
 
 /// The VHDs currently stored in Azure Blob Storage.
 #[cfg_attr(feature = "clap", derive(clap::ValueEnum))]

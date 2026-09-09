@@ -13,12 +13,15 @@ use anyhow::Context as _;
 use flowey::node::prelude::ReadVar;
 use flowey::pipeline::prelude::*;
 use flowey_lib_hvlite::_jobs::local_build_and_run_nextest_vmm_tests::BuildSelections;
+use flowey_lib_hvlite::_jobs::local_build_and_run_nextest_vmm_tests::CcaPlatformSource;
 use flowey_lib_hvlite::_jobs::local_build_and_run_nextest_vmm_tests::VmmTestSelections;
 use flowey_lib_hvlite::common::CommonPlatform;
 use flowey_lib_hvlite::common::CommonTriple;
 use flowey_lib_hvlite::install_vmm_tests_deps::VmmTestsDepSelections;
 use flowey_lib_hvlite::install_vmm_tests_deps::VmmTestsDepSelectionsLinux;
 use flowey_lib_hvlite::install_vmm_tests_deps::VmmTestsDepSelectionsWindows;
+use flowey_lib_hvlite::write_incubator_target_runner::FvpPlatformRoots;
+use flowey_lib_hvlite::write_incubator_target_runner::IncubatorPlatform;
 use petri_artifacts_core::ArtifactId;
 use petri_artifacts_core::ArtifactListOutput;
 use std::collections::BTreeMap;
@@ -167,6 +170,14 @@ pub struct VmmTestsRunCli {
     /// Local AArch64 test-initrd archive.
     #[clap(long)]
     cca_initrd_archive: Option<PathBuf>,
+
+    /// Licensed FVP platform root (fallback: INCUBATOR_FVP_PLATFORM_ROOT).
+    #[clap(long)]
+    fvp_platform_root: Option<PathBuf>,
+
+    /// Pinned Shrinkwrap package root (fallback: INCUBATOR_SHRINKWRAP_PACKAGE_ROOT).
+    #[clap(long)]
+    shrinkwrap_package_root: Option<PathBuf>,
 }
 
 struct CargoNextestListRequest<'a> {
@@ -240,6 +251,8 @@ impl IntoPipeline for VmmTestsRunCli {
             cca_tfa_archive,
             cca_initrd_archive_sha256,
             cca_initrd_archive,
+            fvp_platform_root,
+            shrinkwrap_package_root,
         } = self;
 
         // When --incubator is set, --target must also be specified
@@ -286,8 +299,76 @@ impl IntoPipeline for VmmTestsRunCli {
             .as_deref()
             .map(classify_incubator_platform)
             .transpose()?;
+        let fvp_roots = if incubator_platform == Some(IncubatorPlatform::FvpCca) {
+            validate_fvp_target(FlowPlatform::host(backend_hint), &target.as_triple())?;
+            anyhow::ensure!(
+                cca_rmm_archive.is_none()
+                    && cca_rmm_archive_sha256.is_none()
+                    && cca_tfa_archive.is_none()
+                    && cca_tfa_archive_sha256.is_none()
+                    && custom_uefi_firmware.is_none(),
+                "FVP CCA does not accept QEMU TF-A/TF-RMM or UEFI firmware overrides"
+            );
+            anyhow::ensure!(
+                custom_kernel.is_none() && custom_kernel_modules.is_none(),
+                "FVP CCA uses the common CCA payload; use --cca-kernel-archive and --cca-initrd-archive"
+            );
+            Some(FvpPlatformRoots::resolve(
+                fvp_platform_root
+                    .or_else(|| std::env::var_os("INCUBATOR_FVP_PLATFORM_ROOT").map(PathBuf::from)),
+                shrinkwrap_package_root.or_else(|| {
+                    std::env::var_os("INCUBATOR_SHRINKWRAP_PACKAGE_ROOT").map(PathBuf::from)
+                }),
+            )?)
+        } else {
+            anyhow::ensure!(
+                fvp_platform_root.is_none() && shrinkwrap_package_root.is_none(),
+                "FVP platform roots require an FVP CCA incubator profile"
+            );
+            None
+        };
+        if let Some(roots) = &fvp_roots {
+            roots.output_directory(
+                dir.as_deref()
+                    .unwrap_or(&repo_root.join("target").join("vmm_tests")),
+            )?;
+            anyhow::ensure!(
+                !repo_root.starts_with(&roots.platform) && !repo_root.starts_with(&roots.package),
+                "the build repository must be outside the read-only FVP input roots"
+            );
+        }
         let cca_platform_source = match incubator_platform {
-            Some(flowey_lib_hvlite::write_incubator_target_runner::IncubatorPlatform::QemuCca) => {
+            Some(IncubatorPlatform::FvpCca) => {
+                let local_archives = match (cca_kernel_archive, cca_initrd_archive) {
+                    (None, None) => None,
+                    (Some(kernel), Some(initrd)) => {
+                        let archive = |path: PathBuf| -> anyhow::Result<PathBuf> {
+                            let path = if path.is_absolute() {
+                                path
+                            } else {
+                                repo_root.join(path)
+                            };
+                            anyhow::ensure!(
+                                path.is_file(),
+                                "CCA payload archive not found at {}",
+                                path.display()
+                            );
+                            Ok(path)
+                        };
+                        Some((archive(kernel)?, archive(initrd)?))
+                    }
+                    _ => anyhow::bail!(
+                        "FVP CCA local payload requires both kernel and initrd archives"
+                    ),
+                };
+                Some(CcaPlatformSource::fvp_payload(
+                    cca_deps_version,
+                    cca_kernel_archive_sha256,
+                    cca_initrd_archive_sha256,
+                    local_archives,
+                )?)
+            }
+            Some(IncubatorPlatform::QemuCca) => {
                 let version = cca_deps_version
                     .unwrap_or_else(|| flowey_lib_hvlite::cca_pins::OPENVMM_DEPS_RELEASE.into());
                 let kernel_archive_sha256 = cca_kernel_archive_sha256
@@ -313,15 +394,13 @@ impl IntoPipeline for VmmTestsRunCli {
                     "specify all local CCA archives or none"
                 );
                 if local_count == 0 {
-                    Some(
-                        flowey_lib_hvlite::_jobs::local_build_and_run_nextest_vmm_tests::CcaPlatformSource::Release {
-                            version,
-                            kernel_archive_sha256,
-                            rmm_archive_sha256,
-                            tfa_archive_sha256,
-                            initrd_archive_sha256,
-                        },
-                    )
+                    Some(CcaPlatformSource::Release {
+                        version,
+                        kernel_archive_sha256,
+                        rmm_archive_sha256,
+                        tfa_archive_sha256,
+                        initrd_archive_sha256,
+                    })
                 } else {
                     let [kernel, rmm, tfa, initrd] = local_archives.map(|archive| {
                         let path = archive.unwrap();
@@ -343,19 +422,17 @@ impl IntoPipeline for VmmTestsRunCli {
                             path.display()
                         );
                     }
-                    Some(
-                        flowey_lib_hvlite::_jobs::local_build_and_run_nextest_vmm_tests::CcaPlatformSource::Local {
-                            version,
-                            kernel_archive: kernel,
-                            kernel_archive_sha256,
-                            rmm_archive: rmm,
-                            rmm_archive_sha256,
-                            tfa_archive: tfa,
-                            tfa_archive_sha256,
-                            initrd_archive: initrd,
-                            initrd_archive_sha256,
-                        },
-                    )
+                    Some(CcaPlatformSource::Local {
+                        version,
+                        kernel_archive: kernel,
+                        kernel_archive_sha256,
+                        rmm_archive: rmm,
+                        rmm_archive_sha256,
+                        tfa_archive: tfa,
+                        tfa_archive_sha256,
+                        initrd_archive: initrd,
+                        initrd_archive_sha256,
+                    })
                 }
             }
             _ => {
@@ -369,7 +446,7 @@ impl IntoPipeline for VmmTestsRunCli {
                         && cca_tfa_archive.is_none()
                         && cca_initrd_archive_sha256.is_none()
                         && cca_initrd_archive.is_none(),
-                    "CCA artifact options require a QEMU CCA incubator profile"
+                    "CCA artifact options require a CCA incubator profile"
                 );
                 None
             }
@@ -526,6 +603,11 @@ impl IntoPipeline for VmmTestsRunCli {
                     .any(|a| a.filename().ends_with(".vhdx")));
         validate_output_dir(dir.as_deref(), target_os, needs_windows_disk)?;
         let test_content_dir = dir.unwrap_or_else(|| repo_root.join("target").join("vmm_tests"));
+        let test_content_dir = if let Some(roots) = &fvp_roots {
+            roots.output_directory(&test_content_dir)?
+        } else {
+            test_content_dir
+        };
         std::fs::create_dir_all(&test_content_dir).context("failed to create output directory")?;
 
         let openvmm_repo = flowey_lib_common::git_checkout::RepoSource::ExistingClone(
@@ -605,6 +687,7 @@ impl IntoPipeline for VmmTestsRunCli {
                     incubator_profile,
                     incubator_platform,
                     cca_platform_source,
+                    fvp_roots,
                     done: ctx.new_done_handle(),
                 }
             });
@@ -882,9 +965,7 @@ fn default_incubator_profile(repo_root: &Path, target: &CommonTriple) -> Option<
     )
 }
 
-fn classify_incubator_platform(
-    profile: &Path,
-) -> anyhow::Result<flowey_lib_hvlite::write_incubator_target_runner::IncubatorPlatform> {
+fn classify_incubator_platform(profile: &Path) -> anyhow::Result<IncubatorPlatform> {
     let contents = std::fs::read_to_string(profile)
         .with_context(|| format!("failed to read incubator profile {}", profile.display()))?;
     let document = contents
@@ -926,13 +1007,25 @@ fn classify_incubator_platform(
                     == Some(flowey_lib_hvlite::cca_pins::QEMU_INITRD_LOAD_ADDRESS),
                 "QEMU CCA profile initrd-load-address does not match the pinned platform"
             );
-            Ok(flowey_lib_hvlite::write_incubator_target_runner::IncubatorPlatform::QemuCca)
+            Ok(IncubatorPlatform::QemuCca)
         }
-        "qemu-tcg" => {
-            Ok(flowey_lib_hvlite::write_incubator_target_runner::IncubatorPlatform::QemuTcg)
-        }
+        "qemu-tcg" => Ok(IncubatorPlatform::QemuTcg),
+        "fvp-cca" => Ok(IncubatorPlatform::FvpCca),
         other => anyhow::bail!("unsupported incubator backend type: {other}"),
     }
+}
+
+fn validate_fvp_target(host: FlowPlatform, target: &target_lexicon::Triple) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        matches!(host, FlowPlatform::Linux(_))
+            && matches!(
+                target.architecture,
+                target_lexicon::Architecture::Aarch64(_)
+            )
+            && target.operating_system == target_lexicon::OperatingSystem::Linux,
+        "FVP CCA requires a Linux host and an AArch64 Linux target"
+    );
+    Ok(())
 }
 
 /// Validate the output directory path based on the current platform.
@@ -1228,6 +1321,7 @@ impl ResolvedArtifactSelections {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flowey::node::prelude::FlowPlatformLinuxDistro;
 
     #[test]
     fn parses_target_runner_with_arguments() {
@@ -1241,17 +1335,142 @@ mod tests {
     fn classifies_incubator_profile_backend() {
         assert_eq!(
             classify_incubator_platform(
+                &crate::repo_root().join("petri/incubator/profiles/aarch64-fvp-cca.toml")
+            )
+            .unwrap(),
+            IncubatorPlatform::FvpCca
+        );
+        assert_eq!(
+            classify_incubator_platform(
                 &crate::repo_root().join("petri/incubator/profiles/aarch64-qemu-cca.toml")
             )
             .unwrap(),
-            flowey_lib_hvlite::write_incubator_target_runner::IncubatorPlatform::QemuCca
+            IncubatorPlatform::QemuCca
         );
         assert_eq!(
             classify_incubator_platform(
                 &crate::repo_root().join("petri/incubator/profiles/aarch64-tcg-pcie.toml")
             )
             .unwrap(),
-            flowey_lib_hvlite::write_incubator_target_runner::IncubatorPlatform::QemuTcg
+            IncubatorPlatform::QemuTcg
         );
+    }
+
+    #[test]
+    fn fvp_requires_linux_host_and_aarch64_linux_guest() {
+        let linux = FlowPlatform::Linux(FlowPlatformLinuxDistro::Ubuntu);
+        validate_fvp_target(
+            linux,
+            &target_lexicon::triple!("aarch64-unknown-linux-musl"),
+        )
+        .unwrap();
+        for target in [
+            target_lexicon::triple!("x86_64-unknown-linux-gnu"),
+            target_lexicon::triple!("aarch64-pc-windows-msvc"),
+        ] {
+            assert!(validate_fvp_target(linux, &target).is_err());
+        }
+        assert!(
+            validate_fvp_target(
+                FlowPlatform::Windows,
+                &target_lexicon::triple!("aarch64-unknown-linux-musl")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn fvp_rejects_qemu_firmware_overrides_before_artifact_discovery() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: VmmTestsRunCli,
+        }
+
+        let profile = crate::repo_root().join("petri/incubator/profiles/aarch64-fvp-cca.toml");
+        for option in [
+            "--cca-rmm-archive",
+            "--cca-rmm-archive-sha256",
+            "--cca-tfa-archive",
+            "--cca-tfa-archive-sha256",
+            "--custom-uefi-firmware",
+        ] {
+            let cli = Cli::try_parse_from([
+                "vmm-tests-run",
+                "--target",
+                "linux-aarch64-musl",
+                "--incubator",
+                profile.to_str().unwrap(),
+                option,
+                "unused",
+            ])
+            .unwrap();
+            let error = cli
+                .args
+                .into_pipeline(PipelineBackendHint::Local)
+                .err()
+                .unwrap();
+            // On non-Linux hosts, target validation must also fail before discovery.
+            let expected = if cfg!(target_os = "linux") {
+                "FVP CCA does not accept QEMU"
+            } else {
+                "FVP CCA requires a Linux host"
+            };
+            assert!(error.to_string().contains(expected), "{option}: {error:#}");
+        }
+    }
+
+    #[test]
+    fn fvp_payload_cli_rejects_unqualified_identities_before_discovery() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: VmmTestsRunCli,
+        }
+
+        let roots = crate::repo_root().join("petri/incubator/profiles");
+        let profile = roots.join("aarch64-fvp-cca.toml");
+        for (option, value) in [
+            ("--cca-deps-version", "0.3.0-140"),
+            ("--cca-kernel-archive-sha256", "unqualified-kernel"),
+            ("--cca-initrd-archive-sha256", "unqualified-initrd"),
+        ] {
+            let cli = Cli::try_parse_from([
+                "vmm-tests-run",
+                "--target",
+                "linux-aarch64-musl",
+                "--incubator",
+                profile.to_str().unwrap(),
+                "--fvp-platform-root",
+                roots.to_str().unwrap(),
+                "--shrinkwrap-package-root",
+                roots.to_str().unwrap(),
+                option,
+                value,
+            ])
+            .unwrap();
+            let error = cli
+                .args
+                .into_pipeline(PipelineBackendHint::Local)
+                .err()
+                .unwrap();
+            let message = error.to_string();
+            if cfg!(target_os = "linux") {
+                assert!(
+                    message.contains("FVP CCA requires the qualified"),
+                    "{error:#}"
+                );
+                assert!(message.contains(option), "{error:#}");
+            } else {
+                assert!(
+                    message.contains("FVP CCA requires a Linux host"),
+                    "{error:#}"
+                );
+            }
+        }
     }
 }

@@ -6,6 +6,24 @@
 
 #![forbid(unsafe_code)]
 
+/// Published payload identities for the qualified CCA v15 incubators.
+pub mod cca_payload {
+    /// Release containing the qualified kernel and immutable base initrd.
+    pub const OPENVMM_DEPS_RELEASE: &str = "0.3.0-139";
+    /// SHA-256 of the published AArch64 CCA kernel archive.
+    pub const KERNEL_ARCHIVE_SHA256: &str =
+        "852e5b6edf09b1e54ac39ba50f34cbe502b24f03b4598a5bc26db29d138217eb";
+    /// SHA-256 of the published AArch64 test-initrd archive.
+    pub const INITRD_ARCHIVE_SHA256: &str =
+        "132b4b4e66b032ee108cd06fc17aee5660b930aade9a3dace4525709a5fbf344";
+    /// SHA-256 of the extracted, unmodified Linux Image.
+    pub const LINUX_IMAGE_SHA256: &str =
+        "2f4dde0a43269ede897b2382b77130e63427b32cb23e968cfc494e82320d5482";
+    /// SHA-256 of the extracted base initrd, before per-run init injection.
+    pub const BASE_INITRD_SHA256: &str =
+        "74ecad46de9da08aff7520a93a09fa473276360bcb018e106ae41862a6f2feb2";
+}
+
 /// Runtime capabilities that VMM tests can require.
 pub mod capabilities {
     /// Software VPCI device emulation support.

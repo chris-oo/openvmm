@@ -36,6 +36,7 @@
 - [Testing](./dev_guide/tests.md)
   - [Unit Tests](./dev_guide/tests/unit.md)
   - [VMM Tests](./dev_guide/tests/vmm.md)
+    - [CCA Incubator Tests](./dev_guide/tests/vmm/qemu_cca.md)
     - [Azure-hosted Test Images](./dev_guide/tests/vmm/azure_images.md)
   - [Performance Tests (burette)](./dev_guide/tests/perf.md)
   - [Fuzzing](./dev_guide/tests/fuzzing.md)

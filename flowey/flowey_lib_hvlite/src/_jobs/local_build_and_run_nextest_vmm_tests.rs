@@ -60,6 +60,18 @@ pub struct BuildSelections {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum CcaPlatformSource {
+    PayloadRelease {
+        version: String,
+        kernel_archive_sha256: String,
+        initrd_archive_sha256: String,
+    },
+    PayloadLocal {
+        version: String,
+        kernel_archive: PathBuf,
+        kernel_archive_sha256: String,
+        initrd_archive: PathBuf,
+        initrd_archive_sha256: String,
+    },
     Release {
         version: String,
         kernel_archive_sha256: String,
@@ -78,6 +90,81 @@ pub enum CcaPlatformSource {
         initrd_archive: PathBuf,
         initrd_archive_sha256: String,
     },
+}
+
+impl CcaPlatformSource {
+    /// Select the qualified FVP payload, optionally from local copies of the
+    /// official archives. The payload resolver verifies their bytes.
+    pub fn fvp_payload(
+        version: Option<String>,
+        kernel_archive_sha256: Option<String>,
+        initrd_archive_sha256: Option<String>,
+        local_archives: Option<(PathBuf, PathBuf)>,
+    ) -> anyhow::Result<Self> {
+        let version = version.unwrap_or_else(|| crate::cca_pins::OPENVMM_DEPS_RELEASE.into());
+        let kernel_archive_sha256 =
+            kernel_archive_sha256.unwrap_or_else(|| crate::cca_pins::KERNEL_ARCHIVE_SHA256.into());
+        let initrd_archive_sha256 =
+            initrd_archive_sha256.unwrap_or_else(|| crate::cca_pins::INITRD_ARCHIVE_SHA256.into());
+        let source = match local_archives {
+            None => Self::PayloadRelease {
+                version,
+                kernel_archive_sha256,
+                initrd_archive_sha256,
+            },
+            Some((kernel_archive, initrd_archive)) => Self::PayloadLocal {
+                version,
+                kernel_archive,
+                kernel_archive_sha256,
+                initrd_archive,
+                initrd_archive_sha256,
+            },
+        };
+        source.validate_fvp_payload()?;
+        Ok(source)
+    }
+
+    fn validate_fvp_payload(&self) -> anyhow::Result<()> {
+        let (version, kernel_hash, initrd_hash) = match self {
+            Self::PayloadRelease {
+                version,
+                kernel_archive_sha256,
+                initrd_archive_sha256,
+            }
+            | Self::PayloadLocal {
+                version,
+                kernel_archive_sha256,
+                initrd_archive_sha256,
+                ..
+            } => (version, kernel_archive_sha256, initrd_archive_sha256),
+            _ => anyhow::bail!("FVP CCA requires common payload artifacts without QEMU firmware"),
+        };
+        for (option, selected, expected) in [
+            (
+                "--cca-deps-version",
+                version,
+                crate::cca_pins::OPENVMM_DEPS_RELEASE,
+            ),
+            (
+                "--cca-kernel-archive-sha256",
+                kernel_hash,
+                crate::cca_pins::KERNEL_ARCHIVE_SHA256,
+            ),
+            (
+                "--cca-initrd-archive-sha256",
+                initrd_hash,
+                crate::cca_pins::INITRD_ARCHIVE_SHA256,
+            ),
+        ] {
+            anyhow::ensure!(
+                selected == expected,
+                "FVP CCA requires the qualified {} payload: {option} must be {expected}; \
+                 local archive paths are allowed only with these identities",
+                crate::cca_pins::OPENVMM_DEPS_RELEASE
+            );
+        }
+        Ok(())
+    }
 }
 
 flowey_request! {
@@ -124,8 +211,159 @@ flowey_request! {
             Option<crate::write_incubator_target_runner::IncubatorPlatform>,
         /// Coherent CCA platform artifact source.
         pub cca_platform_source: Option<CcaPlatformSource>,
+        /// Licensed FVP toolchain and package input directories.
+        pub fvp_roots: Option<crate::write_incubator_target_runner::FvpPlatformRoots>,
 
         pub done: WriteVar<SideEffect>,
+    }
+}
+
+fn validate_fvp_selections(selections: &VmmTestSelections) -> anyhow::Result<()> {
+    let allowed = BuildSelections {
+        openvmm: true,
+        pipette_linux: true,
+        ..Default::default()
+    };
+    anyhow::ensure!(
+        selections.build == allowed
+            && selections.artifacts.is_empty()
+            && !selections.needs_release_igvm,
+        "FVP CCA supports only direct-boot CCA artifacts; narrow --filter to the CCA tests"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fvp_payload_defaults_to_qualified_release() {
+        let source = CcaPlatformSource::fvp_payload(None, None, None, None).unwrap();
+        let CcaPlatformSource::PayloadRelease {
+            version,
+            kernel_archive_sha256,
+            initrd_archive_sha256,
+        } = source
+        else {
+            panic!("expected release payload");
+        };
+        assert_eq!(version, crate::cca_pins::OPENVMM_DEPS_RELEASE);
+        assert_eq!(
+            kernel_archive_sha256,
+            crate::cca_pins::KERNEL_ARCHIVE_SHA256
+        );
+        assert_eq!(
+            initrd_archive_sha256,
+            crate::cca_pins::INITRD_ARCHIVE_SHA256
+        );
+    }
+
+    #[test]
+    fn fvp_payload_accepts_same_identity_local_archives() {
+        let kernel = PathBuf::from("local/openvmm-test-linux-cca-v15.aarch64.0.3.0-139.tar.gz");
+        let initrd = PathBuf::from("local/openvmm-test-initrd.aarch64.0.3.0-139.tar.gz");
+        for explicit in [false, true] {
+            let source = CcaPlatformSource::fvp_payload(
+                explicit.then(|| crate::cca_pins::OPENVMM_DEPS_RELEASE.into()),
+                explicit.then(|| crate::cca_pins::KERNEL_ARCHIVE_SHA256.into()),
+                explicit.then(|| crate::cca_pins::INITRD_ARCHIVE_SHA256.into()),
+                Some((kernel.clone(), initrd.clone())),
+            )
+            .unwrap();
+            source.validate_fvp_payload().unwrap();
+            let CcaPlatformSource::PayloadLocal {
+                kernel_archive,
+                initrd_archive,
+                ..
+            } = source
+            else {
+                panic!("expected local payload");
+            };
+            assert_eq!(kernel_archive, kernel);
+            assert_eq!(initrd_archive, initrd);
+        }
+    }
+
+    #[test]
+    fn fvp_payload_rejects_incompatible_release_and_archive_identities() {
+        for local in [None, Some(("local-kernel".into(), "local-initrd".into()))] {
+            for (version, kernel, initrd, diagnostic) in [
+                (Some("0.3.0-140".into()), None, None, "--cca-deps-version"),
+                (
+                    None,
+                    Some("0".repeat(64)),
+                    None,
+                    "--cca-kernel-archive-sha256",
+                ),
+                (
+                    None,
+                    None,
+                    Some("0".repeat(64)),
+                    "--cca-initrd-archive-sha256",
+                ),
+            ] {
+                let error = CcaPlatformSource::fvp_payload(version, kernel, initrd, local.clone())
+                    .unwrap_err();
+                assert!(error.to_string().contains(diagnostic), "{error:#}");
+            }
+        }
+    }
+
+    #[test]
+    fn fvp_payload_revalidates_direct_graph_sources() {
+        let invalid = CcaPlatformSource::PayloadRelease {
+            version: "unqualified-release".into(),
+            kernel_archive_sha256: crate::cca_pins::KERNEL_ARCHIVE_SHA256.into(),
+            initrd_archive_sha256: crate::cca_pins::INITRD_ARCHIVE_SHA256.into(),
+        };
+        assert!(invalid.validate_fvp_payload().is_err());
+        let invalid = CcaPlatformSource::PayloadLocal {
+            version: crate::cca_pins::OPENVMM_DEPS_RELEASE.into(),
+            kernel_archive: "kernel".into(),
+            kernel_archive_sha256: crate::cca_pins::KERNEL_ARCHIVE_SHA256.into(),
+            initrd_archive: "initrd".into(),
+            initrd_archive_sha256: "0".repeat(64),
+        };
+        assert!(invalid.validate_fvp_payload().is_err());
+    }
+
+    fn fvp_selections() -> VmmTestSelections {
+        VmmTestSelections {
+            filter: "binary(=tests) & test(boot_linux_direct_cca)".into(),
+            artifacts: Vec::new(),
+            build: BuildSelections {
+                openvmm: true,
+                pipette_linux: true,
+                ..Default::default()
+            },
+            deps: VmmTestsDepSelections::Linux(
+                crate::install_vmm_tests_deps::VmmTestsDepSelectionsLinux {
+                    hugetlb_2mb_overcommit_pages: None,
+                    prepare_vhost_vsock: false,
+                },
+            ),
+            needs_release_igvm: false,
+        }
+    }
+
+    #[test]
+    fn fvp_selects_only_source_matched_cca_binaries() {
+        validate_fvp_selections(&fvp_selections()).unwrap();
+        let mut selections = fvp_selections();
+        selections.build.openhcl_standard = true;
+        assert!(validate_fvp_selections(&selections).is_err());
+        selections = fvp_selections();
+        selections.build.guest_test_uefi = true;
+        assert!(validate_fvp_selections(&selections).is_err());
+        selections = fvp_selections();
+        selections.needs_release_igvm = true;
+        assert!(validate_fvp_selections(&selections).is_err());
+        selections = fvp_selections();
+        selections
+            .artifacts
+            .push(KnownTestArtifacts::Alpine323Aarch64Vhd);
+        assert!(validate_fvp_selections(&selections).is_err());
     }
 }
 
@@ -162,6 +400,7 @@ impl SimpleFlowNode for Node {
         ctx.import::<crate::resolve_openvmm_test_linux_kernel::Node>();
         ctx.import::<crate::resolve_openvmm_qemu::Node>();
         ctx.import::<crate::resolve_cca_platform::Node>();
+        ctx.import::<crate::resolve_cca_payload::Node>();
         ctx.import::<crate::run_prep_steps::Node>();
         ctx.import::<crate::build_vmgstool::Node>();
         ctx.import::<crate::write_incubator_target_runner::Node>();
@@ -185,10 +424,63 @@ impl SimpleFlowNode for Node {
             incubator_profile,
             incubator_platform,
             cca_platform_source,
+            fvp_roots,
             done,
         } = request;
 
-        if let Some(source) = &cca_platform_source {
+        let is_fvp = incubator_platform
+            == Some(crate::write_incubator_target_runner::IncubatorPlatform::FvpCca);
+        anyhow::ensure!(
+            is_fvp == fvp_roots.is_some(),
+            "FVP CCA requires both local platform roots; other backends do not accept them"
+        );
+        if is_fvp {
+            anyhow::ensure!(
+                matches!(ctx.platform(), FlowPlatform::Linux(_))
+                    && target.common_arch()? == CommonArch::Aarch64
+                    && target.as_triple().operating_system
+                        == target_lexicon::OperatingSystem::Linux,
+                "FVP CCA requires a Linux host and an AArch64 Linux target"
+            );
+            validate_fvp_selections(&selections)?;
+            cca_platform_source
+                .as_ref()
+                .context("FVP CCA requires configured payload artifacts")?
+                .validate_fvp_payload()?;
+            let config = match cca_platform_source.as_ref() {
+                Some(CcaPlatformSource::PayloadRelease {
+                    version,
+                    kernel_archive_sha256,
+                    initrd_archive_sha256,
+                }) => crate::resolve_cca_payload::Config {
+                    version: Some(version.clone()),
+                    kernel_archive_sha256: Some(kernel_archive_sha256.clone()),
+                    initrd_archive_sha256: Some(initrd_archive_sha256.clone()),
+                    ..Default::default()
+                },
+                Some(CcaPlatformSource::PayloadLocal {
+                    version,
+                    kernel_archive,
+                    kernel_archive_sha256,
+                    initrd_archive,
+                    initrd_archive_sha256,
+                }) => crate::resolve_cca_payload::Config {
+                    version: Some(version.clone()),
+                    kernel_archive_sha256: Some(kernel_archive_sha256.clone()),
+                    initrd_archive_sha256: Some(initrd_archive_sha256.clone()),
+                    local_kernel_archive: Some(ConfigVar(ReadVar::from_static(
+                        kernel_archive.clone(),
+                    ))),
+                    local_initrd_archive: Some(ConfigVar(ReadVar::from_static(
+                        initrd_archive.clone(),
+                    ))),
+                },
+                _ => {
+                    anyhow::bail!("FVP CCA requires common payload artifacts without QEMU firmware")
+                }
+            };
+            ctx.config(config);
+        } else if let Some(source) = &cca_platform_source {
             let config = match source {
                 CcaPlatformSource::Release {
                     version,
@@ -229,6 +521,10 @@ impl SimpleFlowNode for Node {
                         initrd_archive.clone(),
                     ))),
                 },
+                CcaPlatformSource::PayloadRelease { .. }
+                | CcaPlatformSource::PayloadLocal { .. } => {
+                    anyhow::bail!("payload-only CCA sources require FVP CCA")
+                }
             };
             ctx.config(config);
         }
@@ -237,8 +533,28 @@ impl SimpleFlowNode for Node {
             Some(crate::write_incubator_target_runner::IncubatorPlatform::QemuCca)
         )
         .then(|| ctx.reqv(crate::resolve_cca_platform::Request::Get));
+        let fvp_payload = is_fvp.then(|| {
+            let payload = ctx.reqv(crate::resolve_cca_payload::Request::Get);
+            ctx.emit_rust_stepv("verify qualified FVP payload", |ctx| {
+                let payload = payload.claim(ctx);
+                move |rt| {
+                    let payload = rt.read(payload);
+                    payload.validate_fvp()?;
+                    Ok(payload)
+                }
+            })
+        });
 
-        let test_content_dir = test_content_dir.absolute()?;
+        let test_content_dir = if is_fvp {
+            let test_content_dir = fvp_roots
+                .as_ref()
+                .context("missing FVP roots")?
+                .output_directory(&test_content_dir)?;
+            fs_err::create_dir_all(&test_content_dir)?;
+            fs_err::canonicalize(&test_content_dir)?
+        } else {
+            test_content_dir.absolute()?
+        };
         let custom_kernel_modules_abs = custom_kernel_modules.map(|p| p.absolute()).transpose()?;
         let custom_kernel_abs = custom_kernel.map(|p| p.absolute()).transpose()?;
 
@@ -789,10 +1105,20 @@ impl SimpleFlowNode for Node {
 
         let cca_realm_kernel = cca_platform
             .clone()
-            .map(|platform| platform.map(ctx, |output| output.realm_kernel));
+            .map(|platform| platform.map(ctx, |output| output.realm_kernel))
+            .or_else(|| {
+                fvp_payload
+                    .clone()
+                    .map(|payload| payload.map(ctx, |output| output.realm_kernel))
+            });
         let cca_realm_initrd = cca_platform
             .clone()
-            .map(|platform| platform.map(ctx, |output| output.host_initrd));
+            .map(|platform| platform.map(ctx, |output| output.host_initrd))
+            .or_else(|| {
+                fvp_payload
+                    .clone()
+                    .map(|payload| payload.map(ctx, |output| output.initrd))
+            });
         let extra_env = ctx.reqv(|v| crate::init_vmm_tests_env::Request {
             test_content_dir: ReadVar::from_static(test_content_dir.clone()),
             vmm_tests_target: target_triple.clone(),
@@ -810,14 +1136,15 @@ impl SimpleFlowNode for Node {
             register_tpm_guest_tests_linux,
             test_linux_kernel_override: cca_realm_kernel,
             test_linux_initrd_override: cca_realm_initrd,
+            cca_payload_only: is_fvp,
             register_test_igvm_agent_rpc_server,
             disk_images_dir: Some(test_artifacts_dir),
             register_openhcl_igvm_files,
             get_test_log_path: None,
             get_env: v,
             release_igvm_files,
-            use_relative_paths: build_only,
-            disable_remote_artifacts: false,
+            use_relative_paths: build_only && !is_fvp,
+            disable_remote_artifacts: is_fvp,
             reuse_prepped_vhds,
             require_2mb_hugetlb: false,
         });
@@ -975,7 +1302,7 @@ impl SimpleFlowNode for Node {
                                 v,
                             )
                         });
-                        (kernel, Some(initrd), None, qemu_binary, Vec::new())
+                        (kernel, Some(initrd), None, Some(qemu_binary), Vec::new())
                     }
                     crate::write_incubator_target_runner::IncubatorPlatform::QemuCca => {
                         anyhow::ensure!(
@@ -1010,9 +1337,15 @@ impl SimpleFlowNode for Node {
                             kernel,
                             Some(initrd),
                             Some(firmware),
-                            qemu_binary,
+                            Some(qemu_binary),
                             Vec::new(),
                         )
+                    }
+                    crate::write_incubator_target_runner::IncubatorPlatform::FvpCca => {
+                        let payload = fvp_payload.context("FVP CCA payload was not requested")?;
+                        let kernel = payload.clone().map(ctx, |output| output.host_kernel);
+                        let initrd = payload.map(ctx, |output| output.initrd);
+                        (kernel, Some(initrd), None, None, Vec::new())
                     }
                 };
             extra_share_paths.extend([
@@ -1026,11 +1359,12 @@ impl SimpleFlowNode for Node {
                 kernel: Some(kernel),
                 initrd,
                 firmware,
+                fvp_roots,
                 repo_root: openvmm_repo_path.clone(),
                 test_content_dir: ReadVar::from_static(test_content_dir.clone()),
                 extra_share_paths,
                 extra_env: Some(extra_env),
-                qemu_binary: Some(qemu_binary),
+                qemu_binary,
                 target: target_triple.clone(),
                 nextest_env: v,
             });
@@ -1049,6 +1383,7 @@ impl SimpleFlowNode for Node {
             if let Some((prep_steps, _)) = register_prep_steps {
                 prep_steps.claim_unused(ctx);
             }
+
             return Ok(());
         } else {
             side_effects.push(ctx.reqv(crate::install_vmm_tests_deps::Request::Install));
@@ -1085,6 +1420,12 @@ impl SimpleFlowNode for Node {
                 stop_rpc_server,
             )
         };
+
+        if build_only && is_fvp {
+            side_effects.push(extra_env.into_side_effect());
+            ctx.emit_side_effect_step(side_effects, [done]);
+            return Ok(());
+        }
 
         let results = ctx.reqv(|v| crate::test_nextest_vmm_tests_archive::Request {
             nextest_archive_file: ReadVar::from_static(NextestVmmTestsArchive {

@@ -147,8 +147,15 @@ Each row in the mapping table follows:
 | Code path | Guide page |
 | --- | --- |
 | `openvmm/openvmm_build_info/` | `reference/openvmm/management/cli.md` |
+| `petri/incubator/` | `dev_guide/tests/vmm/qemu_cca.md` |
+| `flowey/flowey_hvlite/src/pipelines/vmm_tests_run.rs` | `dev_guide/tests/vmm.md`, `dev_guide/tests/vmm/qemu_cca.md` |
+| `flowey/flowey_lib_hvlite/src/write_incubator_target_runner.rs` | `dev_guide/tests/vmm/qemu_cca.md` |
+| `flowey/flowey_lib_hvlite/src/_jobs/local_build_and_run_nextest_vmm_tests.rs` | `dev_guide/tests/vmm/qemu_cca.md` |
 
 ## What to Flag
+
+- CCA platform prerequisites, profiles, artifact selection, runner flags, or
+  test filters changed -> update `dev_guide/tests/vmm/qemu_cca.md`.
 
 - Changes to the reported build identity -- the `-V` / `--version` strings, the
   version format, dirty detection, or what a Git-free tree reports -- must
