@@ -88,6 +88,9 @@ fn main() -> anyhow::Result<()> {
     let profile = incubator::IncubatorProfile::from_file(std::path::Path::new(&args.profile))?;
 
     let (kernel, initrd, firmware) = match &profile.incubator {
+        incubator::IncubatorBackend::FvpCca(_) => {
+            anyhow::bail!("FVP CCA launch integration is not enabled in this stack layer")
+        }
         incubator::IncubatorBackend::QemuTcg(_) => {
             let arch = profile.incubator.arch();
             let kernel = match args.kernel {
@@ -148,6 +151,9 @@ fn main() -> anyhow::Result<()> {
     let timeout = std::time::Duration::from_secs(args.timeout);
     let allocate_pty = !args.no_pty && std::io::stdin().is_terminal();
     let output = match profile.incubator {
+        incubator::IncubatorBackend::FvpCca(_) => {
+            anyhow::bail!("FVP CCA launch integration is not enabled in this stack layer")
+        }
         incubator::IncubatorBackend::QemuTcg(_) => {
             incubator::run_in_incubator(incubator::IncubatorConfig {
                 profile,

@@ -161,6 +161,14 @@ test binaries. It does not bypass host-requirement checks or accelerate an
 individual boot. Omit this restriction when selecting tests in other
 binaries.
 
+The `incubator` library also contains the typed FVP CCA profile and Linux
+platform/lifecycle components. These validate a locally provisioned licensed
+model tuple and manage owned processes, locks, and state. The profile alone
+does not advertise `cca` or enable FVP CLI execution; runtime overlay and
+Flowey integration are a separate layer. See the
+[`incubator::fvp` API](https://openvmm.dev/rustdoc/linux/incubator/fvp/index.html)
+for the validation and cleanup contracts.
+
 ### Targeting a Platform
 
 By default, `vmm-tests-run` builds for the current host. Use `--target` to

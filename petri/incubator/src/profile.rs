@@ -26,6 +26,8 @@ pub enum IncubatorBackend {
     QemuTcg(QemuTcgConfig),
     /// QEMU Arm CCA emulation.
     QemuCca(QemuCcaConfig),
+    /// Licensed Arm FVP CCA platform.
+    FvpCca(FvpCcaConfig),
 }
 
 impl IncubatorBackend {
@@ -33,7 +35,7 @@ impl IncubatorBackend {
     pub fn arch(&self) -> Arch {
         match self {
             IncubatorBackend::QemuTcg(config) => config.arch,
-            IncubatorBackend::QemuCca(_) => Arch::Aarch64,
+            IncubatorBackend::QemuCca(_) | IncubatorBackend::FvpCca(_) => Arch::Aarch64,
         }
     }
 }
@@ -224,6 +226,170 @@ pub enum QemuCcaExtraArg {
     },
 }
 
+/// A named UART in the pinned FVP platform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FvpConsole {
+    /// Normal-world Linux and EFI shell.
+    Host,
+    /// EDK2 debug output.
+    Edk2,
+    /// Secure-world output.
+    Secure,
+    /// Realm management monitor output.
+    Rmm,
+}
+
+impl FvpConsole {
+    /// Stable console name used in logs.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Host => "host",
+            Self::Edk2 => "edk2",
+            Self::Secure => "secure",
+            Self::Rmm => "rmm",
+        }
+    }
+
+    /// Packaged FVP terminal identifier.
+    pub fn terminal(self) -> &'static str {
+        match self {
+            Self::Host => "bp.terminal_0",
+            Self::Edk2 => "bp.terminal_1",
+            Self::Secure => "bp.terminal_2",
+            Self::Rmm => "bp.terminal_3",
+        }
+    }
+}
+
+/// Per-phase host deadlines, in seconds, for the FVP lifecycle.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct FvpDeadlines {
+    /// Time from launching Shrinkwrap to observing the model process.
+    pub model_start: u64,
+    /// Time from observing the model to usable pipette.
+    pub pipette_ready: u64,
+    /// Maximum duration of a dispatched test.
+    pub test_execution: u64,
+    /// Graceful guest shutdown allowance.
+    pub guest_shutdown: u64,
+    /// Forced process/container cleanup allowance.
+    pub forced_cleanup: u64,
+    /// Model lock acquisition allowance; zero means do not wait.
+    pub model_lock: u64,
+    /// Total port-allocation and launch-collision retry budget.
+    pub port_allocation: u64,
+    /// Host elapsed-time bound on guest DHCP.
+    pub dhcp: u64,
+}
+
+impl Default for FvpDeadlines {
+    fn default() -> Self {
+        Self {
+            model_start: 120,
+            pipette_ready: 900,
+            test_execution: 1800,
+            guest_shutdown: 120,
+            forced_cleanup: 30,
+            model_lock: 1800,
+            port_allocation: 60,
+            dhcp: 30,
+        }
+    }
+}
+
+impl FvpDeadlines {
+    /// Reject unreasonable phase budgets before starting external commands.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for (name, value, minimum, maximum) in [
+            ("model-start", self.model_start, 30, 300),
+            ("pipette-ready", self.pipette_ready, 120, 1800),
+            ("test-execution", self.test_execution, 300, 7200),
+            ("guest-shutdown", self.guest_shutdown, 30, 300),
+            ("forced-cleanup", self.forced_cleanup, 10, 120),
+            ("model-lock", self.model_lock, 0, 7200),
+            ("port-allocation", self.port_allocation, 10, 300),
+            ("dhcp", self.dhcp, 10, 120),
+        ] {
+            anyhow::ensure!(
+                (minimum..=maximum).contains(&value),
+                "FVP {name} deadline must be in {minimum}..={maximum} seconds"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Typed configuration for the licensed FVP CCA platform.
+///
+/// Local platform/package roots are runtime inputs, not embedded in a portable
+/// profile. A declared capability is not published until runtime qualification.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct FvpCcaConfig {
+    /// Named console outputs to retain.
+    pub consoles: Vec<FvpConsole>,
+    /// Console carrying Linux startup and readiness.
+    pub primary_console: FvpConsole,
+    /// Requested capabilities, subject to runtime qualification.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    /// Per-phase deadlines in seconds.
+    #[serde(default)]
+    pub deadlines: FvpDeadlines,
+    /// Maximum port collision attempts within the fixed port budget.
+    #[serde(default = "default_fvp_port_retries")]
+    pub port_retries: u32,
+}
+
+fn default_fvp_port_retries() -> u32 {
+    20
+}
+
+impl FvpCcaConfig {
+    /// Validate configuration independently of any host platform inputs.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        self.deadlines.validate()?;
+        anyhow::ensure!(
+            (1..=50).contains(&self.port_retries),
+            "FVP port retries must be in 1..=50"
+        );
+        anyhow::ensure!(
+            !self.consoles.is_empty(),
+            "FVP requires at least one console"
+        );
+        let mut consoles = BTreeSet::new();
+        for console in &self.consoles {
+            anyhow::ensure!(
+                consoles.insert(console),
+                "duplicate FVP console: {}",
+                console.name()
+            );
+        }
+        anyhow::ensure!(
+            consoles.contains(&self.primary_console),
+            "FVP primary console must be in the console list"
+        );
+        anyhow::ensure!(
+            self.primary_console == FvpConsole::Host,
+            "FVP primary console must be host for the pinned platform"
+        );
+        let mut capabilities = BTreeSet::new();
+        for capability in &self.capabilities {
+            anyhow::ensure!(
+                capability == "cca",
+                "unsupported FVP capability: {capability}"
+            );
+            anyhow::ensure!(
+                capabilities.insert(capability),
+                "duplicate FVP capability: {capability}"
+            );
+        }
+        Ok(())
+    }
+}
+
 impl IncubatorProfile {
     /// Load a profile from a TOML file.
     pub fn from_file(path: &Path) -> anyhow::Result<Self> {
@@ -235,11 +401,29 @@ impl IncubatorProfile {
     pub fn from_toml(toml: &str) -> anyhow::Result<Self> {
         let profile: Self =
             toml_edit::de::from_str(toml).context("failed to parse incubator profile")?;
+        if matches!(profile.incubator, IncubatorBackend::FvpCca(_)) {
+            let document = toml
+                .parse::<toml_edit::DocumentMut>()
+                .context("failed to parse FVP profile fields")?;
+            for (name, _) in document.iter() {
+                anyhow::ensure!(
+                    matches!(name, "incubator" | "devices"),
+                    "unknown FVP profile field: {name}"
+                );
+            }
+        }
         profile.validate()?;
         Ok(profile)
     }
 
     fn validate(&self) -> anyhow::Result<()> {
+        if let IncubatorBackend::FvpCca(config) = &self.incubator {
+            config.validate()?;
+            anyhow::ensure!(
+                self.devices.is_empty(),
+                "FVP CCA profiles do not support extra devices"
+            );
+        }
         if let IncubatorBackend::QemuCca(config) = &self.incubator {
             validate_qemu_cca(config)?;
             anyhow::ensure!(
@@ -343,6 +527,85 @@ fn validate_qemu_cca(config: &QemuCcaConfig) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_with_tracing::test;
+
+    #[test]
+    fn parses_fvp_profile_without_advertising_capabilities() {
+        let profile =
+            IncubatorProfile::from_toml(include_str!("../profiles/aarch64-fvp-cca.toml")).unwrap();
+        assert_eq!(profile.incubator.arch(), Arch::Aarch64);
+        let IncubatorBackend::FvpCca(config) = profile.incubator else {
+            panic!("expected FVP profile");
+        };
+        assert!(config.capabilities.is_empty());
+        assert_eq!(config.primary_console, FvpConsole::Host);
+        assert_eq!(config.deadlines.model_start, 120);
+        assert_eq!(config.deadlines.dhcp, 30);
+        assert_eq!(config.port_retries, 20);
+    }
+
+    #[test]
+    fn rejects_invalid_fvp_profiles() {
+        for fields in [
+            "consoles = []\nprimary-console = 'host'",
+            "consoles = ['host', 'host']\nprimary-console = 'host'",
+            "consoles = ['host', 'unknown']\nprimary-console = 'host'",
+            "consoles = ['edk2']\nprimary-console = 'host'",
+            "consoles = ['host', 'edk2']\nprimary-console = 'edk2'",
+            "consoles = ['host']\nprimary-console = 'host'\ncapabilities = ['vpci']",
+            "consoles = ['host']\nprimary-console = 'host'\ncapabilities = ['cca', 'cca']",
+            "consoles = ['host']\nprimary-console = 'host'\nrootfs = 'disk.img'",
+            "consoles = ['host']\nprimary-console = 'host'\nport-retries = 0",
+            "consoles = ['host']\nprimary-console = 'host'\nport-retries = 51",
+        ] {
+            assert!(
+                IncubatorProfile::from_toml(&format!("[incubator]\ntype='fvp-cca'\n{fields}"))
+                    .is_err(),
+                "{fields}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_fvp_top_level_rootfs() {
+        let profile = "rootfs = 'disk.img'\n\
+                       [incubator]\ntype = 'fvp-cca'\n\
+                       consoles = ['host']\nprimary-console = 'host'\n";
+        assert!(
+            IncubatorProfile::from_toml(profile)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown FVP profile field: rootfs")
+        );
+    }
+
+    #[test]
+    fn fvp_deadline_boundaries() {
+        for (name, minimum, maximum) in [
+            ("model-start", 30u64, 300u64),
+            ("pipette-ready", 120, 1800),
+            ("test-execution", 300, 7200),
+            ("guest-shutdown", 30, 300),
+            ("forced-cleanup", 10, 120),
+            ("model-lock", 0, 7200),
+            ("port-allocation", 10, 300),
+            ("dhcp", 10, 120),
+        ] {
+            for value in [minimum, maximum] {
+                let deadlines: FvpDeadlines =
+                    toml_edit::de::from_str(&format!("{name}={value}")).unwrap();
+                deadlines.validate().unwrap();
+            }
+            for value in [minimum.checked_sub(1), Some(maximum + 1)]
+                .into_iter()
+                .flatten()
+            {
+                let deadlines: FvpDeadlines =
+                    toml_edit::de::from_str(&format!("{name}={value}")).unwrap();
+                assert!(deadlines.validate().is_err(), "{name}={value}");
+            }
+        }
+    }
 
     #[test]
     fn parses_qemu_tcg_profile() {

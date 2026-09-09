@@ -14,16 +14,25 @@ ctrlc.workspace = true
 futures.workspace = true
 futures-concurrency.workspace = true
 initrd_cpio.workspace = true
+getrandom.workspace = true
+hex.workspace = true
 mesh.workspace = true
 pal_async.workspace = true
+parking_lot.workspace = true
 petri_artifacts_common.workspace = true
 pipette_client.workspace = true
 serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["std"] }
+serde_yaml.workspace = true
+sha2.workspace = true
 signal-hook = { workspace = true, features = ["iterator"] }
 tempfile.workspace = true
 toml_edit = { workspace = true, features = ["serde"] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { workspace = true, features = ["signal", "process"] }
 
 [dev-dependencies]
 test_with_tracing.workspace = true

@@ -1,0 +1,37 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+schema_version: 1
+fvp:
+  executable_in_container: /tools/FVP_Base_RevC_AEMvA_11.31_28/bin/FVP_Base_RevC-2xAEMvA
+  version_output: Fast Models [11.31.28 (Mar  1 2026)]
+shrinkwrap:
+  root_relative_path: shrinkwrap
+  executable_relative_path: shrinkwrap/venv/bin/shrinkwrap
+  checkout_revision: 1c6b7a5278b47be11cad3bcd3a20416fc43fd388
+  package_version: 2026.9.0.dev0
+  container:
+    tag: shrinkwraptool/base-slim:2026.9.0.dev0
+    digest: shrinkwraptool/base-slim@sha256:dc5ac44b4cd8d8142c8df0f7fab4b5ecb11f9a399c6b94320b14f07f1476ea99
+package:
+  root_input: shrinkwrap_package_root
+  yaml_relative_path: cca-3world.yaml
+  sha256: 745b29d024e09ae1dc23dc3b4d9b9d252fd74bacf311f001be6ee67f42ee517f
+overlay:
+  root_input: fvp_platform_root
+  relative_path: shrinkwrap/config/kvm_cca_planes.yaml
+  sha256: 79e0f26e8e566692e4280dff5f461fed3ab7db1ae946ec6b0571abe18a53b354
+runtime:
+  root_input: shrinkwrap_package_root
+  bl1_relative_path: cca-3world/bl1.bin
+  bl1_sha256: 4cd9ed8dfc3ffc8822291a7c2e076612a8bd3114b90d55aa4c39e70570f9bf01
+  fip_relative_path: cca-3world/fip.bin
+  fip_sha256: acf6843a06ed36083a1a48369804ab0a056930a59fcc741edf999653018a764a
+  dtb_relative_path: cca-3world/dt_bootargs.dtb
+  dtb_sha256: 3a2e6b85fc1c10f17cab2f6ec7eadb63b18c6f3d08a74e38eeddc6f587ea3630
+provenance:
+  tf_a_revision: da738d5eae93af342fdc4995dd3c05acb4c9d757
+  tf_rmm_revision: f00eac344b6f7c18abc6dad1948b07e9a82ff9f0
+  tf_rmm_config: fvp_defcfg
+  edk2_revision: 3223_arm_cca_v4
+  dt_revision: v7.1-rc7-dts
