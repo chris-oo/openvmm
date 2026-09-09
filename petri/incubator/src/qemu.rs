@@ -4,6 +4,7 @@
 //! QEMU process management.
 
 use crate::GUEST_SHARE_ROOT;
+use crate::cca_init::CCA_INIT_SCRIPT_NAME;
 use crate::profile::DeviceConfig;
 use crate::profile::QemuCcaConfig;
 use crate::profile::QemuCcaExtraArg;
@@ -28,9 +29,8 @@ use std::time::UNIX_EPOCH;
 
 /// Filename of the injected init script, run by the kernel as `rdinit`.
 const INIT_SCRIPT_NAME: &str = "tcg-init.sh";
-const CCA_INIT_SCRIPT_NAME: &str = "cca-init.sh";
 /// Filename of the host CA bundle injected into the initrd.
-const CA_CERTIFICATES_NAME: &str = "incubator-ca-certificates.crt";
+pub(crate) const CA_CERTIFICATES_NAME: &str = "incubator-ca-certificates.crt";
 static ACTIVE_QEMU_PID: AtomicU32 = AtomicU32::new(0);
 static TERMINATION_REQUESTED: AtomicBool = AtomicBool::new(false);
 static TERMINATION_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
@@ -382,53 +382,7 @@ fn build_init_script(guest_pipette_path: &str) -> String {
     )
 }
 
-fn build_cca_init_script(guest_pipette_path: &str) -> String {
-    let guest_pipette_path = shell_single_quote(guest_pipette_path);
-    let guest_share_root = shell_single_quote(GUEST_SHARE_ROOT);
-    let host_epoch_seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("host clock is before the Unix epoch")
-        .as_secs();
-
-    format!(
-        "\
-        #!/bin/sh\n\
-        set -eu\n\
-        shutdown() {{\n\
-            status=$?\n\
-            trap - EXIT\n\
-            sync\n\
-            poweroff -f\n\
-            exit \"$status\"\n\
-        }}\n\
-        trap shutdown EXIT\n\
-        /bin/busybox --install /bin 2>/dev/null\n\
-        mountpoint -q /dev || mount -t devtmpfs none /dev\n\
-        mountpoint -q /proc || mount -t proc none /proc\n\
-        mountpoint -q /sys || mount -t sysfs none /sys\n\
-        mkdir -p /dev/pts {guest_share_root} /root /tmp /etc\n\
-        mountpoint -q /dev/pts || mount -t devpts devpts /dev/pts\n\
-        date -u -s @{host_epoch_seconds}\n\
-        mount -t 9p -o trans=virtio,version=9p2000.L,msize=512000 host {guest_share_root}\n\
-        log_dir=\"$(dirname {guest_pipette_path})/cca-logs\"\n\
-        mkdir -p \"$log_dir\"\n\
-        ip link set lo up\n\
-        ip link set eth0 up\n\
-        ip addr replace 10.0.2.15/24 dev eth0\n\
-        ip route replace default via 10.0.2.2\n\
-        echo 'nameserver 10.0.2.3' > /etc/resolv.conf\n\
-        {{\n\
-            ip address show\n\
-            ip route show\n\
-        }} > \"$log_dir/incubator-network.log\" 2>&1\n\
-        export HOME=/root\n\
-        export SSL_CERT_FILE=/{CA_CERTIFICATES_NAME}\n\
-        cd {guest_share_root}\n\
-        {guest_pipette_path} --transport tcp\n"
-    )
-}
-
-fn shell_single_quote(s: &str) -> String {
+pub(crate) fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
@@ -462,15 +416,15 @@ pub fn prepare_cca_initrd(
     scratch_dir: &Path,
     guest_pipette_path: &str,
 ) -> anyhow::Result<tempfile::TempPath> {
-    prepare_initrd_with_script(
+    crate::cca_init::prepare_cca_initrd(
         base_initrd,
         scratch_dir,
-        CCA_INIT_SCRIPT_NAME,
-        build_cca_init_script(guest_pipette_path),
+        guest_pipette_path,
+        &crate::cca_init::CcaInitConfig::qemu(),
     )
 }
 
-fn prepare_initrd_with_script(
+pub(crate) fn prepare_initrd_with_script(
     base_initrd: &Path,
     scratch_dir: &Path,
     script_name: &str,
