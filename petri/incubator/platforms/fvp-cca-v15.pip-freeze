@@ -1,0 +1,4 @@
+-e git+https://git.gitlab.arm.com/tooling/shrinkwrap.git@1c6b7a5278b47be11cad3bcd3a20416fc43fd388#egg=shrinkwraptool
+PyYAML==6.0.3
+termcolor==3.3.0
+tuxmake==1.43.0

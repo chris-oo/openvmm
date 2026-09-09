@@ -201,6 +201,9 @@ fn run_once(config: &RuntimeConfig) -> anyhow::Result<AttemptResult> {
     // Keep the per-run patched initrd alive until QEMU exits.
     let (mut cmd, serial_log, backend_capabilities, _prepared_boot_artifact) =
         match &config.profile.incubator {
+            IncubatorBackend::FvpCca(_) => {
+                anyhow::bail!("FVP CCA requires its dedicated lifecycle runner")
+            }
             IncubatorBackend::QemuTcg(qemu_config) => {
                 let kernel = config
                     .kernel

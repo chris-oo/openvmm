@@ -26,6 +26,8 @@
 #![forbid(unsafe_code)]
 
 mod cca_init;
+#[cfg(target_os = "linux")]
+pub mod fvp;
 mod path_mapping;
 mod profile;
 mod qemu;
@@ -40,6 +42,9 @@ pub use cca_init::prepare_cca_initrd;
 pub use path_mapping::HostPathMapper;
 pub use path_mapping::guest_env_from_incubator_env;
 pub use profile::Arch;
+pub use profile::FvpCcaConfig;
+pub use profile::FvpConsole;
+pub use profile::FvpDeadlines;
 pub use profile::IncubatorBackend;
 pub use profile::IncubatorProfile;
 pub use run::IncubatorConfig;
