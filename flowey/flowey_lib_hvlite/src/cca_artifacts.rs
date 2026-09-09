@@ -4,6 +4,7 @@
 //! Shared CCA dependency artifact validation.
 
 use anyhow::Context as _;
+use flowey::node::prelude::RustRuntimeServices;
 use sha2::Digest as _;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -11,6 +12,37 @@ use std::fs;
 use std::fs::File;
 use std::io::Read as _;
 use std::path::Path;
+use std::path::PathBuf;
+
+pub(crate) fn validate_local_archives(present: &[bool], message: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        present.iter().all(|present| *present) || present.iter().all(|present| !present),
+        "{message}"
+    );
+    Ok(())
+}
+
+pub(crate) fn resolve_archive(
+    rt: &mut RustRuntimeServices<'_>,
+    persistent_dir: Option<&Path>,
+    archive: &Path,
+    expected_name: &str,
+    expected_sha256: &str,
+    label: &str,
+) -> anyhow::Result<PathBuf> {
+    anyhow::ensure!(
+        archive.file_name() == Some(expected_name.as_ref()),
+        "{label} name does not match expected {expected_name}: {}",
+        archive.display()
+    );
+    verify_sha256(archive, expected_sha256, label)?;
+    flowey_lib_common::_util::extract::extract_tar_gz_if_new(
+        rt,
+        persistent_dir,
+        archive,
+        expected_sha256,
+    )
+}
 
 pub fn parse_manifest(path: &Path) -> anyhow::Result<BTreeMap<String, String>> {
     let contents = fs::read_to_string(path)
@@ -73,6 +105,20 @@ pub fn verify_sha256(path: &Path, expected: &str, label: &str) -> anyhow::Result
 mod tests {
     use super::*;
     use std::io::Write as _;
+
+    #[test]
+    fn local_archives_are_all_or_none() {
+        for count in [2, 4] {
+            for mask in 0..1 << count {
+                let present: Vec<_> = (0..count).map(|bit| mask & (1 << bit) != 0).collect();
+                assert_eq!(
+                    validate_local_archives(&present, "incomplete local archives").is_ok(),
+                    mask == 0 || mask == (1 << count) - 1,
+                    "{present:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn rejects_duplicate_manifest_keys() {

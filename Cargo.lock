@@ -3916,6 +3916,7 @@ dependencies = [
  "serde",
  "signal-hook",
  "tempfile",
+ "test_with_tracing",
  "toml_edit",
  "tracing",
  "tracing-subscriber",

@@ -134,6 +134,33 @@ To run a **specific test** (or set of tests), use `--filter` with a
 cargo xflowey vmm-tests-run --filter "test(my_test_name)" --dir /tmp/vmm-tests-run
 ```
 
+### CCA incubator payloads
+
+The QEMU CCA incubator uses the unified AArch64 CCA kernel and test initrd
+from the pinned `openvmm-deps` release. The common CCA payload resolver
+selects the kernel and base initrd separately from QEMU's TF-A and TF-RMM
+firmware. Local release-shaped archive overrides remain available for
+development; they must match the configured archive identities.
+
+The incubator injects `/cca-init.sh` and host CA certificates into a temporary
+copy of the base initrd. It does not modify the published kernel or initrd
+and does not require a block root filesystem. QEMU CCA mounts the `host` 9P
+share and uses static QEMU user networking.
+
+To run the shared CCA Realm boot test with QEMU:
+
+```bash
+cargo xflowey vmm-tests-run \
+  --target linux-aarch64-musl \
+  --incubator petri/incubator/profiles/aarch64-qemu-cca.toml \
+  --filter 'binary(=tests) & test(boot_linux_direct_cca)'
+```
+
+The `binary(=tests)` filter avoids launching an incubator to enumerate other
+test binaries. It does not bypass host-requirement checks or accelerate an
+individual boot. Omit this restriction when selecting tests in other
+binaries.
+
 ### Targeting a Platform
 
 By default, `vmm-tests-run` builds for the current host. Use `--target` to

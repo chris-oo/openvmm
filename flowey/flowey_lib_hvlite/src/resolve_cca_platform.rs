@@ -1,10 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Resolve the QEMU CCA platform from one openvmm-deps release.
+//! Compatibility entry point for the QEMU CCA platform resolver.
+//!
+//! New payload-only callers should use [`crate::resolve_cca_payload`].
 
+use crate::resolve_cca_payload::CcaPayloadOutput;
+use crate::resolve_cca_qemu_platform::CcaQemuPlatformOutput;
 use flowey::node::prelude::*;
-use std::path::Path;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CcaPlatformOutput {
@@ -37,6 +40,56 @@ flowey_config! {
     }
 }
 
+impl Config {
+    fn split(
+        self,
+    ) -> anyhow::Result<(
+        crate::resolve_cca_payload::Config,
+        crate::resolve_cca_qemu_platform::Config,
+    )> {
+        self.version
+            .as_ref()
+            .context("CCA openvmm-deps release is not configured")?;
+        self.kernel_archive_sha256
+            .as_ref()
+            .context("CCA kernel archive SHA-256 is not configured")?;
+        self.rmm_archive_sha256
+            .as_ref()
+            .context("CCA TF-RMM archive SHA-256 is not configured")?;
+        self.tfa_archive_sha256
+            .as_ref()
+            .context("CCA TF-A archive SHA-256 is not configured")?;
+        self.initrd_archive_sha256
+            .as_ref()
+            .context("CCA initrd archive SHA-256 is not configured")?;
+        crate::cca_artifacts::validate_local_archives(
+            &[
+                self.local_kernel_archive.is_some(),
+                self.local_rmm_archive.is_some(),
+                self.local_tfa_archive.is_some(),
+                self.local_initrd_archive.is_some(),
+            ],
+            "local CCA configuration requires kernel, TF-RMM, TF-A, and initrd archives",
+        )?;
+        Ok((
+            crate::resolve_cca_payload::Config {
+                version: self.version.clone(),
+                kernel_archive_sha256: self.kernel_archive_sha256,
+                initrd_archive_sha256: self.initrd_archive_sha256,
+                local_kernel_archive: self.local_kernel_archive,
+                local_initrd_archive: self.local_initrd_archive,
+            },
+            crate::resolve_cca_qemu_platform::Config {
+                version: self.version,
+                rmm_archive_sha256: self.rmm_archive_sha256,
+                tfa_archive_sha256: self.tfa_archive_sha256,
+                local_rmm_archive: self.local_rmm_archive,
+                local_tfa_archive: self.local_tfa_archive,
+            },
+        ))
+    }
+}
+
 flowey_request! {
     pub enum Request {
         Get(WriteVar<CcaPlatformOutput>),
@@ -50,7 +103,8 @@ impl FlowNodeWithConfig for Node {
     type Config = Config;
 
     fn imports(ctx: &mut ImportCtx<'_>) {
-        ctx.import::<flowey_lib_common::download_gh_release::Node>();
+        ctx.import::<crate::resolve_cca_payload::Node>();
+        ctx.import::<crate::resolve_cca_qemu_platform::Node>();
     }
 
     fn emit(
@@ -65,248 +119,134 @@ impl FlowNodeWithConfig for Node {
         if outputs.is_empty() {
             return Ok(());
         }
-
-        let Config {
-            version,
-            kernel_archive_sha256,
-            rmm_archive_sha256,
-            tfa_archive_sha256,
-            initrd_archive_sha256,
-            local_kernel_archive,
-            local_rmm_archive,
-            local_tfa_archive,
-            local_initrd_archive,
-        } = config;
-        let version = version.context("CCA openvmm-deps release is not configured")?;
-        let hashes = ArchiveHashes {
-            kernel: kernel_archive_sha256
-                .context("CCA kernel archive SHA-256 is not configured")?,
-            rmm: rmm_archive_sha256.context("CCA TF-RMM archive SHA-256 is not configured")?,
-            tfa: tfa_archive_sha256.context("CCA TF-A archive SHA-256 is not configured")?,
-            initrd: initrd_archive_sha256
-                .context("CCA initrd archive SHA-256 is not configured")?,
-        };
-        let local_count = [
-            local_kernel_archive.is_some(),
-            local_rmm_archive.is_some(),
-            local_tfa_archive.is_some(),
-            local_initrd_archive.is_some(),
-        ]
-        .into_iter()
-        .filter(|present| *present)
-        .count();
-        anyhow::ensure!(
-            local_count == 0 || local_count == 4,
-            "local CCA configuration requires kernel, TF-RMM, TF-A, and initrd archives"
-        );
-
-        let names = ArchiveNames::new(&version);
-        let (kernel_archive, rmm_archive, tfa_archive, initrd_archive) = if local_count == 0 {
-            let download = |file_name: String, ctx: &mut NodeCtx<'_>| {
-                ctx.reqv(|v| flowey_lib_common::download_gh_release::Request {
-                    repo_owner: "microsoft".into(),
-                    repo_name: "openvmm-deps".into(),
-                    needs_auth: false,
-                    tag: version.clone(),
-                    file_name,
-                    path: v,
-                })
-            };
-            (
-                download(names.kernel.clone(), ctx),
-                download(names.rmm.clone(), ctx),
-                download(names.tfa.clone(), ctx),
-                download(names.initrd.clone(), ctx),
-            )
-        } else {
-            (
-                local_kernel_archive.unwrap().0,
-                local_rmm_archive.unwrap().0,
-                local_tfa_archive.unwrap().0,
-                local_initrd_archive.unwrap().0,
-            )
-        };
-
-        let persistent_dir = ctx.persistent_dir();
-        ctx.emit_rust_step("resolve CCA platform archives", |ctx| {
-            let kernel_archive = kernel_archive.claim(ctx);
-            let rmm_archive = rmm_archive.claim(ctx);
-            let tfa_archive = tfa_archive.claim(ctx);
-            let initrd_archive = initrd_archive.claim(ctx);
-            let persistent_dir = persistent_dir.claim(ctx);
+        let (payload_config, qemu_config) = config.split()?;
+        ctx.config(payload_config);
+        ctx.config(qemu_config);
+        let platform = ctx.reqv(crate::resolve_cca_qemu_platform::Request::Get);
+        ctx.emit_rust_step("forward QEMU CCA platform", |ctx| {
+            let platform = platform.claim(ctx);
             let outputs = outputs.claim(ctx);
             move |rt| {
-                let kernel_archive = rt.read(kernel_archive).absolute()?;
-                let rmm_archive = rt.read(rmm_archive).absolute()?;
-                let tfa_archive = rt.read(tfa_archive).absolute()?;
-                let initrd_archive = rt.read(initrd_archive).absolute()?;
-                for (archive, name, expected, label) in [
-                    (
-                        &kernel_archive,
-                        &names.kernel,
-                        &hashes.kernel,
-                        "CCA kernel archive",
-                    ),
-                    (&rmm_archive, &names.rmm, &hashes.rmm, "CCA TF-RMM archive"),
-                    (&tfa_archive, &names.tfa, &hashes.tfa, "CCA TF-A archive"),
-                    (
-                        &initrd_archive,
-                        &names.initrd,
-                        &hashes.initrd,
-                        "CCA initrd archive",
-                    ),
-                ] {
-                    anyhow::ensure!(
-                        archive.file_name() == Some(name.as_ref()),
-                        "{label} name does not match release {version}: {}",
-                        archive.display()
-                    );
-                    crate::cca_artifacts::verify_sha256(archive, expected, label)?;
-                }
-
-                let persistent_dir = persistent_dir.map(|dir| rt.read(dir));
-                let kernel_dir = extract(
-                    rt,
-                    persistent_dir.as_deref(),
-                    &kernel_archive,
-                    &hashes.kernel,
-                )?;
-                let rmm_dir = extract(rt, persistent_dir.as_deref(), &rmm_archive, &hashes.rmm)?;
-                let tfa_dir = extract(rt, persistent_dir.as_deref(), &tfa_archive, &hashes.tfa)?;
-                let initrd_dir = extract(
-                    rt,
-                    persistent_dir.as_deref(),
-                    &initrd_archive,
-                    &hashes.initrd,
-                )?;
-                let output = CcaPlatformOutput {
-                    host_kernel: kernel_dir.join("Image"),
-                    realm_kernel: kernel_dir.join("Image"),
-                    kernel_config: kernel_dir.join("config"),
-                    kernel_manifest: kernel_dir.join("manifest.txt"),
-                    firmware: tfa_dir.join("flash.bin"),
-                    firmware_manifest: tfa_dir.join("manifest.txt"),
-                    rmm_image: rmm_dir.join("rmm.img"),
-                    rmm_manifest: rmm_dir.join("manifest.txt"),
-                    host_initrd: initrd_dir.join("initrd"),
-                };
-                output.validate()?;
+                let output = CcaPlatformOutput::from(rt.read(platform));
                 rt.write_all(outputs, &output);
                 Ok(())
             }
         });
-
         Ok(())
     }
 }
 
-fn extract(
-    rt: &mut RustRuntimeServices<'_>,
-    persistent_dir: Option<&Path>,
-    archive: &Path,
-    archive_sha256: &str,
-) -> anyhow::Result<PathBuf> {
-    flowey_lib_common::_util::extract::extract_tar_gz_if_new(
-        rt,
-        persistent_dir,
-        archive,
-        archive_sha256,
-    )
+impl From<CcaQemuPlatformOutput> for CcaPlatformOutput {
+    fn from(platform: CcaQemuPlatformOutput) -> Self {
+        Self {
+            host_kernel: platform.payload.host_kernel,
+            realm_kernel: platform.payload.realm_kernel,
+            kernel_config: platform.payload.kernel_config,
+            kernel_manifest: platform.payload.kernel_manifest,
+            host_initrd: platform.payload.initrd,
+            firmware: platform.firmware,
+            firmware_manifest: platform.firmware_manifest,
+            rmm_image: platform.rmm_image,
+            rmm_manifest: platform.rmm_manifest,
+        }
+    }
 }
 
 impl CcaPlatformOutput {
     pub fn validate(&self) -> anyhow::Result<()> {
-        let kernel = crate::cca_artifacts::parse_manifest(&self.kernel_manifest)?;
-        for (key, expected) in [
-            ("architecture", "aarch64"),
-            ("revision", crate::cca_pins::LINUX_REVISION),
-            ("kernel_release", crate::cca_pins::LINUX_RELEASE),
-            ("config_sha256", crate::cca_pins::LINUX_CONFIG_SHA256),
-            ("Image_sha256", crate::cca_pins::LINUX_IMAGE_SHA256),
-        ] {
-            crate::cca_artifacts::require_manifest_value(&kernel, key, expected)?;
+        CcaQemuPlatformOutput {
+            payload: CcaPayloadOutput {
+                host_kernel: self.host_kernel.clone(),
+                realm_kernel: self.realm_kernel.clone(),
+                kernel_config: self.kernel_config.clone(),
+                kernel_manifest: self.kernel_manifest.clone(),
+                initrd: self.host_initrd.clone(),
+            },
+            firmware: self.firmware.clone(),
+            firmware_manifest: self.firmware_manifest.clone(),
+            rmm_image: self.rmm_image.clone(),
+            rmm_manifest: self.rmm_manifest.clone(),
         }
-        crate::cca_artifacts::verify_sha256(
-            &self.host_kernel,
-            crate::cca_pins::LINUX_IMAGE_SHA256,
-            "CCA v15 Image",
-        )?;
-        crate::cca_artifacts::verify_sha256(
-            &self.kernel_config,
-            crate::cca_pins::LINUX_CONFIG_SHA256,
-            "CCA v15 config",
-        )?;
-
-        let rmm = crate::cca_artifacts::parse_manifest(&self.rmm_manifest)?;
-        for (key, expected) in [
-            ("architecture", "aarch64"),
-            ("source_revision", crate::cca_pins::TF_RMM_REVISION),
-            ("config", "qemu_virt_defcfg"),
-            ("rmm_img_sha256", crate::cca_pins::TF_RMM_IMAGE_SHA256),
-        ] {
-            crate::cca_artifacts::require_manifest_value(&rmm, key, expected)?;
-        }
-        crate::cca_artifacts::verify_sha256(
-            &self.rmm_image,
-            crate::cca_pins::TF_RMM_IMAGE_SHA256,
-            "CCA TF-RMM image",
-        )?;
-
-        let firmware = crate::cca_artifacts::parse_manifest(&self.firmware_manifest)?;
-        for (key, expected) in [
-            ("architecture", "aarch64"),
-            ("source_revision", crate::cca_pins::TF_A_REVISION),
-            ("rmm_source_revision", crate::cca_pins::TF_RMM_REVISION),
-            ("rmm_img_sha256", crate::cca_pins::TF_RMM_IMAGE_SHA256),
-            ("platform", "qemu"),
-            ("linux_as_bl33", "true"),
-            ("flash_sha256", crate::cca_pins::TF_A_FLASH_SHA256),
-            ("flash_size", "67108864"),
-            ("flash_fip_offset", "0x40000"),
-            ("preloaded_bl33_base", "0x50080000"),
-            ("dtb_base", "0x40000000"),
-        ] {
-            crate::cca_artifacts::require_manifest_value(&firmware, key, expected)?;
-        }
-        crate::cca_artifacts::verify_sha256(
-            &self.firmware,
-            crate::cca_pins::TF_A_FLASH_SHA256,
-            "CCA TF-A flash",
-        )?;
-        anyhow::ensure!(
-            self.host_initrd.is_file(),
-            "CCA host initrd not found at {}",
-            self.host_initrd.display()
-        );
-        anyhow::ensure!(
-            std::fs::metadata(&self.host_initrd)?.len() <= crate::cca_pins::QEMU_INITRD_MAX_SIZE,
-            "CCA host initrd is too large for its reserved physical range"
-        );
-        Ok(())
+        .validate()
     }
 }
 
-struct ArchiveHashes {
-    kernel: String,
-    rmm: String,
-    tfa: String,
-    initrd: String,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-struct ArchiveNames {
-    kernel: String,
-    rmm: String,
-    tfa: String,
-    initrd: String,
-}
+    fn release_config() -> Config {
+        Config {
+            version: Some("local-release".into()),
+            kernel_archive_sha256: Some("kernel-hash".into()),
+            rmm_archive_sha256: Some("rmm-hash".into()),
+            tfa_archive_sha256: Some("tfa-hash".into()),
+            initrd_archive_sha256: Some("initrd-hash".into()),
+            ..Default::default()
+        }
+    }
 
-impl ArchiveNames {
-    fn new(version: &str) -> Self {
-        Self {
-            kernel: format!("openvmm-test-linux-cca-v15.aarch64.{version}.tar.gz"),
-            rmm: format!("openvmm-test-rmm-cca.aarch64.{version}.tar.gz"),
-            tfa: format!("openvmm-test-tfa-cca.aarch64.{version}.tar.gz"),
-            initrd: format!("openvmm-test-initrd.aarch64.{version}.tar.gz"),
+    #[test]
+    fn forwards_release_overrides() {
+        let (payload, qemu) = release_config().split().unwrap();
+        assert_eq!(payload.version.as_deref(), Some("local-release"));
+        assert_eq!(qemu.version, payload.version);
+        assert_eq!(
+            payload.kernel_archive_sha256.as_deref(),
+            Some("kernel-hash")
+        );
+        assert_eq!(
+            payload.initrd_archive_sha256.as_deref(),
+            Some("initrd-hash")
+        );
+        assert_eq!(qemu.rmm_archive_sha256.as_deref(), Some("rmm-hash"));
+        assert_eq!(qemu.tfa_archive_sha256.as_deref(), Some("tfa-hash"));
+        assert!(payload.local_kernel_archive.is_none());
+        assert!(payload.local_initrd_archive.is_none());
+        assert!(qemu.local_rmm_archive.is_none());
+        assert!(qemu.local_tfa_archive.is_none());
+    }
+
+    #[test]
+    fn preserves_local_archive_coherence() {
+        for mask in 0..16 {
+            let local = |bit, name: &str| {
+                (mask & (1 << bit) != 0)
+                    .then(|| ConfigVar(ReadVar::from_static(PathBuf::from(name))))
+            };
+            let config = Config {
+                local_kernel_archive: local(0, "kernel"),
+                local_rmm_archive: local(1, "rmm"),
+                local_tfa_archive: local(2, "tfa"),
+                local_initrd_archive: local(3, "initrd"),
+                ..release_config()
+            };
+            let result = config.split();
+            assert_eq!(result.is_ok(), mask == 0 || mask == 15, "{mask}");
+            if mask == 15 {
+                let (payload, qemu) = result.unwrap();
+                assert!(payload.local_kernel_archive.is_some());
+                assert!(payload.local_initrd_archive.is_some());
+                assert!(qemu.local_rmm_archive.is_some());
+                assert!(qemu.local_tfa_archive.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn preserves_required_configuration() {
+        assert!(Config::default().split().is_err());
+        for field in 0..5 {
+            let mut config = release_config();
+            match field {
+                0 => config.version = None,
+                1 => config.kernel_archive_sha256 = None,
+                2 => config.rmm_archive_sha256 = None,
+                3 => config.tfa_archive_sha256 = None,
+                4 => config.initrd_archive_sha256 = None,
+                _ => unreachable!(),
+            }
+            assert!(config.split().is_err(), "{field}");
         }
     }
 }

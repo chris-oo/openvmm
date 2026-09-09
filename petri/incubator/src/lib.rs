@@ -25,6 +25,7 @@
 
 #![forbid(unsafe_code)]
 
+mod cca_init;
 mod path_mapping;
 mod profile;
 mod qemu;
@@ -33,6 +34,9 @@ mod run;
 /// Guest path where the host share is mounted.
 pub const GUEST_SHARE_ROOT: &str = "/share";
 
+pub use cca_init::CcaHostNetwork;
+pub use cca_init::CcaInitConfig;
+pub use cca_init::prepare_cca_initrd;
 pub use path_mapping::HostPathMapper;
 pub use path_mapping::guest_env_from_incubator_env;
 pub use profile::Arch;
