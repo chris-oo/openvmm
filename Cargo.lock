@@ -4198,6 +4198,7 @@ dependencies = [
  "pal",
  "parking_lot",
  "signal-hook",
+ "test_with_tracing",
  "thiserror 2.0.16",
 ]
 
