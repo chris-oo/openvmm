@@ -549,8 +549,13 @@ impl virt::Processor for KvmProcessor<'_> {
                 let exit = match exit {
                     Ok(exit) => exit,
                     Err(kvm::Error::RunMemoryFault {
-                        flags, gpa, size, ..
-                    }) if self.partition.caps.isolation == virt::IsolationType::Cca => {
+                        flags,
+                        gpa,
+                        size,
+                        source,
+                    }) if self.partition.caps.isolation == virt::IsolationType::Cca
+                        && source as i32 == libc::EFAULT =>
+                    {
                         match self.partition.handle_cca_ripas_change(gpa, size, flags) {
                             Ok(()) => {
                                 pending_exit = false;
@@ -569,6 +574,14 @@ impl virt::Processor for KvmProcessor<'_> {
                 match exit {
                     kvm::Exit::Interrupted => {
                         pending_exit = false;
+                    }
+                    // The v15 backing handler cannot satisfy v7's successful
+                    // completion re-exits. Do not discard backing or retry
+                    // until the in-place conversion path is implemented.
+                    kvm::Exit::MemoryFault { flags, gpa, size } => {
+                        return Err(dev.fatal_error(
+                            KvmRunVpError::UnsupportedMemoryFault { flags, gpa, size }.into(),
+                        ));
                     }
                     kvm::Exit::MmioWrite { address, data } => {
                         dev.write_mmio(self.vpindex, self.partition.mmio_address(address), data)

@@ -2000,23 +2000,7 @@ impl<'a> VpRunner<'a> {
             // SAFETY: Calling IOCTL as documented, with no special requirements.
             let result = unsafe { ioctl::kvm_run(vp.vcpu.as_raw_fd(), 0) };
             CURRENT_KVM_RUN.with(|r| r.store(NO_KVM_RUN, Ordering::Relaxed));
-            match result {
-                Ok(_) => Ok(true),
-                Err(err) => match err {
-                    nix::errno::Errno::EINTR | nix::errno::Errno::EAGAIN => Ok(false),
-                    _ if self.run_data().exit_reason == KVM_EXIT_MEMORY_FAULT => {
-                        // SAFETY: KVM reported KVM_EXIT_MEMORY_FAULT, so this is the active union field.
-                        let memory_fault = unsafe { self.run_data().__bindgen_anon_1.memory_fault };
-                        Err(Error::RunMemoryFault {
-                            flags: memory_fault.flags,
-                            gpa: memory_fault.gpa,
-                            size: memory_fault.size,
-                            source: err,
-                        })
-                    }
-                    _ => Err(Error::Run(err)),
-                },
-            }
+            decode_run_result(result, self.run_data())
         })
     }
 
@@ -2038,6 +2022,7 @@ impl<'a> VpRunner<'a> {
         }
 
         let exit = match self.run_data().exit_reason {
+            KVM_EXIT_MEMORY_FAULT => memory_fault_exit(self.run_data()),
             #[cfg(target_arch = "x86_64")]
             KVM_EXIT_DEBUG => {
                 // SAFETY: no other references to this data.
@@ -2230,9 +2215,46 @@ impl<'a> VpRunner<'a> {
     }
 }
 
+fn decode_run_result(result: nix::Result<libc::c_int>, run: &kvm_run) -> Result<bool> {
+    match result {
+        Ok(_) => Ok(true),
+        Err(nix::errno::Errno::EINTR | nix::errno::Errno::EAGAIN) => Ok(false),
+        Err(source) if run.exit_reason == KVM_EXIT_MEMORY_FAULT => {
+            // SAFETY: KVM reported the memory-fault union field as active.
+            let fault = unsafe { run.__bindgen_anon_1.memory_fault };
+            Err(Error::RunMemoryFault {
+                flags: fault.flags,
+                gpa: fault.gpa,
+                size: fault.size,
+                source,
+            })
+        }
+        Err(source) => Err(Error::Run(source)),
+    }
+}
+
+fn memory_fault_exit(run: &kvm_run) -> Exit<'_> {
+    // SAFETY: The caller checked that KVM reported KVM_EXIT_MEMORY_FAULT.
+    let fault = unsafe { run.__bindgen_anon_1.memory_fault };
+    Exit::MemoryFault {
+        flags: fault.flags,
+        gpa: fault.gpa,
+        size: fault.size,
+    }
+}
+
 #[derive(Debug)]
 pub enum Exit<'a> {
     Interrupted,
+    /// A memory-fault exit from a successful KVM_RUN, as used by experimental
+    /// Arm CCA kernels during RIPAS completion. This is not itself permission
+    /// to change memory visibility. Error-return exits retain their errno in
+    /// [`Error::RunMemoryFault`] instead.
+    MemoryFault {
+        flags: u64,
+        gpa: u64,
+        size: u64,
+    },
     #[cfg(target_arch = "x86_64")]
     InterruptWindow,
     #[cfg(target_arch = "x86_64")]
@@ -2416,6 +2438,71 @@ mod memory_abi_tests {
     use std::mem::align_of;
     use std::mem::offset_of;
     use test_with_tracing::test;
+
+    fn memory_fault_run() -> kvm_run {
+        let mut run = kvm_run {
+            exit_reason: KVM_EXIT_MEMORY_FAULT,
+            ..Default::default()
+        };
+        run.__bindgen_anon_1.memory_fault.flags = KVM_MEMORY_EXIT_FLAG_PRIVATE_UAPI;
+        run.__bindgen_anon_1.memory_fault.gpa = 0x4000;
+        run.__bindgen_anon_1.memory_fault.size = 0x2000;
+        run
+    }
+
+    #[test]
+    fn successful_memory_fault_keeps_exit_payload() {
+        let run = memory_fault_run();
+        assert!(decode_run_result(Ok(0), &run).unwrap());
+        assert!(matches!(
+            memory_fault_exit(&run),
+            Exit::MemoryFault {
+                flags: KVM_MEMORY_EXIT_FLAG_PRIVATE_UAPI,
+                gpa: 0x4000,
+                size: 0x2000,
+            }
+        ));
+    }
+
+    #[test]
+    fn failed_memory_fault_preserves_each_errno() {
+        let run = memory_fault_run();
+        for errno in [
+            nix::errno::Errno::EFAULT,
+            nix::errno::Errno::ENOMEM,
+            nix::errno::Errno::EHWPOISON,
+        ] {
+            assert!(matches!(
+                decode_run_result(Err(errno), &run).unwrap_err(),
+                Error::RunMemoryFault {
+                    flags: KVM_MEMORY_EXIT_FLAG_PRIVATE_UAPI,
+                    gpa: 0x4000,
+                    size: 0x2000,
+                    source,
+                } if source == errno
+            ));
+        }
+    }
+
+    #[test]
+    fn interrupted_run_ignores_stale_memory_fault_payload() {
+        let run = memory_fault_run();
+        for errno in [nix::errno::Errno::EINTR, nix::errno::Errno::EAGAIN] {
+            assert!(!decode_run_result(Err(errno), &run).unwrap());
+        }
+    }
+
+    #[test]
+    fn unrelated_run_error_is_not_a_memory_fault() {
+        let run = kvm_run {
+            exit_reason: KVM_EXIT_MMIO,
+            ..Default::default()
+        };
+        assert!(matches!(
+            decode_run_result(Err(nix::errno::Errno::EFAULT), &run).unwrap_err(),
+            Error::Run(nix::errno::Errno::EFAULT)
+        ));
+    }
 
     #[test]
     fn guest_memfd_attributes2_layout() {

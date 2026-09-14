@@ -221,9 +221,8 @@ enum KvmRunVpError {
     InvalidVpState,
     #[error("failed to run VP")]
     Run(#[source] kvm::Error),
-    #[cfg(guest_arch = "aarch64")]
     #[error(
-        "unsupported KVM memory fault/RIPAS change: flags={flags:#x}, gpa={gpa:#x}, size={size:#x}"
+        "unsupported successful KVM memory-fault exit: flags={flags:#x}, gpa={gpa:#x}, size={size:#x}"
     )]
     UnsupportedMemoryFault { flags: u64, gpa: u64, size: u64 },
     #[cfg(guest_arch = "aarch64")]
@@ -261,20 +260,19 @@ impl KvmRunVpError {
     /// Preserves CCA memory-fault details when converting a KVM run error.
     #[cfg(guest_arch = "aarch64")]
     fn from_kvm_run_error(err: kvm::Error) -> Self {
-        match err {
-            kvm::Error::RunMemoryFault {
-                flags, gpa, size, ..
-            } => {
-                tracelimit::warn_ratelimited!(
-                    flags,
-                    gpa,
-                    size,
-                    "unsupported KVM memory fault/RIPAS change"
-                );
-                KvmRunVpError::UnsupportedMemoryFault { flags, gpa, size }
-            }
-            err => KvmRunVpError::Run(err),
+        if let kvm::Error::RunMemoryFault {
+            flags, gpa, size, ..
+        } = &err
+        {
+            tracelimit::warn_ratelimited!(
+                flags,
+                gpa,
+                size,
+                error = &err as &dyn std::error::Error,
+                "unsupported KVM memory fault/RIPAS change"
+            );
         }
+        KvmRunVpError::Run(err)
     }
 }
 

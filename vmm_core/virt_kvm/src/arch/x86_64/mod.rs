@@ -1768,6 +1768,11 @@ impl<'p> Processor for KvmProcessor<'p> {
                             ));
                         }
                     }
+                    kvm::Exit::MemoryFault { flags, gpa, size } => {
+                        return Err(dev.fatal_error(
+                            KvmRunVpError::UnsupportedMemoryFault { flags, gpa, size }.into(),
+                        ));
+                    }
                     kvm::Exit::Debug {
                         exception: _,
                         pc: _,
