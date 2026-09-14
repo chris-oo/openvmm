@@ -99,6 +99,14 @@ describes the source definitions.
   KVM SNP does not support Hyper-V enlightenments.
   The IGVM must use VTL0, no shared GPA boundary, and no relocation metadata.
 
+  For MSHV SNP IGVM boots, OpenVMM selects restricted or normal (standard)
+  interrupt injection from the BSP VMSA before creating the partition.
+  Normal injection requires a host MSHV driver that accepts the
+  `MSHV_PT_BIT_SNP_NORMAL_INJECTION` creation flag. Older drivers reject this
+  request; OpenVMM does not fall back to restricted injection. Restricted
+  injection remains the partition-creation default, including when no IGVM
+  metadata is supplied. Alternate injection and secure AVIC are not supported.
+
   SNP does not support UEFI, VTL2, or hugetlb-backed memory. In addition to
   the minimal emulated chipset and serial console, optional devices are
   limited to virtio devices attached through PCIe.
