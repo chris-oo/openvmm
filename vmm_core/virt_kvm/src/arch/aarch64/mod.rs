@@ -211,6 +211,8 @@ pub struct KvmVpInner {
     needs_yield: NeedsYield,
     eval: AtomicBool,
     vp_info: Aarch64VpInfo,
+    #[inspect(skip)]
+    cca_fault: Mutex<crate::cca_v7::FaultTracker>,
 }
 
 impl KvmVpInner {
@@ -512,8 +514,16 @@ impl virt::Processor for KvmProcessor<'_> {
             //
             // Don't break out of the loop while there is a pending exit so that
             // the register state is up-to-date for save.
+            // CCA faults do not require register completion before stopping.
+            // Their ambiguity guards live on the VP across stop/rebind; an
+            // immediate_exit cannot guarantee REC pre-entry completion.
             let mut pending_exit = false;
             loop {
+                if self.partition.memory_backing_mode.is_in_place()
+                    && self.partition.cca_fatal.load(Ordering::Acquire)
+                {
+                    return Err(dev.fatal_error(KvmRunVpError::CcaMemoryCleanupFailed.into()));
+                }
                 let exit = if self.inner.eval.load(Ordering::Relaxed) || stop.check().is_err() {
                     // Break out of the loop as soon as there is no pending exit.
                     if !pending_exit {
@@ -556,28 +566,57 @@ impl virt::Processor for KvmProcessor<'_> {
                     }) if self.partition.caps.isolation == virt::IsolationType::Cca
                         && source as i32 == libc::EFAULT =>
                     {
+                        if self.partition.memory_backing_mode.is_in_place() {
+                            if let Err(err) = self.partition.handle_cca_v7_memory_fault(
+                                &mut self.inner.cca_fault.lock(),
+                                crate::cca_v7::Fault { gpa, size, flags },
+                                false,
+                            ) {
+                                return Err(dev.fatal_error(err.into()));
+                            }
+                            pending_exit = false;
+                            continue;
+                        }
                         match self.partition.handle_cca_ripas_change(gpa, size, flags) {
                             Ok(()) => {
                                 pending_exit = false;
                                 continue;
                             }
                             Err(err) => {
+                                if self.partition.memory_backing_mode.is_in_place() {
+                                    self.partition.mark_cca_fatal();
+                                }
                                 return Err(dev.fatal_error(err.into()));
                             }
                         }
                     }
                     Err(err) => {
+                        if self.partition.memory_backing_mode.is_in_place() {
+                            self.partition.mark_cca_fatal();
+                        }
                         return Err(dev.fatal_error(KvmRunVpError::from_kvm_run_error(err).into()));
                     }
                 };
                 pending_exit = true;
+                if !matches!(exit, kvm::Exit::Interrupted | kvm::Exit::MemoryFault { .. }) {
+                    self.inner.cca_fault.lock().completed();
+                }
                 match exit {
                     kvm::Exit::Interrupted => {
                         pending_exit = false;
                     }
-                    // The v15 backing handler cannot satisfy v7's successful
-                    // completion re-exits. Do not discard backing or retry
-                    // until the in-place conversion path is implemented.
+                    kvm::Exit::MemoryFault { flags, gpa, size }
+                        if self.partition.memory_backing_mode.is_in_place() =>
+                    {
+                        if let Err(err) = self.partition.handle_cca_v7_memory_fault(
+                            &mut self.inner.cca_fault.lock(),
+                            crate::cca_v7::Fault { gpa, size, flags },
+                            true,
+                        ) {
+                            return Err(dev.fatal_error(err.into()));
+                        }
+                        pending_exit = false;
+                    }
                     kvm::Exit::MemoryFault { flags, gpa, size } => {
                         return Err(dev.fatal_error(
                             KvmRunVpError::UnsupportedMemoryFault { flags, gpa, size }.into(),
@@ -669,6 +708,7 @@ pub struct KvmProtoPartition<'a> {
     config: ProtoPartitionConfig<'a>,
     ipa_size: u8,
     ram_backing: crate::memory::KvmPreparedRamBacking,
+    ram_backing_exported: bool,
 }
 
 impl KvmProtoPartition<'_> {
@@ -676,6 +716,9 @@ impl KvmProtoPartition<'_> {
         &mut self,
         layout: &vm_topology::memory::MemoryLayout,
     ) -> Result<&mut KvmMemoryBackingMode, KvmError> {
+        if self.config.cca_v7 {
+            crate::cca_v7::validate_host_page_size(sparse_mmap::SparseMapping::page_size())?;
+        }
         let ranges = layout
             .ram()
             .iter()
@@ -688,7 +731,11 @@ impl KvmProtoPartition<'_> {
                 virt::IsolationType::Cca => KvmMemoryBackingMode::guest_memfd(
                     &self.vm,
                     ranges.iter().copied(),
-                    crate::memory::KvmGuestMemfdPrivateState::GuestMemfdDefault,
+                    if self.config.cca_v7 {
+                        crate::memory::KvmGuestMemfdPrivateState::InPlace
+                    } else {
+                        crate::memory::KvmGuestMemfdPrivateState::GuestMemfdDefault
+                    },
                 ),
                 virt::IsolationType::Vbs | virt::IsolationType::Snp | virt::IsolationType::Tdx => {
                     Err(
@@ -910,10 +957,11 @@ impl virt::ProtoPartition for KvmProtoPartition<'_> {
         &mut self,
         layout: &vm_topology::memory::MemoryLayout,
     ) -> Result<Option<virt::MappableRamBacking>, Self::Error> {
-        self.prepare_memory_backing(layout)?;
-        // The v15 guestmemfd is private-only. Shared RAM must still use the
-        // worker's separate userspace allocation, not this file.
-        Ok(None)
+        let backing = self
+            .prepare_memory_backing(layout)?
+            .mappable_ram_backing(layout)?;
+        self.ram_backing_exported |= backing.is_some();
+        Ok(backing)
     }
 
     fn build(
@@ -921,6 +969,11 @@ impl virt::ProtoPartition for KvmProtoPartition<'_> {
         config: virt::PartitionConfig<'_>,
     ) -> Result<(Self::Partition, Vec<Self::ProcessorBinder>), Self::Error> {
         let isolation = self.config.isolation.isolation_type();
+        if self.config.cca_v7 && !self.ram_backing_exported {
+            return Err(KvmError::UnsupportedIsolationConfiguration(
+                "CCA v7 requires prepare_ram_backing before constructing guest memory",
+            ));
+        }
         // Also support direct build callers that did not prepare RAM. If RAM
         // was prepared, validate its layout before creating any VCPUs.
         self.prepare_memory_backing(config.mem_layout)?;
@@ -1018,6 +1071,7 @@ impl virt::ProtoPartition for KvmProtoPartition<'_> {
                 .processor_topology
                 .vps_arch()
                 .map(|vp_info| KvmVpInner {
+                    cca_fault: Default::default(),
                     vp_info,
                     needs_yield: NeedsYield::new(),
                     eval: false.into(),
@@ -1323,6 +1377,10 @@ impl virt::Hypervisor for Kvm {
     type Partition = KvmPartition;
     type Error = KvmError;
 
+    fn recognizes_cca_v7(&self) -> bool {
+        true
+    }
+
     fn platform_info(&self) -> virt::PlatformInfo {
         virt::PlatformInfo {
             platform_gsiv: None,
@@ -1342,6 +1400,11 @@ impl virt::Hypervisor for Kvm {
         config: ProtoPartitionConfig<'a>,
     ) -> Result<Self::ProtoPartition<'a>, Self::Error> {
         let isolation = config.isolation.isolation_type();
+        if config.cca_v7 && isolation != virt::IsolationType::Cca {
+            return Err(KvmError::UnsupportedIsolationConfiguration(
+                "experimental CCA v7 RAM requires CCA isolation",
+            ));
+        }
         match isolation {
             virt::IsolationType::None => {}
             virt::IsolationType::Cca => {
@@ -1401,6 +1464,7 @@ impl virt::Hypervisor for Kvm {
             config,
             ipa_size,
             ram_backing: Default::default(),
+            ram_backing_exported: false,
         })
     }
 }

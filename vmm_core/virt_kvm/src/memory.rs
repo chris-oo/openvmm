@@ -17,6 +17,8 @@ use crate::cca::map_cca_conversion_error;
 use inspect::Inspect;
 use memory_range::MemoryRange;
 use std::fs::File;
+#[cfg(guest_arch = "aarch64")]
+use std::os::fd::AsFd;
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use thiserror::Error;
@@ -42,6 +44,12 @@ pub enum MemoryError {
     #[cfg(any(guest_arch = "aarch64", test))]
     #[error("RAM layout differs from the prepared KVM backing")]
     PreparedRamLayoutChanged,
+    #[cfg(guest_arch = "aarch64")]
+    #[error("invalid partition-supplied RAM backing")]
+    MappableRam(#[from] virt::RamBackingError),
+    #[cfg(guest_arch = "aarch64")]
+    #[error("failed to clone guestmemfd")]
+    CloneGuestMemfd(#[source] std::io::Error),
 }
 
 #[derive(Debug, Inspect)]
@@ -61,6 +69,24 @@ unsafe impl Send for KvmMemoryRange {}
 pub(crate) struct KvmMemoryRangeState {
     #[inspect(flatten, iter_by_index)]
     pub(crate) ranges: Vec<Option<KvmMemoryRange>>,
+    #[cfg(any(guest_arch = "aarch64", test))]
+    #[inspect(skip)]
+    pub(crate) cca_visibility: crate::cca_v7::Visibility,
+}
+
+impl KvmMemoryRangeState {
+    #[cfg(any(guest_arch = "aarch64", test))]
+    pub(crate) fn in_place_ram_slots(&self) -> Vec<MemoryRange> {
+        self.ranges
+            .iter()
+            .flatten()
+            .filter_map(|slot| {
+                (slot.private_state == Some(KvmGuestMemfdPrivateState::InPlace)
+                    && slot.guest_memfd_offset.is_some())
+                .then_some(slot.range)
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -133,6 +159,8 @@ pub(crate) enum KvmGuestMemfdPrivateState {
     VmAttributes,
     #[cfg(guest_arch = "aarch64")]
     GuestMemfdDefault,
+    #[cfg(any(guest_arch = "aarch64", test))]
+    InPlace,
 }
 
 impl KvmGuestMemfdPrivateState {
@@ -183,18 +211,91 @@ impl KvmMemoryBackingMode {
                 range,
                 file_offset: file_size,
             });
-            file_size += range.len();
+            file_size = file_size.checked_add(range.len()).ok_or(
+                MemoryError::UnsupportedIsolationConfiguration("guestmemfd size overflow"),
+            )?;
         }
 
         Ok(Self::GuestMemfd(KvmGuestMemfdBacking {
-            file: kvm.create_guest_memfd(file_size)?,
+            file: kvm.create_guest_memfd_with_flags(file_size, private_state.create_flags())?,
             ranges,
             private_state,
         }))
     }
+
+    #[cfg(guest_arch = "aarch64")]
+    pub(crate) fn mappable_ram_backing(
+        &self,
+        layout: &vm_topology::memory::MemoryLayout,
+    ) -> Result<Option<virt::MappableRamBacking>, MemoryError> {
+        match self {
+            Self::GuestMemfd(backing)
+                if backing.private_state == KvmGuestMemfdPrivateState::InPlace =>
+            {
+                Ok(Some(virt::MappableRamBacking::new(
+                    backing
+                        .file
+                        .try_clone()
+                        .map_err(MemoryError::CloneGuestMemfd)?,
+                    layout,
+                )?))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    #[cfg(any(guest_arch = "aarch64", test))]
+    pub(crate) fn is_in_place(&self) -> bool {
+        matches!(self, Self::GuestMemfd(backing) if backing.private_state == KvmGuestMemfdPrivateState::InPlace)
+    }
+}
+
+impl KvmGuestMemfdPrivateState {
+    fn create_flags(self) -> u64 {
+        #[cfg(any(guest_arch = "aarch64", test))]
+        if self == Self::InPlace {
+            return kvm::GUEST_MEMFD_FLAG_MMAP_UAPI | kvm::GUEST_MEMFD_FLAG_INIT_SHARED_UAPI;
+        }
+        0
+    }
 }
 
 impl KvmPartitionInner {
+    #[cfg(guest_arch = "aarch64")]
+    pub(crate) fn handle_cca_v7_memory_fault(
+        &self,
+        tracker: &mut crate::cca_v7::FaultTracker,
+        fault: crate::cca_v7::Fault,
+        successful_exit: bool,
+    ) -> Result<(), KvmError> {
+        let mut state = self.memory.lock();
+        let result = (|| {
+            if self.cca_fatal.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(crate::cca_v7::CcaV7Error::AmbiguousFault.into());
+            }
+            let range = crate::cca_v7::checked_range(fault.gpa, fault.size)?;
+            // Validate slot coverage even for probes and no-op requests.
+            guest_memfd_range_segments(range, &state.ranges)?;
+            let action = tracker.observe(fault, successful_exit, &state.cca_visibility)?;
+            if action == crate::cca_v7::FaultAction::Convert {
+                let private = fault.flags != 0;
+                let changes = state.cca_visibility.changes(range, private)?;
+                for change in changes {
+                    let segments = guest_memfd_range_segments(change, &state.ranges)?;
+                    self.convert_cca_segments(&segments, private)?;
+                    state.cca_visibility.record(change, private);
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            // Conversion can fail after changing part of a segment. Poison
+            // before releasing the memory lock; never retry from the ledger.
+            self.mark_cca_fatal();
+        }
+        result
+    }
+
     /// # Safety
     ///
     /// `data..data+size` must be and remain an allocated VA range until the
@@ -476,6 +577,11 @@ impl KvmPartitionInner {
         private: bool,
         isolation_name: &'static str,
     ) -> Result<(), MemoryError> {
+        #[cfg(guest_arch = "aarch64")]
+        if self.memory_backing_mode.is_in_place() {
+            // There is only one backing. Removing either alias destroys data.
+            return Ok(());
+        }
         if private {
             for segment in segments {
                 tracing::debug!(
@@ -539,7 +645,7 @@ impl KvmPartitionInner {
         Ok(())
     }
 
-    /// Applies a KVM CCA memory-fault/RIPAS state transition.
+    /// Applies a KVM CCA v15 memory-fault/RIPAS state transition.
     ///
     /// The kernel supplies a page-aligned range and indicates whether it must
     /// become private. The range must remain within configured RAM. As with SNP
@@ -580,6 +686,59 @@ impl KvmPartitionInner {
         }
         Ok(())
     }
+
+    #[cfg(guest_arch = "aarch64")]
+    pub(crate) fn convert_cca_segments(
+        &self,
+        segments: &[KvmMemoryRangeSegment],
+        private: bool,
+    ) -> Result<(), KvmError> {
+        let KvmMemoryBackingMode::GuestMemfd(backing) = &self.memory_backing_mode else {
+            return Err(KvmError::InvalidCcaMemoryFault);
+        };
+        convert_in_place_segments(segments, private, |attributes| {
+            kvm::set_guest_memfd_memory_attributes(backing.file.as_fd(), attributes)
+        })?;
+        Ok(())
+    }
+}
+
+#[cfg(any(guest_arch = "aarch64", test))]
+fn convert_in_place_segments(
+    segments: &[KvmMemoryRangeSegment],
+    private: bool,
+    mut set_attributes: impl FnMut(&mut kvm::KvmMemoryAttributes2) -> Result<(), kvm::Error>,
+) -> Result<(), MemoryError> {
+    // Validate all offsets before the first ioctl, including packed NUMA
+    // offsets that are not consecutive in guest-physical order.
+    for segment in segments {
+        let size = segment.range.len();
+        if size == 0
+            || !size.is_multiple_of(hvdef::HV_PAGE_SIZE)
+            || !segment
+                .guest_memfd_offset
+                .is_multiple_of(hvdef::HV_PAGE_SIZE)
+            || segment.guest_memfd_offset.checked_add(size).is_none()
+        {
+            return Err(MemoryError::InvalidMapGpaRange);
+        }
+    }
+    for segment in segments {
+        let mut attributes = kvm::KvmMemoryAttributes2 {
+            offset: segment.guest_memfd_offset,
+            size: segment.range.len(),
+            attributes: if private {
+                kvm::KVM_MEMORY_ATTRIBUTE_PRIVATE as u64
+            } else {
+                0
+            },
+            ..Default::default()
+        };
+        // No retry: even EFAULT can follow a partial conversion. error_offset
+        // is diagnostic, not a safe restart point.
+        set_attributes(&mut attributes)?;
+    }
+    Ok(())
 }
 
 #[cfg(any(guest_arch = "aarch64", test))]
@@ -674,6 +833,19 @@ pub(crate) fn check_private_memory_extensions(
 ) -> Result<(), MemoryError> {
     require_kvm_extension(kvm, kvm::KVM_CAP_USER_MEMORY2, "KVM_CAP_USER_MEMORY2")?;
     require_kvm_extension(kvm, kvm::KVM_CAP_GUEST_MEMFD, "KVM_CAP_GUEST_MEMFD")?;
+    let flags = private_state.create_flags();
+    if flags != 0 {
+        let supported = require_kvm_extension(
+            kvm,
+            kvm::KVM_CAP_GUEST_MEMFD_FLAGS_UAPI,
+            "KVM_CAP_GUEST_MEMFD_FLAGS",
+        )?;
+        require_capability_bits(
+            supported,
+            flags,
+            "KVM_CAP_GUEST_MEMFD_FLAGS (MMAP | INIT_SHARED)",
+        )?;
+    }
     let (capability, capability_name) = match private_state {
         #[cfg(guest_arch = "x86_64")]
         KvmGuestMemfdPrivateState::VmAttributes => {
@@ -684,10 +856,27 @@ pub(crate) fn check_private_memory_extensions(
             kvm::KVM_CAP_GUEST_MEMFD_MEMORY_ATTRIBUTES_UAPI,
             "KVM_CAP_GUEST_MEMFD_MEMORY_ATTRIBUTES",
         ),
+        #[cfg(any(guest_arch = "aarch64", test))]
+        KvmGuestMemfdPrivateState::InPlace => (
+            kvm::KVM_CAP_GUEST_MEMFD_MEMORY_ATTRIBUTES_UAPI,
+            "KVM_CAP_GUEST_MEMFD_MEMORY_ATTRIBUTES",
+        ),
     };
     let memory_attributes = require_kvm_extension(kvm, capability, capability_name)?;
-    if memory_attributes as u64 & kvm::KVM_MEMORY_ATTRIBUTE_PRIVATE as u64 == 0 {
-        return Err(kvm::Error::MissingCapability(capability_name).into());
+    require_capability_bits(
+        memory_attributes,
+        kvm::KVM_MEMORY_ATTRIBUTE_PRIVATE as u64,
+        capability_name,
+    )
+}
+
+fn require_capability_bits(
+    supported: i32,
+    required: u64,
+    name: &'static str,
+) -> Result<(), MemoryError> {
+    if supported < 0 || supported as u64 & required != required {
+        return Err(kvm::Error::MissingCapability(name).into());
     }
     Ok(())
 }
@@ -833,6 +1022,165 @@ impl virt::PartitionMemoryMap for KvmPartitionInner {
 mod tests {
     use super::*;
     use test_with_tracing::test;
+
+    #[test]
+    fn in_place_requires_both_creation_flags_and_private_attributes() {
+        assert_eq!(test_private_state().create_flags(), 0);
+        let flags = KvmGuestMemfdPrivateState::InPlace.create_flags();
+        assert_eq!(flags, 3);
+        for supported in [-1, 0, 1, 2] {
+            assert!(require_capability_bits(supported, flags, "flags").is_err());
+        }
+        require_capability_bits(3, flags, "flags").unwrap();
+        require_capability_bits(7, flags, "flags").unwrap();
+        assert!(
+            require_capability_bits(1, kvm::KVM_MEMORY_ATTRIBUTE_PRIVATE as u64, "attributes")
+                .is_err()
+        );
+        require_capability_bits(
+            kvm::KVM_MEMORY_ATTRIBUTE_PRIVATE as i32,
+            kvm::KVM_MEMORY_ATTRIBUTE_PRIVATE as u64,
+            "attributes",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn in_place_converts_packed_offsets_without_retry_or_discard() {
+        let segments = [
+            KvmMemoryRangeSegment {
+                range: range(0x1000, 0x2000),
+                host_addr: std::ptr::null_mut(),
+                guest_memfd_offset: 0x8000,
+            },
+            KvmMemoryRangeSegment {
+                range: range(0x2000, 0x4000),
+                host_addr: std::ptr::null_mut(),
+                guest_memfd_offset: 0,
+            },
+        ];
+        for private in [false, true] {
+            for fail in [false, true] {
+                let mut requests = Vec::new();
+                let result = convert_in_place_segments(&segments, private, |request| {
+                    requests.push(*request);
+                    if fail {
+                        request.error_offset = request.offset + 4096;
+                        return Err(kvm::Error::MissingCapability("injected conversion error"));
+                    }
+                    Ok(())
+                });
+                assert_eq!(result.is_err(), fail);
+                assert_eq!(requests.len(), if fail { 1 } else { 2 });
+                assert_eq!(requests[0].offset, 0x8000);
+                assert_eq!(
+                    requests[0].attributes,
+                    if private {
+                        kvm::KVM_MEMORY_ATTRIBUTE_PRIVATE as u64
+                    } else {
+                        0
+                    }
+                );
+                if !fail {
+                    assert_eq!(requests[1].offset, 0);
+                    assert_eq!(requests[1].size, 0x2000);
+                }
+            }
+        }
+        for offset in [1, u64::MAX - 4095] {
+            let invalid = [KvmMemoryRangeSegment {
+                guest_memfd_offset: offset,
+                ..segments[0]
+            }];
+            assert!(
+                convert_in_place_segments(&invalid, true, |_| panic!("invalid request")).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn in_place_mixed_visibility_preserves_shared_pages_across_packed_slots() {
+        let slots = vec![
+            Some(KvmMemoryRange {
+                host_addr: std::ptr::null_mut(),
+                range: range(0x1000, 0x4000),
+                guest_memfd_offset: Some(0x3000),
+                private_state: Some(KvmGuestMemfdPrivateState::InPlace),
+            }),
+            Some(KvmMemoryRange {
+                host_addr: std::ptr::null_mut(),
+                range: range(0x4000, 0x7000),
+                guest_memfd_offset: Some(0),
+                private_state: Some(KvmGuestMemfdPrivateState::InPlace),
+            }),
+        ];
+        let mut visibility = crate::cca_v7::Visibility::all_private(
+            slots.iter().flatten().map(|slot| slot.range).collect(),
+        )
+        .unwrap();
+        visibility.record(range(0x1000, 0x2000), false);
+        visibility.record(range(0x5000, 0x6000), false);
+        let request = range(0x1000, 0x7000);
+        let mut calls = Vec::new();
+        for change in visibility.changes(request, false).unwrap() {
+            let segments = guest_memfd_range_segments(change, &slots).unwrap();
+            convert_in_place_segments(&segments, false, |attributes| {
+                calls.push((attributes.offset, attributes.size));
+                Ok(())
+            })
+            .unwrap();
+            visibility.record(change, false);
+        }
+        assert_eq!(calls, [(0x4000, 0x2000), (0, 0x1000), (0x2000, 0x1000)]);
+        assert!(visibility.changes(request, false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn in_place_init_includes_only_ram_slots() {
+        let mut state = KvmMemoryRangeState {
+            ranges: vec![
+                None,
+                Some(KvmMemoryRange {
+                    host_addr: std::ptr::null_mut(),
+                    range: range(0x1000, 0x3000),
+                    guest_memfd_offset: Some(0),
+                    private_state: Some(KvmGuestMemfdPrivateState::InPlace),
+                }),
+                Some(KvmMemoryRange {
+                    host_addr: std::ptr::null_mut(),
+                    range: range(0x5000, 0x7000),
+                    guest_memfd_offset: None,
+                    private_state: None,
+                }),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(state.in_place_ram_slots(), [range(0x1000, 0x3000)]);
+        state.cca_visibility =
+            crate::cca_v7::Visibility::all_private(state.in_place_ram_slots()).unwrap();
+        assert!(
+            state
+                .cca_visibility
+                .changes(range(0x1000, 0x3000), true)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            state
+                .cca_visibility
+                .changes(range(0x1000, 0x7000), true)
+                .is_err()
+        );
+        assert!(!KvmMemoryBackingMode::Userspace.is_in_place());
+        let mode = KvmMemoryBackingMode::GuestMemfd(KvmGuestMemfdBacking {
+            file: sparse_mmap::alloc_shared_memory(0x2000, "in-place-test")
+                .unwrap()
+                .into(),
+            ranges: guest_memfd_ranges(&[range(0x1000, 0x3000)]),
+            private_state: KvmGuestMemfdPrivateState::InPlace,
+        });
+        assert!(mode.is_in_place());
+    }
 
     #[test]
     fn default_prototype_preparation_leaves_userspace_allocation_to_worker() {
