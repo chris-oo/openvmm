@@ -2,8 +2,12 @@
 
 Date: 2026-09-11
 
-Status: proposed implementation, based on source inspection. No implementation,
-kernel build, or FVP execution was done for this document.
+Updated: 2026-09-14
+
+Status: implementation started. Two small OpenVMM foundation changes are
+committed. The local kvmtool/FVP reference stack passed the protocol/read
+smoke test, but failed clean shutdown. Buffer-level confidential DMA and the
+OpenVMM TDISP `vmm_test` are not yet qualified. See the runtime results below.
 
 ## 1. Recommendation
 
@@ -41,7 +45,7 @@ and the pinned kvmtool reference. Paths beginning with `../linux-cca`,
 
 | Input | Reference inspected | Qualification |
 |---|---|---|
-| OpenVMM | Current working change ID `rukkunwr`, based on change ID `llntpwqp`, bookmark `cca-v15-fvp-upstream` | Source baseline, not a new runtime qualification |
+| OpenVMM | Plan baseline change ID `rukkunwr`, based on change ID `llntpwqp`, bookmark `cca-v15-fvp-upstream` | Later foundation changes are listed below; no OpenVMM DA runtime qualification |
 | Host and Realm Linux | `../linux-cca`, `scratch/cca-tdisp-integration-v7`, `2b68f486fdbc8d2818309f91199dde46b2b7cdd6` | Matches the findings document |
 | kvmtool | `scratch/cca-tdisp-integration-v7`, `2e0928d1f945d68af388575e7bd4d6bfa7200120` | Pinned revision inspected initially; matching working tree independently reviewed in pass two |
 | TF-RMM | `../tf-rmm`, `33bbaf7814fee335027bf4d2417d97b551838b70` | Includes the DA overlay selecting both v7 branches |
@@ -54,8 +58,64 @@ establish working-tree cleanliness or byte-for-byte equivalence to committed
 files. Build from recorded clean inputs when creating the reference baseline.
 
 These sources are a **candidate integration set**. TF-A, model compatibility,
-the effective firmware configuration, and the full artifact hashes must still
-be qualified together. Do not label the old v15 FVP tuple as a tested v7 tuple.
+the effective firmware configuration, and artifact hashes were recorded for
+the local run below. Protocol/read success does not establish a clean lifecycle
+or production trust policy. Do not label the old v15 FVP tuple as a tested v7
+tuple.
+
+### Implementation status
+
+| Change ID | Completed scope | Not enabled by that change |
+|---|---|---|
+| `wrwxunkx` | Explicit guest_memfd flags, attributes2, INIT_RIPAS and prefault wrappers with ABI tests | In-place backing integration or device assignment |
+| `orsxqwvz` | Successful memory-fault exit decoding, original errno preservation, and rejection of non-`EFAULT` errors by the legacy conversion path | Handling v7 completion through in-place conversion; successful memory-fault exits still stop explicitly |
+
+Both code chunks received code review and scoped validation before commit.
+The baseline-code descriptions elsewhere in this plan identify why the full
+integration is needed; the two completed wrapper/exit tasks above supersede
+statements that those low-level interfaces are entirely absent.
+
+### Local Stage A results: 2026-09-14
+
+The local reference uses the Linux/kvmtool/RMM pins above, TF-A
+`38269bb73d34b4a31100adf208a27e4c28e7d611`, FVP 11.31.28, and Shrinkwrap
+`1c6b7a5278b47be11cad3bcd3a20416fc43fd388`. The container digest, effective
+kernel settings, build deviations and artifact hashes are saved under
+`target/cca-tdisp-stage-a/`. These are local artifacts, not a published
+OpenVMM platform. The existing v15 package was not changed.
+
+| Observation in run 3 | Result and limit |
+|---|---|
+| Host and no-device Realm boot | Passed; the no-device Realm powered off |
+| Host AHCI connection | `0000:02:00.0` bound to VFIO and connected to the host TSM |
+| Guest TDISP | Guest `0000:00:00.0` completed LOCK and RUN; RMM logged `RSI_VDEV_DMA_ENABLE > RSI_SUCCESS` |
+| Protected MMIO | ABAR `[0x50006000,0x50008000)` observed with RIPAS_DEV |
+| Data transfer | Read the complete 64 MiB disk using `dd bs=1048576 count=64 iflag=direct`; hash matched the nonzero fixture |
+| Interrupts | MSI-X through the GIC ITS; AHCI cumulative interrupt count was 132 after I/O, not a read-only interrupt delta |
+| RMM device teardown | STE disable, VDEV unlock/destroy, stream-table destruction and pSMMU deactivation succeeded |
+| Remaining cleanup | Four `IOMMU_DESTROY` failures with errno 16 (`EBUSY`) |
+| Simulator shutdown | FVP aborted with exit 134 and `corrupted size vs. prev_size`; launcher failed despite guest/host script exit 0 |
+| Confidential DMA | Expected normal path, but not yet demonstrated for the actual command/data buffers |
+
+The complete-image SHA-256 was
+`281e519df3077b557c6b03f5da83c4e8d397219259615dd7c3308f89cae8f2a6`.
+This proves matching read data, not writes, absence of shared bounce buffers,
+or physical-link encryption.
+
+Evidence is in
+[`runs/run-20260914-3/result.json`](target/cca-tdisp-stage-a/runs/run-20260914-3/result.json),
+the run's `input-hashes.json`, `share/realm-ahci.log:327-359,661-673`, and
+`console.log:82363,82379-82405,84016-84017,84058-84059`. The invocation is
+preserved in `guest-overlay/da-guest-init.sh`; the guest log prints transfer
+record counts and the hash, not the full command line.
+
+Run 1 stopped on a local BusyBox `lspci` option mismatch. Run 2 reached
+acceptance but the local probe exited before asynchronous disk discovery
+finished. Run 3 added a bounded discovery wait and passed the read test.
+Run 2's VDEV/stream/pSMMU teardown failures did **not** recur in run 3.
+The remaining IOMMUFD errors and model heap abort are separate observations;
+their causal relationship is unknown. Do not suppress either or treat the
+model's shutdown failure as a passing end-to-end test.
 
 ### Important refinements to the earlier findings
 
@@ -289,8 +349,9 @@ rebuild the binding safely or be explicitly unsupported. [O4-O5]
 
 The current `GuestMemfdDefault` mode creates guest_memfd with flags zero,
 registers it alongside a separate userspace mapping, populates imported pages,
-and discards old backing on conversion. It has no INIT_RIPAS, attributes2, or
-prefault wrapper. [O3]
+and discards old backing on conversion. The INIT_RIPAS, attributes2 and
+prefault wrappers now exist, but this mode does not use them. [O3; implementation
+status above]
 
 The pinned v7 reference creates RAM with
 `GUEST_MEMFD_FLAG_MMAP | GUEST_MEMFD_FLAG_INIT_SHARED`, maps that fd, and issues
@@ -329,8 +390,9 @@ the old separate-backing path and retain destructive discard calls.
 5. Decode both forms of `KVM_EXIT_MEMORY_FAULT`: supported negative `KVM_RUN`
    returns and successful returns carrying that exit reason. The initial
    RIPAS exit returns `-EFAULT`, but completion can re-exit with return zero
-   when backing attributes still disagree. OpenVMM currently handles only
-   the error-return form. Preserve the originating errno and pending-exit
+   when backing attributes still disagree. The low-level decoder now exposes
+   both forms, but the successful form is explicitly rejected by the existing
+   backends. Preserve the originating errno and pending-exit
    state across re-entry and `complete_exit()`, including stop/cancellation.
    [O10, K6]
 6. Classify memory-fault causes before changing visibility. Backing acquisition
@@ -550,8 +612,12 @@ path explicitly has no legacy INTx interrupt map. The TF-RMM recipe proves
 an AHCI baseline exists for kvmtool, not that OpenVMM's MSI-X-only frontend can
 drive that endpoint. [O4-O5, F1]
 
-During reference qualification, capture `lspci -vv`, VFIO IRQ capability
-queries, and the mode used by the AHCI driver. If it needs MSI, implement
+Run 3 established that the modeled AHCI endpoint uses MSI-X with kvmtool.
+Thus ordinary MSI or INTx support is not a demonstrated prerequisite for this
+fixture. Still validate OpenVMM's MSI-X routing and protected/nonsecure range
+handling on the same endpoint. Capture PCI configuration, VFIO IRQ capability
+queries, and the mode used by the AHCI driver. If another supported fixture
+needs MSI, implement
 ordinary MSI capability virtualization, VFIO eventfd setup, and GIC routing.
 If it only works with INTx, implement level/mask/resample handling and the
 guest DT interrupt map. Gate the test on the supported observed mode.
@@ -713,6 +779,176 @@ A shell `accept` return code cannot cover the kernel issue described above.
 Fixing that upstream/local guest error propagation is recommended; record any
 kernel patch separately from OpenVMM changes.
 
+### Next qualification step: prove the actual DMA path
+
+**Recommendation:** add a small test-only Linux instrumentation/helper patch,
+then rerun kvmtool on the same FVP configuration. Do not change the pinned
+kernel silently: retain the baseline, record the patch and new Image/config
+hashes, and keep this qualification work separate from the OpenVMM stack.
+
+There are three different claims:
+
+| Claim | Required evidence |
+|---|---|
+| The device can transfer data after acceptance | Already shown by run 3 |
+| The device actually transfers to/from Realm-private buffers | Final device DMA addresses, private RAM state, transfer completion, and no shared staging for those bytes |
+| An untrusted host/unauthorized device cannot access those buffers | Additional negative access/isolation tests; neither a hash nor a clear address selector alone establishes this |
+
+FVP can validate the modeled CCA assignment/isolation flow. It cannot establish
+production device trust, real link encryption, side-channel resistance or
+hardware confidentiality.
+
+#### Why private DMA is expected, but still needs measurement
+
+In this guest kernel, `force_dma_unencrypted()` returns false for an accepted
+device. The ordinary direct DMA path then selects the encrypted/private address
+form unless attributes or a bounce path require another form. On Arm CCA,
+shared DMA uses the `PROT_NS_SHARED` selector; the normal encrypted form is the
+canonical address. The selector must be obtained from this guest's negotiated
+address configuration, not a hardcoded bit. [K9]
+
+AHCI allocates coherent memory for command headers, received FIS data and
+command tables. Payloads go through `dma_map_sg`, then `ahci_fill_sg` writes
+the **mapped** addresses and lengths into PRDT entries. A userspace pointer,
+`sg_phys()` of the original buffer, the absence of `DMA_ATTR_CC_SHARED`, or
+`O_DIRECT` alone is not proof of what the device actually addresses. [K10]
+
+#### Phase A1: collect the DMA API evidence
+
+Enable guest event tracing in a derived test kernel if necessary. The current
+effective config has `TRACING_SUPPORT`, but that alone does not mean tracefs
+DMA events are enabled. Verify the effective tracing configuration and actual
+`events/dma` availability.
+
+Capture `dma_alloc`, `dma_map_sg`, corresponding unmap/free events, and
+SWIOTLB bounce events for the AHCI BDF. Start before **post-accept driver
+reprobe** so coherent command/FIS allocations are included. Add explicit
+workload begin/end markers and record device acceptance and DMA direction.
+Use per-event filters only after checking each event's `format`; do not assume
+all events expose the same fields. Size the trace buffer for the bounded test
+and fail evidence collection on overruns/dropped records. DMA SG events also
+cap their arrays at `DMA_TRACE_MAX_ENTRIES` (128 in this tree), exposing
+`truncated`, `full_nents` and `full_ents`. A larger ring does not remove that
+per-event cap. Bound the request below the limit or supply independently
+correlated complete hook records; a truncated event never satisfies full
+buffer coverage. Record truncation separately from ring-buffer loss. [K11]
+
+DMA API traces are useful first evidence, but not the final oracle. They do
+not establish every buffer's RIPAS or all actual descriptor contents.
+SWIOTLB can use private as well as shared pools in this tree; "a bounce
+occurred" is not identical to "confidentiality failed". For the initial
+controlled test require **no bounce at all**, and report private-bounce support
+as separate future coverage rather than guessing from an event. [K9, K11]
+
+#### Phase A2: correlate a real AHCI command with private buffers
+
+Use a small, deterministic, single-request test before repeating the large
+`dd` workload. Recommended helper shape:
+
+1. After guest acceptance and AHCI reprobe, allocate owned, page-aligned guest
+   kernel pages for a bounded test read. Submit them through the normal block
+   layer to the confirmed AHCI scratch disk; do not emulate DMA with a CPU
+   copy or replace the AHCI driver. Keep the pages alive until completion and
+   verification. Serialize the test with driver reset/unbind and prohibit
+   conversion/reuse of its buffers while in flight.
+2. In a test hook after DMA mapping and before command issue, record the guest
+   BDF, acceptance state, request ID, ATA hardware tag, direction, LBA/length,
+   final mapped SG entries, and actual PRDT address/length fields. Check the
+   entries submitted to hardware, not just the input list to `dma_map_sg`.
+   Correlate request completion/error with the same ID, including all split,
+   retried and reissued commands. Reject truncated SG/PRDT coverage rather
+   than counting a partially recorded request as complete. [K10]
+3. Check the coherent command-header/table and received-FIS ranges as well.
+   These can contain addresses and data; proving private payload pages alone
+   does not qualify the entire AHCI command path. Capture their allocation
+   after acceptance and their programmed addresses before engine startup.
+4. For every device-visible test range, require a clear shared selector and
+   convert the DMA address back to a Realm IPA using the device's actual DMA
+   translation. For this fixture require the direct-DMA/no-guest-IOMMU path.
+   Do not treat an arbitrary IOVA as an IPA. Match payload ranges to the owned
+   test pages; reject unexpected remapping/staging or uncovered bytes.
+5. Query `rsi_ipa_state_get()` across **every covered granule**, requiring
+   `RSI_SUCCESS`, bounded forward progress and exactly `RIPAS_RAM`. Do not use
+   `arm64_rsi_is_protected()` as a RAM proof: it accepts non-EMPTY states,
+   including device memory. Record checks before submission and after
+   completion, plus buffer ownership/conversion exclusion for the interval
+   between them. [K12]
+6. Confirm that none of the submitted addresses resolves to a SWIOTLB buffer
+   or other staging allocation, and that the helper's original pages hold the
+   expected disk bytes after normal DMA synchronization/completion. Reconcile
+   per-request SG/PRDT byte totals with the requested transfer size.
+
+Review hook execution context before implementation. `ata_sg_setup` runs with
+the host lock held; do not insert sleeping allocation, unbounded logging, or
+an unchecked long RSI walk there. Perform preparation/state walks in a safe
+context, keep fast-path records bounded, and use owned-buffer lifetime plus
+conversion exclusion to bridge the checks to the actual command. If those
+constraints cannot be established, the result stays inconclusive rather than
+claiming atomic proof from two snapshots. [K10]
+
+For a read, device DMA writes guest memory (`DMA_FROM_DEVICE`). Follow it with
+a write/read-back variant on the **per-run disposable disk** to cover device
+DMA reads (`DMA_TO_DEVICE`). Generate a fresh nonsecret test pattern inside the
+Realm, use a page-aligned transfer/LBA range, flush the scratch device before
+read-back, and compare data using a separate verified read request. Never run
+this write test on a host or guest boot disk.
+
+Then repeat the 64 MiB read with equivalent range coverage. Report the initial
+small-request result separately until instrumentation covers the full workload.
+
+Suggested machine-readable result fields:
+
+```text
+run_id, device_bdf, request_id, ata_tag, direction, lba, transfer_bytes
+accepted, dma_enable_result, shared_selector
+command_fis_ranges[], mapped_sg[], submitted_prdt[]
+each_range: dma_address, realm_ipa, length, ripas_before, ripas_after
+bounce_count, conversion_count, completed_bytes, completion_status
+expected_hash, actual_hash, trace_dropped_records, sg_event_truncated
+```
+
+Pass only if the test records cover the actual submitted buffers, all required
+checks succeed, completion/data match, and no evidence is missing. Never
+convert a trace failure into a skipped-success result.
+
+#### Phase A3: prove the oracle rejects a non-confidential path
+
+Run controls in **fresh** FVP/Realm instances because same-host cleanup is not
+qualified.
+
+| Control | Required result |
+|---|---|
+| Ordinary unaccepted AHCI, where supported | Shared/bounce DMA may work, but the confidential-DMA checker must report **not confidential** |
+| Synthetic helper record with a shared selector, non-RAM state, missing segment, truncated SG array or dropped record | Checker fails deterministically; this tests the checker, not hardware isolation |
+| Test-only guest mode that withholds RSI DMA enable while retaining private test pages | No successful private transfer; require a mapped-request trace and a bounded completion failure with unchanged destination sentinel where applicable |
+
+For the DMA-disabled control, implement an explicit test-only guest mode.
+Do not merely omit `tsm/accept`: an unaccepted driver may fall back to shared
+buffers and legitimately work. Establish the control's bootstrap path first:
+withholding DMA enable can prevent AHCI discovery because even IDENTIFY uses
+DMA with this driver. There may be no block device for the normal helper to
+submit against. Select an actual observable probe command if necessary and
+capture its private buffers, submission and attributable failure; do not
+promise a post-discovery block request. Missing disk discovery alone is
+inconclusive. [K13]
+
+Never revoke DMA during an active request or
+declare a timeout alone proof of enforcement. Correlate the attempted private
+command with device/RMM/SMMU status; if attribution is unavailable, mark the
+negative isolation result inconclusive. Keep instrumentation that reports an
+invalid state from being mistaken for a production acceptance path.
+
+An optional later host-access control can attempt a bounded read of the exact
+private guest_memfd offset in an isolated helper process and verify expected
+denial, after checking this kernel's fault contract. This is supplementary:
+host denial by itself does not prove the device used that range. Do not expose
+real secrets or convert the tested pages to shared to inspect their contents.
+
+After A2 and meaningful controls pass, the justified claim is: **this pinned
+model stack completed AHCI DMA using checked Realm-private command/data
+buffers for the tested requests**. Clean teardown, cross-VM/device isolation
+and physical hardware assurance remain separately qualified results.
+
 ### Invocation and selection
 
 After the proposed profile/capability/test are implemented and the new roots
@@ -762,15 +998,22 @@ transport/error plumbing, but do not replace a real FVP negative result.
 
 | Stage | Main files/crates | Exit criterion |
 |---|---|---|
-| A. Reference and interrupt qualification | Pinned Linux/kvmtool/TF-RMM build manifest; DA model assets | kvmtool baseline, exact IRQ mode, known AHCI data image; unresolved firmware inputs closed |
+| A. Reference and interrupt qualification | Pinned Linux/kvmtool/TF-RMM build manifest; DA model assets; qualification helper | Recorded reference/IRQ baseline plus section 10 buffer-level qualification and clean lifecycle; current read smoke success alone does not close A |
 | B. v7 memory ABI and backing | `vm/kvm`; `vmm_core/virt_kvm/{cca,memory}`; `openvmm/membacking`; worker assembly | v7 Realm boots; INIT_RIPAS ledgers, both memory-fault return forms/cause classification, pending completion and both conversion directions pass; v15 unchanged |
 | C. DA FVP/payload mode | `petri/incubator/{profile,fvp,cca_init}`; platform/profile files; `resolve_cca_payload`; Flowey runner/pipeline; Petri artifacts | Validated DA L1 and guest artifacts; readiness-gated fixture; negative identity tests |
 | D. Host object path | `vfio_sys/{cdev,iommufd}`; VFIO resources/resolver/manager; KVM association service | Realm vIOMMU/vdevice/S1-bypass attach and partial-allocation cleanup; no live TDISP state requests yet |
 | E. Native TDISP/RHI | `tdisp` host module; VFIO CCA coordinator; Arm KVM exit/register adapter | Whole-object snapshot adapter, guest buffer encoding, mocked requests and evidence transport pass; real LOCK/RUN remain disabled |
 | F. Access and DMA completion | VFIO BAR/config/IRQ paths; TIO handler; memory/DMA coordinator; DT/address integration | Real transitions enabled only now; protected MMIO, private/shared DMA and observed interrupt mode work |
-| G. End-to-end and lifecycle | Petri fixture; new test and helper/instrumentation; fault tests; Guide | Exact FVP test passes, required evidence exists, lifecycle status explicitly recorded |
+| G. End-to-end and lifecycle | Petri fixture; new test and helper/instrumentation; fault tests; Guide | Exact FVP test and required evidence pass with clean teardown; record any failures separately, never as overall success |
 
-Stage C can proceed after Stage A while B is implemented. D depends on B;
+Stage A has a protocol/read baseline and known MSI-X mode, but remains
+incomplete for confidential DMA and clean lifecycle. The next qualification
+task is the buffer-level test in section 10; investigate the two shutdown failures
+separately. Do not use repeated forced shutdown as a clean-reuse result.
+
+Stage C scaffolding and B can proceed using the recorded local candidate;
+publishing a qualified DA platform/test still requires the open Stage A gates.
+D depends on B;
 E can develop against fakes alongside D. F requires B, D and E. G requires
 the qualified C/F outputs. Interrupt work discovered in A is a prerequisite
 for F, not deferred cleanup.
@@ -795,14 +1038,17 @@ policy, and hardware qualification.
 
 Resolve these before claiming end-to-end support:
 
-- Exact DA firmware/model/toolchain tuple and effective kernel configuration.
-- AHCI's real interrupt mode and the required OpenVMM implementation.
+- Clean lifecycle qualification of the recorded DA tuple, including separate
+  IOMMUFD `EBUSY` and FVP heap-abort investigations.
+- OpenVMM MSI-X delivery and BAR-range handling for the now-observed AHCI mode.
 - v7 backing integration, memory-fault cause/completion handling and
   guest-buffer access tracking.
 - Private/shared PCI address translation with the actual Linux TSM resource
   allocator.
 - Protected-map cleanup on forced exit; same-host reuse cannot be assumed.
 - Reliable observation/error propagation for guest RSI DMA enable.
+- Actual command/data-buffer private-state and no-shared-bounce evidence for
+  completed device transfers, as specified below.
 
 These are bounded engineering gates, not reasons to implement a second VMM
 or replace the existing TDISP infrastructure.
@@ -833,6 +1079,11 @@ review pass two. The revision links below remain the reproducible references.
 | K6 | `../linux-cca/arch/arm64/kvm/rmi-exit.c:88-116`; `arch/arm64/kvm/rmi.c:1312-1370,1651-1683`; `arch/arm64/kvm/arm.c:1344-1359`; `arch/arm64/kvm/mmu.c:1723-1730`; `virt/kvm/guest_memfd.c:1179-1254` |
 | K7 | `../linux-cca/drivers/virt/coco/arm-cca-host/rmi-da.c:1296-1351`; `drivers/virt/coco/arm-cca-host/arm-cca.c:552-578`; `drivers/virt/coco/arm-cca-guest/rhi-da.c:290-370`, actual whole-object read behavior |
 | K8 | `../linux-cca/drivers/virt/coco/arm-cca-guest/rsi-da.c:39-59`; `drivers/virt/coco/arm-cca-guest/rhi-da.c:249-272,327-343`; `arch/arm64/include/asm/memory.h:340-371`; `drivers/firmware/arm_rmm/rsi.c:88-139,239-243` |
+| K9 | `../linux-cca/arch/arm64/mm/mem_encrypt.c:77-83`; `arch/arm64/include/asm/mem_encrypt.h:26-35`; `include/linux/dma-direct.h:92-123,149-156`; `kernel/dma/direct.c:688-742`; `kernel/dma/swiotlb.c:1767-1776` |
+| K10 | `../linux-cca/drivers/ata/libahci.c:749-756,1652-1672,1684-1723,2044-2073,2525-2553`; `drivers/ata/libata-core.c:4870-4915` |
+| K11 | `../linux-cca/include/trace/events/dma.h`, DMA allocation/mapping event formats; `kernel/dma/mapping.c:240-269`; `kernel/dma/swiotlb.c:1767-1776` |
+| K12 | `../linux-cca/include/linux/arm-rsi-cmds.h:39-43,71-85`; `drivers/firmware/arm_rmm/rsi.c:106-130`, non-EMPTY versus exact RAM checks |
+| K13 | `../linux-cca/drivers/ata/libata-core.c:1763-1767,5228-5229`; `drivers/ata/ahci.h:253`, IDENTIFY and AHCI PIO-protocol DMA |
 | V1 | [kvmtool v7 `kvm.c:431-474`](https://gitlab.arm.com/linux-arm/kvmtool-cca/-/blob/2e0928d1f945d68af388575e7bd4d6bfa7200120/kvm.c); `util/util.c:175-225`; `arm64/realm.c:84-141`; `arm64/kvm-cpu.c:547-596` at the same revision |
 | V2 | [kvmtool v7 `vfio/iommufd.c`](https://gitlab.arm.com/linux-arm/kvmtool-cca/-/blob/2e0928d1f945d68af388575e7bd4d6bfa7200120/vfio/iommufd.c), allocation/BAR/IOAS helpers; `arm64/kvm.c:530-554,628-646` |
 | V3 | [kvmtool v7 `arm64/smccc.c`](https://gitlab.arm.com/linux-arm/kvmtool-cca/-/blob/2e0928d1f945d68af388575e7bd4d6bfa7200120/arm64/smccc.c); `arm64/include/asm/smccc.h:20-64`; `arm64/tsm.c`; `arm64/kvm-cpu.c:600-630` |
@@ -899,3 +1150,28 @@ corrections are reflected in the design, validation cases and implementation
 gates, with no further amendments required. That check used the established
 second-pass source evidence and revised document sections; it was not another
 full source audit or a runtime qualification.
+
+### Runtime evidence and DMA qualification update: 2026-09-14
+
+The `verify` agent independently checked run 3's matching-image read, MSI-X,
+RSI DMA-enable success, successful RMM device teardown, remaining IOMMUFD
+errors and FVP abort. It did not infer private-buffer DMA from those results
+and did not attribute the model abort to the cleanup errors.
+
+The plan now separates completed foundation changes and observed local results
+from the proposed buffer-level qualification. The new test design requires
+actual AHCI descriptor/SG correlation, exact RIPAS_RAM checks and no staging
+for owned test buffers, followed by explicit controls.
+
+Targeted `review-plan` review: **Minor revisions**. The review cross-checked
+run 3 artifacts and K9-K12 and confirmed the scope of the claimed result.
+Its three corrections are incorporated: establish an observable DMA-disabled
+probe command before promising a block-request control; reject truncated SG
+trace records separately from dropped events; and require buffer-level
+qualification/clean lifecycle consistently in the stage table. The review
+does not establish confidential DMA or resolve the shutdown failures.
+
+Final targeted review before commit: **Ready**. All three corrections were
+confirmed, and the DMA/SWIOTLB tracepoints needed to start A1 were checked in
+the pinned Linux sources. A1 remains trace evidence collection, not a substitute
+for A2's descriptor, RAM-state and lifetime checks.
