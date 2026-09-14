@@ -37,6 +37,9 @@ zerocopy.workspace = true
 [dev-dependencies]
 test_with_tracing.workspace = true
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+sparse_mmap.workspace = true
+
 [target.'cfg(all(target_os = "linux", target_arch = "aarch64"))'.dependencies]
 aarch64defs.workspace = true
 bitfield-struct.workspace = true
