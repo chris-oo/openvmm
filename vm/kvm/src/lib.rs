@@ -133,7 +133,7 @@ mod ioctl {
         0xd2,
         kvm_memory_attributes
     );
-    pub(super) const SET_MEMORY_ATTRIBUTES2: libc::c_ulong =
+    pub(super) const SET_MEMORY_ATTRIBUTES2: nix::sys::ioctl::ioctl_num_type =
         request_code_readwrite!(KVMIO, 0xd2, size_of::<KvmMemoryAttributes2>());
     ioctl_readwrite_bad!(
         kvm_set_memory_attributes2,
@@ -145,7 +145,7 @@ mod ioctl {
     #[cfg(target_arch = "x86_64")]
     ioctl_write_ptr!(kvm_get_device_attr, KVMIO, 0xe2, kvm_device_attr);
     ioctl_readwrite!(kvm_create_guest_memfd, KVMIO, 0xd4, kvm_create_guest_memfd);
-    pub(super) const PRE_FAULT_MEMORY: libc::c_ulong =
+    pub(super) const PRE_FAULT_MEMORY: nix::sys::ioctl::ioctl_num_type =
         request_code_readwrite!(KVMIO, 0xd5, size_of::<KvmPreFaultMemory>());
     ioctl_readwrite_bad!(kvm_pre_fault_memory, PRE_FAULT_MEMORY, KvmPreFaultMemory);
     #[cfg(target_arch = "aarch64")]
@@ -155,7 +155,7 @@ mod ioctl {
         KvmArmRmiPopulate
     );
     #[cfg(any(target_arch = "aarch64", test))]
-    pub(super) const ARM_RMI_INIT_RIPAS: libc::c_ulong =
+    pub(super) const ARM_RMI_INIT_RIPAS: nix::sys::ioctl::ioctl_num_type =
         request_code_write!(KVMIO, 0xd8, size_of::<KvmArmRmiInitRipas>());
     #[cfg(any(target_arch = "aarch64", test))]
     ioctl_write_ptr_bad!(
@@ -2541,9 +2541,9 @@ mod memory_abi_tests {
 
     #[test]
     fn memory_ioctl_encodings_match_v7_uapi() {
-        assert_eq!(ioctl::SET_MEMORY_ATTRIBUTES2, 0xc080_aed2);
-        assert_eq!(ioctl::PRE_FAULT_MEMORY, 0xc040_aed5);
-        assert_eq!(ioctl::ARM_RMI_INIT_RIPAS, 0x4040_aed8);
+        assert_eq!(ioctl::SET_MEMORY_ATTRIBUTES2 as u32, 0xc080_aed2);
+        assert_eq!(ioctl::PRE_FAULT_MEMORY as u32, 0xc040_aed5);
+        assert_eq!(ioctl::ARM_RMI_INIT_RIPAS as u32, 0x4040_aed8);
         assert_eq!(KVM_CAP_GUEST_MEMFD_FLAGS_UAPI, 244);
         assert_eq!(KVM_CAP_GUEST_MEMFD_MEMORY_ATTRIBUTES_UAPI, 250);
         assert_eq!(GUEST_MEMFD_FLAG_MMAP_UAPI, 1);
