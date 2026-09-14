@@ -39,6 +39,9 @@ pub enum MemoryError {
     DiscardPrivateBacking(#[source] std::io::Error),
     #[error("unsupported isolation configuration: {0}")]
     UnsupportedIsolationConfiguration(&'static str),
+    #[cfg(any(guest_arch = "aarch64", test))]
+    #[error("RAM layout differs from the prepared KVM backing")]
+    PreparedRamLayoutChanged,
 }
 
 #[derive(Debug, Inspect)]
@@ -84,6 +87,34 @@ pub(crate) enum KvmMemoryBackingMode {
     Userspace,
     /// Register shared userspace and private guestmemfd backing for RAM.
     GuestMemfd(KvmGuestMemfdBacking),
+}
+
+/// Retains Arm backing between prototype preparation and partition creation.
+#[cfg(any(guest_arch = "aarch64", test))]
+#[derive(Default)]
+pub(crate) struct KvmPreparedRamBacking {
+    backing: Option<(Vec<MemoryRange>, KvmMemoryBackingMode)>,
+}
+
+#[cfg(any(guest_arch = "aarch64", test))]
+impl KvmPreparedRamBacking {
+    /// Repeated preparation is idempotent only for the same RAM ranges.
+    /// A failed allocation leaves the prototype unprepared and can be retried.
+    pub(crate) fn prepare(
+        &mut self,
+        ranges: Vec<MemoryRange>,
+        create: impl FnOnce(&[MemoryRange]) -> Result<KvmMemoryBackingMode, MemoryError>,
+    ) -> Result<&mut KvmMemoryBackingMode, MemoryError> {
+        if self.backing.is_none() {
+            let mode = create(&ranges)?;
+            self.backing = Some((ranges.clone(), mode));
+        }
+        let (prepared_ranges, mode) = self.backing.as_mut().expect("backing was prepared above");
+        if *prepared_ranges != ranges {
+            return Err(MemoryError::PreparedRamLayoutChanged);
+        }
+        Ok(mode)
+    }
 }
 
 #[derive(Debug, Inspect)]
@@ -801,6 +832,109 @@ impl virt::PartitionMemoryMap for KvmPartitionInner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_with_tracing::test;
+
+    #[test]
+    fn default_prototype_preparation_leaves_userspace_allocation_to_worker() {
+        use crate::KvmError;
+        use crate::KvmProcessorBinder;
+        use virt::ProtoPartition;
+        use vm_topology::memory::MemoryLayout;
+        use vm_topology::memory::MemoryRangeWithNode;
+
+        struct DefaultProto;
+        impl ProtoPartition for DefaultProto {
+            type Partition = KvmPartition;
+            type ProcessorBinder = KvmProcessorBinder;
+            type Error = KvmError;
+
+            fn max_physical_address_size(&self) -> u8 {
+                32
+            }
+
+            fn build(
+                self,
+                _config: virt::PartitionConfig<'_>,
+            ) -> Result<(Self::Partition, Vec<Self::ProcessorBinder>), Self::Error> {
+                Err(KvmError::NotSupported)
+            }
+        }
+
+        let layout = MemoryLayout::new_from_ranges(
+            &[MemoryRangeWithNode {
+                range: range(0x1000, 0x3000),
+                vnode: 0,
+            }],
+            &[],
+        )
+        .unwrap();
+        assert!(DefaultProto.prepare_ram_backing(&layout).unwrap().is_none());
+    }
+
+    #[test]
+    fn prepared_ram_retains_backing_and_rejects_layout_changes() {
+        let mut prepared = KvmPreparedRamBacking::default();
+        let ranges = vec![range(0x1000, 0x3000), range(0x8000, 0xa000)];
+        let file: File = sparse_mmap::alloc_shared_memory(0x4000, "prepared-kvm-ram-test")
+            .unwrap()
+            .into();
+        let fd = file.as_raw_fd();
+        let mode = prepared
+            .prepare(ranges.clone(), |ranges| {
+                Ok(KvmMemoryBackingMode::GuestMemfd(KvmGuestMemfdBacking {
+                    file,
+                    ranges: guest_memfd_ranges(ranges),
+                    private_state: test_private_state(),
+                }))
+            })
+            .unwrap();
+        assert!(
+            matches!(mode, KvmMemoryBackingMode::GuestMemfd(backing) if backing.file.as_raw_fd() == fd)
+        );
+        // Both an explicit preparation and the direct-build fallback use this
+        // method. A repeat must not replace the file or its packed offsets.
+        let mode = prepared
+            .prepare(ranges, |_| panic!("must reuse prepared backing"))
+            .unwrap();
+        let KvmMemoryBackingMode::GuestMemfd(backing) = mode else {
+            panic!("lost guestmemfd backing");
+        };
+        assert_eq!(backing.file.as_raw_fd(), fd);
+        assert_eq!(backing.ranges[1].file_offset, 0x2000);
+        assert!(matches!(
+            prepared.prepare(vec![range(0x1000, 0x5000)], |_| panic!(
+                "must reject changed layout"
+            )),
+            Err(MemoryError::PreparedRamLayoutChanged)
+        ));
+    }
+
+    #[test]
+    fn unprepared_ram_falls_back_and_failed_preparation_can_retry() {
+        let mut prepared = KvmPreparedRamBacking::default();
+        let ranges = vec![range(0x1000, 0x3000)];
+        assert!(
+            prepared
+                .prepare(ranges.clone(), |_| {
+                    Err(MemoryError::UnsupportedIsolationConfiguration(
+                        "test allocation failure",
+                    ))
+                })
+                .is_err()
+        );
+        assert!(matches!(
+            prepared
+                .prepare(ranges.clone(), |_| Ok(KvmMemoryBackingMode::Userspace))
+                .unwrap(),
+            KvmMemoryBackingMode::Userspace
+        ));
+        assert!(matches!(
+            prepared
+                .prepare(ranges, |_| panic!("must reuse ordinary mode"))
+                .unwrap(),
+            KvmMemoryBackingMode::Userspace
+        ));
+    }
 
     fn range(start: u64, end: u64) -> MemoryRange {
         MemoryRange::new(start..end)

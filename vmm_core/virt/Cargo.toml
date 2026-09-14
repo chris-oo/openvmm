@@ -28,6 +28,10 @@ thiserror.workspace = true
 tracing.workspace = true
 zerocopy.workspace = true
 [dev-dependencies]
+test_with_tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+sparse_mmap.workspace = true
 
 [build-dependencies]
 build_rs_guest_arch.workspace = true

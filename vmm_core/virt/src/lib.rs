@@ -8,6 +8,8 @@ mod cpuid;
 mod generic;
 pub mod io;
 pub mod irqcon;
+#[cfg(target_os = "linux")]
+mod ram_backing;
 pub use vmcore::irqfd;
 pub mod state;
 pub mod synic;
@@ -16,6 +18,8 @@ pub mod x86;
 pub use arch::*;
 pub use cpuid::*;
 pub use generic::*;
+#[cfg(target_os = "linux")]
+pub use ram_backing::*;
 pub use vm_topology::processor::VpInfo;
 
 mod arch {

@@ -140,6 +140,27 @@ the backing file persists guest memory to disk so it can be saved and
 restored. It is a form of shared memory and cannot be combined with private
 memory or explicit huge pages.
 
+## Partition-supplied RAM on Linux
+
+Before the memory manager allocates RAM, OpenVMM calls the prototype
+partition's `prepare_ram_backing` method. A backend can return a
+[`MappableRamBacking`](https://openvmm.dev/rustdoc/linux/virt/struct.MappableRamBacking.html)
+to supply its own shared-writable file. The file packs the memory layout's
+RAM ranges in order, followed by VTL2 RAM, without space for GPA holes.
+OpenVMM imports each range at its recorded file offset and preserves the
+node's memory policy. A supplied file cannot be combined with restored
+backing, anonymous private memory or explicit huge pages.
+
+Returning no file leaves ordinary userspace RAM allocation unchanged. The
+Arm KVM backend uses preparation to retain its private guestmemfd, but does
+not return that private-only file as shared-writable RAM. Its existing CCA
+mode still uses separate userspace and private backing. This interface does
+not by itself enable CCA in-place conversion or trusted device assignment.
+
+The shared/private backing choice on this page is not the same as Realm
+page visibility. Sharing a file handle does not establish permission to read
+Realm-private pages or map them for ordinary host DMA.
+
 ## Choosing a backing
 
 | Goal | Backing |

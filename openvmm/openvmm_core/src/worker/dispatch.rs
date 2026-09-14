@@ -8,6 +8,7 @@ mod intel_vtd_wiring;
 mod ioapic_iommu_wiring;
 mod pcie_topology;
 mod pcie_wiring;
+mod ram_backing;
 mod smmu_wiring;
 
 use crate::emuplat;
@@ -1222,6 +1223,8 @@ impl InitializedVm {
                 device_assignment_msi_iova_range,
             })
             .context("failed to create the prototype partition")?;
+        #[cfg(target_os = "linux")]
+        let mut proto = proto;
 
         let physical_address_size = proto.max_physical_address_size();
 
@@ -1480,9 +1483,35 @@ impl InitializedVm {
             }
         }
 
-        // Build per-node RAM backing requests. Each NUMA node with memory
-        // gets its own backing (memfd), enabling per-node hugepage settings
-        // and host NUMA binding.
+        let max_addr = mem_layout
+            .end_of_layout()
+            .max(mem_layout.vtl2_range().map_or(0, |r| r.end()));
+        #[cfg(guest_arch = "aarch64")]
+        let shared_gpa_bit =
+            if cfg.hypervisor.with_isolation == Some(openvmm_defs::config::IsolationType::Cca) {
+                let shared_bit = platform_info
+                    .shared_gpa_bit
+                    .context("missing CCA shared GPA bit")?;
+                anyhow::ensure!(
+                    shared_bit.is_power_of_two(),
+                    "CCA shared GPA bit must be a power of two"
+                );
+                anyhow::ensure!(
+                    max_addr <= shared_bit,
+                    "guest memory layout overlaps CCA shared GPA alias region"
+                );
+                Some(shared_bit)
+            } else {
+                None
+            };
+
+        #[cfg(target_os = "linux")]
+        let partition_backing = proto
+            .prepare_ram_backing(&mem_layout)
+            .context("failed to prepare partition RAM backing")?;
+
+        // Ordinary RAM gets one backing per NUMA node. Partition-supplied RAM
+        // instead uses slices of the backend's file, with the same node policy.
         let num_nodes = cfg.numa.nodes.len();
 
         // Group RAM ranges by vnode.
@@ -1502,19 +1531,15 @@ impl InitializedVm {
             ranges_by_node[first_mem_node].push(vtl2_range);
         }
 
-        // For restore, an existing mappable can only be applied to
-        // single-node configurations.
         let nodes_with_ranges = ranges_by_node.iter().filter(|r| !r.is_empty()).count();
-        let mut existing_mappable = if let Some(smb) = shared_memory {
-            if nodes_with_ranges > 1 {
-                anyhow::bail!(
-                    "shared memory restore not supported with {nodes_with_ranges} memory nodes"
-                );
-            }
-            Some(smb.into_mappable())
-        } else {
-            None
-        };
+        let mut backing_source = ram_backing::RamBackingSource::new(
+            shared_memory,
+            nodes_with_ranges,
+            #[cfg(target_os = "linux")]
+            partition_backing,
+            #[cfg(target_os = "linux")]
+            &mem_layout,
+        )?;
 
         let mut memory_builder = GuestMemoryBuilder::new();
         memory_builder = memory_builder
@@ -1534,25 +1559,7 @@ impl InitializedVm {
                 .as_ref()
                 .with_context(|| format!("node {vnode} has RAM ranges but no memory config"))?;
 
-            if let Some(size) = mem.hugepage_size
-                && !mem.hugepages
-            {
-                anyhow::bail!("node {vnode}: hugepage_size={size} requires hugepages=on");
-            }
-
-            let mut backing = membacking::RamBackingRequest::new(ranges)
-                .prefetch(mem.prefetch_memory)
-                .private_memory(mem.private_memory)
-                .transparent_hugepages(mem.transparent_hugepages)
-                .host_numa_node(mem.host_numa_node);
-            if mem.hugepages {
-                backing = backing.hugepages(mem.hugepage_size);
-            }
-            if let Some(mappable) = existing_mappable.take() {
-                backing = backing.existing_mappable(mappable);
-            }
-
-            memory_builder = memory_builder.add_backing(backing);
+            memory_builder = backing_source.add_node(memory_builder, vnode, ranges, mem)?;
         }
 
         #[cfg(all(windows, feature = "virt_whp"))]
@@ -1575,10 +1582,6 @@ impl InitializedVm {
             }
         }
 
-        let max_addr = mem_layout
-            .end_of_layout()
-            .max(mem_layout.vtl2_range().map_or(0, |r| r.end()));
-
         let mut memory_manager = memory_builder
             .build(max_addr)
             .await
@@ -1589,24 +1592,6 @@ impl InitializedVm {
             .guest_memory()
             .await
             .context("failed to get guest memory")?;
-        #[cfg(guest_arch = "aarch64")]
-        let shared_gpa_bit =
-            if cfg.hypervisor.with_isolation == Some(openvmm_defs::config::IsolationType::Cca) {
-                let shared_bit = platform_info
-                    .shared_gpa_bit
-                    .context("missing CCA shared GPA bit")?;
-                anyhow::ensure!(
-                    shared_bit.is_power_of_two(),
-                    "CCA shared GPA bit must be a power of two"
-                );
-                anyhow::ensure!(
-                    max_addr <= shared_bit,
-                    "guest memory layout overlaps CCA shared GPA alias region"
-                );
-                Some(shared_bit)
-            } else {
-                None
-            };
         let device_gm = {
             #[cfg(guest_arch = "aarch64")]
             {

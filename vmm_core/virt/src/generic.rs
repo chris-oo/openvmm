@@ -441,6 +441,25 @@ pub trait ProtoPartition {
         false
     }
 
+    /// Prepares backend-owned RAM for the final layout, before userspace maps it.
+    ///
+    /// `None` leaves userspace backing allocation to the caller. A backend can
+    /// still retain separate private backing in this case. `Some` supplies the
+    /// exclusive userspace RAM backing; the caller must not allocate another
+    /// backing or combine it with restored memory.
+    ///
+    /// The backend must retain the corresponding backing through `build` and
+    /// partition destruction, and reject later preparations or builds with a
+    /// different RAM layout. Backends that require preparation must also define
+    /// their behavior for callers that invoke `build` without this step.
+    #[cfg(target_os = "linux")]
+    fn prepare_ram_backing(
+        &mut self,
+        _layout: &MemoryLayout,
+    ) -> Result<Option<crate::MappableRamBacking>, Self::Error> {
+        Ok(None)
+    }
+
     /// Constructs the full partition.
     fn build(
         self,

@@ -668,9 +668,39 @@ pub struct KvmProtoPartition<'a> {
     vm: kvm::Partition,
     config: ProtoPartitionConfig<'a>,
     ipa_size: u8,
+    ram_backing: crate::memory::KvmPreparedRamBacking,
 }
 
 impl KvmProtoPartition<'_> {
+    fn prepare_memory_backing(
+        &mut self,
+        layout: &vm_topology::memory::MemoryLayout,
+    ) -> Result<&mut KvmMemoryBackingMode, KvmError> {
+        let ranges = layout
+            .ram()
+            .iter()
+            .map(|r| r.range)
+            .chain(layout.vtl2_range())
+            .collect();
+        Ok(self.ram_backing.prepare(ranges, |ranges| {
+            match self.config.isolation.isolation_type() {
+                virt::IsolationType::None => Ok(KvmMemoryBackingMode::Userspace),
+                virt::IsolationType::Cca => KvmMemoryBackingMode::guest_memfd(
+                    &self.vm,
+                    ranges.iter().copied(),
+                    crate::memory::KvmGuestMemfdPrivateState::GuestMemfdDefault,
+                ),
+                virt::IsolationType::Vbs | virt::IsolationType::Snp | virt::IsolationType::Tdx => {
+                    Err(
+                        crate::memory::MemoryError::UnsupportedIsolationConfiguration(
+                            "unsupported Arm RAM backing isolation",
+                        ),
+                    )
+                }
+            }
+        })?)
+    }
+
     fn add_gicv3(&mut self, redistributors_base: u64) -> Result<kvm::Device, KvmError> {
         // KVM requires the distributor and redistributor bases be _64KiB aligned_,
         // these ranges come from the OpenVMM MMIO gaps.
@@ -876,11 +906,25 @@ impl virt::ProtoPartition for KvmProtoPartition<'_> {
         self.ipa_size
     }
 
+    fn prepare_ram_backing(
+        &mut self,
+        layout: &vm_topology::memory::MemoryLayout,
+    ) -> Result<Option<virt::MappableRamBacking>, Self::Error> {
+        self.prepare_memory_backing(layout)?;
+        // The v15 guestmemfd is private-only. Shared RAM must still use the
+        // worker's separate userspace allocation, not this file.
+        Ok(None)
+    }
+
     fn build(
         mut self,
         config: virt::PartitionConfig<'_>,
     ) -> Result<(Self::Partition, Vec<Self::ProcessorBinder>), Self::Error> {
         let isolation = self.config.isolation.isolation_type();
+        // Also support direct build callers that did not prepare RAM. If RAM
+        // was prepared, validate its layout before creating any VCPUs.
+        self.prepare_memory_backing(config.mem_layout)?;
+
         // Create all VCPUs now so that they are assigned dense, sequential
         // vcpu_idx values in KVM.  See the x86_64 build() for details on why
         // this matters for the Hyper-V enlightenment fast paths.
@@ -953,17 +997,10 @@ impl virt::ProtoPartition for KvmProtoPartition<'_> {
             .map(|range| range.range)
             .chain(config.mem_layout.vtl2_range())
             .collect();
-        let memory_backing_mode = match isolation {
-            virt::IsolationType::None => KvmMemoryBackingMode::Userspace,
-            virt::IsolationType::Cca => KvmMemoryBackingMode::guest_memfd(
-                &self.vm,
-                ram_ranges.iter().copied(),
-                crate::memory::KvmGuestMemfdPrivateState::GuestMemfdDefault,
-            )?,
-            virt::IsolationType::Vbs | virt::IsolationType::Snp | virt::IsolationType::Tdx => {
-                unreachable!()
-            }
-        };
+        let memory_backing_mode = std::mem::replace(
+            self.prepare_memory_backing(config.mem_layout)?,
+            KvmMemoryBackingMode::Userspace,
+        );
 
         let partition = Arc::new(KvmPartitionInner {
             kvm: self.vm,
@@ -1363,6 +1400,7 @@ impl virt::Hypervisor for Kvm {
             vm,
             config,
             ipa_size,
+            ram_backing: Default::default(),
         })
     }
 }
