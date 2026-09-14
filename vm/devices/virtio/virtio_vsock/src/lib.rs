@@ -424,14 +424,19 @@ impl VsockWorker {
     }
 
     /// Try to deliver pending rx packets to the guest via the rx virtqueue.
-    fn handle_host_rx(&mut self, state: &mut VsockWorkerState, rx_ready: RxReady) {
+    /// An error retires the worker because the peeked queue item is no longer usable.
+    fn handle_host_rx(
+        &mut self,
+        state: &mut VsockWorkerState,
+        rx_ready: RxReady,
+    ) -> anyhow::Result<()> {
         // Due to lifetime issues the PeekedWork cannot be passed into this function so get it
-        // back here.
+        // back here. Guest memory may have changed while waiting for host work.
         let peeked_work = state
             .rx_queue
             .try_peek()
-            .expect("peek already succeeded before")
-            .expect("queue was already checked to have items");
+            .context("failed to re-peek virtio rx queue")?
+            .ok_or_else(|| anyhow::anyhow!("peeked virtio rx queue item is no longer available"))?;
 
         let (packet, pending) = state.connections.get_rx_packet(
             &state.memory,
@@ -463,6 +468,7 @@ impl VsockWorker {
         }
 
         state.queue_pending(pending);
+        Ok(())
     }
 }
 
@@ -478,7 +484,7 @@ impl AsyncRun<VsockWorkerState> for VsockWorker {
                 let peeked = match state.rx_queue.try_peek() {
                     Ok(p) => p,
                     Err(err) => {
-                        tracing::error!(
+                        tracelimit::error_ratelimited!(
                             error = &err as &dyn std::error::Error,
                             "error peeking virtio rx queue"
                         );
@@ -519,7 +525,13 @@ impl AsyncRun<VsockWorkerState> for VsockWorker {
                     }
                     r = rx_ready => {
                         let work = r.unwrap();
-                        self.handle_host_rx(state, work);
+                        if let Err(err) = self.handle_host_rx(state, work) {
+                            tracelimit::error_ratelimited!(
+                                error = err.as_ref() as &dyn std::error::Error,
+                                "error accessing virtio rx queue, stopping worker"
+                            );
+                            return;
+                        }
                     }
                     _ = rx_queue_kick => {
                         // New buffers are available in the rx queue; repeat the loop to peek again.

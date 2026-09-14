@@ -450,6 +450,16 @@ impl Connection {
 
         tracing::trace!(?self.key, peer_free, "peer buffer credit available");
 
+        let buf_len: usize = payload
+            .iter()
+            .filter_map(|p| p.writeable.then_some(p.length as usize))
+            .sum();
+        if buf_len <= VSOCK_HEADER_SIZE {
+            // A zero-length socket read would look like EOF, not a full guest buffer.
+            anyhow::bail!("guest buffer too small for vsock payload");
+        }
+        let read_len = (buf_len - VSOCK_HEADER_SIZE).min(peer_free as usize);
+
         // Attempt to lock the payload buffers so we can write directly into them.
         let mut locked = lock_payload_data(
             mem,
@@ -470,16 +480,7 @@ impl Connection {
             (bytes_read, Vec::new())
         } else {
             // A temp bounce buffer is needed since the guest buffer couldn't be locked.
-            let buf_len: usize = payload
-                .iter()
-                .filter_map(|p| p.writeable.then_some(p.length as usize))
-                .sum();
-
-            if buf_len < VSOCK_HEADER_SIZE {
-                anyhow::bail!("guest buffer too small for vsock header");
-            }
-
-            let mut temp_buf = vec![0u8; buf_len - VSOCK_HEADER_SIZE];
+            let mut temp_buf = vec![0u8; read_len];
             let bytes_read = self
                 .socket
                 .read(&mut temp_buf)

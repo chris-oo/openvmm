@@ -465,6 +465,66 @@ impl TestHarness {
 
 // --- Tests ---
 
+async fn host_rx_repeek_failure(driver: DefaultDriver, retired: bool) {
+    let tmp_dir = tempfile::tempdir_in(".").unwrap();
+    let mut harness = TestHarness::new(&driver, tmp_dir);
+    harness.enable().await;
+    harness.device.worker.stop().await;
+
+    let (desc, gpa) = harness.post_rx_buffer(HDR_SIZE + 1024);
+    let key = crate::connections::ConnectionKey::from_tx_packet(&harness.guest_header(
+        1024,
+        5000,
+        Operation::REQUEST,
+        0,
+        0,
+    ));
+    let (worker, state) = harness.device.worker.get_mut();
+    let state = state.unwrap();
+    assert!(state.rx_queue.try_peek().unwrap().is_some());
+
+    // Inject a guest ring change between the two peeks without racing the worker.
+    write_descriptor(
+        &harness.mem,
+        RX_DESC_ADDR,
+        desc,
+        gpa,
+        HDR_SIZE + 1024,
+        DescriptorFlags::new().with_write(true).with_next(true),
+        QUEUE_SIZE,
+    );
+    if retired {
+        // A queue reports failure once, then returns no item on later peeks.
+        assert!(state.rx_queue.try_peek().is_err());
+    }
+
+    let err = worker
+        .handle_host_rx(state, crate::RxReady::SendReset(key))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains(if retired {
+            "no longer available"
+        } else {
+            "failed to re-peek"
+        }),
+        "{err:#}"
+    );
+    assert_eq!(state.rx_queue.queue_state().avail_index, 0);
+    assert_eq!(state.rx_queue.queue_state().used_index, 0);
+    assert!(state.rx_ready.is_empty());
+    assert_eq!(harness.read_rx_data(gpa, 1024), vec![0; 1024]);
+}
+
+#[async_test]
+async fn host_rx_repeek_invalid_chain(driver: DefaultDriver) {
+    host_rx_repeek_failure(driver, false).await;
+}
+
+#[async_test]
+async fn host_rx_repeek_retired_queue(driver: DefaultDriver) {
+    host_rx_repeek_failure(driver, true).await;
+}
+
 /// Test that the device can be constructed and its config space returns the
 /// correct guest CID.
 #[async_test]
@@ -1270,6 +1330,144 @@ async fn guest_send_exercises_ring_buffer(driver: DefaultDriver) {
         fwd_cnt, TOTAL_BYTES as u32,
         "final credit update should reflect all forwarded data"
     );
+}
+
+/// A header-only RX buffer must not turn a zero-length read into host EOF.
+#[async_test]
+async fn host_rx_header_only_buffer(driver: DefaultDriver) {
+    let tmp_dir = tempfile::tempdir_in(".").unwrap();
+    let mut harness = TestHarness::new(&driver, tmp_dir);
+    let mut listener = harness.create_port_listener(5042);
+    harness.enable().await;
+    let mut stream = harness
+        .connect_guest_to_host(&mut listener, 1024, 5042)
+        .await;
+
+    let (desc, gpa) = harness.post_rx_buffer(HDR_SIZE);
+    stream.write_all(b"not EOF").unwrap();
+    assert_eq!(harness.wait_for_rx_used().await, (desc, HDR_SIZE));
+    assert_eq!(Operation(harness.read_header(gpa).op), Operation::RST);
+}
+
+/// A fragmented buffer must not let the copying path exceed peer credit.
+#[async_test]
+async fn bounce_buffer_rx_respects_small_credit(driver: DefaultDriver) {
+    let tmp_dir = tempfile::tempdir_in(".").unwrap();
+    let mut harness = TestHarness::new(&driver, tmp_dir);
+    let mut listener = harness.create_port_listener(5043);
+    harness.enable().await;
+    let mut stream = harness
+        .connect_guest_to_host(&mut listener, 1024, 5043)
+        .await;
+
+    let mut credit = harness.guest_header(1024, 5043, Operation::CREDIT_UPDATE, 0, 0);
+    credit.buf_alloc = 100;
+    harness.post_tx_packet(&credit, &[]);
+    harness.wait_for_tx_used().await;
+
+    // The fragment boundary must fall within the first 100 bytes of data.
+    // Otherwise the credit-limited lock could succeed without using fragment 2.
+    let frag1_size = HDR_SIZE + 50;
+    let frag1_gpa = harness.alloc_data(frag1_size);
+    harness.alloc_data(100);
+    let frag2_gpa = harness.alloc_data(4096);
+    let payload = [
+        virtio::queue::VirtioQueuePayload {
+            writeable: true,
+            address: frag1_gpa,
+            length: frag1_size,
+        },
+        virtio::queue::VirtioQueuePayload {
+            writeable: true,
+            address: frag2_gpa,
+            length: 4096,
+        },
+    ];
+    assert!(
+        crate::lock_payload_data(
+            &harness.mem,
+            &payload,
+            100,
+            false,
+            true,
+            crate::LockedIoSliceMut::new(),
+        )
+        .unwrap()
+        .is_none(),
+        "the first data packet must use the copying path"
+    );
+
+    let desc = harness.next_rx_desc;
+    harness.next_rx_desc += 2;
+    write_descriptor(
+        &harness.mem,
+        RX_DESC_ADDR,
+        desc,
+        frag1_gpa,
+        frag1_size,
+        DescriptorFlags::new().with_write(true).with_next(true),
+        desc + 1,
+    );
+    write_descriptor(
+        &harness.mem,
+        RX_DESC_ADDR,
+        desc + 1,
+        frag2_gpa,
+        4096,
+        DescriptorFlags::new().with_write(true),
+        0,
+    );
+    make_available(
+        &harness.mem,
+        RX_AVAIL_ADDR,
+        QUEUE_SIZE,
+        desc,
+        &mut harness.rx_avail_idx,
+    );
+    harness.rx_queue_event.signal();
+    let (request_desc, request_gpa) = harness.post_rx_buffer(HDR_SIZE + 4096);
+    let (resume_desc, resume_gpa) = harness.post_rx_buffer(HDR_SIZE + 4096);
+
+    let sent: Vec<u8> = (0..180).collect();
+    stream.write_all(&sent).unwrap();
+    assert_eq!(harness.wait_for_rx_used().await, (desc, HDR_SIZE + 100));
+    let header = harness.read_header(frag1_gpa);
+    assert_eq!(Operation(header.op), Operation::RW);
+    assert_eq!(header.len as usize, 100);
+    let mut received = harness.read_rx_data(frag1_gpa, 50);
+    let mut second_fragment = [0; 50];
+    harness
+        .mem
+        .read_at(frag2_gpa, &mut second_fragment)
+        .unwrap();
+    received.extend_from_slice(&second_fragment);
+    assert_eq!(received, sent[..100]);
+    let mut unused = [0; 100];
+    harness.mem.read_at(frag2_gpa + 50, &mut unused).unwrap();
+    assert_eq!(unused, [0; 100], "no data beyond credit may be copied");
+
+    assert_eq!(harness.wait_for_rx_used().await, (request_desc, HDR_SIZE));
+    assert_eq!(
+        Operation(harness.read_header(request_gpa).op),
+        Operation::CREDIT_REQUEST
+    );
+    harness
+        .wait_for_rx_used_timeout(Duration::from_millis(100))
+        .await
+        .expect_err("no more data may arrive before a credit update");
+
+    credit.fwd_cnt = 100;
+    harness.post_tx_packet(&credit, &[]);
+    harness.wait_for_tx_used().await;
+    assert_eq!(
+        harness.wait_for_rx_used().await,
+        (resume_desc, HDR_SIZE + 80)
+    );
+    let header = harness.read_header(resume_gpa);
+    assert_eq!(Operation(header.op), Operation::RW);
+    assert_eq!(header.len as usize, 80);
+    received.extend_from_slice(&harness.read_rx_data(resume_gpa, 80));
+    assert_eq!(received, sent);
 }
 
 /// Host sends data to the guest through an established connection.
