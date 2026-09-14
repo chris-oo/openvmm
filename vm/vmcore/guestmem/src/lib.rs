@@ -806,6 +806,10 @@ pub struct BitmapInfo {
 
 // SAFETY: passing through guarantees from `T`.
 unsafe impl<T: GuestMemoryAccess> GuestMemoryAccess for Arc<T> {
+    fn supports_locking(&self) -> bool {
+        self.as_ref().supports_locking()
+    }
+
     fn mapping(&self) -> Option<NonNull<u8>> {
         self.as_ref().mapping()
     }
@@ -920,6 +924,10 @@ impl GuestMemoryAccessRange {
 
 // SAFETY: `mapping()` is guaranteed to be valid for the lifetime of the object.
 unsafe impl GuestMemoryAccess for GuestMemoryAccessRange {
+    fn supports_locking(&self) -> bool {
+        self.base.supports_locking
+    }
+
     fn mapping(&self) -> Option<NonNull<u8>> {
         let region = &self.base.regions[self.region];
         region.mapping.and_then(|mapping| {
@@ -3025,6 +3033,28 @@ mod tests {
         let gm = GuestMemory::new("nolock", ToggleLockMapping::new(SIZE_1MB, false));
         assert!(!gm.supports_locking());
         assert!(gm.lock_gpns(crate::AccessType::Write, false, &[0]).is_err());
+
+        for lockable in [false, true] {
+            let gm = GuestMemory::new(
+                "arc-lock-policy",
+                Arc::new(ToggleLockMapping::new(SIZE_1MB, lockable)),
+            );
+            assert_eq!(gm.supports_locking(), lockable);
+            let subrange = gm.subrange(0x1000, 0x2000, false).unwrap();
+            assert_eq!(subrange.supports_locking(), lockable);
+            let nested = subrange.subrange(0x1000, 0x1000, false).unwrap();
+            assert_eq!(nested.supports_locking(), lockable);
+            if !lockable {
+                assert!(gm.lock_gpns(crate::AccessType::Read, false, &[0]).is_err());
+                assert!(
+                    nested
+                        .lock_gpns(crate::AccessType::Read, false, &[0])
+                        .is_err()
+                );
+                nested.write_at(0, &[0x35]).unwrap();
+                assert_eq!(gm.read_plain::<u8>(0x2000).unwrap(), 0x35);
+            }
+        }
 
         // Multi-region: locking is supported only when every present backing
         // supports it.
