@@ -385,6 +385,11 @@ Examples:
     #[clap(long)]
     pub snp_restricted_injection: bool,
 
+    /// Use experimental CCA v7 in-place RAM (requires --isolation cca and 4 KiB host pages;
+    /// no devices, snapshot, restore, or automatic ABI fallback)
+    #[clap(long)]
+    pub cca_v7: bool,
+
     /// the hybrid vsock listener path
     #[clap(long, value_name = "PATH", alias = "vsock-path")]
     pub vmbus_vsock_path: Option<String>,
@@ -1463,6 +1468,14 @@ impl Options {
             && (self.uefi || self.pcat || self.igvm.is_some() || self.restore_snapshot.is_some())
         {
             anyhow::bail!("--snp-restricted-injection requires Linux direct boot");
+        }
+        if self.cca_v7 {
+            #[cfg(not(guest_arch = "aarch64"))]
+            anyhow::bail!("--cca-v7 requires an aarch64 KVM CCA guest");
+            #[cfg(guest_arch = "aarch64")]
+            if !matches!(self.isolation, Some(IsolationCli::Cca)) {
+                anyhow::bail!("--cca-v7 requires --isolation cca");
+            }
         }
         if matches!(self.isolation, Some(IsolationCli::Snp)) {
             if self.uefi {
@@ -5556,6 +5569,32 @@ mod tests {
         let opt = Options::try_parse_from(["openvmm", "--isolation", "vbs", "--uefi"]).unwrap();
 
         opt.validate_isolation_options().unwrap();
+    }
+
+    #[test]
+    fn cca_v7_defaults_off_and_requires_cca() {
+        let default = Options::try_parse_from(["openvmm"]).unwrap();
+        assert!(!default.cca_v7);
+        default.validate_isolation_options().unwrap();
+        let opt = Options::try_parse_from(["openvmm", "--cca-v7"]).unwrap();
+        assert!(opt.cca_v7);
+        assert!(opt.validate_isolation_options().is_err());
+        let opt = Options::try_parse_from(["openvmm", "--cca-v7", "--isolation", "vbs"]).unwrap();
+        assert!(opt.validate_isolation_options().is_err());
+    }
+
+    #[cfg(guest_arch = "aarch64")]
+    #[test]
+    fn cca_v7_is_opt_in_without_changing_cca_defaults() {
+        for enabled in [false, true] {
+            let mut args = vec!["openvmm", "--isolation", "cca"];
+            if enabled {
+                args.push("--cca-v7");
+            }
+            let opt = Options::try_parse_from(args).unwrap();
+            assert_eq!(opt.cca_v7, enabled);
+            opt.validate_isolation_options().unwrap();
+        }
     }
 
     #[test]

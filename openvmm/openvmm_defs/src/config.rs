@@ -543,6 +543,8 @@ pub struct HypervisorConfig {
     /// rejects it rather than silently ignoring it (see
     /// `virt::Hypervisor::recognizes_nested_virt`).
     pub nested_virt: bool,
+    /// Select experimental KVM Arm CCA v7 in-place RAM. Defaults to false.
+    pub cca_v7: bool,
 }
 
 #[derive(Debug, MeshPayload)]

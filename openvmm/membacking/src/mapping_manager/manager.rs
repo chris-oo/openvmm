@@ -61,8 +61,10 @@ impl MappingManager {
         max_addr: u64,
         minimum_va_alignment: Option<usize>,
         supports_memory_fault_resolution: bool,
+        force_eager: bool,
     ) -> Result<(Self, Arc<VaMapper>), VaMapperError> {
-        let this = Self::new_bare(spawn, max_addr, minimum_va_alignment);
+        let mut this = Self::new_bare(spawn, max_addr, minimum_va_alignment);
+        this.client.force_eager = force_eager;
         // Create the primary mapper as part of construction. Being first, it is
         // the instance the shared cache hands to every later `new_mapper` in
         // this process.
@@ -96,6 +98,7 @@ impl MappingManager {
                 req_send,
                 max_addr,
                 minimum_va_alignment,
+                force_eager: false,
             },
         }
     }
@@ -126,6 +129,8 @@ pub struct MappingManagerClient {
     id: ObjectId,
     max_addr: u64,
     minimum_va_alignment: Option<usize>,
+    /// Revocable file backing must not retry host faults through lazy remaps.
+    force_eager: bool,
 }
 
 static MAPPER_CACHE: ObjectCache<VaMapper> = ObjectCache::new();
@@ -162,7 +167,7 @@ impl MappingManagerClient {
     /// in other processes (device/DMA workers) this creates a fresh secondary
     /// mapper.
     pub async fn new_mapper(&self, eager: bool) -> Result<Arc<VaMapper>, VaMapperError> {
-        self.get_or_create_mapper(eager, MapperRole::Secondary)
+        self.get_or_create_mapper(eager || self.force_eager, MapperRole::Secondary)
             .await
     }
 
@@ -1601,6 +1606,47 @@ mod tests {
         drop(mm);
         drop(manager_driver);
         manager_thread.join().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[pal_async::async_test]
+    async fn revocable_backing_forces_secondary_views_eager(spawn: impl Spawn) {
+        let mut manager = MappingManager::new_without_primary(&spawn, 0x10000, None);
+        manager.client.force_eager = true;
+        let file: std::fs::File =
+            sparse_mmap::alloc_shared_memory(0x2000, "secondary-revoked-test")
+                .unwrap()
+                .into();
+        let fd = std::os::fd::OwnedFd::from(file.try_clone().unwrap());
+        manager
+            .client
+            .add_mapping(MappingParams {
+                range: MemoryRange::new(0..0x1000),
+                backing: MappingBacking::File {
+                    mappable: fd.into(),
+                    file_offset: 0x1000,
+                },
+                writable: true,
+                mapping_type: MappingType::Device,
+                policy: MemoryPolicy::none(),
+            })
+            .await
+            .unwrap();
+        let mapper = manager.client.new_mapper(false).await.unwrap();
+        assert!(mapper.is_eager());
+        let gm = guestmem::GuestMemory::new("secondary-revoked", mapper.clone());
+        gm.write_at(0, &[0x35]).unwrap();
+        use std::os::unix::fs::FileExt;
+        let mut byte = [0];
+        file.read_exact_at(&mut byte, 0x1000).unwrap();
+        assert_eq!(byte, [0x35]);
+        file.set_len(0).unwrap();
+        assert!(gm.read_plain::<u8>(0).is_err());
+        assert!(gm.write_at(0, &[0xee]).is_err());
+        assert!(matches!(
+            mapper.page_fault(0, 4096, false, false),
+            guestmem::PageFaultAction::Fail(_)
+        ));
     }
 
     /// Tests that creating an eager mapper succeeds even when mappings

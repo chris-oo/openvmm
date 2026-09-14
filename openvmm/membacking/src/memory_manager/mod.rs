@@ -69,6 +69,7 @@ struct RamBacking {
     mappable: Option<Mappable>,
     /// First byte in the file backing this request's packed RAM ranges.
     file_offset: u64,
+    restartable: bool,
     /// GPA ranges covered by this backing.
     ranges: Vec<MemoryRange>,
     /// Prefetch pages at build time.
@@ -221,6 +222,7 @@ pub struct RamBackingRequest {
     hugepage_size: Option<u64>,
     existing_mappable: Option<Mappable>,
     file_offset: u64,
+    restartable: bool,
     host_numa_node: Option<u32>,
 }
 
@@ -239,6 +241,7 @@ impl RamBackingRequest {
             hugepage_size: None,
             existing_mappable: None,
             file_offset: 0,
+            restartable: true,
             host_numa_node: None,
         }
     }
@@ -280,6 +283,7 @@ impl RamBackingRequest {
     pub fn existing_mappable(mut self, mappable: Mappable) -> Self {
         self.existing_mappable = Some(mappable);
         self.file_offset = 0;
+        self.restartable = true;
         self
     }
 
@@ -291,12 +295,16 @@ impl RamBackingRequest {
     /// This can describe slices of partition-owned backing such as guestmemfd;
     /// it does not perform private/shared conversion or control DMA visibility.
     ///
-    /// A nonzero offset cannot be exported by
-    /// [`GuestMemoryManager::shared_memory_backing`] for restart.
+    /// Offset imports cannot be exported by
+    /// [`GuestMemoryManager::shared_memory_backing`] for restart, even at
+    /// offset zero: the file can belong to the current partition.
+    /// All host views are eagerly mapped so a revoked page fails access
+    /// instead of repeatedly retrying a lazy mapping.
     #[cfg(target_os = "linux")]
     pub fn existing_mappable_at(mut self, mappable: Mappable, file_offset: u64) -> Self {
         self.existing_mappable = Some(mappable);
         self.file_offset = file_offset;
+        self.restartable = false;
         self
     }
 
@@ -528,6 +536,7 @@ impl GuestMemoryBuilder {
                 backings.push(RamBacking {
                     mappable: None,
                     file_offset: 0,
+                    restartable: false,
                     ranges: req.ranges,
                     prefetch: req.prefetch,
                     transparent_hugepages: req.transparent_hugepages,
@@ -582,6 +591,7 @@ impl GuestMemoryBuilder {
             backings.push(RamBacking {
                 mappable: Some(mappable),
                 file_offset: req.file_offset,
+                restartable: req.restartable,
                 ranges: req.ranges,
                 // On Windows, hugepage (SEC_LARGE_PAGES) backing only yields 2 MB
                 // SLAT entries when the SLAT is populated in >= 512-page batches;
@@ -619,6 +629,9 @@ impl GuestMemoryBuilder {
             max_addr,
             max_hugepage_size,
             self.supports_memory_fault_resolution,
+            backings
+                .iter()
+                .any(|backing| backing.mappable.is_some() && !backing.restartable),
         )
         .await
         .map_err(MemoryBuildError::VaMapper)?;
@@ -845,11 +858,11 @@ impl GuestMemoryManager {
     /// guest may see unpredictable results.
     ///
     /// Returns `None` unless there is exactly one backing and it is
-    /// file-backed at offset zero. This currently means multi-backing,
+    /// file-backed at offset zero and restartable. This means multi-backing,
     /// private-memory and offset-import configurations cannot be restarted.
     pub fn shared_memory_backing(&self) -> Option<SharedMemoryBacking> {
         // Require exactly one backing, and it must be file-backed.
-        if self.guest_ram.len() != 1 || self.guest_ram[0].file_offset != 0 {
+        if self.guest_ram.len() != 1 || !self.guest_ram[0].restartable {
             return None;
         }
         Some(SharedMemoryBacking {
@@ -1107,6 +1120,32 @@ mod tests {
                 .unwrap(),
             0x42
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[async_test]
+    async fn offset_zero_partition_backing_is_not_exported_and_faults_fail() {
+        let page = SparseMapping::page_size();
+        let file: std::fs::File = sparse_mmap::alloc_shared_memory(page, "revoked-ram-test")
+            .unwrap()
+            .into();
+        let fd = std::os::fd::OwnedFd::from(file.try_clone().unwrap());
+        let manager = GuestMemoryBuilder::new()
+            .add_backing(
+                RamBackingRequest::new(vec![MemoryRange::new(0..page as u64)])
+                    .existing_mappable_at(fd.into(), 0),
+            )
+            .build(page as u64)
+            .await
+            .unwrap();
+        assert!(manager.shared_memory_backing().is_none());
+        let gm = manager.client().guest_memory().await.unwrap();
+        gm.write_at(0, &[0x35]).unwrap();
+        // Truncation produces SIGBUS on an existing mapping, like a revoked
+        // private guestmemfd page. GuestMemory must return an error, not retry.
+        file.set_len(0).unwrap();
+        assert!(gm.read_plain::<u8>(0).is_err());
+        assert!(gm.write_at(0, &[0xee]).is_err());
     }
 
     /// Build a GuestMemoryManager with the given backing range groups,

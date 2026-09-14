@@ -152,10 +152,33 @@ node's memory policy. A supplied file cannot be combined with restored
 backing, anonymous private memory or explicit huge pages.
 
 Returning no file leaves ordinary userspace RAM allocation unchanged. The
-Arm KVM backend uses preparation to retain its private guestmemfd, but does
-not return that private-only file as shared-writable RAM. Its existing CCA
-mode still uses separate userspace and private backing. This interface does
-not by itself enable CCA in-place conversion or trusted device assignment.
+Arm KVM backend's default CCA v15 mode retains a private-only guestmemfd and
+uses separate userspace RAM. The experimental
+[`--cca-v7`](../../openvmm/management/cli.md) option instead returns a clone
+of an mmap-enabled, initially shared guestmemfd. The partition retains the
+original file. Loader writes and host-visible shared aliases refer to that
+same file, including across NUMA ranges.
+
+CCA v7 requires 4 KiB host pages. Preparation rejects other page sizes before
+creating guestmemfd or exporting RAM backing; imports are not rounded up.
+
+Before conversion, OpenVMM copies every initial import into separate aligned
+storage for Realm population and measurement. It then populates the imports
+and initializes RIPAS for each RAM slot before vCPU entry. In-place
+conversions never discard either alias. Failures stop the partition; there
+is no fallback to the v15 ABI. All host views are eagerly mapped, so access
+to a revoked private page fails instead of retrying a lazy mapping. Supplied
+offset imports, including offset zero, cannot be exported for restart.
+
+Runtime conversion tracks actual guestmemfd visibility under the partition
+memory lock and changes only subranges whose attributes differ. A request
+that already matches does not convert backing or wait for a completion exit.
+Repeated identical shared no-op faults without an intervening guest exit or
+different request cannot be distinguished from backing failures and stop the
+VM. Interrupts and stop/re-entry do not clear this guard.
+
+CCA v7 currently supports only no-device Linux-direct bring-up, apart from
+the serial console. It does not enable trusted device assignment or DMA.
 
 The shared/private backing choice on this page is not the same as Realm
 page visibility. Sharing a file handle does not establish permission to read

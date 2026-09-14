@@ -1022,12 +1022,47 @@ fn validate_cca_pcie_resource(resource_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_cca_v7_config(
+    config: &HypervisorConfig,
+    recognized: bool,
+    has_pcie: bool,
+) -> anyhow::Result<()> {
+    if !config.cca_v7 {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        recognized,
+        "the selected hypervisor does not support experimental CCA v7 RAM"
+    );
+    anyhow::ensure!(
+        config.with_isolation == Some(openvmm_defs::config::IsolationType::Cca),
+        "experimental CCA v7 RAM requires CCA isolation"
+    );
+    anyhow::ensure!(
+        !has_pcie,
+        "experimental CCA v7 RAM currently requires a no-device Realm"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod cca_validation_tests {
     use super::validate_cca_memory_config;
     use super::validate_cca_pcie_resource;
     use openvmm_defs::config::MemoryConfig;
     use test_with_tracing::test;
+
+    #[test]
+    fn cca_v7_is_explicit_and_rejects_unsupported_backends_and_devices() {
+        let mut config = openvmm_defs::config::HypervisorConfig::default();
+        super::validate_cca_v7_config(&config, false, true).unwrap();
+        config.cca_v7 = true;
+        assert!(super::validate_cca_v7_config(&config, true, false).is_err());
+        config.with_isolation = Some(openvmm_defs::config::IsolationType::Cca);
+        assert!(super::validate_cca_v7_config(&config, false, false).is_err());
+        assert!(super::validate_cca_v7_config(&config, true, true).is_err());
+        super::validate_cca_v7_config(&config, true, false).unwrap();
+    }
 
     fn memory_config() -> MemoryConfig {
         MemoryConfig {
@@ -1207,6 +1242,11 @@ impl InitializedVm {
         if cfg.hypervisor.nested_virt && !hypervisor.recognizes_nested_virt() {
             anyhow::bail!("the selected hypervisor does not support nested virtualization");
         }
+        validate_cca_v7_config(
+            &cfg.hypervisor,
+            hypervisor.recognizes_cca_v7(),
+            !cfg.pcie_devices.is_empty() || !cfg.pcie_root_complexes.is_empty(),
+        )?;
 
         #[cfg(guest_arch = "aarch64")]
         let device_assignment_msi_iova_range =
@@ -1219,6 +1259,7 @@ impl InitializedVm {
                 vmtime: &vmtime_source,
                 isolation: proto_partition_isolation,
                 nested_virt: cfg.hypervisor.nested_virt,
+                cca_v7: cfg.hypervisor.cca_v7,
                 #[cfg(guest_arch = "aarch64")]
                 device_assignment_msi_iova_range,
             })
@@ -3904,6 +3945,11 @@ impl LoadedVm {
                         let mut stopped = false;
                         // First run the non-destructive operations.
                         let r = async {
+                            anyhow::ensure!(
+                                self.inner.hypervisor_cfg.with_isolation
+                                    != Some(openvmm_defs::config::IsolationType::Cca),
+                                "KVM CCA does not support restart"
+                            );
                             let shared_memory = self.inner.memory_manager.shared_memory_backing();
                             if shared_memory.is_none() {
                                 anyhow::bail!("restart is not supported with --private-memory");
@@ -4413,6 +4459,11 @@ impl LoadedVm {
     ///
     /// TODO: virtio & vmbus unsupported.
     async fn save(&mut self) -> anyhow::Result<SavedState> {
+        anyhow::ensure!(
+            self.inner.hypervisor_cfg.with_isolation
+                != Some(openvmm_defs::config::IsolationType::Cca),
+            "KVM CCA does not support snapshot or saved state"
+        );
         Ok(SavedState {
             units: self.state_units.save().await?,
         })
@@ -4420,6 +4471,11 @@ impl LoadedVm {
 
     /// Restore state on the VM.
     async fn restore(&mut self, state: SavedState) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.inner.hypervisor_cfg.with_isolation
+                != Some(openvmm_defs::config::IsolationType::Cca),
+            "KVM CCA does not support restore"
+        );
         self.state_units.restore(state.units).await?;
         Ok(())
     }

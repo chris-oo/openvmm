@@ -680,6 +680,7 @@ impl PetriVmConfigOpenVmm {
                 with_vtl2,
                 with_isolation: isolation.map(openvmm_isolation_type).transpose()?,
                 nested_virt: false,
+                cca_v7: false,
             },
             vmbus: if properties.no_vmbus {
                 None

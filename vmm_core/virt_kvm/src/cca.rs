@@ -59,6 +59,9 @@ impl KvmPartitionInner {
                 Ok(())
             }
             Err(err) => {
+                if self.memory_backing_mode.is_in_place() {
+                    self.mark_cca_fatal();
+                }
                 *self.cca_launch_state.lock() = CcaLaunchState::Failed;
                 tracing::error!(
                     error = &err as &dyn std::error::Error,
@@ -74,6 +77,9 @@ impl KvmPartitionInner {
         &self,
         pages: &[virt::InitialPageImport],
     ) -> Result<(), KvmError> {
+        if self.memory_backing_mode.is_in_place() {
+            return self.cca_populate_in_place(pages);
+        }
         crate::memory::check_private_memory_extensions(
             &self.kvm,
             crate::memory::KvmGuestMemfdPrivateState::GuestMemfdDefault,
@@ -116,6 +122,75 @@ impl KvmPartitionInner {
             self.discard_stale_private_memory_backing(&segments, true, "CCA initial population")?;
         }
 
+        Ok(())
+    }
+
+    fn cca_populate_in_place(&self, pages: &[virt::InitialPageImport]) -> Result<(), KvmError> {
+        let mut memory = self.memory.lock();
+        for range in &self.ram_ranges {
+            crate::memory::guest_memfd_range_segments(*range, &memory.ranges)
+                .map_err(map_cca_private_range_error)?;
+        }
+        for page in pages {
+            crate::memory::guest_memfd_range_segments(page.range, &memory.ranges)
+                .map_err(map_cca_private_range_error)?;
+        }
+        let slots = memory.in_place_ram_slots();
+        crate::cca_v7::launch(
+            &self.gm,
+            pages,
+            &slots,
+            InPlaceLaunch {
+                partition: self,
+                memory: &memory,
+            },
+        )?;
+        // INIT_RIPAS sets guestmemfd PRIVATE for the entire slot, not just
+        // the imported pages. No VP can enter until population succeeds.
+        memory.cca_visibility = crate::cca_v7::Visibility::all_private(slots)?;
+        Ok(())
+    }
+}
+
+struct InPlaceLaunch<'a> {
+    partition: &'a KvmPartitionInner,
+    memory: &'a crate::memory::KvmMemoryRangeState,
+}
+
+impl crate::cca_v7::LaunchOps for InPlaceLaunch<'_> {
+    fn convert(&mut self, range: memory_range::MemoryRange) -> Result<(), KvmError> {
+        let segments = crate::memory::guest_memfd_range_segments(range, &self.memory.ranges)?;
+        self.partition.convert_cca_segments(&segments, true)
+    }
+
+    fn populate(
+        &mut self,
+        (base, size, source_uaddr): (u64, u64, u64),
+        measured: bool,
+    ) -> Result<(u64, u64, u64), KvmError> {
+        let mut request = kvm::KvmArmRmiPopulate {
+            base,
+            size,
+            source_uaddr,
+            flags: if measured {
+                kvm::KVM_ARM_RMI_POPULATE_FLAGS_MEASURE_UAPI
+            } else {
+                0
+            },
+            reserved: 0,
+        };
+        self.partition.kvm.arm_rmi_populate(&mut request)?;
+        Ok((request.base, request.size, request.source_uaddr))
+    }
+
+    fn init_ripas(&mut self, range: memory_range::MemoryRange) -> Result<(), KvmError> {
+        self.partition
+            .kvm
+            .arm_rmi_init_ripas(&kvm::KvmArmRmiInitRipas {
+                base: range.start(),
+                size: range.len(),
+                ..Default::default()
+            })?;
         Ok(())
     }
 }
