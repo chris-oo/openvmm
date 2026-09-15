@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Read-only validation of the one approved local FVP platform.
+//! Read-only validation of the explicitly supported local FVP platforms.
 //!
 //! The caller holds the shared toolchain-use lock from validation through
 //! post-run verification, including failure and cancellation cleanup. Source
@@ -37,6 +37,9 @@ use std::process::Output;
 
 /// The approved manifest, not an override mechanism.
 pub const PINNED_MANIFEST: &str = include_str!("../../platforms/fvp-cca-v15.yaml");
+/// Explicit local in-place memory tuple; not an arbitrary manifest override.
+pub const IN_PLACE_MANIFEST: &str =
+    include_str!("../../platforms/fvp-cca-guest-memfd-in-place.yaml");
 /// Sorted, exact package identities, including the editable checkout revision.
 pub const PINNED_PIP_FREEZE: &str = include_str!("../../platforms/fvp-cca-v15.pip-freeze");
 
@@ -162,17 +165,40 @@ impl PlatformManifest {
         serde_yaml::from_str(PINNED_MANIFEST).context("invalid built-in FVP platform manifest")
     }
 
-    /// Parse a supplied inventory declaration and reject every tuple deviation.
+    /// Select a complete built-in tuple without reading user roots.
+    pub fn for_platform(platform: crate::profile::FvpPlatform) -> anyhow::Result<Self> {
+        match platform {
+            crate::profile::FvpPlatform::CcaV15 => Self::pinned(),
+            crate::profile::FvpPlatform::GuestMemfdInPlace => {
+                serde_yaml::from_str(IN_PLACE_MANIFEST)
+                    .context("invalid built-in in-place FVP platform manifest")
+            }
+        }
+    }
+
+    /// Parse the default v15 inventory and reject every tuple deviation.
     pub fn parse(text: &str) -> anyhow::Result<Self> {
+        Self::parse_for_platform(text, crate::profile::FvpPlatform::CcaV15)
+    }
+
+    /// Parse an inventory for an explicitly selected complete platform tuple.
+    pub fn parse_for_platform(
+        text: &str,
+        platform: crate::profile::FvpPlatform,
+    ) -> anyhow::Result<Self> {
         let manifest: Self =
             serde_yaml::from_str(text).context("invalid FVP platform manifest schema")?;
-        manifest.require_pinned()?;
+        ensure!(
+            manifest == Self::for_platform(platform)?,
+            "FVP inventory does not match the selected platform tuple"
+        );
         Ok(manifest)
     }
 
     fn require_pinned(&self) -> anyhow::Result<()> {
         ensure!(
-            *self == Self::pinned()?,
+            *self == Self::pinned()?
+                || *self == Self::for_platform(crate::profile::FvpPlatform::GuestMemfdInPlace)?,
             "unsupported FVP platform tuple; the complete pinned manifest must match"
         );
         Ok(())
@@ -524,12 +550,12 @@ impl PlatformSources {
             "--untracked-files=all",
             "--ignored=matching",
         ])?;
-        let overlay = self
-            .overlay
-            .canonical
-            .strip_prefix(&self.shrinkwrap_root)
-            .context("FVP overlay must be inside the pinned Shrinkwrap checkout")?;
-        verify_checkout_status(&status, overlay)?;
+        let overlay = checkout_overlay_path(
+            &self.manifest,
+            &self.overlay.canonical,
+            &self.shrinkwrap_root,
+        )?;
+        verify_checkout_status(&status, &overlay)?;
         let tree = git(&["ls-tree", "-r", "-z", "--full-tree", "HEAD"])?;
         for entry in tree.split(|b| *b == 0).filter(|entry| !entry.is_empty()) {
             cancellation.check()?;
@@ -811,6 +837,30 @@ pub fn verify_pip_freeze(text: &str) -> anyhow::Result<()> {
         "FVP Python package set or editable revision mismatch"
     );
     Ok(())
+}
+
+fn checkout_overlay_path(
+    manifest: &PlatformManifest,
+    overlay: &Path,
+    checkout: &Path,
+) -> anyhow::Result<PathBuf> {
+    if let Ok(relative) = overlay.strip_prefix(checkout) {
+        return Ok(relative.to_owned());
+    }
+    ensure!(
+        *manifest
+            == PlatformManifest::for_platform(crate::profile::FvpPlatform::GuestMemfdInPlace)?,
+        "FVP overlay must be inside the pinned Shrinkwrap checkout"
+    );
+    // The in-place tuple uses a separately hashed overlay but shares the
+    // unchanged toolchain checkout with v15. Keep only its original exact
+    // untracked-overlay allowance; do not allow arbitrary external inputs.
+    let legacy = PlatformManifest::pinned()?;
+    Ok(legacy
+        .overlay
+        .relative_path
+        .strip_prefix(&legacy.shrinkwrap.root_relative_path)?
+        .to_owned())
 }
 
 fn verify_checkout_status(status: &[u8], overlay: &Path) -> anyhow::Result<()> {
@@ -1166,6 +1216,44 @@ mod tests {
     }
 
     #[test]
+    fn in_place_tuple_is_complete_and_cannot_mix_firmware() {
+        let in_place =
+            PlatformManifest::for_platform(crate::profile::FvpPlatform::GuestMemfdInPlace).unwrap();
+        assert_eq!(
+            PlatformManifest::parse_for_platform(
+                IN_PLACE_MANIFEST,
+                crate::profile::FvpPlatform::GuestMemfdInPlace,
+            )
+            .unwrap(),
+            in_place
+        );
+        assert!(PlatformManifest::parse(IN_PLACE_MANIFEST).is_err());
+        let mut mixed = in_place.clone();
+        mixed.runtime.fip_sha256 = PlatformManifest::pinned().unwrap().runtime.fip_sha256;
+        assert!(mixed.require_pinned().is_err());
+        let overlay = include_str!("../../platforms/fvp-guest-memfd-in-place-overlay.yaml");
+        assert_eq!(
+            hex::encode(Sha256::digest(overlay.as_bytes())),
+            in_place.overlay.sha256
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the pinned local in-place test platform"]
+    fn local_in_place_platform_sources_match_pins() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
+        let manifest =
+            PlatformManifest::for_platform(crate::profile::FvpPlatform::GuestMemfdInPlace).unwrap();
+        PlatformSources::validate(
+            &manifest,
+            &root,
+            &root.join("cca-tdisp-stage-a/test-platform/package"),
+            &deadline(),
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn snapshot_and_source_mutations_fail() {
         let dir = fixture();
         let root = canonical_root(dir.path()).unwrap();
@@ -1481,6 +1569,26 @@ mod tests {
         ] {
             assert!(verify_pip_freeze(&bad).is_err());
         }
+    }
+
+    #[test]
+    fn external_in_place_overlay_keeps_exact_legacy_checkout_allowance() {
+        let checkout = Path::new("/platform/shrinkwrap");
+        let external = Path::new("/platform/in-place/overlay.yaml");
+        let legacy = PlatformManifest::pinned().unwrap();
+        assert!(checkout_overlay_path(&legacy, external, checkout).is_err());
+        let internal = checkout.join("config/kvm_cca_planes.yaml");
+        assert_eq!(
+            checkout_overlay_path(&legacy, &internal, checkout).unwrap(),
+            Path::new("config/kvm_cca_planes.yaml")
+        );
+        let in_place =
+            PlatformManifest::for_platform(crate::profile::FvpPlatform::GuestMemfdInPlace).unwrap();
+        let allowance = checkout_overlay_path(&in_place, external, checkout).unwrap();
+        assert_eq!(allowance, Path::new("config/kvm_cca_planes.yaml"));
+        verify_checkout_status(b"?? config/kvm_cca_planes.yaml\0!! venv/\0", &allowance).unwrap();
+        assert!(verify_checkout_status(b"?? config/unknown.yaml\0", &allowance).is_err());
+        assert!(verify_checkout_status(b" M tracked.py\0", &allowance).is_err());
     }
 
     #[test]

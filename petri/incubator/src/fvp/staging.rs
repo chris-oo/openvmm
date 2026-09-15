@@ -428,7 +428,10 @@ impl PreparedFvpRun {
                 "--runtime=docker",
                 &format!(
                     "--image={}",
-                    PlatformManifest::pinned()?.shrinkwrap.container.digest
+                    PlatformManifest::for_platform(config.platform)?
+                        .shrinkwrap
+                        .container
+                        .digest
                 ),
                 "run",
                 "--no-color",
@@ -1251,6 +1254,7 @@ command cp "$SEMIHOSTDIR/startup.nsh" "$CAPTURE"
         let directory = directory();
         let prepared = PreparedFvpRun::allocate(directory.path(), &deadline()).unwrap();
         let config = FvpCcaConfig {
+            platform: Default::default(),
             consoles: vec![FvpConsole::Host, FvpConsole::Rmm],
             primary_console: FvpConsole::Host,
             capabilities: vec!["cca".into()],
@@ -1332,6 +1336,7 @@ command cp "$SEMIHOSTDIR/startup.nsh" "$CAPTURE"
         let directory = directory();
         let prepared = PreparedFvpRun::allocate(directory.path(), &deadline()).unwrap();
         let config = FvpCcaConfig {
+            platform: Default::default(),
             consoles: vec![FvpConsole::Host],
             primary_console: FvpConsole::Host,
             capabilities: vec!["cca".into()],

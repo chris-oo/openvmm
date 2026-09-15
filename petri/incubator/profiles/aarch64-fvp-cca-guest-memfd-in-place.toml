@@ -1,0 +1,11 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# Local in-process Virtio test platform. No assigned devices.
+# Tests select their memory mode; this profile does not set OpenVMM flags.
+[incubator]
+type = "fvp-cca"
+platform = "guest-memfd-in-place"
+consoles = ["host", "edk2", "rmm"]
+primary-console = "host"
+capabilities = ["cca", "guest_memfd_in_place"]
