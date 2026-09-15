@@ -1116,6 +1116,10 @@ impl virt::Partition for KvmPartition {
         virt::InitialVpStateSource::Registers
     }
 
+    fn vfio_assignment_provider(&self) -> Option<Arc<dyn pci_core::vfio::VfioVmProvider>> {
+        Some(crate::vfio::provider(self.inner.clone()))
+    }
+
     fn supports_reset(
         &self,
     ) -> Option<&dyn virt::ResetPartition<Error = <Self as virt::Hv1>::Error>> {

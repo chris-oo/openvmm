@@ -6,6 +6,9 @@
 use crate::KvmPartition;
 use crate::KvmPartitionInner;
 use parking_lot::Mutex;
+use pci_core::vfio::VfioVm;
+use pci_core::vfio::VfioVmError;
+use pci_core::vfio::VfioVmProvider;
 use std::os::fd::BorrowedFd;
 use std::sync::Arc;
 
@@ -28,13 +31,23 @@ impl KvmPartition {
     /// error. This method does not change device-assignment policy or associate
     /// any files.
     pub fn vfio_assignment(&self) -> Result<KvmVfioAssignment, kvm::Error> {
-        initialize_once(&self.inner.vfio_device, || {
-            self.inner.kvm.create_vfio_device()
-        })?;
-        Ok(KvmVfioAssignment {
-            partition: self.inner.clone(),
-        })
+        create_assignment(self.inner.clone())
     }
+}
+
+fn create_assignment(partition: Arc<KvmPartitionInner>) -> Result<KvmVfioAssignment, kvm::Error> {
+    initialize_once(&partition.vfio_device, || {
+        partition.kvm.create_vfio_device()
+    })?;
+    Ok(KvmVfioAssignment { partition })
+}
+
+pub(super) fn provider(partition: Arc<KvmPartitionInner>) -> Arc<dyn VfioVmProvider> {
+    Arc::new(move || -> Result<Arc<dyn VfioVm>, VfioVmError> {
+        Ok(Arc::new(
+            create_assignment(partition.clone()).map_err(VfioVmError::new)?,
+        ))
+    })
 }
 
 /// Keeps the KVM partition and its bridge alive for an assignment owner.
@@ -73,12 +86,48 @@ impl KvmVfioAssignment {
     }
 }
 
+impl VfioVm for KvmVfioAssignment {
+    fn add_file(&self, file: BorrowedFd<'_>) -> Result<(), VfioVmError> {
+        KvmVfioAssignment::add_file(self, file).map_err(VfioVmError::new)
+    }
+
+    fn remove_file(&self, file: BorrowedFd<'_>) -> Result<(), VfioVmError> {
+        KvmVfioAssignment::remove_file(self, file).map_err(VfioVmError::new)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
     use test_with_tracing::test;
+
+    #[test]
+    fn provider_defers_creation_and_preserves_backend_error() {
+        use std::error::Error as _;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let provider: Arc<dyn VfioVmProvider> =
+            Arc::new(move || -> Result<Arc<dyn VfioVm>, VfioVmError> {
+                counter.fetch_add(1, Ordering::Relaxed);
+                Err(VfioVmError::new(std::io::Error::from_raw_os_error(
+                    libc::ENOTTY,
+                )))
+            });
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        let error = provider.create().err().unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            error
+                .source()
+                .unwrap()
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::ENOTTY)
+        );
+    }
 
     #[test]
     fn failed_creation_can_be_retried_without_caching_a_handle() {
