@@ -1040,12 +1040,54 @@ fn validate_guest_memfd_in_place_config(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn select_realm_vfio_provider<T>(
+    config: &HypervisorConfig,
+    get_provider: impl FnOnce() -> Option<T>,
+) -> Option<T> {
+    if config.guest_memfd_in_place
+        && config.with_isolation == Some(openvmm_defs::config::IsolationType::Cca)
+    {
+        get_provider()
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod cca_validation_tests {
     use super::validate_cca_memory_config;
     use super::validate_cca_pcie_resource;
     use openvmm_defs::config::MemoryConfig;
     use test_with_tracing::test;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn realm_provider_is_requested_only_for_in_place_cca() {
+        use openvmm_defs::config::HypervisorConfig;
+        use openvmm_defs::config::IsolationType;
+        for isolation in [None, Some(IsolationType::Cca), Some(IsolationType::Snp)] {
+            for in_place in [false, true] {
+                let config = HypervisorConfig {
+                    with_isolation: isolation,
+                    guest_memfd_in_place: in_place,
+                    ..Default::default()
+                };
+                let mut calls = 0;
+                let provider = super::select_realm_vfio_provider(&config, || {
+                    calls += 1;
+                    Some(17)
+                });
+                let selected = isolation == Some(IsolationType::Cca) && in_place;
+                assert_eq!(calls, usize::from(selected));
+                assert_eq!(provider, selected.then_some(17));
+                assert_eq!(
+                    super::select_realm_vfio_provider::<u32>(&config, || None),
+                    None
+                );
+            }
+        }
+    }
 
     #[test]
     fn guest_memfd_in_place_is_explicit_and_rejects_unsupported_backends() {
@@ -2696,7 +2738,10 @@ impl InitializedVm {
             let cdev_resolver = vfio_assigned_device::resolver::VfioCdevDeviceResolver::new(
                 driver_source.builder().build("vfio-cdev-mgr"),
                 dma_mapper_client,
-            );
+            )
+            .with_realm_assignment_provider(select_realm_vfio_provider(&cfg.hypervisor, || {
+                partition.vfio_assignment_provider()
+            }));
             let cdev_handle = cdev_resolver.inspect_handle();
             resolver.add_async_resolver::<
                 vm_resource::kind::PciDeviceHandleKind,

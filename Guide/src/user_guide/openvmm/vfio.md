@@ -11,10 +11,14 @@ VFIO device assignment is experimental. PCI config space, BAR MMIO passthrough, 
 ```admonish note
 Arm CCA trusted device assignment is not yet enabled. The `vfio_sys` crate
 has low-level helpers for IOAS page-size policy, Realm vIOMMU allocation,
-and S1-bypass descriptors. The KVM backend also provides a partition-owned
-VFIO association handle. Resolver wiring, owned IOMMUFD allocation and
-rollback, private/shared DMA coordination, and the TDISP device lifecycle
-remain incomplete.
+and S1-bypass descriptors. A lazy, partition-owned KVM association provider
+is passed to the cdev resolver for in-place CCA. The separate Realm object
+owner prepares the IOAS/page-table graph, attaches only after receiving a
+final requester ID, and retains partial state if rollback fails.
+This path does not expose a PCI device, register DMA mappings, or perform
+TDISP LOCK/RUN. Private/shared DMA coordination and the device lifecycle
+remain incomplete. Explicit cleanup is required; abandoned cleanup failures
+retain their resource bundle until process exit and are not clean teardown.
 Do not use the unsafe-interrupt workaround below for trusted assignment.
 ```
 

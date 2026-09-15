@@ -121,6 +121,7 @@ impl AsyncResolveResource<PciDeviceHandleKind, VfioDeviceHandle> for VfioDeviceR
 /// per-device stream backend, and registers the backend with the SMMU shared
 /// state.
 pub struct VfioCdevDeviceResolver {
+    realm_assignment: Option<Arc<dyn pci_core::vfio::VfioVmProvider>>,
     client: crate::manager::VfioCdevManagerClient,
     _task: pal_async::task::Task<()>,
 }
@@ -137,15 +138,47 @@ impl VfioCdevDeviceResolver {
         let client = manager.client();
         let task = spawner.spawn("vfio-cdev-dispatch", manager.run());
         Self {
+            realm_assignment: None,
             client,
             _task: task,
         }
+    }
+
+    /// Supply lazy VM association access for the separate Realm object path.
+    /// This does not enable CCA assignment or change ordinary cdev resolution.
+    pub fn with_realm_assignment_provider(
+        mut self,
+        provider: Option<Arc<dyn pci_core::vfio::VfioVmProvider>>,
+    ) -> Self {
+        self.realm_assignment = provider;
+        self
+    }
+
+    /// Prepare an unmapped Realm object graph without exposing a PCI device.
+    ///
+    /// The caller retains the returned owner through final-RID attachment and
+    /// cleanup, including the recovery owner on failure. Ordinary resource
+    /// resolution does not call this path; CCA admission remains disabled.
+    pub fn prepare_realm_objects(
+        &self,
+        cdev: std::fs::File,
+        iommufd: std::fs::File,
+    ) -> Result<crate::realm::RealmDevice, crate::realm::RealmPrepareError> {
+        crate::realm::RealmDevice::prepare(self.realm_assignment.as_deref(), cdev, iommufd)
     }
 
     /// Returns a handle for the VM's inspect tree.
     pub fn inspect_handle(&self) -> crate::manager::VfioCdevManagerClient {
         self.client.clone()
     }
+}
+
+fn validate_ordinary_cdev_path(realm_provider_present: bool) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !realm_provider_present,
+        "Realm object preparation is not yet enabled as a PCI device; refusing ordinary DMA mapping"
+    );
+    Ok(())
 }
 
 #[async_trait]
@@ -159,6 +192,7 @@ impl AsyncResolveResource<PciDeviceHandleKind, VfioCdevDeviceHandle> for VfioCde
         resource: VfioCdevDeviceHandle,
         input: ResolvePciDeviceHandleParams<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        validate_ordinary_cdev_path(self.realm_assignment.is_some())?;
         let VfioCdevDeviceHandle {
             pci_id,
             cdev,
@@ -179,6 +213,7 @@ impl AsyncResolveResource<PciDeviceHandleKind, VfioCdevDeviceHandle> for VfioCde
                      program the host IOMMU for passthrough DMA"
                 );
             }
+
             pci_core::dma::DmaPassthrough::Allowed => None,
             pci_core::dma::DmaPassthrough::HardwareNestable(handle) => Some(
                 handle
@@ -267,5 +302,17 @@ impl AsyncResolveResource<PciDeviceHandleKind, VfioCdevDeviceHandle> for VfioCde
         .await?;
 
         Ok(assigned.into())
+    }
+}
+
+#[cfg(test)]
+mod realm_guard_tests {
+    use super::validate_ordinary_cdev_path;
+    use test_with_tracing::test;
+
+    #[test]
+    fn realm_provider_cannot_fall_back_to_ordinary_dma_mapping() {
+        validate_ordinary_cdev_path(false).unwrap();
+        assert!(validate_ordinary_cdev_path(true).is_err());
     }
 }

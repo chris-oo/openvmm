@@ -468,6 +468,59 @@ new explicit service parameter or an architecture-scoped device callback is
 needed; `supports_tdisp()` alone does not connect KVM exits to the device.
 [O2-O5]
 
+### Owned host-object construction
+
+Use a Linux-only, backend-neutral VFIO association provider at the PCI
+boundary. The KVM provider creates the existing partition-owned bridge only
+when requested. Worker/resolver wiring may carry this provider for CCA, but
+must not change the current rejection of live CCA VFIO devices or create a
+bridge for ordinary boots.
+
+The Realm allocation owner retains the VFIO file, IOMMUFD context and KVM
+association together. Preparation associates before binding, then allocates
+an IOAS with huge-page combining disabled, a nesting parent, a Realm vIOMMU,
+and an S1-bypass child. A separate attachment step takes the final guest
+requester identity, creates the vdevice, and only then attaches the child
+HWPT. No DMA mapper or guest BAR access is registered by these operations.
+The caller must supply an unbound VFIO file under exclusive lifecycle
+control; duplicate descriptors can delay final unbinding.
+
+On a preparation or attachment error, attempt dependency-ordered rollback.
+Stop at the first cleanup error, preserve both the original operation error
+and cleanup error, and retain the remaining handles and object IDs in a
+recoverable owner. Clear each ownership marker only after successful cleanup.
+An attempted attachment must be detached even if its completion is ambiguous;
+do not destroy an unexpected returned HWPT ID that this owner did not allocate.
+Attachment is allowed once from the prepared state. Once cleanup starts,
+only cleanup retry is allowed, not renewed setup or attachment.
+
+Cleanup order is detach, vdevice, child HWPT, vIOMMU, nesting parent, IOAS,
+KVM file association, VFIO file close, then IOMMUFD and partition handles.
+Skip absent objects. The bound device ID is bookkeeping, not an independently
+allocated object to destroy; final VFIO file release ends the binding.
+
+Normal teardown is explicit and retryable. If a caller abandons an owner whose
+cleanup still fails, log the failure and retain the entire remaining resource
+bundle until process exit rather than release memory or associations out of
+order. This is a fail-closed fallback, not clean teardown or a reuse result.
+The later live-DMA path must stop access before calling this cleanup path.
+
+Mock tests must cover every allocation and cleanup failure boundary, retained
+state and retry, association-before-bind, vdevice-before-attach, and the exact
+cleanup order. Drop-counter tests must prove failed recovery retains the
+entire resource bundle. Wiring tests must preserve lazy provider creation,
+ordinary boot behavior, and the existing CCA VFIO rejection cases.
+Actual FVP object-lifecycle testing still requires the DA
+fixture; mock results do not close that runtime gate.
+
+The provider and unmapped object owner are now implemented. Mock coverage
+checks allocation/cleanup boundaries, ambiguous attachment, final-RID ordering,
+and retention of all resource handles on failed cleanup. The existing
+in-place FVP Realm boot regression also passes (nextest run
+`d19f865a-4932-4d92-bd20-7c4f1ec62b42`, 243.217 s), confirming ordinary
+boot/teardown with provider wiring present. This run does not allocate a
+Realm vdevice. Actual DA object-lifecycle qualification remains outstanding.
+
 ### Guest identity and topology
 
 Store this mapping per VM:
@@ -1358,3 +1411,13 @@ The targeted FVP-priority revision review also returned **Ready**. It
 confirmed that broken QEMU qualification is explicitly deferred while the
 FVP assignment, private-DMA, interrupt and clean-lifecycle gates remain
 mandatory.
+
+### Owned Realm object design and implementation review
+
+Design review: **Minor revisions**, incorporated. The review required final
+file-release ordering, exclusive control of the VFIO open file description,
+one-time attachment and cleanup-only retry, structurally retained recovery
+ownership, and drop-counter/wiring regression tests. Separate code reviews
+of the provider wiring and allocation owner found no significant issues.
+The FVP boot regression checks provider lifetime integration only, not
+hardware object creation or trusted DMA.

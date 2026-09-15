@@ -97,6 +97,10 @@ pub trait HvlitePartition: Inspect + Send + Sync + RequestYield {
     /// Gets the irqfd routing interface, if supported.
     fn irqfd(&self) -> Option<Arc<dyn virt::irqfd::IrqFd>>;
 
+    /// Gets lazy VFIO association access without allocating a bridge.
+    #[cfg(target_os = "linux")]
+    fn vfio_assignment_provider(&self) -> Option<Arc<dyn pci_core::vfio::VfioVmProvider>>;
+
     /// Returns whether virtual devices are supported.
     fn supports_virtual_devices(&self) -> bool;
 
@@ -240,6 +244,11 @@ where
 
     fn irqfd(&self) -> Option<Arc<dyn virt::irqfd::IrqFd>> {
         Partition::irqfd(self)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn vfio_assignment_provider(&self) -> Option<Arc<dyn pci_core::vfio::VfioVmProvider>> {
+        Partition::vfio_assignment_provider(self)
     }
 
     fn supports_virtual_devices(&self) -> bool {
