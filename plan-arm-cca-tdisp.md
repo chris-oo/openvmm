@@ -125,9 +125,9 @@ Its local output is under `vmm_test_results/in-place/test_results/`.
 Each of the three VMM results above represents one executed, passing test,
 not enumeration-only success or a capability skip. The in-place FVP run also
 completed with outer exit status 0. The separate crate suites reported 275
-passed and 1 skipped. The matched guest-VM coverage is Virtio-vsock; the other
-listed Virtio devices have crate
-regression coverage, not new CCA guest-VM tests.
+passed and 1 skipped. At that checkpoint, the matched guest-VM coverage was
+Virtio-vsock; the other listed Virtio devices had crate regression coverage.
+The later block and network results are recorded below.
 
 The separate FVP profile and command are documented in
 `Guide/src/dev_guide/tests/vmm/qemu_cca.md`. Its kernel differs from the local
@@ -145,6 +145,84 @@ records one 4096-byte AHCI read into checked RIPAS_RAM payload and command
 buffers. Its data and completion checks passed. Four IOMMUFD `EBUSY` cleanup
 errors and FVP exit 134 remained. That bounded kvmtool result is separate
 from the clean OpenVMM Virtio test and does not complete the A3 controls.
+
+### Upstream firmware and payload publication
+
+As checked on 2026-09-15, the latest `microsoft/openvmm-deps` release is
+`0.3.0-139`. Its CCA firmware archives target QEMU: the TF-A manifest specifies
+`platform=qemu` and `linux_as_bl33=true`, and TF-RMM specifies
+`config=qemu_virt_defcfg`. The release does not contain an FVP firmware
+archive. QEMU binaries are not a substitute for FVP-targeted firmware.
+
+For reproducible upstream FVP testing, add an upstream build and release
+package for the qualified FVP configuration. Include BL1, the FIP containing
+the required TF-A/RMM/EDK2 components, the device tree, and relocatable
+package metadata. Record source revisions, effective configurations,
+toolchain identity and artifact hashes. Update the FVP resolver to download
+and validate these assets rather than require a developer's locally built
+Shrinkwrap package. The licensed simulator remains separately provisioned.
+Qualify the resulting published bytes with the VMM tests before changing
+the profile pins; the current local results do not qualify an unpublished
+replacement package.
+
+For QEMU, reuse the existing upstream QEMU/TF-A/RMM assets first. A newer
+in-place guest_memfd kernel alone does not justify rebuilding firmware.
+Publish replacement QEMU firmware only if a demonstrated compatibility
+failure requires it, or a later feature such as device assignment requires
+different firmware support. Keep that decision separate from publishing
+the in-place-capable host/Realm Linux kernel, config and manifest, which
+are currently local test inputs. Reuse the existing published base initrd.
+Retain the default v15 release/profile as the separate-backing control.
+
+### In-place block and network testing: 2026-09-15
+
+The new `virtio_blk_cca_in_place` and `virtio_net_cca_in_place` VMM tests
+explicitly select CCA and in-place guest_memfd. Both use Virtio-vsock as an
+independent control channel and require clean OpenVMM teardown.
+
+| Test | FVP | QEMU with published `0.3.0-139` firmware |
+|---|---|---|
+| Virtio-blk | Passed, 258.168 s | Blocked during Realm boot; no I/O qualification |
+| Virtio-net | Passed, 261.217 s | Blocked before pipette; bounded run timed out |
+
+Block coverage checks distinct 64-KiB patterns at the start and end of an
+8-MiB scratch disk, guest direct writes and direct readback, and the host
+backing file after teardown. Network coverage verifies all 64 KiB in each
+direction over TCP through the Virtio NIC. An initial network test error
+polled the IPv4 socket table while BusyBox listened on IPv6; explicit IPv4
+binding and early server-exit detection fixed that test error.
+
+FVP evidence: nextest run `44ad82a7-df38-4e44-ab1e-5ce899ef02a3` contains the
+block pass and initial network failure; run
+`1d92bc67-4790-4537-ab02-993662472978` contains the corrected network pass.
+Outputs remain under `vmm_test_results/in-place-io/` and
+`vmm_test_results/in-place-net/`.
+
+The QEMU diagnostic profile reuses the published emulator and TF-A/RMM,
+with the same local kernel/initrd payload used on FVP. No locally rebuilt
+QEMU firmware was used. The host boots and the Realm reaches early kernel
+initialization;
+the block diagnostic console stops after printing the ITS resource.
+Temporary tracing recorded completed guest_memfd attribute conversions for
+the SWIOTLB and initial ITS allocations, but does not establish correct
+subsequent access or the cause of the stall. The separate network attempt
+also failed to reach pipette. Bounded diagnostic runs exited with timeout
+status 124, not test success.
+
+QEMU evidence is under `vmm_test_results/qemu-in-place-io/`,
+`qemu-in-place-diagnostic/`, `qemu-in-place-trace/`, and
+`qemu-in-place-net/`. This combination remains unqualified. Do not infer
+that firmware replacement alone fixes the stall; isolate the kernel,
+RMM and VMM interaction before changing upstream firmware pins. The
+temporary console, monitor and conversion-trace changes were removed.
+
+**QEMU is broken for this in-place test combination and needs further debug.**
+Per the implementation priority, defer that investigation and continue native
+TDISP bring-up on the tested FVP path. QEMU is not a gate for the next FVP
+implementation chunks. Keep its diagnostic profile and failure evidence;
+do not present it as qualified or replace firmware without an identified
+cause. This deferral does not waive the FVP device-assignment, private-DMA,
+interrupt, or clean-lifecycle gates.
 
 ### Local Stage A results: 2026-09-14
 
@@ -260,7 +338,7 @@ it is not implemented as ordinary OpenVMM MMIO emulation. [K3-K5]
 | TDISP | `tdisp`, `tdisp_proto`, OpenHCL client, VPCI dispatch, synthetic NVMe tests | Add native-host lifecycle support without changing the existing wire protocol |
 | PCI assignment | `vfio_assigned_device` config filtering, BAR maps, MSI-X, cdev manager and resources | Add typed CCA mode, lifecycle/access coordinator, and AHCI interrupt support if required |
 | Host IOMMU | `vfio_sys::iommufd`, IOAS/HWPT/vIOMMU/vdevice wrappers; `iommufd_nesting` | Add Realm vIOMMU type, TSM request ABI, KVM association, and S1-bypass Realm path |
-| KVM | Realm creation, population, memory-fault handling, GICv3 | Add v7 memory mode, Arm SMCCC exits/register completion, TIO exits and prefault |
+| KVM | Realm creation, population, memory-fault handling, GICv3, in-place guest_memfd | Add Arm SMCCC exits/register completion, TIO exits and assignment prefault |
 | VM assembly | CCA validation, PCI roots, device-tree generation, resource resolution | Admit only the new CCA-aware resource; wire partition/device services and address views |
 | Petri | Realm boot and ordinary AArch64 VFIO tests | Combine their patterns with a DA-specific fixture and real lock/accept/I/O assertions |
 | FVP | Validated v15 tuple, initrd boot, checked staging, logs, deadlines, cleanup | Add a separate DA tuple, payload, PCI assets, and L1 provisioning |
@@ -1074,7 +1152,7 @@ transport/error plumbing, but do not replace a real FVP negative result.
 | Stage | Main files/crates | Exit criterion |
 |---|---|---|
 | A. Reference and interrupt qualification | Pinned Linux/kvmtool/TF-RMM build manifest; DA model assets; qualification helper | Recorded reference/IRQ baseline plus section 10 buffer-level qualification and clean lifecycle; current read smoke success alone does not close A |
-| B. v7 memory ABI and backing | `vm/kvm`; `vmm_core/virt_kvm/{cca,memory}`; `openvmm/membacking`; worker assembly | v7 Realm boots; INIT_RIPAS ledgers, both memory-fault return forms/cause classification, pending completion and both conversion directions pass; v15 unchanged |
+| B. In-place guest_memfd ABI and backing | `vm/kvm`; `vmm_core/virt_kvm/{cca,memory}`; `openvmm/membacking`; worker assembly | In-place Realm boots on FVP; INIT_RIPAS ledgers, both memory-fault return forms/cause classification, pending completion and both conversion directions pass; v15 unchanged; QEMU debug deferred |
 | C. DA FVP/payload mode | `petri/incubator/{profile,fvp,cca_init}`; platform/profile files; `resolve_cca_payload`; Flowey runner/pipeline; Petri artifacts | Validated DA L1 and guest artifacts; readiness-gated fixture; negative identity tests |
 | D. Host object path | `vfio_sys/{cdev,iommufd}`; VFIO resources/resolver/manager; KVM association service | Realm vIOMMU/vdevice/S1-bypass attach and partial-allocation cleanup; no live TDISP state requests yet |
 | E. Native TDISP/RHI | `tdisp` host module; VFIO CCA coordinator; Arm KVM exit/register adapter | Whole-object snapshot adapter, guest buffer encoding, mocked requests and evidence transport pass; real LOCK/RUN remain disabled |
@@ -1266,3 +1344,17 @@ the exact backend-hook name, an explicit distinction between shared test
 configuration and different platform tuples, and separate wording for
 executed VMM tests versus the skipped crate test. It did not qualify
 additional Virtio guest devices, same-tuple parity, or TDISP assignment.
+
+### Upstream publication note review: 2026-09-15
+
+Targeted `review-plan` review: **Ready**. The review accepted the checked
+release/manifest observations and confirmed the distinction between missing
+FVP package publication, local Linux payload publication, and conditional
+QEMU firmware replacement. It did not qualify the QEMU runtime combination.
+Code reviews of the device tests and QEMU input plumbing completed; the
+duplicate builder modification and IPv4 listener setup findings were fixed.
+
+The targeted FVP-priority revision review also returned **Ready**. It
+confirmed that broken QEMU qualification is explicitly deferred while the
+FVP assignment, private-DMA, interrupt and clean-lifecycle gates remain
+mandatory.
