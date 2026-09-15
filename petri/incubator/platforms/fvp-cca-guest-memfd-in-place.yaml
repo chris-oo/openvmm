@@ -1,0 +1,44 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# Local in-process Virtio candidate, not device-assignment qualification.
+# Read-only platform root is target/, reusing its existing clean toolchain.
+# Package source SHA-256:
+# 56bb44c6855d1661e948b32bf166db5e23beb19fa943be7a610b7155053c7083
+# Effective package changes: omit pci.hierarchy_file_name (model default),
+# remove FIX_PCI_JSON_FILE prerun and PCI_HIERARCHY_FILE_FIXED/SAMPLE_KEY rtvars.
+# Other DA SMMU/CPU model parameters and firmware bytes remain unchanged.
+schema_version: 1
+fvp:
+  executable_in_container: /tools/FVP_Base_RevC_AEMvA_11.31_28/bin/FVP_Base_RevC-2xAEMvA
+  version_output: Fast Models [11.31.28 (Mar  1 2026)]
+shrinkwrap:
+  root_relative_path: cca-test/shrinkwrap
+  executable_relative_path: cca-test/shrinkwrap/venv/bin/shrinkwrap
+  checkout_revision: 1c6b7a5278b47be11cad3bcd3a20416fc43fd388
+  package_version: 2026.9.0.dev0
+  container:
+    tag: shrinkwraptool/base-slim:2026.9.0.dev0
+    digest: shrinkwraptool/base-slim@sha256:dc5ac44b4cd8d8142c8df0f7fab4b5ecb11f9a399c6b94320b14f07f1476ea99
+package:
+  root_input: shrinkwrap_package_root
+  yaml_relative_path: cca-3world.yaml
+  sha256: c7804d85f11e3e9bab1d1d9fb019213b8858de58f176754bdb9270ca1ef17203
+overlay:
+  root_input: fvp_platform_root
+  relative_path: cca-tdisp-stage-a/test-platform/overlay.yaml
+  sha256: a4af191d30492a88246a3107c44387f8a0861642f13a79bde9d4cf286f358055
+runtime:
+  root_input: shrinkwrap_package_root
+  bl1_relative_path: cca-3world/bl1.bin
+  bl1_sha256: 7e05af43b84d1ca26134c4de572754cbae02f9aeaf042d13ff2b00c04076fe5f
+  fip_relative_path: cca-3world/fip.bin
+  fip_sha256: 7cb0bf5e6227de272180b8414870dafa8ca8363cb22110f7242d7bab21ded7ef
+  dtb_relative_path: cca-3world/dt_bootargs.dtb
+  dtb_sha256: 3a2e6b85fc1c10f17cab2f6ec7eadb63b18c6f3d08a74e38eeddc6f587ea3630
+provenance:
+  tf_a_revision: 38269bb73d34b4a31100adf208a27e4c28e7d611
+  tf_rmm_revision: 33bbaf7814fee335027bf4d2417d97b551838b70
+  tf_rmm_config: fvp_defcfg
+  edk2_revision: e425c4f3ccf023f01438d8c7f751ecadc036c9b8
+  dt_revision: 504267e5a417a7481329783924a5f2a475aca748

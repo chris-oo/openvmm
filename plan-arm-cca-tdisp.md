@@ -2,12 +2,14 @@
 
 Date: 2026-09-11
 
-Updated: 2026-09-14
+Updated: 2026-09-15
 
-Status: implementation started. Two small OpenVMM foundation changes are
-committed. The local kvmtool/FVP reference stack passed the protocol/read
-smoke test, but failed clean shutdown. Buffer-level confidential DMA and the
-OpenVMM TDISP `vmm_test` are not yet qualified. See the runtime results below.
+Status: the OpenVMM guest_memfd in-place memory foundation is implemented.
+The paired CCA Virtio-vsock VMM test passes on FVP. The existing separate-backing
+test still passes on QEMU and FVP. Native OpenVMM TDISP assignment is not
+implemented. The local kvmtool reference has demonstrated one bounded
+private-buffer DMA read, but clean device teardown and negative isolation
+controls remain unqualified. See the runtime results below.
 
 ## 1. Recommendation
 
@@ -24,7 +26,7 @@ v15 FVP/QEMU boot paths intact.
 
 This is not just a TDISP callback implementation. The main prerequisites are:
 
-1. v7 memory compatibility, including explicit initial RIPAS, the guest_memfd
+1. Guest_memfd in-place memory, including explicit initial RIPAS, the guest_memfd
    attribute ABI, and DMA-ready private mappings.
 2. KVM-associated Realm IOMMUFD objects, distinct from ordinary SMMUv3 nesting.
 3. Guest RHI transport, TIO completion, and one serialized device/access state.
@@ -74,6 +76,75 @@ Both code chunks received code review and scoped validation before commit.
 The baseline-code descriptions elsewhere in this plan identify why the full
 integration is needed; the two completed wrapper/exit tasks above supersede
 statements that those low-level interfaces are entirely absent.
+
+### Guest_memfd in-place implementation and parity
+
+The memory mode is **guest_memfd in-place**, selected by
+`--guest-memfd-in-place` with `--isolation cca`. The configuration field is
+`guest_memfd_in_place`; the backend recognition hook is
+`recognizes_guest_memfd_in_place`. The helper module is
+`vmm_core/virt_kvm/src/cca_in_place.rs`. The old `--cca-v7` spelling is
+rejected. References to v7 elsewhere identify the pinned Linux integration
+branch and its ABI, not an OpenVMM memory-mode name.
+
+The later foundation changes are `nkxtrrzo` (backing imports at file offsets),
+`pyrmwurs` (GNU/musl ioctl request types), `svvtpwvn` (partition-owned RAM
+preparation and imports), and `vxmksnus` (in-place launch and conversion).
+They supersede the corresponding baseline gaps described in section 6.
+Private prefaulting for assigned devices and coordinated IOAS mapping remain
+future work.
+
+The follow-up fixes are change ID `wmumznmy` (guest-memory policy forwarding
+and vsock copy paths) and change ID `vwkkpkwp` (in-place naming, revocable
+access policy, and the paired VMM test).
+
+In-place memory now uses the ordinary CCA device allowlist, not a separate
+no-PCI restriction. Revocable mappings disable raw page locking and file-based
+sharing. Arc and subrange guest-memory wrappers preserve that policy. Vsock
+uses its copy path when locking is unavailable; that path now respects peer
+credit and handles an RX descriptor chain that changes across an await.
+
+The paired tests in
+`vmm_tests/vmm_tests/tests/tests/aarch64_exclusive.rs` share one body. Each
+boots a one-VP, 256-MiB Realm with the same PCIe/Virtio-vsock setup, connects
+pipette, pings, requests poweroff, and requires clean OpenVMM teardown.
+Within the shared test body, only the in-place selection differs. The
+recorded runs use the default QEMU/FVP tuples for separate backing and the
+separately pinned FVP tuple for in-place backing; they do not establish
+same-tuple backing-mode parity.
+
+| Parity check | Result |
+|---|---|
+| Existing separate-backing CCA VMM test, default QEMU tuple | 1 passed, 36.663 s |
+| Existing separate-backing CCA VMM test, default FVP tuple | 1 passed, 219.714 s |
+| Paired guest_memfd in-place CCA VMM test, pinned in-place FVP tuple | 1 passed, 246.103 s |
+| `guestmem`, `membacking`, `virtio`, block, net, rng, console and vsock suites | 275 passed, 1 skipped |
+
+The in-place nextest run ID is `efcaa82e-e82b-4c51-a2ad-f935bdb7bc95`.
+Its local output is under `vmm_test_results/in-place/test_results/`.
+Each of the three VMM results above represents one executed, passing test,
+not enumeration-only success or a capability skip. The in-place FVP run also
+completed with outer exit status 0. The separate crate suites reported 275
+passed and 1 skipped. The matched guest-VM coverage is Virtio-vsock; the other
+listed Virtio devices have crate
+regression coverage, not new CCA guest-VM tests.
+
+The separate FVP profile and command are documented in
+`Guide/src/dev_guide/tests/vmm/qemu_cca.md`. Its kernel differs from the local
+reference config only by `CONFIG_SMC91X=m` becoming `y`: the official initrd
+does not load that host NIC module. The effective package omits
+`pci.hierarchy_file_name` to select the model default. An empty filename is
+not the default and caused a model error during an earlier enumeration run.
+The corrected profile completed both the Realm test and outer host shutdown.
+The default v15 inputs remain unchanged. This does not qualify in-place
+memory on the old QEMU tuple, TDISP, host DMA, or assigned-device teardown.
+
+The reference's later
+[`run-20260914-private2/result.json`](target/cca-tdisp-stage-a/runs/run-20260914-private2/result.json)
+records one 4096-byte AHCI read into checked RIPAS_RAM payload and command
+buffers. Its data and completion checks passed. Four IOMMUFD `EBUSY` cleanup
+errors and FVP exit 134 remained. That bounded kvmtool result is separate
+from the clean OpenVMM Virtio test and does not complete the A3 controls.
 
 ### Local Stage A results: 2026-09-14
 
@@ -345,7 +416,11 @@ rebuild the binding safely or be explicitly unsupported. [O4-O5]
 
 ## 6. Memory: the first implementation gate
 
-### Why the current backend needs work
+### Why the original separate-backing backend needed work
+
+This section records the baseline requirements. The implementation status
+above identifies the completed memory work; assignment-specific coordination
+below is still required.
 
 The current `GuestMemfdDefault` mode creates guest_memfd with flags zero,
 registers it alongside a separate userspace mapping, populates imported pages,
@@ -360,7 +435,7 @@ attributes before completing a RAM RIPAS change. Keeping the old handler
 unchanged can repeatedly exit without completing the requested conversion.
 [K1, V1]
 
-**Recommended baseline:** implement a separate v7 in-place backing mode that
+**Recommended baseline:** implement an opt-in guest_memfd in-place mode that
 matches this kernel/reference design. Do not transplant its operations onto
 the old separate-backing path and retain destructive discard calls.
 
@@ -403,7 +478,7 @@ the old separate-backing path and retain destructive discard calls.
    stop with a diagnostic; resolve any required kernel-interface gap rather
    than guessing a visibility change. Test classification before admitting
    the coordinated conversion path. [K6]
-7. Replace the v7 RIPAS handler with coordinated conversion:
+7. Extend the in-place RIPAS handler with coordinated assignment conversion:
    withdraw shared IOAS mappings before shared-to-private conversion; change
    guest_memfd attributes; prefault private ranges; map newly shared RAM into
    IOAS after conversion. Complete the KVM exit only after required work has
@@ -432,7 +507,7 @@ failure behavior must not become success for required CCA DMA mappings.
 The exact `membacking` backing-import API and scheduling/lock order need a
 focused design pass during the memory milestone. The required outcome is
 fixed: one coherent backing, correct access restrictions, no stale DMA alias,
-and no old discard operation that destroys in-place data. A v7 Realm boot and
+and no old discard operation that destroys in-place data. An in-place Realm boot and
 both conversion directions must pass before enabling physical assignment.
 
 ## 7. Guest RHI and trusted-I/O transport
@@ -1175,3 +1250,19 @@ Final targeted review before commit: **Ready**. All three corrections were
 confirmed, and the DMA/SWIOTLB tracepoints needed to start A1 were checked in
 the pinned Linux sources. A1 remains trace evidence collection, not a substitute
 for A2's descriptor, RAM-state and lifetime checks.
+
+### Guest_memfd in-place parity update: 2026-09-15
+
+Code review found no significant issues in the naming, revocable-memory,
+vsock and FVP runner changes after the earlier scoped corrections.
+The effective package was then corrected to omit the PCI hierarchy filename;
+the model's parameter listing identifies `<default>`, not an empty string,
+as its default. The corrected FVP VMM run passed.
+
+Targeted `review-plan` review: **Minor revisions**, incorporated above.
+The review checked the shared test body and bounded private-read record,
+using the recorded test outcomes as supplied execution evidence. It required
+the exact backend-hook name, an explicit distinction between shared test
+configuration and different platform tuples, and separate wording for
+executed VMM tests versus the skipped crate test. It did not qualify
+additional Virtio guest devices, same-tuple parity, or TDISP assignment.

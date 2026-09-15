@@ -65,6 +65,8 @@ pub struct BuildSelections {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum CcaPlatformSource {
+    /// Explicit local directory containing the pinned in-place payload files.
+    PayloadGuestMemfdInPlace { root: PathBuf },
     PayloadRelease {
         version: String,
         kernel_archive_sha256: String,
@@ -98,6 +100,18 @@ pub enum CcaPlatformSource {
 }
 
 impl CcaPlatformSource {
+    /// Protect local payload inputs from output creation and cleanup. Also used
+    /// for direct job requests, which do not pass through CLI validation.
+    pub fn protect_payload_from_output(&mut self, output: &Path) -> anyhow::Result<()> {
+        if let Self::PayloadGuestMemfdInPlace { root } = self {
+            *root =
+                crate::write_incubator_target_runner::FvpPlatformRoots::resolve_fvp_payload_root(
+                    root, output,
+                )?;
+        }
+        Ok(())
+    }
+
     /// Select the qualified FVP payload, optionally from local copies of the
     /// official archives. The payload resolver verifies their bytes.
     pub fn fvp_payload(
@@ -130,6 +144,9 @@ impl CcaPlatformSource {
     }
 
     fn validate_fvp_payload(&self) -> anyhow::Result<()> {
+        if matches!(self, Self::PayloadGuestMemfdInPlace { .. }) {
+            return Ok(());
+        }
         let (version, kernel_hash, initrd_hash) = match self {
             Self::PayloadRelease {
                 version,
@@ -322,6 +339,81 @@ mod tests {
     }
 
     #[test]
+    fn fvp_payload_output_rejects_cleanup_ancestors() {
+        let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let output = directory.path().join("output");
+        for relative in ["temp/payload", "test_results/payload", ""] {
+            let payload = output.join(relative);
+            fs_err::create_dir_all(&payload).unwrap();
+            fs_err::write(payload.join("Image"), b"preserve payload").unwrap();
+            let mut source = CcaPlatformSource::PayloadGuestMemfdInPlace {
+                root: payload.clone(),
+            };
+            let error = source.protect_payload_from_output(&output).unwrap_err();
+            assert!(error.to_string().contains("must not overlap"), "{error:#}");
+            assert_eq!(
+                fs_err::read(payload.join("Image")).unwrap(),
+                b"preserve payload"
+            );
+        }
+    }
+
+    #[test]
+    fn fvp_payload_output_rejects_descendants_before_creation() {
+        let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let payload = directory.path().join("payload");
+        fs_err::create_dir(&payload).unwrap();
+        let output = payload.join("missing/output");
+        let mut source = CcaPlatformSource::PayloadGuestMemfdInPlace {
+            root: payload.clone(),
+        };
+        assert!(source.protect_payload_from_output(&output).is_err());
+        assert!(!payload.join("missing").exists());
+        let separate = directory.path().join("separate/output");
+        source.protect_payload_from_output(&separate).unwrap();
+        let CcaPlatformSource::PayloadGuestMemfdInPlace { root } = source else {
+            panic!("expected in-place payload");
+        };
+        assert_eq!(root, fs_err::canonicalize(payload).unwrap());
+        assert!(!separate.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fvp_payload_output_rejects_symlink_aliases_in_both_directions() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let output = directory.path().join("output");
+        let payload = output.join("temp/payload");
+        fs_err::create_dir_all(&payload).unwrap();
+        let payload_alias = directory.path().join("payload-alias");
+        let output_alias = directory.path().join("output-alias");
+        symlink(&payload, &payload_alias).unwrap();
+        symlink(&output, &output_alias).unwrap();
+        for (input, destination) in [
+            (payload_alias.clone(), output.clone()),
+            (payload.clone(), output_alias.clone()),
+            (payload_alias.clone(), output_alias),
+            (payload.clone(), payload_alias.join("missing/output")),
+            (payload_alias.clone(), payload.clone()),
+        ] {
+            let mut source = CcaPlatformSource::PayloadGuestMemfdInPlace { root: input };
+            assert!(source.protect_payload_from_output(&destination).is_err());
+        }
+        assert!(!payload.join("missing").exists());
+        let mut source = CcaPlatformSource::PayloadGuestMemfdInPlace {
+            root: payload_alias,
+        };
+        source
+            .protect_payload_from_output(&directory.path().join("safe"))
+            .unwrap();
+        let CcaPlatformSource::PayloadGuestMemfdInPlace { root } = source else {
+            panic!("expected in-place payload");
+        };
+        assert_eq!(root, fs_err::canonicalize(payload).unwrap());
+    }
+
+    #[test]
     fn fvp_payload_defaults_to_qualified_release() {
         let source = CcaPlatformSource::fvp_payload(None, None, None, None).unwrap();
         let CcaPlatformSource::PayloadRelease {
@@ -505,7 +597,7 @@ impl SimpleFlowNode for Node {
             repetitions,
             incubator_profile,
             incubator_platform,
-            cca_platform_source,
+            mut cca_platform_source,
             fvp_roots,
             done,
         } = request;
@@ -514,19 +606,29 @@ impl SimpleFlowNode for Node {
             incubator_profile.is_some() == incubator_platform.is_some(),
             "incubator profile and platform classification must be provided together"
         );
+        let is_fvp = incubator_platform.is_some_and(|platform| platform.is_fvp());
         anyhow::ensure!(
             cca_platform_source.is_some()
-                == matches!(
-                    incubator_platform,
-                    Some(
-                        crate::write_incubator_target_runner::IncubatorPlatform::QemuCca
-                            | crate::write_incubator_target_runner::IncubatorPlatform::FvpCca
-                    )
-                ),
+                == (is_fvp
+                    || incubator_platform
+                        == Some(crate::write_incubator_target_runner::IncubatorPlatform::QemuCca)),
             "CCA platform artifacts require a CCA incubator profile"
         );
-        let is_fvp = incubator_platform
-            == Some(crate::write_incubator_target_runner::IncubatorPlatform::FvpCca);
+        if let Some(source) = &mut cca_platform_source {
+            source.protect_payload_from_output(&test_content_dir)?;
+        }
+        let in_place = incubator_platform
+            == Some(
+                crate::write_incubator_target_runner::IncubatorPlatform::FvpCcaGuestMemfdInPlace,
+            );
+        anyhow::ensure!(
+            in_place
+                == matches!(
+                    cca_platform_source,
+                    Some(CcaPlatformSource::PayloadGuestMemfdInPlace { .. })
+                ),
+            "in-place FVP profiles require the explicit pinned local in-place payload"
+        );
         anyhow::ensure!(
             is_fvp == fvp_roots.is_some(),
             "FVP CCA requires both local platform roots; other backends do not accept them"
@@ -546,6 +648,12 @@ impl SimpleFlowNode for Node {
                 .context("FVP CCA requires configured payload artifacts")?
                 .validate_fvp_payload()?;
             let config = match cca_platform_source.as_ref() {
+                Some(CcaPlatformSource::PayloadGuestMemfdInPlace { root }) => {
+                    crate::resolve_cca_payload::Config {
+                        local_in_place_payload: Some(ConfigVar(ReadVar::from_static(root.clone()))),
+                        ..Default::default()
+                    }
+                }
                 Some(CcaPlatformSource::PayloadRelease {
                     version,
                     kernel_archive_sha256,
@@ -572,6 +680,7 @@ impl SimpleFlowNode for Node {
                     local_initrd_archive: Some(ConfigVar(ReadVar::from_static(
                         initrd_archive.clone(),
                     ))),
+                    ..Default::default()
                 },
                 _ => {
                     anyhow::bail!("FVP CCA requires common payload artifacts without QEMU firmware")
@@ -620,7 +729,8 @@ impl SimpleFlowNode for Node {
                     ))),
                 },
                 CcaPlatformSource::PayloadRelease { .. }
-                | CcaPlatformSource::PayloadLocal { .. } => {
+                | CcaPlatformSource::PayloadLocal { .. }
+                | CcaPlatformSource::PayloadGuestMemfdInPlace { .. } => {
                     anyhow::bail!("payload-only CCA sources require FVP CCA")
                 }
             };

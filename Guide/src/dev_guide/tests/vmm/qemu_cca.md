@@ -3,7 +3,7 @@
 The shared CCA boot test runs an OpenVMM Realm inside a QEMU or licensed FVP
 Linux/KVM host.
 
-Both backends use the unified AArch64 CCA kernel and base test initrd from
+The default profiles use the unified AArch64 CCA kernel and base test initrd from
 `openvmm-deps` release `0.3.0-139`. The incubator injects `/cca-init.sh` and
 host CA certificates into a temporary initrd copy. The published kernel and
 base initrd remain unchanged. No block root filesystem is required.
@@ -93,9 +93,82 @@ There is no FVP rootfs option. The runtime overlay fixes the virtio-blk
 backing-image path to empty. An unbacked, zero-capacity device may still
 appear in the host; it is not used as the root filesystem.
 
+### Local in-place guest_memfd profile
+
+`aarch64-fvp-cca-guest-memfd-in-place.toml` selects a separate, pinned local
+firmware and kernel tuple. It does not change the default v15 profile.
+The tuple is recorded in
+`petri/incubator/platforms/fvp-cca-guest-memfd-in-place.yaml`.
+The kernel comes from linux-cca integration-v7, but the profile names the
+memory mode, not that source branch.
+
+This profile requires `--cca-in-place-payload-root`. Its directory must
+contain `Image`, `config`, `manifest.txt`, and `initrd`. The manifest uses
+the same `key=value` fields as the published kernel manifest. The Image,
+configuration, revision, and release must match the constants in
+`petri_artifacts_common::cca_payload::guest_memfd_in_place`. Both host and
+Realm use that Image. The initrd must be the unmodified official base
+initrd from release `0.3.0-139`, not a local probe initrd. Archive, release,
+and hash overrides are rejected.
+
+The FVP host NIC must be built in (`CONFIG_SMC91X=y`); the base initrd does
+not load its module. Payload validation checks this before launching FVP.
+
+The local layout places the existing clean toolchain at
+`<PLATFORM_ROOT>/cca-test/shrinkwrap` and the isolated runtime overlay at
+`<PLATFORM_ROOT>/cca-tdisp-stage-a/test-platform/overlay.yaml`. Copy the
+checked-in `fvp-guest-memfd-in-place-overlay.yaml` to that overlay path.
+Provide the separately pinned package through `--shrinkwrap-package-root`.
+Keep output outside all input roots. The canonical payload root must neither
+contain the output directory nor be inside it, including through symlinks.
+Both CLI and direct Flowey job requests reject overlap before output creation
+or cleanup:
+
+```bash
+cargo xflowey vmm-tests-run \
+  --target linux-aarch64-musl \
+  --incubator petri/incubator/profiles/aarch64-fvp-cca-guest-memfd-in-place.toml \
+  --fvp-platform-root path/to/platform-root \
+  --shrinkwrap-package-root path/to/in-place-package \
+  --cca-in-place-payload-root path/to/in-place-payload \
+  --dir path/to/separate-output \
+  --filter 'binary(=tests) & test(boot_linux_direct_cca_in_place)'
+```
+
+Tests must require both `cca` and `guest_memfd_in_place` and select the
+OpenVMM memory mode themselves. The profile only selects host inputs and
+publishes capabilities after the normal readiness handshake. Use an explicit
+filter; this profile does not qualify the legacy memory mode on the new host.
+
+The default QEMU and FVP profiles qualify the existing CCA Virtio-vsock
+pipette boot case. They do not advertise `guest_memfd_in_place`. The official
+v15 payload has not been qualified for the full in-place ABI sequence,
+including mmap, INIT_SHARED, ATTRIBUTES2, and INIT_RIPAS. Do not infer support
+from one ioctl or add an ENOTTY fallback. Use the separate pinned candidate
+to run the same CCA test body with the in-place memory mode selected.
+Generic TCG VFIO/P2P tests are separate regressions, not Realm memory-mode
+parity evidence.
+
+The effective package uses the model's default PCI hierarchy. It removes the
+DA recipe's PCI JSON fixup command and its unused PCI hierarchy and sample-key
+runtime variables. Its remaining CPU/SMMU model parameters and firmware
+bytes are unchanged. These differences are recorded beside the package hash.
+The package omits `pci.hierarchy_file_name`; an empty filename is not the
+model default and causes a PCI hierarchy parser error.
+There are no assigned devices, DA certificates, or DA disk images in the
+staged runtime. This is an in-process Virtio test input, not evidence of
+TDISP or host VFIO support. A prior no-device boot of the source package
+does not qualify this effective package; run the Petri tests to qualify it.
+
+The paired CCA Virtio-vsock test has passed on the pinned in-place FVP tuple,
+including pipette ping, Realm poweroff, OpenVMM teardown, and outer host
+shutdown. The original separate-backing test also passes on the default
+QEMU and FVP tuples. Block, net, rng, and console crate tests are separate
+regression coverage; they are not CCA guest-VM coverage for those devices.
+
 ## Build now, run later
 
-Add `--build-only` to either command above to prepare the artifacts without
+Add `--build-only` to a command above to prepare the artifacts without
 running the tests. Run the generated `run.sh` on the same build host.
 It retains the resolved payload, firmware and FVP input paths, so keep those
 inputs at their original locations. This script is not a portable target-side

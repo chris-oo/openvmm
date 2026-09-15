@@ -332,6 +332,9 @@ impl FvpDeadlines {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct FvpCcaConfig {
+    /// Complete, immutable platform and payload tuple to validate.
+    #[serde(default)]
+    pub platform: FvpPlatform,
     /// Named console outputs to retain.
     pub consoles: Vec<FvpConsole>,
     /// Console carrying Linux startup and readiness.
@@ -345,6 +348,17 @@ pub struct FvpCcaConfig {
     /// Maximum port collision attempts within the fixed port budget.
     #[serde(default = "default_fvp_port_retries")]
     pub port_retries: u32,
+}
+
+/// Explicitly supported FVP firmware and kernel tuples.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FvpPlatform {
+    /// Published CCA v15 payload and original firmware.
+    #[default]
+    CcaV15,
+    /// Local kernel and firmware supporting in-place guest_memfd.
+    GuestMemfdInPlace,
 }
 
 fn default_fvp_port_retries() -> u32 {
@@ -382,7 +396,9 @@ impl FvpCcaConfig {
         let mut capabilities = BTreeSet::new();
         for capability in &self.capabilities {
             anyhow::ensure!(
-                capability == "cca",
+                capability == "cca"
+                    || (self.platform == FvpPlatform::GuestMemfdInPlace
+                        && capability == "guest_memfd_in_place"),
                 "unsupported FVP capability: {capability}"
             );
             anyhow::ensure!(
@@ -542,11 +558,37 @@ mod tests {
             panic!("expected FVP profile");
         };
         assert_eq!(config.capabilities, ["cca"]);
+        assert_eq!(config.platform, FvpPlatform::CcaV15);
         assert_eq!(config.primary_console, FvpConsole::Host);
         assert_eq!(config.deadlines.model_start, 120);
         assert_eq!(config.deadlines.validation, 300);
         assert_eq!(config.deadlines.dhcp, 30);
         assert_eq!(config.port_retries, 20);
+    }
+
+    #[test]
+    fn in_place_fvp_capability_requires_its_platform() {
+        let text = include_str!("../profiles/aarch64-fvp-cca-guest-memfd-in-place.toml");
+        let profile = IncubatorProfile::from_toml(text).unwrap();
+        let IncubatorBackend::FvpCca(config) = profile.incubator else {
+            panic!("expected FVP profile");
+        };
+        assert_eq!(config.platform, FvpPlatform::GuestMemfdInPlace);
+        assert_eq!(config.capabilities, ["cca", "guest_memfd_in_place"]);
+        assert!(
+            IncubatorProfile::from_toml(&text.replace(
+                "platform = \"guest-memfd-in-place\"",
+                "platform = \"cca-v15\""
+            ))
+            .is_err()
+        );
+        assert!(
+            IncubatorProfile::from_toml(&text.replace(
+                "platform = \"guest-memfd-in-place\"",
+                "platform = \"arbitrary\""
+            ))
+            .is_err()
+        );
     }
 
     #[test]

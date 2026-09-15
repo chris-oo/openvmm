@@ -178,6 +178,11 @@ pub struct VmmTestsRunCli {
     #[clap(long)]
     cca_initrd_archive: Option<PathBuf>,
 
+    /// Pinned local in-place payload directory (Image, config, manifest.txt, initrd).
+    /// Requires the guest-memfd-in-place FVP profile; accepts no hash overrides.
+    #[clap(long)]
+    cca_in_place_payload_root: Option<PathBuf>,
+
     /// Licensed FVP platform root (fallback: INCUBATOR_FVP_PLATFORM_ROOT).
     #[clap(long)]
     fvp_platform_root: Option<PathBuf>,
@@ -259,6 +264,7 @@ impl IntoPipeline for VmmTestsRunCli {
             cca_tfa_archive,
             cca_initrd_archive_sha256,
             cca_initrd_archive,
+            cca_in_place_payload_root,
             fvp_platform_root,
             shrinkwrap_package_root,
         } = self;
@@ -307,7 +313,7 @@ impl IntoPipeline for VmmTestsRunCli {
                 classify_incubator_platform(&path)
             })
             .transpose()?;
-        let fvp_roots = if incubator_platform == Some(IncubatorPlatform::FvpCca) {
+        let fvp_roots = if incubator_platform.is_some_and(|platform| platform.is_fvp()) {
             validate_fvp_target(FlowPlatform::host(backend_hint), &target.as_triple())?;
             anyhow::ensure!(
                 cca_rmm_archive.is_none()
@@ -335,6 +341,11 @@ impl IntoPipeline for VmmTestsRunCli {
             );
             None
         };
+        anyhow::ensure!(
+            cca_in_place_payload_root.is_none()
+                || incubator_platform == Some(IncubatorPlatform::FvpCcaGuestMemfdInPlace),
+            "--cca-in-place-payload-root requires the guest-memfd-in-place FVP profile"
+        );
         if let Some(roots) = &fvp_roots {
             roots.output_directory(
                 dir.as_deref()
@@ -346,6 +357,29 @@ impl IntoPipeline for VmmTestsRunCli {
             );
         }
         let cca_platform_source = match incubator_platform {
+            Some(IncubatorPlatform::FvpCcaGuestMemfdInPlace) => {
+                anyhow::ensure!(
+                    cca_deps_version.is_none()
+                        && cca_kernel_archive.is_none()
+                        && cca_kernel_archive_sha256.is_none()
+                        && cca_initrd_archive.is_none()
+                        && cca_initrd_archive_sha256.is_none(),
+                    "in-place FVP uses a pinned payload directory, not archive or hash overrides"
+                );
+                let root = cca_in_place_payload_root
+                    .context("guest-memfd-in-place FVP requires --cca-in-place-payload-root")?;
+                let root = if root.is_absolute() {
+                    root
+                } else {
+                    repo_root.join(root)
+                };
+                let mut source = CcaPlatformSource::PayloadGuestMemfdInPlace { root };
+                source.protect_payload_from_output(
+                    dir.as_deref()
+                        .unwrap_or(&repo_root.join("target").join("vmm_tests")),
+                )?;
+                Some(source)
+            }
             Some(IncubatorPlatform::FvpCca) => {
                 let local_archives = match (cca_kernel_archive, cca_initrd_archive) {
                     (None, None) => None,
@@ -692,7 +726,7 @@ impl IntoPipeline for VmmTestsRunCli {
                     },
                     petri_params: PetriParams {
                         disable_remote_artifacts: incubator_platform
-                            == Some(IncubatorPlatform::FvpCca),
+                            .is_some_and(|platform| platform.is_fvp()),
                         reuse_prepped_vhds: !no_reuse_prepped_vhds,
                         require_2mb_hugetlb: false, // TODO
                     },
@@ -1009,7 +1043,14 @@ fn classify_incubator_platform(profile: &Path) -> anyhow::Result<IncubatorPlatfo
             Ok(IncubatorPlatform::QemuCca)
         }
         "qemu-tcg" => Ok(IncubatorPlatform::QemuTcg),
-        "fvp-cca" => Ok(IncubatorPlatform::FvpCca),
+        "fvp-cca" => match incubator.get("platform") {
+            None => Ok(IncubatorPlatform::FvpCca),
+            Some(value) => match value.as_str() {
+                Some("cca-v15") => Ok(IncubatorPlatform::FvpCca),
+                Some("guest-memfd-in-place") => Ok(IncubatorPlatform::FvpCcaGuestMemfdInPlace),
+                _ => anyhow::bail!("unsupported FVP platform tuple"),
+            },
+        },
         other => anyhow::bail!("unsupported incubator backend type: {other}"),
     }
 }
@@ -1358,6 +1399,10 @@ mod tests {
             ("aarch64-tcg-pcie", IncubatorPlatform::QemuTcg),
             ("aarch64-qemu-cca", IncubatorPlatform::QemuCca),
             ("aarch64-fvp-cca", IncubatorPlatform::FvpCca),
+            (
+                "aarch64-fvp-cca-guest-memfd-in-place",
+                IncubatorPlatform::FvpCcaGuestMemfdInPlace,
+            ),
         ] {
             let named = resolve_incubator(Some(name.into()), &target).unwrap();
             assert!(matches!(named, IncubatorProfileNameOrPath::Name(_)));
@@ -1391,6 +1436,14 @@ mod tests {
 
     #[test]
     fn classifies_incubator_profile_backend() {
+        assert_eq!(
+            classify_incubator_platform(
+                &crate::repo_root()
+                    .join("petri/incubator/profiles/aarch64-fvp-cca-guest-memfd-in-place.toml")
+            )
+            .unwrap(),
+            IncubatorPlatform::FvpCcaGuestMemfdInPlace
+        );
         assert_eq!(
             classify_incubator_platform(
                 &crate::repo_root().join("petri/incubator/profiles/aarch64-fvp-cca.toml")

@@ -28,7 +28,6 @@ use pal_async::pipe::PolledPipe;
 use pal_async::socket::PolledSocket;
 use pal_async::timer::PolledTimer;
 use petri_artifacts_common::cca_payload::BASE_INITRD_SHA256 as INITRD_SHA256;
-use petri_artifacts_common::cca_payload::LINUX_IMAGE_SHA256 as KERNEL_SHA256;
 use pipette_client::PipetteClient;
 use sha2::Digest;
 use std::fs::File;
@@ -72,7 +71,15 @@ pub fn run(
     let cancellation = Cancellation::default();
     let _signals = cancellation.install_signal_handlers()?;
     let initial = Deadline::new(seconds(profile.deadlines.validation))?;
-    let manifest = PlatformManifest::pinned()?;
+    let manifest = PlatformManifest::for_platform(profile.platform)?;
+    let kernel_sha256 = match profile.platform {
+        crate::profile::FvpPlatform::CcaV15 => {
+            petri_artifacts_common::cca_payload::LINUX_IMAGE_SHA256
+        }
+        crate::profile::FvpPlatform::GuestMemfdInPlace => {
+            petri_artifacts_common::cca_payload::guest_memfd_in_place::LINUX_IMAGE_SHA256
+        }
+    };
     let sources = PlatformSources::validate(
         &manifest,
         &config.platform_root,
@@ -83,7 +90,7 @@ pub fn run(
         &config.output_dir,
         &[&sources.platform_root, &sources.package_root],
     )?;
-    verify_payload(&config.kernel, KERNEL_SHA256, &initial, &cancellation)?;
+    verify_payload(&config.kernel, kernel_sha256, &initial, &cancellation)?;
     verify_payload(&config.initrd, INITRD_SHA256, &initial, &cancellation)?;
     let directory = RuntimeDirectory::open(
         &RuntimeDirectory::default_base()?,
@@ -176,7 +183,7 @@ pub fn run(
         };
         let kernel_copy = snapshot_payload(
             &config.kernel,
-            KERNEL_SHA256,
+            kernel_sha256,
             &output,
             &inventory_deadline,
             &cancellation,
@@ -207,7 +214,7 @@ pub fn run(
         })??;
         verify_payload(
             &staging.root().join("inputs/Image"),
-            KERNEL_SHA256,
+            kernel_sha256,
             &inventory_deadline,
             &cancellation,
         )?;
@@ -219,7 +226,7 @@ pub fn run(
         )?;
         verify_payload(
             &staging.share().join("aarch64/Image"),
-            KERNEL_SHA256,
+            kernel_sha256,
             &inventory_deadline,
             &cancellation,
         )?;
@@ -234,7 +241,7 @@ pub fn run(
             output.join("platform-identity.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
                 "platform": manifest,
-                "kernel_sha256": KERNEL_SHA256,
+                "kernel_sha256": kernel_sha256,
                 "base_initrd_sha256": INITRD_SHA256,
                 "patched_initrd_sha256": patched_hash,
                 "toolchain_fingerprint": identity.as_ref().context("missing validated toolchain identity")?.fingerprint(),
@@ -1340,7 +1347,7 @@ mod tests {
         assert!(format!("{error:#}").contains("deadline"));
         let error = snapshot_payload(
             &path,
-            KERNEL_SHA256,
+            petri_artifacts_common::cca_payload::LINUX_IMAGE_SHA256,
             directory.path(),
             &deadline,
             &cancellation,

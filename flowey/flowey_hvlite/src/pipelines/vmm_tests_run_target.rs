@@ -212,7 +212,11 @@ mod tests {
     #[test]
     fn target_run_rejects_cca_before_graph_construction() {
         let repo_root = crate::repo_root();
-        for name in ["aarch64-fvp-cca", "aarch64-qemu-cca"] {
+        for name in [
+            "aarch64-fvp-cca",
+            "aarch64-fvp-cca-guest-memfd-in-place",
+            "aarch64-qemu-cca",
+        ] {
             for profile in [
                 PathBuf::from(name),
                 flowey_lib_hvlite::build_incubator::incubator_profile_path(&repo_root, name),

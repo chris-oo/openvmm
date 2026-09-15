@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Resolve the shared CCA v15 kernel and base initrd without platform firmware.
+//! Resolve pinned CCA kernels and base initrds without platform firmware.
 
 use flowey::node::prelude::*;
 use std::collections::BTreeMap;
@@ -9,6 +9,7 @@ use std::path::Path;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CcaPayloadOutput {
+    pub kind: CcaPayloadKind,
     pub host_kernel: PathBuf,
     pub realm_kernel: PathBuf,
     pub kernel_config: PathBuf,
@@ -16,10 +17,20 @@ pub struct CcaPayloadOutput {
     pub initrd: PathBuf,
 }
 
+/// Complete payload identities supported by the FVP runtime.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CcaPayloadKind {
+    #[default]
+    CcaV15,
+    GuestMemfdInPlace,
+}
+
 impl Artifact for CcaPayloadOutput {}
 
 flowey_config! {
     pub struct Config {
+        /// Explicit local in-place tuple: Image, config, manifest.txt, base initrd.
+        pub local_in_place_payload: Option<ConfigVar<PathBuf>>,
         /// Defaults to the pinned CCA openvmm-deps release.
         pub version: Option<String>,
         /// Archive hashes default to the checked-in release identities.
@@ -60,7 +71,38 @@ impl FlowNodeWithConfig for Node {
             return Ok(());
         }
 
+        if let Some(root) = config.local_in_place_payload {
+            anyhow::ensure!(
+                config.version.is_none()
+                    && config.kernel_archive_sha256.is_none()
+                    && config.initrd_archive_sha256.is_none()
+                    && config.local_kernel_archive.is_none()
+                    && config.local_initrd_archive.is_none(),
+                "in-place payload directories cannot be combined with archive overrides"
+            );
+            ctx.emit_rust_step("resolve pinned local in-place CCA payload", |ctx| {
+                let root = root.0.claim(ctx);
+                let outputs = outputs.claim(ctx);
+                move |rt| {
+                    let root = rt.read(root).absolute()?;
+                    let output = CcaPayloadOutput {
+                        kind: CcaPayloadKind::GuestMemfdInPlace,
+                        host_kernel: root.join("Image"),
+                        realm_kernel: root.join("Image"),
+                        kernel_config: root.join("config"),
+                        kernel_manifest: root.join("manifest.txt"),
+                        initrd: root.join("initrd"),
+                    };
+                    output.validate_fvp()?;
+                    rt.write_all(outputs, &output);
+                    Ok(())
+                }
+            });
+            return Ok(());
+        }
+
         let Config {
+            local_in_place_payload: _,
             version,
             kernel_archive_sha256,
             initrd_archive_sha256,
@@ -124,6 +166,7 @@ impl FlowNodeWithConfig for Node {
                     "CCA initrd archive",
                 )?;
                 let output = CcaPayloadOutput {
+                    kind: CcaPayloadKind::CcaV15,
                     host_kernel: kernel_dir.join("Image"),
                     realm_kernel: kernel_dir.join("Image"),
                     kernel_config: kernel_dir.join("config"),
@@ -144,29 +187,50 @@ impl CcaPayloadOutput {
     /// QEMU may use a different local base initrd through [`Self::validate`].
     pub fn validate_fvp(&self) -> anyhow::Result<()> {
         self.validate()?;
+        validate_fvp_kernel_config(&fs_err::read_to_string(&self.kernel_config)?)?;
         validate_fvp_initrd(&self.initrd)
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        validate_kernel_manifest(&crate::cca_artifacts::parse_manifest(
-            &self.kernel_manifest,
-        )?)?;
+        let manifest = crate::cca_artifacts::parse_manifest(&self.kernel_manifest)?;
+        let (image_hash, config_hash) = match self.kind {
+            CcaPayloadKind::CcaV15 => {
+                validate_kernel_manifest(&manifest)?;
+                (
+                    crate::cca_pins::LINUX_IMAGE_SHA256,
+                    crate::cca_pins::LINUX_CONFIG_SHA256,
+                )
+            }
+            CcaPayloadKind::GuestMemfdInPlace => {
+                use vmm_test_images::cca_payload::guest_memfd_in_place as pins;
+                for (key, expected) in [
+                    ("architecture", "aarch64"),
+                    ("revision", pins::LINUX_REVISION),
+                    ("kernel_release", pins::LINUX_RELEASE),
+                    ("config_sha256", pins::LINUX_CONFIG_SHA256),
+                    ("Image_sha256", pins::LINUX_IMAGE_SHA256),
+                ] {
+                    crate::cca_artifacts::require_manifest_value(&manifest, key, expected)?;
+                }
+                (pins::LINUX_IMAGE_SHA256, pins::LINUX_CONFIG_SHA256)
+            }
+        };
         anyhow::ensure!(
             self.host_kernel == self.realm_kernel,
             "CCA host and Realm must use the same unified kernel"
         );
-        crate::cca_artifacts::verify_sha256(
-            &self.host_kernel,
-            crate::cca_pins::LINUX_IMAGE_SHA256,
-            "CCA v15 Image",
-        )?;
-        crate::cca_artifacts::verify_sha256(
-            &self.kernel_config,
-            crate::cca_pins::LINUX_CONFIG_SHA256,
-            "CCA v15 config",
-        )?;
+        crate::cca_artifacts::verify_sha256(&self.host_kernel, image_hash, "CCA Image")?;
+        crate::cca_artifacts::verify_sha256(&self.kernel_config, config_hash, "CCA config")?;
         validate_initrd(&self.initrd)
     }
+}
+
+fn validate_fvp_kernel_config(config: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        config.lines().any(|line| line == "CONFIG_SMC91X=y"),
+        "FVP CCA kernel requires CONFIG_SMC91X=y; the base initrd does not load the host NIC module"
+    );
+    Ok(())
 }
 
 fn validate_fvp_initrd(initrd: &Path) -> anyhow::Result<()> {
@@ -203,6 +267,74 @@ fn validate_kernel_manifest(manifest: &BTreeMap<String, String>) -> anyhow::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_with_tracing::test;
+
+    #[test]
+    fn fvp_kernel_requires_builtin_host_nic() {
+        validate_fvp_kernel_config("CONFIG_OTHER=y\nCONFIG_SMC91X=y\n").unwrap();
+        for config in [
+            "",
+            "CONFIG_SMC91X=m\n",
+            "# CONFIG_SMC91X is not set\n",
+            "CONFIG_SMSC911X=y\n",
+            "# CONFIG_SMC91X=y\n",
+        ] {
+            assert!(validate_fvp_kernel_config(config).is_err(), "{config}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the pinned local in-place test payload"]
+    fn local_in_place_payload_matches_pins() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/cca-tdisp-stage-a/test-platform/payload");
+        CcaPayloadOutput {
+            kind: CcaPayloadKind::GuestMemfdInPlace,
+            host_kernel: root.join("Image"),
+            realm_kernel: root.join("Image"),
+            kernel_config: root.join("config"),
+            kernel_manifest: root.join("manifest.txt"),
+            initrd: root.join("initrd"),
+        }
+        .validate_fvp()
+        .unwrap();
+    }
+
+    #[test]
+    fn in_place_payload_rejects_changed_files_and_v15_manifest() {
+        use vmm_test_images::cca_payload::guest_memfd_in_place as pins;
+        let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let root = directory.path();
+        fs_err::write(root.join("manifest.txt"), format!(
+            "architecture=aarch64\nrevision={}\nkernel_release={}\nconfig_sha256={}\nImage_sha256={}\n",
+            pins::LINUX_REVISION, pins::LINUX_RELEASE,
+            pins::LINUX_CONFIG_SHA256, pins::LINUX_IMAGE_SHA256,
+        )).unwrap();
+        fs_err::write(root.join("Image"), b"changed in-place kernel").unwrap();
+        let mut payload = CcaPayloadOutput {
+            kind: CcaPayloadKind::GuestMemfdInPlace,
+            host_kernel: root.join("Image"),
+            realm_kernel: root.join("Image"),
+            kernel_config: root.join("config"),
+            kernel_manifest: root.join("manifest.txt"),
+            initrd: root.join("initrd"),
+        };
+        assert!(
+            payload
+                .validate_fvp()
+                .unwrap_err()
+                .to_string()
+                .contains("SHA-256 mismatch")
+        );
+        payload.kind = CcaPayloadKind::CcaV15;
+        assert!(
+            payload
+                .validate_fvp()
+                .unwrap_err()
+                .to_string()
+                .contains("manifest revision")
+        );
+    }
 
     #[test]
     fn fvp_payload_rejects_tampered_cached_kernel() {
@@ -220,6 +352,7 @@ mod tests {
         ).unwrap();
         fs_err::write(root.join("Image"), b"modified cached Image").unwrap();
         let payload = CcaPayloadOutput {
+            kind: CcaPayloadKind::CcaV15,
             host_kernel: root.join("Image"),
             realm_kernel: root.join("Image"),
             kernel_config: root.join("config"),
@@ -228,7 +361,7 @@ mod tests {
         };
         let error = payload.validate_fvp().unwrap_err();
         assert!(
-            error.to_string().contains("CCA v15 Image SHA-256 mismatch"),
+            error.to_string().contains("CCA Image SHA-256 mismatch"),
             "{error:#}"
         );
     }

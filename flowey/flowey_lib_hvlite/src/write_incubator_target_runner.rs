@@ -49,6 +49,14 @@ pub enum IncubatorPlatform {
     QemuCca,
     /// Licensed Arm FVP CCA L1 host platform.
     FvpCca,
+    /// Pinned local firmware and payload for in-place guest_memfd tests.
+    FvpCcaGuestMemfdInPlace,
+}
+
+impl IncubatorPlatform {
+    pub fn is_fvp(self) -> bool {
+        matches!(self, Self::FvpCca | Self::FvpCcaGuestMemfdInPlace)
+    }
 }
 
 pub(crate) fn incubator_profile_backend(profile: &Path) -> anyhow::Result<String> {
@@ -77,6 +85,15 @@ impl FvpPlatformRoots {
     /// read-only input root, including when an ancestor is a symlink.
     pub fn output_directory(&self, path: &Path) -> anyhow::Result<PathBuf> {
         let roots = Self::resolve(Some(self.platform.clone()), Some(self.package.clone()))?;
+        let output = Self::canonical_output_directory(path)?;
+        anyhow::ensure!(
+            !output.starts_with(&roots.platform) && !output.starts_with(&roots.package),
+            "FVP output directory must be outside the read-only platform and package roots"
+        );
+        Ok(output)
+    }
+
+    fn canonical_output_directory(path: &Path) -> anyhow::Result<PathBuf> {
         let absolute = std::path::absolute(path)?;
         anyhow::ensure!(
             !absolute
@@ -100,11 +117,29 @@ impl FvpPlatformRoots {
         for part in suffix.into_iter().rev() {
             output.push(part);
         }
-        anyhow::ensure!(
-            !output.starts_with(&roots.platform) && !output.starts_with(&roots.package),
-            "FVP output directory must be outside the read-only platform and package roots"
-        );
         Ok(output)
+    }
+
+    /// Canonicalize a payload input and reject overlap with output in either
+    /// direction, before output creation or cleanup. Resolve existing aliases even
+    /// when the output's final components do not exist yet.
+    pub fn resolve_fvp_payload_root(payload: &Path, output: &Path) -> anyhow::Result<PathBuf> {
+        anyhow::ensure!(
+            !payload.as_os_str().is_empty(),
+            "FVP payload root must not be empty"
+        );
+        let payload = fs_err::canonicalize(payload)
+            .context("cannot resolve the in-place CCA payload directory")?;
+        anyhow::ensure!(
+            payload.is_dir(),
+            "in-place CCA payload root must name a directory"
+        );
+        let output = Self::canonical_output_directory(output)?;
+        anyhow::ensure!(
+            !output.starts_with(&payload) && !payload.starts_with(&output),
+            "FVP output and the read-only in-place payload root must not overlap"
+        );
+        Ok(payload)
     }
 
     pub fn resolve(platform: Option<PathBuf>, package: Option<PathBuf>) -> anyhow::Result<Self> {

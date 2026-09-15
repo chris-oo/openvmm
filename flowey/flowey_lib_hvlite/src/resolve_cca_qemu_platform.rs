@@ -142,6 +142,10 @@ impl FlowNodeWithConfig for Node {
 
 impl CcaQemuPlatformOutput {
     pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.payload.kind == crate::resolve_cca_payload::CcaPayloadKind::CcaV15,
+            "QEMU CCA requires the v15 payload"
+        );
         self.payload.validate()?;
         self.validate_firmware()
     }

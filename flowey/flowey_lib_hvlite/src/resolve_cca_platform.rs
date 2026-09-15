@@ -78,6 +78,7 @@ impl Config {
                 initrd_archive_sha256: self.initrd_archive_sha256,
                 local_kernel_archive: self.local_kernel_archive,
                 local_initrd_archive: self.local_initrd_archive,
+                ..Default::default()
             },
             crate::resolve_cca_qemu_platform::Config {
                 version: self.version,
@@ -156,6 +157,7 @@ impl CcaPlatformOutput {
     pub fn validate(&self) -> anyhow::Result<()> {
         CcaQemuPlatformOutput {
             payload: CcaPayloadOutput {
+                kind: crate::resolve_cca_payload::CcaPayloadKind::CcaV15,
                 host_kernel: self.host_kernel.clone(),
                 realm_kernel: self.realm_kernel.clone(),
                 kernel_config: self.kernel_config.clone(),
