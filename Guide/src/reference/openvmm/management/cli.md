@@ -123,9 +123,11 @@ describes the source definitions.
   SNP GHCB CPUID requests so they are forwarded to OpenVMM. The default is
   offloading enabled. This diagnostic parameter is meaningful only with
   `--isolation snp`.
-* `--cca-v7`: Explicitly select experimental Arm KVM CCA v7 in-place RAM.
-  Requires `--isolation cca` and device-tree Linux direct boot without PCIe
-  or virtio devices. PL011 serial is supported. The default is off: CCA
+* `--guest-memfd-in-place`: Explicitly select experimental Arm KVM CCA
+  guest_memfd in-place memory mode.
+  Requires `--isolation cca` and device-tree Linux direct boot. It supports
+  the same in-process Virtio devices on PCIe as separate backing, plus PL011
+  serial. The default is off: CCA
   continues to use the v15 separate-backing path unless you set this flag.
   The host must use 4 KiB pages; 16 KiB and 64 KiB hosts are not supported.
   The host must support mmap and initially shared guestmemfd, guestmemfd
@@ -135,12 +137,13 @@ describes the source definitions.
 
   RAM and its host-visible aliases use the same partition-owned guestmemfd.
   Private pages are not readable through these aliases. This mode does not
-  support snapshots, restore, restart, assigned devices, or DMA. All other
-  CCA restrictions still apply. It is a bring-up option, not a qualified
-  runtime or a DMA-ready configuration.
+  support snapshots, restore, restart, assigned devices, or host DMA sharing.
+  Virtio uses fault-contained copies instead of raw page-lock fast paths.
+  All other CCA restrictions still apply. This is not a trusted device
+  assignment option.
 
   ```bash
-  openvmm --hypervisor kvm --isolation cca --cca-v7 \
+  openvmm --hypervisor kvm --isolation cca --guest-memfd-in-place \
     --kernel path/to/Image --initrd path/to/initrd --device-tree \
     --memory size=1G,shared=on,thp=off --no-vmbus
   ```

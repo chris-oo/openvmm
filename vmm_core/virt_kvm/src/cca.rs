@@ -136,7 +136,7 @@ impl KvmPartitionInner {
                 .map_err(map_cca_private_range_error)?;
         }
         let slots = memory.in_place_ram_slots();
-        crate::cca_v7::launch(
+        crate::cca_in_place::launch(
             &self.gm,
             pages,
             &slots,
@@ -147,7 +147,7 @@ impl KvmPartitionInner {
         )?;
         // INIT_RIPAS sets guestmemfd PRIVATE for the entire slot, not just
         // the imported pages. No VP can enter until population succeeds.
-        memory.cca_visibility = crate::cca_v7::Visibility::all_private(slots)?;
+        memory.cca_visibility = crate::cca_in_place::Visibility::all_private(slots)?;
         Ok(())
     }
 }
@@ -157,7 +157,7 @@ struct InPlaceLaunch<'a> {
     memory: &'a crate::memory::KvmMemoryRangeState,
 }
 
-impl crate::cca_v7::LaunchOps for InPlaceLaunch<'_> {
+impl crate::cca_in_place::LaunchOps for InPlaceLaunch<'_> {
     fn convert(&mut self, range: memory_range::MemoryRange) -> Result<(), KvmError> {
         let segments = crate::memory::guest_memfd_range_segments(range, &self.memory.ranges)?;
         self.partition.convert_cca_segments(&segments, true)

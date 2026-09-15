@@ -1140,12 +1140,32 @@ mod tests {
             .unwrap();
         assert!(manager.shared_memory_backing().is_none());
         let gm = manager.client().guest_memory().await.unwrap();
+        assert!(!guestmem::GuestMemoryAccess::supports_locking(
+            manager.va_mapper.as_ref()
+        ));
+        assert!(!gm.supports_locking());
+        assert!(gm.sharing().is_none());
+        assert!(
+            gm.lock_gpns(guestmem::AccessType::Read, false, &[0])
+                .is_err()
+        );
+        let alias_bit = 1 << 20;
+        let alias = manager
+            .client()
+            .aliased_guest_memory("revocable-alias-test", alias_bit)
+            .await
+            .unwrap();
+        assert!(!alias.supports_locking());
+        assert!(alias.sharing().is_none());
         gm.write_at(0, &[0x35]).unwrap();
+        assert_eq!(alias.read_plain::<u8>(alias_bit).unwrap(), 0x35);
         // Truncation produces SIGBUS on an existing mapping, like a revoked
         // private guestmemfd page. GuestMemory must return an error, not retry.
         file.set_len(0).unwrap();
         assert!(gm.read_plain::<u8>(0).is_err());
         assert!(gm.write_at(0, &[0xee]).is_err());
+        assert!(alias.read_plain::<u8>(alias_bit).is_err());
+        assert!(alias.write_at(alias_bit, &[0xee]).is_err());
     }
 
     /// Build a GuestMemoryManager with the given backing range groups,

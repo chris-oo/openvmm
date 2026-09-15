@@ -185,6 +185,7 @@ impl MappingManagerClient {
                     self.minimum_va_alignment,
                     eager,
                     role,
+                    self.force_eager,
                 )
                 .await
             })
@@ -228,6 +229,7 @@ impl MappingManagerClient {
                 // in the owning process. This mapper shares the same section
                 // pages, so it just maps them plain read-write 4 KB.
                 MapperRole::Secondary,
+                self.force_eager,
             )
             .await?,
         ))
@@ -1496,6 +1498,7 @@ mod tests {
             MapperRole::Primary {
                 supports_memory_fault_resolution: false,
             },
+            false,
         );
         let (mapper, _) = futures::join!(mapper_future, async {
             let msg = req_recv.recv().await.unwrap();
@@ -1536,6 +1539,7 @@ mod tests {
             MapperRole::Primary {
                 supports_memory_fault_resolution: false,
             },
+            false,
         );
         let (mapper, mapper_req_send) = futures::join!(mapper_future, async {
             let msg = req_recv.recv().await.unwrap();

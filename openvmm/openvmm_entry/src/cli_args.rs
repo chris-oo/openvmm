@@ -385,10 +385,10 @@ Examples:
     #[clap(long)]
     pub snp_restricted_injection: bool,
 
-    /// Use experimental CCA v7 in-place RAM (requires --isolation cca and 4 KiB host pages;
-    /// no devices, snapshot, restore, or automatic ABI fallback)
+    /// Use experimental guest_memfd in-place RAM (requires --isolation cca and
+    /// 4 KiB host pages; no assigned devices, snapshot, restore, or automatic ABI fallback)
     #[clap(long)]
-    pub cca_v7: bool,
+    pub guest_memfd_in_place: bool,
 
     /// the hybrid vsock listener path
     #[clap(long, value_name = "PATH", alias = "vsock-path")]
@@ -1469,12 +1469,12 @@ impl Options {
         {
             anyhow::bail!("--snp-restricted-injection requires Linux direct boot");
         }
-        if self.cca_v7 {
+        if self.guest_memfd_in_place {
             #[cfg(not(guest_arch = "aarch64"))]
-            anyhow::bail!("--cca-v7 requires an aarch64 KVM CCA guest");
+            anyhow::bail!("--guest-memfd-in-place requires an aarch64 KVM CCA guest");
             #[cfg(guest_arch = "aarch64")]
             if !matches!(self.isolation, Some(IsolationCli::Cca)) {
-                anyhow::bail!("--cca-v7 requires --isolation cca");
+                anyhow::bail!("--guest-memfd-in-place requires --isolation cca");
             }
         }
         if matches!(self.isolation, Some(IsolationCli::Snp)) {
@@ -5572,27 +5572,37 @@ mod tests {
     }
 
     #[test]
-    fn cca_v7_defaults_off_and_requires_cca() {
+    fn guest_memfd_in_place_defaults_off_and_requires_cca() {
         let default = Options::try_parse_from(["openvmm"]).unwrap();
-        assert!(!default.cca_v7);
+        assert!(!default.guest_memfd_in_place);
         default.validate_isolation_options().unwrap();
-        let opt = Options::try_parse_from(["openvmm", "--cca-v7"]).unwrap();
-        assert!(opt.cca_v7);
+        let opt = Options::try_parse_from(["openvmm", "--guest-memfd-in-place"]).unwrap();
+        assert!(opt.guest_memfd_in_place);
         assert!(opt.validate_isolation_options().is_err());
-        let opt = Options::try_parse_from(["openvmm", "--cca-v7", "--isolation", "vbs"]).unwrap();
+        let opt =
+            Options::try_parse_from(["openvmm", "--guest-memfd-in-place", "--isolation", "vbs"])
+                .unwrap();
         assert!(opt.validate_isolation_options().is_err());
+    }
+
+    #[test]
+    fn guest_memfd_in_place_rejects_old_flag() {
+        assert!(matches!(
+            Options::try_parse_from(["openvmm", "--cca-v7"]),
+            Err(err) if err.kind() == clap::error::ErrorKind::UnknownArgument
+        ));
     }
 
     #[cfg(guest_arch = "aarch64")]
     #[test]
-    fn cca_v7_is_opt_in_without_changing_cca_defaults() {
+    fn guest_memfd_in_place_is_opt_in_without_changing_cca_defaults() {
         for enabled in [false, true] {
             let mut args = vec!["openvmm", "--isolation", "cca"];
             if enabled {
-                args.push("--cca-v7");
+                args.push("--guest-memfd-in-place");
             }
             let opt = Options::try_parse_from(args).unwrap();
-            assert_eq!(opt.cca_v7, enabled);
+            assert_eq!(opt.guest_memfd_in_place, enabled);
             opt.validate_isolation_options().unwrap();
         }
     }

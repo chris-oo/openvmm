@@ -1022,25 +1022,20 @@ fn validate_cca_pcie_resource(resource_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_cca_v7_config(
+fn validate_guest_memfd_in_place_config(
     config: &HypervisorConfig,
     recognized: bool,
-    has_pcie: bool,
 ) -> anyhow::Result<()> {
-    if !config.cca_v7 {
+    if !config.guest_memfd_in_place {
         return Ok(());
     }
     anyhow::ensure!(
         recognized,
-        "the selected hypervisor does not support experimental CCA v7 RAM"
+        "the selected hypervisor does not support experimental guest_memfd in-place RAM"
     );
     anyhow::ensure!(
         config.with_isolation == Some(openvmm_defs::config::IsolationType::Cca),
-        "experimental CCA v7 RAM requires CCA isolation"
-    );
-    anyhow::ensure!(
-        !has_pcie,
-        "experimental CCA v7 RAM currently requires a no-device Realm"
+        "experimental guest_memfd in-place RAM requires CCA isolation"
     );
     Ok(())
 }
@@ -1053,15 +1048,29 @@ mod cca_validation_tests {
     use test_with_tracing::test;
 
     #[test]
-    fn cca_v7_is_explicit_and_rejects_unsupported_backends_and_devices() {
+    fn guest_memfd_in_place_is_explicit_and_rejects_unsupported_backends() {
         let mut config = openvmm_defs::config::HypervisorConfig::default();
-        super::validate_cca_v7_config(&config, false, true).unwrap();
-        config.cca_v7 = true;
-        assert!(super::validate_cca_v7_config(&config, true, false).is_err());
+        super::validate_guest_memfd_in_place_config(&config, false).unwrap();
+        config.guest_memfd_in_place = true;
+        assert!(super::validate_guest_memfd_in_place_config(&config, true).is_err());
         config.with_isolation = Some(openvmm_defs::config::IsolationType::Cca);
-        assert!(super::validate_cca_v7_config(&config, false, false).is_err());
-        assert!(super::validate_cca_v7_config(&config, true, true).is_err());
-        super::validate_cca_v7_config(&config, true, false).unwrap();
+        assert!(super::validate_guest_memfd_in_place_config(&config, false).is_err());
+        super::validate_guest_memfd_in_place_config(&config, true).unwrap();
+    }
+
+    #[test]
+    fn both_cca_backings_use_the_same_pcie_resource_policy() {
+        for in_place in [false, true] {
+            let config = openvmm_defs::config::HypervisorConfig {
+                with_isolation: Some(openvmm_defs::config::IsolationType::Cca),
+                guest_memfd_in_place: in_place,
+                ..Default::default()
+            };
+            super::validate_guest_memfd_in_place_config(&config, true).unwrap();
+            validate_cca_pcie_resource("virtio").unwrap();
+            assert!(validate_cca_pcie_resource("vfio").is_err());
+            assert!(validate_cca_pcie_resource("vfio-cdev").is_err());
+        }
     }
 
     fn memory_config() -> MemoryConfig {
@@ -1242,10 +1251,9 @@ impl InitializedVm {
         if cfg.hypervisor.nested_virt && !hypervisor.recognizes_nested_virt() {
             anyhow::bail!("the selected hypervisor does not support nested virtualization");
         }
-        validate_cca_v7_config(
+        validate_guest_memfd_in_place_config(
             &cfg.hypervisor,
-            hypervisor.recognizes_cca_v7(),
-            !cfg.pcie_devices.is_empty() || !cfg.pcie_root_complexes.is_empty(),
+            hypervisor.recognizes_guest_memfd_in_place(),
         )?;
 
         #[cfg(guest_arch = "aarch64")]
@@ -1259,7 +1267,7 @@ impl InitializedVm {
                 vmtime: &vmtime_source,
                 isolation: proto_partition_isolation,
                 nested_virt: cfg.hypervisor.nested_virt,
-                cca_v7: cfg.hypervisor.cca_v7,
+                guest_memfd_in_place: cfg.hypervisor.guest_memfd_in_place,
                 #[cfg(guest_arch = "aarch64")]
                 device_assignment_msi_iova_range,
             })

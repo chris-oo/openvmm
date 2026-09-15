@@ -22,6 +22,25 @@ use vmm_test_macros::vmm_test_with;
 /// Boot a Linux-direct CCA Realm and verify the pipette agent over virtio-vsock.
 #[vmm_test_with(openvmm, requires(cca), configs(linux_direct_aarch64))]
 async fn boot_linux_direct_cca(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Result<()> {
+    boot_linux_direct_cca_with_backing(config, false).await
+}
+
+/// Run the same CCA Virtio-vsock test with in-place guest_memfd backing.
+#[vmm_test_with(
+    openvmm,
+    requires(cca, guest_memfd_in_place),
+    configs(linux_direct_aarch64)
+)]
+async fn boot_linux_direct_cca_in_place(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+) -> anyhow::Result<()> {
+    boot_linux_direct_cca_with_backing(config, true).await
+}
+
+async fn boot_linux_direct_cca_with_backing(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+    in_place: bool,
+) -> anyhow::Result<()> {
     let (vm, agent) = config
         .with_isolation(IsolationType::Cca)
         .with_memory(petri::MemoryConfig {
@@ -36,10 +55,11 @@ async fn boot_linux_direct_cca(config: PetriVmBuilder<OpenVmmPetriBackend>) -> a
         // FVP traps each emulated UART access; disabling the diagnostic console
         // cuts Realm boot time substantially while pipette remains on virtio-vsock.
         .without_serial_output()
-        .modify_backend(|backend| {
+        .modify_backend(move |backend| {
             backend
                 .with_pcie_root_topology(1, 1, 1)
-                .with_custom_config(|config| {
+                .with_custom_config(move |config| {
+                    config.hypervisor.guest_memfd_in_place = in_place;
                     for root_complex in &mut config.pcie_root_complexes {
                         for port in &mut root_complex.ports {
                             port.hotplug = false;

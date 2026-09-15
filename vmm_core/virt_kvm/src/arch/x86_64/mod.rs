@@ -151,9 +151,9 @@ impl virt::Hypervisor for Kvm {
         &mut self,
         mut config: ProtoPartitionConfig<'a>,
     ) -> Result<Self::ProtoPartition<'a>, Self::Error> {
-        if config.cca_v7 {
+        if config.guest_memfd_in_place {
             return Err(KvmError::UnsupportedIsolationConfiguration(
-                "experimental CCA v7 RAM requires Arm KVM",
+                "experimental guest_memfd in-place RAM requires Arm KVM",
             ));
         }
         match config.isolation.isolation_type() {

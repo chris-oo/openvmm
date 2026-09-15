@@ -2132,7 +2132,7 @@ async fn vm_config_from_command_line(
             }),
             with_isolation,
             nested_virt: opt.nested_virt,
-            cca_v7: opt.cca_v7,
+            guest_memfd_in_place: opt.guest_memfd_in_place,
         },
         #[cfg(windows)]
         kernel_vmnics,

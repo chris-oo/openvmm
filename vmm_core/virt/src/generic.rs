@@ -119,8 +119,8 @@ pub trait Hypervisor: 'static {
         false
     }
 
-    /// Whether the backend recognizes experimental CCA v7 in-place RAM.
-    fn recognizes_cca_v7(&self) -> bool {
+    /// Whether the backend recognizes experimental guest_memfd in-place RAM.
+    fn recognizes_guest_memfd_in_place(&self) -> bool {
         false
     }
 
@@ -360,9 +360,9 @@ pub struct ProtoPartitionConfig<'a> {
     /// backend recognizes it via [`Hypervisor::recognizes_nested_virt`]; a
     /// backend that receives an unrecognized request may silently ignore it.
     pub nested_virt: bool,
-    /// Explicitly select experimental CCA v7 in-place RAM, without fallback.
-    /// Callers must check [`Hypervisor::recognizes_cca_v7`].
-    pub cca_v7: bool,
+    /// Explicitly select experimental guest_memfd in-place RAM, without fallback.
+    /// Callers must check [`Hypervisor::recognizes_guest_memfd_in_place`].
+    pub guest_memfd_in_place: bool,
     /// Device-assignment MSI IOVA reservation selected for this partition.
     #[cfg(guest_arch = "aarch64")]
     pub device_assignment_msi_iova_range: Option<MemoryRange>,

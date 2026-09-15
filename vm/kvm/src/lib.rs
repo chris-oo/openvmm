@@ -276,8 +276,8 @@ pub struct KvmArmRmiPopulate {
     pub reserved: u32,
 }
 
-/// Guestmemfd-relative request for the experimental CCA v7
-/// `KVM_SET_MEMORY_ATTRIBUTES2` ABI.
+/// Guestmemfd-relative request for the experimental guest_memfd/CCA ABI:
+/// `KVM_SET_MEMORY_ATTRIBUTES2`.
 ///
 /// Unlike `kvm_memory_attributes`, this request is issued on the guestmemfd
 /// file descriptor and uses a file offset, not a guest physical address.
@@ -307,7 +307,8 @@ pub struct KvmPreFaultMemory {
     pub padding: [u64; 5],
 }
 
-/// Initial RAM range for the experimental CCA v7 `KVM_ARM_RMI_INIT_RIPAS` ABI.
+/// Initial RAM range for the experimental guest_memfd/CCA ABI:
+/// `KVM_ARM_RMI_INIT_RIPAS`.
 ///
 /// The range must fit within one guestmemfd-backed memslot. The ioctl also
 /// changes that range's backing attributes to private. It is not just a
@@ -322,7 +323,7 @@ pub struct KvmArmRmiInitRipas {
     pub reserved: [u64; 5],
 }
 
-/// Changes a guestmemfd range's attributes using the experimental CCA v7 ABI.
+/// Changes a guestmemfd range's attributes using the experimental guest_memfd/CCA ABI.
 ///
 /// The caller must coordinate CPU access and DMA mappings with conversion.
 /// This wrapper performs one ioctl; it does not retry partial conversions.

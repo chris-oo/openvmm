@@ -1,19 +1,19 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Fail-closed helpers for the explicitly selected experimental CCA v7 ABI.
+//! Fail-closed helpers for the explicitly selected guest_memfd in-place mode.
 
 use memory_range::MemoryRange;
 use sparse_mmap::SparseMapping;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
-pub enum CcaV7Error {
-    #[error("CCA v7 requires 4096-byte host pages (host page size is {0})")]
+pub enum CcaInPlaceError {
+    #[error("guest_memfd in-place requires 4096-byte host pages (host page size is {0})")]
     UnsupportedHostPageSize(usize),
-    #[error("invalid CCA v7 range or population progress")]
+    #[error("invalid guest_memfd in-place range or population progress")]
     InvalidRange,
-    #[error("overlapping CCA v7 initial imports")]
+    #[error("overlapping guest_memfd in-place initial imports")]
     OverlappingImports,
     #[error("failed to allocate CCA population source")]
     Allocate(#[source] std::io::Error),
@@ -21,35 +21,35 @@ pub enum CcaV7Error {
     Read(#[from] guestmem::GuestMemoryError),
     #[error("failed to write CCA population source")]
     Write(#[from] sparse_mmap::SparseMappingError),
-    #[error("ambiguous or repeated CCA v7 memory fault")]
+    #[error("ambiguous or repeated guest_memfd in-place memory fault")]
     AmbiguousFault,
 }
 
-pub(crate) fn validate_host_page_size(page_size: usize) -> Result<(), CcaV7Error> {
+pub(crate) fn validate_host_page_size(page_size: usize) -> Result<(), CcaInPlaceError> {
     if page_size != 4096 {
-        return Err(CcaV7Error::UnsupportedHostPageSize(page_size));
+        return Err(CcaInPlaceError::UnsupportedHostPageSize(page_size));
     }
     Ok(())
 }
 
-pub(crate) fn checked_range(gpa: u64, size: u64) -> Result<MemoryRange, CcaV7Error> {
-    let end = gpa.checked_add(size).ok_or(CcaV7Error::InvalidRange)?;
+pub(crate) fn checked_range(gpa: u64, size: u64) -> Result<MemoryRange, CcaInPlaceError> {
+    let end = gpa.checked_add(size).ok_or(CcaInPlaceError::InvalidRange)?;
     if size == 0 || !gpa.is_multiple_of(4096) || !size.is_multiple_of(4096) {
-        return Err(CcaV7Error::InvalidRange);
+        return Err(CcaInPlaceError::InvalidRange);
     }
     Ok(MemoryRange::new(gpa..end))
 }
 
 pub(crate) fn validate_imports(
     ranges: impl IntoIterator<Item = MemoryRange>,
-) -> Result<(), CcaV7Error> {
+) -> Result<(), CcaInPlaceError> {
     let mut ranges: Vec<_> = ranges.into_iter().collect();
     for range in &ranges {
         checked_range(range.start(), range.len())?;
     }
     ranges.sort_by_key(|r| r.start());
     if ranges.windows(2).any(|r| r[0].overlaps(&r[1])) {
-        return Err(CcaV7Error::OverlappingImports);
+        return Err(CcaInPlaceError::OverlappingImports);
     }
     Ok(())
 }
@@ -59,12 +59,12 @@ pub(crate) fn validate_imports(
 pub(crate) fn copy_source(
     gm: &guestmem::GuestMemory,
     range: MemoryRange,
-) -> Result<SparseMapping, CcaV7Error> {
+) -> Result<SparseMapping, CcaInPlaceError> {
     validate_host_page_size(SparseMapping::page_size())?;
     checked_range(range.start(), range.len())?;
-    let len = usize::try_from(range.len()).map_err(|_| CcaV7Error::InvalidRange)?;
-    let source = SparseMapping::new(len).map_err(CcaV7Error::Allocate)?;
-    source.alloc(0, len).map_err(CcaV7Error::Allocate)?;
+    let len = usize::try_from(range.len()).map_err(|_| CcaInPlaceError::InvalidRange)?;
+    let source = SparseMapping::new(len).map_err(CcaInPlaceError::Allocate)?;
+    source.alloc(0, len).map_err(CcaInPlaceError::Allocate)?;
     let mut buffer = [0; 4096];
     for offset in (0..len).step_by(buffer.len()) {
         gm.read_at(range.start() + offset as u64, &mut buffer)?;
@@ -76,18 +76,18 @@ pub(crate) fn copy_source(
 pub(crate) fn validate_progress(
     previous: (u64, u64, u64),
     next: (u64, u64, u64),
-) -> Result<(), CcaV7Error> {
+) -> Result<(), CcaInPlaceError> {
     let (base, size, source) = previous;
     let (next_base, next_size, next_source) = next;
     let done = size
         .checked_sub(next_size)
-        .ok_or(CcaV7Error::InvalidRange)?;
+        .ok_or(CcaInPlaceError::InvalidRange)?;
     if done == 0
         || !done.is_multiple_of(4096)
         || base.checked_add(done) != Some(next_base)
         || source.checked_add(done) != Some(next_source)
     {
-        return Err(CcaV7Error::InvalidRange);
+        return Err(CcaInPlaceError::InvalidRange);
     }
     Ok(())
 }
@@ -168,7 +168,7 @@ pub(crate) struct Visibility {
 }
 
 impl Visibility {
-    pub(crate) fn all_private(mut slots: Vec<MemoryRange>) -> Result<Self, CcaV7Error> {
+    pub(crate) fn all_private(mut slots: Vec<MemoryRange>) -> Result<Self, CcaInPlaceError> {
         validate_imports(slots.iter().copied())?;
         slots.sort_by_key(MemoryRange::start);
         Ok(Self {
@@ -183,12 +183,14 @@ impl Visibility {
         &self,
         range: MemoryRange,
         private: bool,
-    ) -> Result<Vec<MemoryRange>, CcaV7Error> {
+    ) -> Result<Vec<MemoryRange>, CcaInPlaceError> {
         checked_range(range.start(), range.len())?;
         let mut changes = Vec::new();
         for (part, state) in memory_range::walk_ranges([(range, ())], self.ranges.iter().copied()) {
             match state {
-                memory_range::RangeWalkResult::Left(()) => return Err(CcaV7Error::InvalidRange),
+                memory_range::RangeWalkResult::Left(()) => {
+                    return Err(CcaInPlaceError::InvalidRange);
+                }
                 memory_range::RangeWalkResult::Both((), current) if current != private => {
                     changes.push(part);
                 }
@@ -252,10 +254,10 @@ impl FaultTracker {
         fault: Fault,
         successful_exit: bool,
         visibility: &Visibility,
-    ) -> Result<FaultAction, CcaV7Error> {
+    ) -> Result<FaultAction, CcaInPlaceError> {
         let range = checked_range(fault.gpa, fault.size)?;
         if fault.flags & !kvm::KVM_MEMORY_EXIT_FLAG_PRIVATE_UAPI != 0 {
-            return Err(CcaV7Error::AmbiguousFault);
+            return Err(CcaInPlaceError::AmbiguousFault);
         }
         let private = fault.flags != 0;
         let needs_change = !visibility.changes(range, private)?.is_empty();
@@ -266,7 +268,7 @@ impl FaultTracker {
                 .changes(checked_range(probe.gpa, probe.size)?, false)?
                 .is_empty();
             if still_pending && (!successful_exit || probe != fault) {
-                return Err(CcaV7Error::AmbiguousFault);
+                return Err(CcaInPlaceError::AmbiguousFault);
             }
             self.probe = None;
         }
@@ -277,7 +279,7 @@ impl FaultTracker {
         }
         let guard_noop = !needs_change && (!private || successful_exit);
         if guard_noop && self.unconfirmed_noop == Some(fault) {
-            return Err(CcaV7Error::AmbiguousFault);
+            return Err(CcaInPlaceError::AmbiguousFault);
         }
         self.unconfirmed_noop = if guard_noop { Some(fault) } else { None };
         if needs_change {
@@ -301,7 +303,7 @@ mod tests {
         for size in [0, 16384, 65536] {
             assert!(matches!(
                 validate_host_page_size(size),
-                Err(CcaV7Error::UnsupportedHostPageSize(actual)) if actual == size
+                Err(CcaInPlaceError::UnsupportedHostPageSize(actual)) if actual == size
             ));
         }
     }

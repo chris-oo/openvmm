@@ -71,7 +71,7 @@ pub(crate) struct KvmMemoryRangeState {
     pub(crate) ranges: Vec<Option<KvmMemoryRange>>,
     #[cfg(any(guest_arch = "aarch64", test))]
     #[inspect(skip)]
-    pub(crate) cca_visibility: crate::cca_v7::Visibility,
+    pub(crate) cca_visibility: crate::cca_in_place::Visibility,
 }
 
 impl KvmMemoryRangeState {
@@ -262,22 +262,22 @@ impl KvmGuestMemfdPrivateState {
 
 impl KvmPartitionInner {
     #[cfg(guest_arch = "aarch64")]
-    pub(crate) fn handle_cca_v7_memory_fault(
+    pub(crate) fn handle_cca_in_place_memory_fault(
         &self,
-        tracker: &mut crate::cca_v7::FaultTracker,
-        fault: crate::cca_v7::Fault,
+        tracker: &mut crate::cca_in_place::FaultTracker,
+        fault: crate::cca_in_place::Fault,
         successful_exit: bool,
     ) -> Result<(), KvmError> {
         let mut state = self.memory.lock();
         let result = (|| {
             if self.cca_fatal.load(std::sync::atomic::Ordering::Acquire) {
-                return Err(crate::cca_v7::CcaV7Error::AmbiguousFault.into());
+                return Err(crate::cca_in_place::CcaInPlaceError::AmbiguousFault.into());
             }
-            let range = crate::cca_v7::checked_range(fault.gpa, fault.size)?;
+            let range = crate::cca_in_place::checked_range(fault.gpa, fault.size)?;
             // Validate slot coverage even for probes and no-op requests.
             guest_memfd_range_segments(range, &state.ranges)?;
             let action = tracker.observe(fault, successful_exit, &state.cca_visibility)?;
-            if action == crate::cca_v7::FaultAction::Convert {
+            if action == crate::cca_in_place::FaultAction::Convert {
                 let private = fault.flags != 0;
                 let changes = state.cca_visibility.changes(range, private)?;
                 for change in changes {
@@ -1114,7 +1114,7 @@ mod tests {
                 private_state: Some(KvmGuestMemfdPrivateState::InPlace),
             }),
         ];
-        let mut visibility = crate::cca_v7::Visibility::all_private(
+        let mut visibility = crate::cca_in_place::Visibility::all_private(
             slots.iter().flatten().map(|slot| slot.range).collect(),
         )
         .unwrap();
@@ -1157,7 +1157,7 @@ mod tests {
         };
         assert_eq!(state.in_place_ram_slots(), [range(0x1000, 0x3000)]);
         state.cca_visibility =
-            crate::cca_v7::Visibility::all_private(state.in_place_ram_slots()).unwrap();
+            crate::cca_in_place::Visibility::all_private(state.in_place_ram_slots()).unwrap();
         assert!(
             state
                 .cca_visibility
