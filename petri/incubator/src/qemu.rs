@@ -808,6 +808,7 @@ mod tests {
 
     fn qemu_cca_config() -> QemuCcaConfig {
         QemuCcaConfig {
+            guest_memfd_in_place: false,
             binary: "qemu-system-aarch64".into(),
             machine: "virt,secure=on,virtualization=on,gic-version=3,acpi=off".into(),
             cpu: "max,x-rme=on,lpa2=off,sme=off,pauth-impdef=on".into(),
