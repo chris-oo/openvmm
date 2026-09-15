@@ -4,7 +4,10 @@
 //! Integration tests for aarch64 guests.
 
 use anyhow::Context;
+use futures::AsyncReadExt;
+use futures::AsyncWriteExt;
 use pal_async::DefaultDriver;
+use pal_async::socket::PolledSocket;
 use pal_async::timer::PolledTimer;
 use petri::IsolationType;
 use petri::PetriVmBuilder;
@@ -41,7 +44,21 @@ async fn boot_linux_direct_cca_with_backing(
     config: PetriVmBuilder<OpenVmmPetriBackend>,
     in_place: bool,
 ) -> anyhow::Result<()> {
-    let (vm, agent) = config
+    let (vm, agent) = cca_config(config, in_place, None).run().await?;
+    agent.ping().await?;
+    agent.power_off().await?;
+    vm.wait_for_clean_teardown().await?;
+
+    Ok(())
+}
+
+fn cca_config(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+    in_place: bool,
+    device: Option<openvmm_defs::config::PcieDeviceConfig>,
+) -> PetriVmBuilder<OpenVmmPetriBackend> {
+    let root_ports = if device.is_some() { 2 } else { 1 };
+    config
         .with_isolation(IsolationType::Cca)
         .with_memory(petri::MemoryConfig {
             startup_bytes: 256 * 1024 * 1024,
@@ -57,9 +74,12 @@ async fn boot_linux_direct_cca_with_backing(
         .without_serial_output()
         .modify_backend(move |backend| {
             backend
-                .with_pcie_root_topology(1, 1, 1)
+                .with_pcie_root_topology(1, 1, root_ports)
                 .with_custom_config(move |config| {
                     config.hypervisor.guest_memfd_in_place = in_place;
+                    if let Some(device) = device {
+                        config.pcie_devices.push(device);
+                    }
                     for root_complex in &mut config.pcie_root_complexes {
                         for port in &mut root_complex.ports {
                             port.hotplug = false;
@@ -67,9 +87,252 @@ async fn boot_linux_direct_cca_with_backing(
                     }
                 })
         })
-        .run()
-        .await?;
+}
+
+const CCA_IO_BYTES: usize = 64 * 1024;
+
+fn cca_io_pattern(seed: u8) -> Vec<u8> {
+    (0..CCA_IO_BYTES)
+        .map(|i| ((i.wrapping_mul(31) ^ (i >> 8)) as u8).wrapping_add(seed))
+        .collect()
+}
+
+/// Exercise direct guest reads and writes on a PCIe Virtio disk in an in-place Realm.
+#[vmm_test_with(
+    openvmm,
+    requires(cca, guest_memfd_in_place),
+    configs(linux_direct_aarch64)
+)]
+async fn virtio_blk_cca_in_place(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+) -> anyhow::Result<()> {
+    use std::io::Read;
+    use std::io::Seek;
+    use std::io::SeekFrom;
+    use std::io::Write;
+
+    const DISK_BYTES: u64 = 8 * 1024 * 1024;
+    let regions = [(0, 17, 93), (DISK_BYTES - CCA_IO_BYTES as u64, 41, 119)];
+    let mut disk = tempfile::tempfile().context("create CCA scratch disk")?;
+    disk.set_len(DISK_BYTES)?;
+    for (offset, initial_seed, _) in regions {
+        disk.seek(SeekFrom::Start(offset))?;
+        disk.write_all(&cca_io_pattern(initial_seed))?;
+    }
+    disk.sync_all()?;
+    let disk_handle = disk_backend_resources::FileDiskHandle(disk.try_clone()?).into_resource();
+    // Pipette's independent Virtio-vsock device occupies root port 0.
+    let device = openvmm_defs::config::PcieDeviceConfig {
+        port_name: "s0rc0rp1".into(),
+        resource: virtio_resources::VirtioPciDeviceHandle(
+            virtio_resources::blk::VirtioBlkHandle {
+                disk: disk_handle,
+                read_only: false,
+            }
+            .into_resource(),
+        )
+        .into_resource(),
+    };
+    let (vm, agent) = cca_config(config, true, Some(device)).run().await?;
     agent.ping().await?;
+    let sh = agent.unix_shell();
+    let sectors: u64 = cmd!(sh, "cat /sys/block/vda/size")
+        .read()
+        .await?
+        .trim()
+        .parse()?;
+    anyhow::ensure!(
+        sectors == DISK_BYTES / 512,
+        "unexpected CCA scratch disk size"
+    );
+    let driver = cmd!(sh, "readlink -f /sys/block/vda/device/driver")
+        .read()
+        .await?;
+    anyhow::ensure!(
+        driver.trim().ends_with("/virtio_blk"),
+        "not a Virtio block device: {driver}"
+    );
+    let io_bytes = CCA_IO_BYTES.to_string();
+    for (offset, initial_seed, written_seed) in regions {
+        let initial = cca_io_pattern(initial_seed);
+        let written = cca_io_pattern(written_seed);
+        agent
+            .write_file("/tmp/cca-write", futures::io::Cursor::new(&written))
+            .await?;
+        let block = (offset / CCA_IO_BYTES as u64).to_string();
+        cmd!(sh, "timeout 120 dd if=/dev/vda of=/tmp/cca-read bs={io_bytes} count=1 skip={block} iflag=direct")
+            .run().await.context("initial direct Virtio disk read")?;
+        anyhow::ensure!(
+            agent.read_file("/tmp/cca-read").await? == initial,
+            "initial disk data mismatch at {offset}"
+        );
+        cmd!(sh, "timeout 120 dd if=/tmp/cca-write of=/dev/vda bs={io_bytes} count=1 seek={block} oflag=direct conv=notrunc,fsync")
+            .run().await.context("direct Virtio disk write")?;
+        cmd!(sh, "timeout 120 dd if=/dev/vda of=/tmp/cca-read bs={io_bytes} count=1 skip={block} iflag=direct")
+            .run().await.context("direct Virtio disk readback")?;
+        anyhow::ensure!(
+            agent.read_file("/tmp/cca-read").await? == written,
+            "disk readback mismatch at {offset}"
+        );
+    }
+    agent.power_off().await?;
+    vm.wait_for_clean_teardown().await?;
+    for (offset, _, written_seed) in regions {
+        let mut actual = vec![0; CCA_IO_BYTES];
+        disk.seek(SeekFrom::Start(offset))?;
+        disk.read_exact(&mut actual)?;
+        anyhow::ensure!(
+            actual == cca_io_pattern(written_seed),
+            "host disk data mismatch at {offset}"
+        );
+    }
+
+    Ok(())
+}
+
+/// Verify TCP payloads in both directions over Virtio-net, with vsock as control.
+#[vmm_test_with(
+    openvmm,
+    requires(cca, guest_memfd_in_place),
+    configs(linux_direct_aarch64)
+)]
+async fn virtio_net_cca_in_place(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+    _: (),
+    driver: DefaultDriver,
+) -> anyhow::Result<()> {
+    use net_backend_resources::consomme::ConsommeHandle;
+    use net_backend_resources::consomme::HostIpAddress;
+    use net_backend_resources::consomme::HostPort;
+    use net_backend_resources::consomme::HostPortConfig;
+    use net_backend_resources::consomme::HostPortProtocol;
+    use net_backend_resources::mac_address::MacAddress;
+    use std::net::Ipv4Addr;
+
+    const GUEST_PORT: u16 = 26000;
+    let mac = MacAddress::new([0x02, 0x15, 0x5d, 0x12, 0x12, 0x34]);
+    let (port_send, port_recv) = mesh::oneshot();
+    let endpoint = ConsommeHandle {
+        cidr: None,
+        ports: vec![HostPortConfig {
+            protocol: HostPortProtocol::Tcp,
+            host_address: Some(HostIpAddress::Ipv4(Ipv4Addr::LOCALHOST)),
+            host_port: HostPort::Dynamic(port_send),
+            guest_port: GUEST_PORT,
+        }],
+        recv: None,
+    }
+    .into_resource();
+    let device = openvmm_defs::config::PcieDeviceConfig {
+        port_name: "s0rc0rp1".into(),
+        resource: virtio_resources::VirtioPciDeviceHandle(
+            virtio_resources::net::VirtioNetHandle {
+                max_queues: Some(1),
+                mac_address: mac,
+                endpoint,
+            }
+            .into_resource(),
+        )
+        .into_resource(),
+    };
+    let (vm, agent) = cca_config(config, true, Some(device)).run().await?;
+    agent.ping().await?;
+    let to_guest = cca_io_pattern(29);
+    let from_guest = cca_io_pattern(157);
+    let transfer = async {
+        let host_port = port_recv.await.context("receive Consomme port")?;
+        let sh = agent.unix_shell();
+        let address = cmd!(sh, "cat /sys/class/net/eth0/address").read().await?;
+        anyhow::ensure!(
+            address.trim().parse::<MacAddress>()? == mac,
+            "unexpected NIC MAC"
+        );
+        let nic_driver = cmd!(sh, "readlink -f /sys/class/net/eth0/device/driver")
+            .read()
+            .await?;
+        anyhow::ensure!(
+            nic_driver.trim().ends_with("/virtio_net"),
+            "not a Virtio NIC: {nic_driver}"
+        );
+        cmd!(sh, "ip address add 10.0.0.2/24 dev eth0")
+            .run()
+            .await?;
+        cmd!(sh, "ip link set eth0 up").run().await?;
+        agent
+            .write_file("/tmp/cca-net-send", futures::io::Cursor::new(&from_guest))
+            .await?;
+        // BusyBox otherwise chooses an IPv6 listener, absent from /proc/net/tcp.
+        let mut server = agent
+            .command("timeout")
+            .args(["120", "sh", "-c"])
+            .arg(format!(
+                "exec nc -l -s 10.0.0.2 -p {GUEST_PORT} < /tmp/cca-net-send > /tmp/cca-net-recv"
+            ))
+            .stdin(pipette_client::process::Stdio::null())
+            .spawn()
+            .await?;
+        let port_suffix = format!(":{GUEST_PORT:04X}");
+        let ready = async {
+            let mut retry = PolledTimer::new(&driver);
+            loop {
+                let sockets = String::from_utf8(agent.read_file("/proc/net/tcp").await?)?;
+                if sockets.lines().any(|line| {
+                    let fields: Vec<_> = line.split_whitespace().collect();
+                    fields
+                        .get(1)
+                        .is_some_and(|address| address.ends_with(&port_suffix))
+                        && fields.get(3) == Some(&"0A")
+                }) {
+                    return anyhow::Ok(());
+                }
+                retry.sleep(Duration::from_millis(500)).await;
+            }
+        };
+        match futures::future::select(std::pin::pin!(ready), std::pin::pin!(server.wait())).await {
+            futures::future::Either::Left((result, _)) => result?,
+            futures::future::Either::Right((status, _)) => {
+                anyhow::bail!("guest netcat exited before listening: {}", status?);
+            }
+        }
+        tracing::info!(host_port, "guest IPv4 TCP listener ready");
+        let socket =
+            PolledSocket::connect_tcp(&driver, (Ipv4Addr::LOCALHOST, host_port).into()).await?;
+        let (read, mut write) = socket.split();
+        let mut received = Vec::new();
+        futures::try_join!(
+            async {
+                write.write_all(&to_guest).await?;
+                write.close().await
+            },
+            async {
+                read.take((CCA_IO_BYTES + 1) as u64)
+                    .read_to_end(&mut received)
+                    .await?;
+                std::io::Result::Ok(())
+            },
+        )?;
+        anyhow::ensure!(
+            received == from_guest,
+            "Virtio-net guest-to-host payload mismatch"
+        );
+        let status = server.wait().await?;
+        anyhow::ensure!(status.success(), "guest netcat failed: {status}");
+        anyhow::ensure!(
+            agent.read_file("/tmp/cca-net-recv").await? == to_guest,
+            "Virtio-net host-to-guest payload mismatch"
+        );
+        tracing::info!(
+            bytes = CCA_IO_BYTES,
+            "verified Virtio-net payloads in both directions"
+        );
+        anyhow::Ok(())
+    };
+    let mut timer = PolledTimer::new(&driver);
+    let transfer = std::pin::pin!(transfer);
+    match futures::future::select(transfer, timer.sleep(Duration::from_secs(180))).await {
+        futures::future::Either::Left((result, _)) => result?,
+        futures::future::Either::Right(_) => anyhow::bail!("CCA Virtio-net transfer timed out"),
+    }
     agent.power_off().await?;
     vm.wait_for_clean_teardown().await?;
 
