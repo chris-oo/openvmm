@@ -1056,6 +1056,7 @@ impl virt::ProtoPartition for KvmProtoPartition<'_> {
         );
 
         let partition = Arc::new(KvmPartitionInner {
+            vfio_device: Mutex::new(None),
             kvm: self.vm,
             memory: Default::default(),
             cca_launch_state: Mutex::new(crate::CcaLaunchState::NotStarted),

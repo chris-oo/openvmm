@@ -18,11 +18,13 @@ mod gsi;
 mod memory;
 #[cfg(guest_arch = "x86_64")]
 mod snp;
+mod vfio;
 
 pub use arch::Kvm;
 pub use memory::MemoryError;
 #[cfg(guest_arch = "x86_64")]
 pub use snp::SnpError;
+pub use vfio::KvmVfioAssignment;
 
 use guestmem::GuestMemory;
 use inspect::Inspect;
@@ -153,6 +155,10 @@ pub struct KvmPartition {
 
 #[derive(Inspect)]
 struct KvmPartitionInner {
+    // Release the bridge's kernel-held file associations before other partition
+    // resources. Assignment owners must stop DMA before releasing their handles.
+    #[inspect(skip)]
+    vfio_device: Mutex<Option<kvm::VfioDevice>>,
     #[inspect(skip)]
     kvm: kvm::Partition,
     #[cfg(guest_arch = "x86_64")]
