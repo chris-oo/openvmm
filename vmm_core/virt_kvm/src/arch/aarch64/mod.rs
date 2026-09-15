@@ -212,7 +212,7 @@ pub struct KvmVpInner {
     eval: AtomicBool,
     vp_info: Aarch64VpInfo,
     #[inspect(skip)]
-    cca_fault: Mutex<crate::cca_v7::FaultTracker>,
+    cca_fault: Mutex<crate::cca_in_place::FaultTracker>,
 }
 
 impl KvmVpInner {
@@ -567,9 +567,9 @@ impl virt::Processor for KvmProcessor<'_> {
                         && source as i32 == libc::EFAULT =>
                     {
                         if self.partition.memory_backing_mode.is_in_place() {
-                            if let Err(err) = self.partition.handle_cca_v7_memory_fault(
+                            if let Err(err) = self.partition.handle_cca_in_place_memory_fault(
                                 &mut self.inner.cca_fault.lock(),
-                                crate::cca_v7::Fault { gpa, size, flags },
+                                crate::cca_in_place::Fault { gpa, size, flags },
                                 false,
                             ) {
                                 return Err(dev.fatal_error(err.into()));
@@ -608,9 +608,9 @@ impl virt::Processor for KvmProcessor<'_> {
                     kvm::Exit::MemoryFault { flags, gpa, size }
                         if self.partition.memory_backing_mode.is_in_place() =>
                     {
-                        if let Err(err) = self.partition.handle_cca_v7_memory_fault(
+                        if let Err(err) = self.partition.handle_cca_in_place_memory_fault(
                             &mut self.inner.cca_fault.lock(),
-                            crate::cca_v7::Fault { gpa, size, flags },
+                            crate::cca_in_place::Fault { gpa, size, flags },
                             true,
                         ) {
                             return Err(dev.fatal_error(err.into()));
@@ -716,8 +716,8 @@ impl KvmProtoPartition<'_> {
         &mut self,
         layout: &vm_topology::memory::MemoryLayout,
     ) -> Result<&mut KvmMemoryBackingMode, KvmError> {
-        if self.config.cca_v7 {
-            crate::cca_v7::validate_host_page_size(sparse_mmap::SparseMapping::page_size())?;
+        if self.config.guest_memfd_in_place {
+            crate::cca_in_place::validate_host_page_size(sparse_mmap::SparseMapping::page_size())?;
         }
         let ranges = layout
             .ram()
@@ -731,7 +731,7 @@ impl KvmProtoPartition<'_> {
                 virt::IsolationType::Cca => KvmMemoryBackingMode::guest_memfd(
                     &self.vm,
                     ranges.iter().copied(),
-                    if self.config.cca_v7 {
+                    if self.config.guest_memfd_in_place {
                         crate::memory::KvmGuestMemfdPrivateState::InPlace
                     } else {
                         crate::memory::KvmGuestMemfdPrivateState::GuestMemfdDefault
@@ -969,9 +969,9 @@ impl virt::ProtoPartition for KvmProtoPartition<'_> {
         config: virt::PartitionConfig<'_>,
     ) -> Result<(Self::Partition, Vec<Self::ProcessorBinder>), Self::Error> {
         let isolation = self.config.isolation.isolation_type();
-        if self.config.cca_v7 && !self.ram_backing_exported {
+        if self.config.guest_memfd_in_place && !self.ram_backing_exported {
             return Err(KvmError::UnsupportedIsolationConfiguration(
-                "CCA v7 requires prepare_ram_backing before constructing guest memory",
+                "guest_memfd in-place requires prepare_ram_backing before constructing guest memory",
             ));
         }
         // Also support direct build callers that did not prepare RAM. If RAM
@@ -1377,7 +1377,7 @@ impl virt::Hypervisor for Kvm {
     type Partition = KvmPartition;
     type Error = KvmError;
 
-    fn recognizes_cca_v7(&self) -> bool {
+    fn recognizes_guest_memfd_in_place(&self) -> bool {
         true
     }
 
@@ -1400,9 +1400,9 @@ impl virt::Hypervisor for Kvm {
         config: ProtoPartitionConfig<'a>,
     ) -> Result<Self::ProtoPartition<'a>, Self::Error> {
         let isolation = config.isolation.isolation_type();
-        if config.cca_v7 && isolation != virt::IsolationType::Cca {
+        if config.guest_memfd_in_place && isolation != virt::IsolationType::Cca {
             return Err(KvmError::UnsupportedIsolationConfiguration(
-                "experimental CCA v7 RAM requires CCA isolation",
+                "experimental guest_memfd in-place RAM requires CCA isolation",
             ));
         }
         match isolation {

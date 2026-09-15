@@ -154,13 +154,14 @@ backing, anonymous private memory or explicit huge pages.
 Returning no file leaves ordinary userspace RAM allocation unchanged. The
 Arm KVM backend's default CCA v15 mode retains a private-only guestmemfd and
 uses separate userspace RAM. The experimental
-[`--cca-v7`](../../openvmm/management/cli.md) option instead returns a clone
-of an mmap-enabled, initially shared guestmemfd. The partition retains the
-original file. Loader writes and host-visible shared aliases refer to that
-same file, including across NUMA ranges.
+[`--guest-memfd-in-place`](../../openvmm/management/cli.md) mode instead
+returns a clone of an mmap-enabled, initially shared guestmemfd. The
+partition retains the original file. Loader writes and host-visible shared
+aliases refer to that same file, including across NUMA ranges.
 
-CCA v7 requires 4 KiB host pages. Preparation rejects other page sizes before
-creating guestmemfd or exporting RAM backing; imports are not rounded up.
+In-place guest_memfd requires 4 KiB host pages. Preparation rejects
+other page sizes before creating guestmemfd or exporting RAM backing;
+imports are not rounded up.
 
 Before conversion, OpenVMM copies every initial import into separate aligned
 storage for Realm population and measurement. It then populates the imports
@@ -177,8 +178,11 @@ Repeated identical shared no-op faults without an intervening guest exit or
 different request cannot be distinguished from backing failures and stop the
 VM. Interrupts and stop/re-entry do not clear this guard.
 
-CCA v7 currently supports only no-device Linux-direct bring-up, apart from
-the serial console. It does not enable trusted device assignment or DMA.
+In-place backing uses the same CCA in-process Virtio PCIe device policy as
+separate backing. Revocable host views do not support raw page locks or
+file-based DMA sharing: device backends must use fault-contained copying
+paths instead of zero-copy pointers that could become inaccessible during
+conversion. This does not enable trusted device assignment or host DMA.
 
 The shared/private backing choice on this page is not the same as Realm
 page visibility. Sharing a file handle does not establish permission to read

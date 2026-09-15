@@ -237,6 +237,10 @@ struct MapperInner {
     /// succeeds because the mapping is already established. The flag
     /// is eventually updated after `SetEager` is processed.
     eager: AtomicBool,
+    /// The kernel can revoke access without a memory-manager unmap. Raw
+    /// locked pointers and file-based DMA sharing cannot promise that access
+    /// remains valid, so devices must use fault-contained copies instead.
+    revocable: bool,
     /// Whether this is the **primary** mapper — the one the partition and the
     /// loader run against. Soft large pages (Windows) are only worthwhile here,
     /// since this is the mapping whose host backing drives the guest's SLAT.
@@ -728,6 +732,7 @@ impl VaMapper {
         minimum_alignment: Option<usize>,
         eager: bool,
         role: MapperRole,
+        revocable: bool,
     ) -> Result<Self, VaMapperError> {
         // Soft large pages apply only to the primary mapper, and only when the
         // partition resolves faults; `supports_memory_fault_resolution` rides on
@@ -767,6 +772,7 @@ impl VaMapper {
             waiters: Mutex::new(Some(Vec::new())),
             mappings: RwLock::new(RangeMap::new()),
             eager: AtomicBool::new(eager),
+            revocable,
             primary,
             supports_memory_fault_resolution,
             req_send,
@@ -959,6 +965,9 @@ unsafe impl GuestMemoryAccess for VaMapper {
     }
 
     fn sharing(&self) -> Option<GuestMemorySharing> {
+        if self.inner.revocable {
+            return None;
+        }
         // Private anonymous memory is committed on fault in the local process
         // and cannot be shared to a remote DMA process, so disable DMA sharing
         // whenever any recorded mapping is private. Derived from the mapping
@@ -969,6 +978,10 @@ unsafe impl GuestMemoryAccess for VaMapper {
         Some(GuestMemorySharing::new(DmaRegionProvider {
             req_send: self.inner.req_send.clone(),
         }))
+    }
+
+    fn supports_locking(&self) -> bool {
+        !self.inner.revocable
     }
 }
 

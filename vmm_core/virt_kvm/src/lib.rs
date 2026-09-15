@@ -13,7 +13,7 @@ mod arch;
 #[cfg(guest_arch = "aarch64")]
 mod cca;
 #[cfg(any(guest_arch = "aarch64", test))]
-mod cca_v7;
+mod cca_in_place;
 mod gsi;
 mod memory;
 #[cfg(guest_arch = "x86_64")]
@@ -56,7 +56,7 @@ use vmcore::vmtime::VmTimeAccess;
 pub enum KvmError {
     #[cfg(any(guest_arch = "aarch64", test))]
     #[error(transparent)]
-    CcaV7(#[from] cca_v7::CcaV7Error),
+    CcaInPlace(#[from] cca_in_place::CcaInPlaceError),
     #[error("operation not supported")]
     NotSupported,
     #[error("vtl2 is not supported on this hypervisor")]
