@@ -22,6 +22,9 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use thiserror::Error;
 
+mod vfio;
+pub use vfio::VfioDevice;
+
 mod ioctl {
     #[cfg(any(target_arch = "aarch64", test))]
     use super::KvmArmRmiInitRipas;
@@ -363,6 +366,12 @@ pub enum Error {
     CreateGuestMemfd(#[source] nix::Error),
     #[error("CreateVm")]
     CreateVm(#[source] nix::Error),
+    #[error("failed to create KVM VFIO bridge")]
+    CreateVfioDevice(#[source] nix::Error),
+    #[error("KVM_DEV_VFIO_FILE_ADD failed")]
+    AddVfioFile(#[source] nix::Error),
+    #[error("KVM_DEV_VFIO_FILE_DEL failed")]
+    RemoveVfioFile(#[source] nix::Error),
     #[cfg(target_arch = "aarch64")]
     #[error("ArmRmiPopulate")]
     ArmRmiPopulate(#[source] nix::Error),
