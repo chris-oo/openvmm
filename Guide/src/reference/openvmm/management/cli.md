@@ -122,6 +122,17 @@ describes the source definitions.
   These launch arguments do not rewrite the measured ACPI tables. Regenerate
   the IGVM after changing its topology or updating the generator.
 
+  The opt-in `snp-linux-direct-pcie.json` profile (`pcie: true`) lets the
+  bootshim generate PCIe ACPI from the runtime's device-tree parameter. Its
+  ECAM and BAR-window addresses need not be fixed in the image. Use the usual
+  `--pcie-root-complex`, `--pcie-root-port`, and PCIe virtio device options.
+  For direct Linux kernels that reject high ECAM without a recent SMBIOS BIOS
+  date, also use `--pcie-ecam-below-4gb`. The initial profile supports up to
+  eight generic ECAM bridges in distinct segments, node 0, identity MMIO
+  windows, and native x86 MSI/MSI-X; IOMMU, CXL, INTx mapping, and preserved
+  PCI boot configuration are not supported. See
+  `vm/loader/manifests/README.md` for the build and launch recipe.
+
   SNP does not support UEFI, VTL2, or hugetlb-backed memory. In addition to
   the minimal emulated chipset and serial console, optional devices are
   limited to virtio devices attached through PCIe.
