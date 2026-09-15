@@ -565,6 +565,7 @@ impl ProtoPartition for KvmProtoPartition<'_> {
         };
 
         let partition = Arc::new(KvmPartitionInner {
+            vfio_device: Mutex::new(None),
             kvm: self.vm,
             sev: self.sev,
             snp_config: self.snp_config,
