@@ -15,6 +15,8 @@
 //! The IOAS path supports identity DMA mapping (Phase 4). The HWPT/vIOMMU
 //! path supports nested stage 1 translation for VFIO passthrough (Phase 5).
 
+pub mod tsm;
+
 use anyhow::Context as _;
 use std::fs;
 use std::os::unix::prelude::*;
