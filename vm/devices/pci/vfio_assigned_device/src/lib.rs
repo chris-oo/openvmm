@@ -16,6 +16,7 @@
 
 pub mod iommufd_nesting;
 pub mod manager;
+pub mod realm;
 pub mod resolver;
 
 use anyhow::Context as _;
