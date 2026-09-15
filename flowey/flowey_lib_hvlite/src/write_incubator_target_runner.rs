@@ -47,6 +47,8 @@ pub enum IncubatorPlatform {
     QemuTcg,
     /// QEMU Arm CCA L1 host platform.
     QemuCca,
+    /// Published QEMU firmware with the pinned in-place guest_memfd payload.
+    QemuCcaGuestMemfdInPlace,
     /// Licensed Arm FVP CCA L1 host platform.
     FvpCca,
     /// Pinned local firmware and payload for in-place guest_memfd tests.
@@ -56,6 +58,13 @@ pub enum IncubatorPlatform {
 impl IncubatorPlatform {
     pub fn is_fvp(self) -> bool {
         matches!(self, Self::FvpCca | Self::FvpCcaGuestMemfdInPlace)
+    }
+
+    pub fn is_in_place(self) -> bool {
+        matches!(
+            self,
+            Self::QemuCcaGuestMemfdInPlace | Self::FvpCcaGuestMemfdInPlace
+        )
     }
 }
 

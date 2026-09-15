@@ -180,6 +180,9 @@ pub struct QemuTcgConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct QemuCcaConfig {
+    /// Select the pinned in-place guest_memfd kernel without changing firmware.
+    #[serde(default)]
+    pub guest_memfd_in_place: bool,
     /// Path or name of the QEMU binary.
     pub binary: String,
     /// Machine configuration.
@@ -518,6 +521,10 @@ fn validate_qemu_cca(config: &QemuCcaConfig) -> anyhow::Result<()> {
     let mut capabilities = BTreeSet::new();
     for capability in &config.capabilities {
         anyhow::ensure!(
+            capability != "guest_memfd_in_place" || config.guest_memfd_in_place,
+            "QEMU in-place capability requires guest-memfd-in-place = true"
+        );
+        anyhow::ensure!(
             petri_artifacts_common::capabilities::is_known_name(capability),
             "unknown QEMU CCA capability: {capability}"
         );
@@ -675,6 +682,33 @@ mod tests {
         assert_eq!(config.primary_console, "host");
         assert_eq!(config.consoles, ["host", "secure"]);
         assert_eq!(config.capabilities, ["cca"]);
+    }
+
+    #[test]
+    fn qemu_in_place_profile_requires_explicit_payload_selection() {
+        let text = include_str!("../profiles/aarch64-qemu-cca-guest-memfd-in-place.toml");
+        let profile = IncubatorProfile::from_toml(text).unwrap();
+        let IncubatorBackend::QemuCca(config) = profile.incubator else {
+            panic!("expected QEMU CCA profile");
+        };
+        assert!(config.guest_memfd_in_place);
+        assert_eq!(config.capabilities, ["cca", "guest_memfd_in_place"]);
+        assert!(
+            IncubatorProfile::from_toml(&text.replace(
+                "guest-memfd-in-place = true",
+                "guest-memfd-in-place = false"
+            ))
+            .unwrap_err()
+            .to_string()
+            .contains("in-place capability")
+        );
+        assert!(
+            IncubatorProfile::from_toml(&text.replace(
+                "guest-memfd-in-place = true",
+                "guest-memfd-in-place = 'true'"
+            ))
+            .is_err()
+        );
     }
 
     #[test]

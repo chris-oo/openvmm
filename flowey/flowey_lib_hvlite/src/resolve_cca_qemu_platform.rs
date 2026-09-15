@@ -142,10 +142,6 @@ impl FlowNodeWithConfig for Node {
 
 impl CcaQemuPlatformOutput {
     pub fn validate(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            self.payload.kind == crate::resolve_cca_payload::CcaPayloadKind::CcaV15,
-            "QEMU CCA requires the v15 payload"
-        );
         self.payload.validate()?;
         self.validate_firmware()
     }
@@ -202,6 +198,45 @@ fn validate_initrd_size(size: u64) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_with_tracing::test;
+
+    #[test]
+    #[ignore = "requires the pinned local payload and downloaded QEMU firmware"]
+    fn local_in_place_payload_with_published_qemu_firmware() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let root = repo.join("target/cca-tdisp-stage-a/test-platform/payload");
+        let firmware_root =
+            repo.join("flowey-persist/flowey_lib_hvlite__resolve_cca_qemu_platform/extracted");
+        let tfa = firmware_root.join(format!(
+            "openvmm-test-tfa-cca.aarch64.{}.tar.gz",
+            crate::cca_pins::OPENVMM_DEPS_RELEASE
+        ));
+        let rmm = firmware_root.join(format!(
+            "openvmm-test-rmm-cca.aarch64.{}.tar.gz",
+            crate::cca_pins::OPENVMM_DEPS_RELEASE
+        ));
+        let platform = CcaQemuPlatformOutput {
+            payload: CcaPayloadOutput {
+                kind: crate::resolve_cca_payload::CcaPayloadKind::GuestMemfdInPlace,
+                host_kernel: root.join("Image"),
+                realm_kernel: root.join("Image"),
+                kernel_config: root.join("config"),
+                kernel_manifest: root.join("manifest.txt"),
+                initrd: root.join("initrd"),
+            },
+            firmware: tfa.join("flash.bin"),
+            firmware_manifest: tfa.join("manifest.txt"),
+            rmm_image: rmm.join("rmm.img"),
+            rmm_manifest: rmm.join("manifest.txt"),
+        };
+        platform.validate().unwrap();
+        let forwarded = crate::resolve_cca_platform::CcaPlatformOutput::from(platform);
+        assert_eq!(
+            forwarded.payload_kind,
+            crate::resolve_cca_payload::CcaPayloadKind::GuestMemfdInPlace
+        );
+        forwarded.validate().unwrap();
+    }
 
     #[test]
     fn initrd_fits_qemu_physical_range() {

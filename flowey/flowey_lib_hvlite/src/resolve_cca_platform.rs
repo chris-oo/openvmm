@@ -11,6 +11,7 @@ use flowey::node::prelude::*;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CcaPlatformOutput {
+    pub payload_kind: crate::resolve_cca_payload::CcaPayloadKind,
     pub host_kernel: PathBuf,
     pub realm_kernel: PathBuf,
     pub kernel_config: PathBuf,
@@ -140,6 +141,7 @@ impl FlowNodeWithConfig for Node {
 impl From<CcaQemuPlatformOutput> for CcaPlatformOutput {
     fn from(platform: CcaQemuPlatformOutput) -> Self {
         Self {
+            payload_kind: platform.payload.kind,
             host_kernel: platform.payload.host_kernel,
             realm_kernel: platform.payload.realm_kernel,
             kernel_config: platform.payload.kernel_config,
@@ -157,7 +159,7 @@ impl CcaPlatformOutput {
     pub fn validate(&self) -> anyhow::Result<()> {
         CcaQemuPlatformOutput {
             payload: CcaPayloadOutput {
-                kind: crate::resolve_cca_payload::CcaPayloadKind::CcaV15,
+                kind: self.payload_kind,
                 host_kernel: self.host_kernel.clone(),
                 realm_kernel: self.realm_kernel.clone(),
                 kernel_config: self.kernel_config.clone(),
@@ -176,6 +178,33 @@ impl CcaPlatformOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preserves_in_place_payload_with_released_qemu_firmware() {
+        let output = CcaPlatformOutput::from(CcaQemuPlatformOutput {
+            payload: CcaPayloadOutput {
+                kind: crate::resolve_cca_payload::CcaPayloadKind::GuestMemfdInPlace,
+                host_kernel: "local-payload/Image".into(),
+                realm_kernel: "local-payload/Image".into(),
+                kernel_config: "local-payload/config".into(),
+                kernel_manifest: "local-payload/manifest.txt".into(),
+                initrd: "local-payload/initrd".into(),
+            },
+            firmware: "released-tfa/flash.bin".into(),
+            firmware_manifest: "released-tfa/manifest.txt".into(),
+            rmm_image: "released-rmm/rmm.img".into(),
+            rmm_manifest: "released-rmm/manifest.txt".into(),
+        });
+        assert_eq!(
+            output.payload_kind,
+            crate::resolve_cca_payload::CcaPayloadKind::GuestMemfdInPlace
+        );
+        assert_eq!(output.host_kernel, PathBuf::from("local-payload/Image"));
+        assert_eq!(output.realm_kernel, output.host_kernel);
+        assert_eq!(output.host_initrd, PathBuf::from("local-payload/initrd"));
+        assert_eq!(output.firmware, PathBuf::from("released-tfa/flash.bin"));
+        assert_eq!(output.rmm_image, PathBuf::from("released-rmm/rmm.img"));
+    }
 
     fn release_config() -> Config {
         Config {

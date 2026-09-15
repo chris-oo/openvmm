@@ -216,6 +216,7 @@ mod tests {
             "aarch64-fvp-cca",
             "aarch64-fvp-cca-guest-memfd-in-place",
             "aarch64-qemu-cca",
+            "aarch64-qemu-cca-guest-memfd-in-place",
         ] {
             for profile in [
                 PathBuf::from(name),

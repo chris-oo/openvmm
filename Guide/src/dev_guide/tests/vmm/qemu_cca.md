@@ -149,6 +149,20 @@ to run the same CCA test body with the in-place memory mode selected.
 Generic TCG VFIO/P2P tests are separate regressions, not Realm memory-mode
 parity evidence.
 
+For QEMU, `aarch64-qemu-cca-guest-memfd-in-place.toml` selects the same pinned
+local kernel and official initrd while reusing the published QEMU, TF-A and
+TF-RMM archives from `openvmm-deps` release `0.3.0-139`. It does not rebuild
+firmware or change the default QEMU profile. Supply the payload directory;
+firmware, release and hash overrides are rejected for this profile.
+
+```admonish warning
+The in-place QEMU profile is a diagnostic candidate, not a qualified tuple.
+The current local kernel and published firmware boot the host, but the
+Realm stalls before pipette. A block-test console run stopped during ITS
+initialization. This does not yet identify the component that needs a fix.
+Use `INCUBATOR_TIMEOUT` to bound each incubator invocation while debugging.
+```
+
 The effective package uses the model's default PCI hierarchy. It removes the
 DA recipe's PCI JSON fixup command and its unused PCI hierarchy and sample-key
 runtime variables. Its remaining CPU/SMMU model parameters and firmware
@@ -163,8 +177,57 @@ does not qualify this effective package; run the Petri tests to qualify it.
 The paired CCA Virtio-vsock test has passed on the pinned in-place FVP tuple,
 including pipette ping, Realm poweroff, OpenVMM teardown, and outer host
 shutdown. The original separate-backing test also passes on the default
-QEMU and FVP tuples. Block, net, rng, and console crate tests are separate
-regression coverage; they are not CCA guest-VM coverage for those devices.
+QEMU and FVP tuples. The dedicated block and network tests below extend
+guest-VM coverage. Rng and console crate tests remain separate regression
+coverage, not CCA guest-VM coverage.
+
+### Virtio block and network I/O
+
+`virtio_blk_cca_in_place` and `virtio_net_cca_in_place` require both `cca` and
+`guest_memfd_in_place`. Each explicitly enables in-place backing in a
+Linux-direct Realm and keeps Virtio-vsock as the independent pipette control
+channel.
+
+The block test attaches a temporary 8-MiB scratch file as a PCIe Virtio disk.
+It checks distinct 64-KiB patterns near each end, performs guest direct writes
+and direct readback, then checks the backing file from the host after clean
+teardown. Direct I/O prevents guest page-cache hits from replacing device
+reads.
+
+The network test attaches a PCIe Virtio-net NIC backed by Consomme. It uses
+a dynamically allocated loopback forwarding port and a guest TCP listener,
+with distinct 64-KiB payloads in each direction. Both receivers check all
+bytes. The exchange has a deadline and needs no external network service.
+Both tests require Realm poweroff and clean OpenVMM teardown.
+
+Use the in-place FVP invocation above with this filter. Run one test at a
+time so model instances do not compete for the FVP lock:
+
+```bash
+NEXTEST_TEST_THREADS=1 cargo xflowey vmm-tests-run \
+  --target linux-aarch64-musl \
+  --incubator petri/incubator/profiles/aarch64-fvp-cca-guest-memfd-in-place.toml \
+  --fvp-platform-root path/to/platform-root \
+  --shrinkwrap-package-root path/to/in-place-package \
+  --cca-in-place-payload-root path/to/in-place-payload \
+  --dir path/to/separate-output \
+  --filter 'binary(=tests) & test(virtio_) & test(cca_in_place)'
+```
+
+Attempt the same tests on QEMU with upstream firmware and bounded execution:
+
+```bash
+NEXTEST_TEST_THREADS=1 INCUBATOR_TIMEOUT=180 cargo xflowey vmm-tests-run \
+  --target linux-aarch64-musl \
+  --incubator petri/incubator/profiles/aarch64-qemu-cca-guest-memfd-in-place.toml \
+  --cca-in-place-payload-root path/to/in-place-payload \
+  --dir path/to/separate-qemu-output \
+  --filter 'binary(=tests) & test(virtio_) & test(cca_in_place)'
+```
+
+These are in-process Virtio tests, not assigned-device or TDISP DMA tests.
+Both have passed on the pinned in-place FVP tuple. Neither has completed on
+the current in-place QEMU candidate.
 
 ## Build now, run later
 

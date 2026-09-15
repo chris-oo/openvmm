@@ -179,7 +179,7 @@ pub struct VmmTestsRunCli {
     cca_initrd_archive: Option<PathBuf>,
 
     /// Pinned local in-place payload directory (Image, config, manifest.txt, initrd).
-    /// Requires the guest-memfd-in-place FVP profile; accepts no hash overrides.
+    /// Requires an in-place guest_memfd profile; accepts no hash overrides.
     #[clap(long)]
     cca_in_place_payload_root: Option<PathBuf>,
 
@@ -343,8 +343,8 @@ impl IntoPipeline for VmmTestsRunCli {
         };
         anyhow::ensure!(
             cca_in_place_payload_root.is_none()
-                || incubator_platform == Some(IncubatorPlatform::FvpCcaGuestMemfdInPlace),
-            "--cca-in-place-payload-root requires the guest-memfd-in-place FVP profile"
+                || incubator_platform.is_some_and(IncubatorPlatform::is_in_place),
+            "--cca-in-place-payload-root requires an in-place guest_memfd profile"
         );
         if let Some(roots) = &fvp_roots {
             roots.output_directory(
@@ -357,17 +357,27 @@ impl IntoPipeline for VmmTestsRunCli {
             );
         }
         let cca_platform_source = match incubator_platform {
-            Some(IncubatorPlatform::FvpCcaGuestMemfdInPlace) => {
+            Some(
+                IncubatorPlatform::FvpCcaGuestMemfdInPlace
+                | IncubatorPlatform::QemuCcaGuestMemfdInPlace,
+            ) => {
                 anyhow::ensure!(
                     cca_deps_version.is_none()
                         && cca_kernel_archive.is_none()
                         && cca_kernel_archive_sha256.is_none()
                         && cca_initrd_archive.is_none()
-                        && cca_initrd_archive_sha256.is_none(),
-                    "in-place FVP uses a pinned payload directory, not archive or hash overrides"
+                        && cca_initrd_archive_sha256.is_none()
+                        && cca_rmm_archive.is_none()
+                        && cca_rmm_archive_sha256.is_none()
+                        && cca_tfa_archive.is_none()
+                        && cca_tfa_archive_sha256.is_none()
+                        && custom_kernel.is_none()
+                        && custom_kernel_modules.is_none()
+                        && custom_uefi_firmware.is_none(),
+                    "in-place CCA uses a pinned payload directory and pinned firmware, not overrides"
                 );
                 let root = cca_in_place_payload_root
-                    .context("guest-memfd-in-place FVP requires --cca-in-place-payload-root")?;
+                    .context("in-place guest_memfd requires --cca-in-place-payload-root")?;
                 let root = if root.is_absolute() {
                     root
                 } else {
@@ -1040,7 +1050,14 @@ fn classify_incubator_platform(profile: &Path) -> anyhow::Result<IncubatorPlatfo
                     == Some(flowey_lib_hvlite::cca_pins::QEMU_INITRD_LOAD_ADDRESS),
                 "QEMU CCA profile initrd-load-address does not match the pinned platform"
             );
-            Ok(IncubatorPlatform::QemuCca)
+            match incubator.get("guest-memfd-in-place") {
+                None => Ok(IncubatorPlatform::QemuCca),
+                Some(value) => match value.as_bool() {
+                    Some(false) => Ok(IncubatorPlatform::QemuCca),
+                    Some(true) => Ok(IncubatorPlatform::QemuCcaGuestMemfdInPlace),
+                    None => anyhow::bail!("QEMU guest-memfd-in-place must be a boolean"),
+                },
+            }
         }
         "qemu-tcg" => Ok(IncubatorPlatform::QemuTcg),
         "fvp-cca" => match incubator.get("platform") {
@@ -1398,6 +1415,10 @@ mod tests {
         for (name, expected) in [
             ("aarch64-tcg-pcie", IncubatorPlatform::QemuTcg),
             ("aarch64-qemu-cca", IncubatorPlatform::QemuCca),
+            (
+                "aarch64-qemu-cca-guest-memfd-in-place",
+                IncubatorPlatform::QemuCcaGuestMemfdInPlace,
+            ),
             ("aarch64-fvp-cca", IncubatorPlatform::FvpCca),
             (
                 "aarch64-fvp-cca-guest-memfd-in-place",
@@ -1436,6 +1457,14 @@ mod tests {
 
     #[test]
     fn classifies_incubator_profile_backend() {
+        assert_eq!(
+            classify_incubator_platform(
+                &crate::repo_root()
+                    .join("petri/incubator/profiles/aarch64-qemu-cca-guest-memfd-in-place.toml")
+            )
+            .unwrap(),
+            IncubatorPlatform::QemuCcaGuestMemfdInPlace
+        );
         assert_eq!(
             classify_incubator_platform(
                 &crate::repo_root()

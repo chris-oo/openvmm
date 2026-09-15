@@ -17,7 +17,7 @@ pub struct CcaPayloadOutput {
     pub initrd: PathBuf,
 }
 
-/// Complete payload identities supported by the FVP runtime.
+/// Complete payload identities supported by the CCA test platforms.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CcaPayloadKind {
     #[default]

@@ -573,6 +573,7 @@ impl SimpleFlowNode for Node {
         ctx.import::<crate::resolve_vmm_tests_pipeline_artifacts::Node>();
         ctx.import::<flowey_lib_common::download_cargo_nextest::Node>();
         ctx.import::<flowey_lib_common::gen_cargo_nextest_run_cmd::Node>();
+        ctx.import::<crate::resolve_cca_qemu_platform::Node>();
         ctx.import::<crate::build_vmgstool::Node>();
         ctx.import::<crate::_jobs::build_and_publish_openhcl_igvm_from_recipe::Node>();
         ctx.import::<crate::_jobs::consume_and_test_nextest_vmm_tests_archive::Node>();
@@ -610,24 +611,26 @@ impl SimpleFlowNode for Node {
         anyhow::ensure!(
             cca_platform_source.is_some()
                 == (is_fvp
-                    || incubator_platform
-                        == Some(crate::write_incubator_target_runner::IncubatorPlatform::QemuCca)),
+                    || matches!(
+                        incubator_platform,
+                        Some(
+                            crate::write_incubator_target_runner::IncubatorPlatform::QemuCca
+                                | crate::write_incubator_target_runner::IncubatorPlatform::QemuCcaGuestMemfdInPlace
+                        )
+                    )),
             "CCA platform artifacts require a CCA incubator profile"
         );
         if let Some(source) = &mut cca_platform_source {
             source.protect_payload_from_output(&test_content_dir)?;
         }
-        let in_place = incubator_platform
-            == Some(
-                crate::write_incubator_target_runner::IncubatorPlatform::FvpCcaGuestMemfdInPlace,
-            );
+        let in_place = incubator_platform.is_some_and(|platform| platform.is_in_place());
         anyhow::ensure!(
             in_place
                 == matches!(
                     cca_platform_source,
                     Some(CcaPlatformSource::PayloadGuestMemfdInPlace { .. })
                 ),
-            "in-place FVP profiles require the explicit pinned local in-place payload"
+            "in-place CCA profiles require the explicit pinned local in-place payload"
         );
         anyhow::ensure!(
             is_fvp == fvp_roots.is_some(),
@@ -687,6 +690,19 @@ impl SimpleFlowNode for Node {
                 }
             };
             ctx.config(config);
+        } else if let Some(CcaPlatformSource::PayloadGuestMemfdInPlace { root }) =
+            &cca_platform_source
+        {
+            ctx.config(crate::resolve_cca_payload::Config {
+                local_in_place_payload: Some(ConfigVar(ReadVar::from_static(root.clone()))),
+                ..Default::default()
+            });
+            ctx.config(crate::resolve_cca_qemu_platform::Config {
+                version: Some(crate::cca_pins::OPENVMM_DEPS_RELEASE.into()),
+                rmm_archive_sha256: Some(crate::cca_pins::RMM_ARCHIVE_SHA256.into()),
+                tfa_archive_sha256: Some(crate::cca_pins::TFA_ARCHIVE_SHA256.into()),
+                ..Default::default()
+            });
         } else if let Some(source) = &cca_platform_source {
             let config = match source {
                 CcaPlatformSource::Release {
@@ -736,11 +752,18 @@ impl SimpleFlowNode for Node {
             };
             ctx.config(config);
         }
-        let cca_platform = matches!(
-            incubator_platform,
-            Some(crate::write_incubator_target_runner::IncubatorPlatform::QemuCca)
-        )
-        .then(|| ctx.reqv(crate::resolve_cca_platform::Request::Get));
+        let cca_platform = match incubator_platform {
+            Some(crate::write_incubator_target_runner::IncubatorPlatform::QemuCca) => {
+                Some(ctx.reqv(crate::resolve_cca_platform::Request::Get))
+            }
+            Some(
+                crate::write_incubator_target_runner::IncubatorPlatform::QemuCcaGuestMemfdInPlace,
+            ) => Some(
+                ctx.reqv(crate::resolve_cca_qemu_platform::Request::Get)
+                    .map(ctx, crate::resolve_cca_platform::CcaPlatformOutput::from),
+            ),
+            _ => None,
+        };
         let fvp_payload = is_fvp.then(|| {
             let payload = ctx.reqv(crate::resolve_cca_payload::Request::Get);
             ctx.emit_rust_stepv("verify qualified FVP payload", |ctx| {
