@@ -22,6 +22,16 @@ retain their resource bundle until process exit and are not clean teardown.
 Do not use the unsafe-interrupt workaround below for trusted assignment.
 ```
 
+The experimental CCA TSM bindings in `vfio_sys::iommufd::tsm` encode native
+state, evidence, and MMIO-validation requests for the pinned integration
+kernel. They borrow host buffers for each synchronous ioctl and preserve
+syscall errors, unused-byte counts, and TSM result codes separately. Object
+reads always use backend offset zero; the device coordinator must fetch a
+bounded whole object before serving guest slices. These bindings alone do
+not enable guest requests or make state changes safe. Access revocation,
+request serialization, and uncertain-completion handling belong to the
+device coordinator.
+
 ## Overview
 
 OpenVMM running on a Linux host can assign physical PCI devices to guest VMs using VFIO. The device is bound to the `vfio-pci` kernel driver, then OpenVMM opens it via VFIO and presents it to the guest as a PCIe endpoint.
