@@ -10,6 +10,7 @@
 //! - Hardware info query (`IOMMU_GET_HW_INFO`)
 //! - Virtual IOMMU objects (`IOMMU_VIOMMU_ALLOC`, `IOMMU_VDEVICE_ALLOC`,
 //!   `IOMMU_VEVENTQ_ALLOC`)
+//! - Per-IOAS huge-page policy (`IOMMU_OPTION`)
 //!
 //! The IOAS path supports identity DMA mapping (Phase 4). The HWPT/vIOMMU
 //! path supports nested stage 1 translation for VFIO passthrough (Phase 5).
@@ -33,6 +34,7 @@ const IOMMUFD_CMD_DESTROY: u8 = IOMMUFD_CMD_BASE;
 const IOMMUFD_CMD_IOAS_ALLOC: u8 = IOMMUFD_CMD_BASE + 1;
 const IOMMUFD_CMD_IOAS_MAP: u8 = IOMMUFD_CMD_BASE + 5;
 const IOMMUFD_CMD_IOAS_UNMAP: u8 = IOMMUFD_CMD_BASE + 6;
+const IOMMUFD_CMD_OPTION: u8 = IOMMUFD_CMD_BASE + 7;
 const IOMMUFD_CMD_HWPT_ALLOC: u8 = IOMMUFD_CMD_BASE + 9;
 const IOMMUFD_CMD_IOAS_MAP_FILE: u8 = IOMMUFD_CMD_BASE + 15;
 const IOMMUFD_CMD_GET_HW_INFO: u8 = IOMMUFD_CMD_BASE + 0x0a;
@@ -45,6 +47,9 @@ const IOMMUFD_CMD_VEVENTQ_ALLOC: u8 = IOMMUFD_CMD_BASE + 0x13;
 pub const IOMMU_IOAS_MAP_FIXED_IOVA: u32 = 1 << 0;
 pub const IOMMU_IOAS_MAP_WRITEABLE: u32 = 1 << 1;
 pub const IOMMU_IOAS_MAP_READABLE: u32 = 1 << 2;
+
+const IOMMU_OPTION_HUGE_PAGES: u32 = 1;
+const IOMMU_OPTION_OP_SET: u16 = 0;
 
 mod ioctl {
     use nix::request_code_none;
@@ -90,6 +95,11 @@ mod ioctl {
             super::IOMMUFD_CMD_IOAS_UNMAP as u32
         ),
         super::IommuIoasUnmap
+    );
+    nix::ioctl_readwrite_bad!(
+        iommu_option,
+        request_code_none!(super::IOMMUFD_TYPE as u32, super::IOMMUFD_CMD_OPTION as u32),
+        super::IommuOption
     );
     nix::ioctl_readwrite_bad!(
         iommu_hwpt_alloc,
@@ -186,6 +196,39 @@ struct IommuIoasUnmap {
     length: u64,
 }
 
+#[repr(C)]
+struct IommuOption {
+    size: u32,
+    option_id: u32,
+    op: u16,
+    __reserved: u16,
+    object_id: u32,
+    val64: u64,
+}
+
+impl IommuOption {
+    fn huge_pages(ioas_id: u32, enabled: bool) -> Self {
+        Self {
+            size: size_of::<Self>() as u32,
+            option_id: IOMMU_OPTION_HUGE_PAGES,
+            op: IOMMU_OPTION_OP_SET,
+            __reserved: 0,
+            object_id: ioas_id,
+            val64: u64::from(enabled),
+        }
+    }
+}
+
+/// Failure to change an IOAS's huge-page policy.
+#[derive(Debug, thiserror::Error)]
+#[error("IOMMU_OPTION_HUGE_PAGES failed for IOAS {ioas_id} (enabled={enabled})")]
+pub struct IoasHugePagesError {
+    pub ioas_id: u32,
+    pub enabled: bool,
+    #[source]
+    pub errno: nix::errno::Errno,
+}
+
 // --- HWPT allocation ---
 
 /// Flags for `IOMMU_HWPT_ALLOC`.
@@ -216,8 +259,22 @@ struct IommuHwptAlloc {
 /// Passed via `data_uptr` when `data_type == IOMMU_HWPT_DATA_ARM_SMMUV3`.
 /// The kernel validates the STE fields and programs the host IOMMU.
 #[repr(C)]
+#[derive(IntoBytes, Immutable)]
 pub struct IommuHwptArmSmmuv3 {
     pub ste: [u64; 2],
+}
+
+impl IommuHwptArmSmmuv3 {
+    /// A valid S1-bypass STE in the little-endian format required by Linux.
+    ///
+    /// Sets `V=1` and `Cfg=0b100`; all other fields are zero.
+    /// This bypasses only stage 1; the nesting parent's stage 2 still applies.
+    /// Use with [`IOMMU_HWPT_DATA_ARM_SMMUV3`] and a vIOMMU as `pt_id`.
+    pub const fn s1_bypass() -> Self {
+        Self {
+            ste: [(1_u64 | (4 << 1)).to_le(), 0],
+        }
+    }
 }
 
 // --- Hardware info query ---
@@ -286,6 +343,22 @@ pub struct HwptInvalidateError {
 
 /// vIOMMU type: ARM SMMUv3.
 pub const IOMMU_VIOMMU_TYPE_ARM_SMMUV3: u32 = 1;
+/// vIOMMU type: KVM-associated Arm Realm SMMUv3 in the CCA integration ABI.
+pub const IOMMU_VIOMMU_TYPE_ARM_REALM_SMMUV3: u32 = 3;
+
+/// Failure to allocate a KVM-associated Realm vIOMMU.
+///
+/// In particular, `EINVAL` is not a reliable physical-IOMMU mismatch signal
+/// for this type: it can also report a missing KVM association or invalid IRQ
+/// configuration. Callers must not treat it as permission to try another parent.
+#[derive(Debug, thiserror::Error)]
+#[error("IOMMU_VIOMMU_ALLOC failed for Realm device {dev_id}, parent HWPT {hwpt_id}")]
+pub struct RealmViommuAllocError {
+    pub dev_id: u32,
+    pub hwpt_id: u32,
+    #[source]
+    pub errno: nix::errno::Errno,
+}
 
 /// Outcome of [`IommufdCtx::viommu_alloc`].
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -308,6 +381,35 @@ struct IommuViommuAlloc {
     data_len: u32,
     __reserved: u32,
     data_uptr: u64,
+}
+
+impl IommuViommuAlloc {
+    fn new(viommu_type: u32, dev_id: u32, hwpt_id: u32) -> Self {
+        Self {
+            size: size_of::<Self>() as u32,
+            flags: 0,
+            r#type: viommu_type,
+            dev_id,
+            hwpt_id,
+            out_viommu_id: 0,
+            data_len: 0,
+            __reserved: 0,
+            data_uptr: 0,
+        }
+    }
+}
+
+fn classify_viommu_alloc(
+    viommu_type: u32,
+    result: Result<u32, nix::errno::Errno>,
+) -> Result<ViommuAlloc, nix::errno::Errno> {
+    match result {
+        Ok(id) => Ok(ViommuAlloc::Allocated(id)),
+        Err(nix::errno::Errno::EINVAL) if viommu_type == IOMMU_VIOMMU_TYPE_ARM_SMMUV3 => {
+            Ok(ViommuAlloc::Incompatible)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 // --- Virtual device ---
@@ -404,6 +506,28 @@ impl IommufdCtx {
                 .context("IOMMU_IOAS_ALLOC failed")?;
         }
         Ok(cmd.out_ioas_id)
+    }
+
+    /// Enable or disable coalescing contiguous pages in this IOAS's DMA mappings.
+    ///
+    /// Linux enables coalescing by default. Passing `false` limits mappings to
+    /// the host page size, as required by the initial Realm assignment path.
+    /// This is not the VM's RAM hugetlb policy. Configure it before DMA mapping.
+    pub fn ioas_set_huge_pages(
+        &self,
+        ioas_id: u32,
+        enabled: bool,
+    ) -> Result<(), IoasHugePagesError> {
+        let mut cmd = IommuOption::huge_pages(ioas_id, enabled);
+        // SAFETY: the fd is borrowed from self and cmd is a fully initialized,
+        // correctly sized scalar-only ioctl buffer.
+        unsafe { ioctl::iommu_option(self.file.as_raw_fd(), &mut cmd) }
+            .map(|_| ())
+            .map_err(|errno| IoasHugePagesError {
+                ioas_id,
+                enabled,
+                errno,
+            })
     }
 
     /// Map a user VA range into an IOAS at a fixed IOVA.
@@ -657,36 +781,60 @@ impl IommufdCtx {
     /// `dev_id` is a device bound to the physical IOMMU backing this vIOMMU.
     /// `hwpt_id` is the nesting parent HWPT to associate with.
     ///
-    /// Returns [`ViommuAlloc::Incompatible`] when the nesting parent and device
-    /// belong to different physical SMMUs. For this wrapper all generic fields
+    /// For `IOMMU_VIOMMU_TYPE_ARM_SMMUV3`, returns [`ViommuAlloc::Incompatible`]
+    /// when the nesting parent and device belong to different physical SMMUs.
+    /// For this type all generic fields
     /// are fixed to valid Arm SMMUv3 values and `hwpt_id` is supplied by
     /// [`IommufdCtx::hwpt_alloc`] with `IOMMU_HWPT_ALLOC_NEST_PARENT`; after
     /// those core checks, the Arm driver returns `EINVAL` only when the parent
-    /// domain's SMMU differs from the device's SMMU.
+    /// domain's SMMU differs from the device's SMMU. Other types propagate
+    /// `EINVAL` as an error. Use [`Self::viommu_alloc_realm`] for Realm allocation.
     pub fn viommu_alloc(
         &self,
         viommu_type: u32,
         dev_id: u32,
         hwpt_id: u32,
     ) -> anyhow::Result<ViommuAlloc> {
-        let mut cmd = IommuViommuAlloc {
-            size: size_of::<IommuViommuAlloc>() as u32,
-            flags: 0,
-            r#type: viommu_type,
-            dev_id,
-            hwpt_id,
-            out_viommu_id: 0,
-            data_len: 0,
-            __reserved: 0,
-            data_uptr: 0,
-        };
+        classify_viommu_alloc(
+            viommu_type,
+            self.viommu_alloc_raw(viommu_type, dev_id, hwpt_id),
+        )
+        .context("IOMMU_VIOMMU_ALLOC failed")
+    }
+
+    /// Allocate an Arm Realm vIOMMU, preserving every kernel error.
+    ///
+    /// Before binding the VFIO cdev to this IOMMUFD, associate it with the KVM
+    /// VM using `KVM_DEV_VFIO_FILE_ADD`. The kernel obtains that KVM association
+    /// from `dev_id` and creates the Realm if necessary. `hwpt_id` must be a
+    /// nesting parent for the device's physical SMMU.
+    ///
+    /// The caller owns the returned object ID and must destroy dependent
+    /// objects before destroying it. This does not lock or accept a TDISP
+    /// device, attach an HWPT, or enable DMA.
+    pub fn viommu_alloc_realm(
+        &self,
+        dev_id: u32,
+        hwpt_id: u32,
+    ) -> Result<u32, RealmViommuAllocError> {
+        self.viommu_alloc_raw(IOMMU_VIOMMU_TYPE_ARM_REALM_SMMUV3, dev_id, hwpt_id)
+            .map_err(|errno| RealmViommuAllocError {
+                dev_id,
+                hwpt_id,
+                errno,
+            })
+    }
+
+    fn viommu_alloc_raw(
+        &self,
+        viommu_type: u32,
+        dev_id: u32,
+        hwpt_id: u32,
+    ) -> Result<u32, nix::errno::Errno> {
+        let mut cmd = IommuViommuAlloc::new(viommu_type, dev_id, hwpt_id);
         // SAFETY: fd is valid, struct correctly constructed.
-        let r = unsafe { ioctl::iommu_viommu_alloc(self.file.as_raw_fd(), &mut cmd) };
-        match r {
-            Ok(_) => Ok(ViommuAlloc::Allocated(cmd.out_viommu_id)),
-            Err(nix::errno::Errno::EINVAL) => Ok(ViommuAlloc::Incompatible),
-            Err(err) => Err(err).context("IOMMU_VIOMMU_ALLOC failed"),
-        }
+        unsafe { ioctl::iommu_viommu_alloc(self.file.as_raw_fd(), &mut cmd) }?;
+        Ok(cmd.out_viommu_id)
     }
 
     /// Allocate a virtual device (vDevice) on a vIOMMU.
@@ -753,5 +901,126 @@ impl AsFd for IommufdCtx {
 impl AsRawFd for IommufdCtx {
     fn as_raw_fd(&self) -> RawFd {
         self.file.as_raw_fd()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nix::errno::Errno;
+    use std::mem::align_of;
+    use std::mem::offset_of;
+    use test_with_tracing::test;
+
+    #[test]
+    fn realm_object_abi_matches_linux() {
+        assert_eq!(IOMMU_VIOMMU_TYPE_ARM_REALM_SMMUV3, 3);
+        assert_eq!(
+            nix::request_code_none!(IOMMUFD_TYPE, IOMMUFD_CMD_OPTION),
+            0x3b87
+        );
+        assert_eq!(
+            nix::request_code_none!(IOMMUFD_TYPE, IOMMUFD_CMD_VIOMMU_ALLOC),
+            0x3b90
+        );
+        assert_eq!(size_of::<IommuOption>(), 24);
+        assert_eq!(align_of::<IommuOption>(), 8);
+        assert_eq!(offset_of!(IommuOption, size), 0);
+        assert_eq!(offset_of!(IommuOption, option_id), 4);
+        assert_eq!(offset_of!(IommuOption, op), 8);
+        assert_eq!(offset_of!(IommuOption, __reserved), 10);
+        assert_eq!(offset_of!(IommuOption, object_id), 12);
+        assert_eq!(offset_of!(IommuOption, val64), 16);
+        assert_eq!(size_of::<IommuViommuAlloc>(), 40);
+        assert_eq!(align_of::<IommuViommuAlloc>(), 8);
+        assert_eq!(offset_of!(IommuViommuAlloc, size), 0);
+        assert_eq!(offset_of!(IommuViommuAlloc, flags), 4);
+        assert_eq!(offset_of!(IommuViommuAlloc, r#type), 8);
+        assert_eq!(offset_of!(IommuViommuAlloc, dev_id), 12);
+        assert_eq!(offset_of!(IommuViommuAlloc, hwpt_id), 16);
+        assert_eq!(offset_of!(IommuViommuAlloc, out_viommu_id), 20);
+        assert_eq!(offset_of!(IommuViommuAlloc, data_len), 24);
+        assert_eq!(offset_of!(IommuViommuAlloc, __reserved), 28);
+        assert_eq!(offset_of!(IommuViommuAlloc, data_uptr), 32);
+    }
+
+    #[test]
+    fn huge_page_option_initializes_all_fields() {
+        for enabled in [false, true] {
+            let cmd = IommuOption::huge_pages(71, enabled);
+            assert_eq!(cmd.size, 24);
+            assert_eq!(cmd.option_id, 1);
+            assert_eq!(cmd.op, 0);
+            assert_eq!(cmd.__reserved, 0);
+            assert_eq!(cmd.object_id, 71);
+            assert_eq!(cmd.val64, u64::from(enabled));
+        }
+    }
+
+    #[test]
+    fn realm_viommu_request_has_no_extra_data() {
+        let cmd = IommuViommuAlloc::new(IOMMU_VIOMMU_TYPE_ARM_REALM_SMMUV3, 17, 23);
+        assert_eq!(cmd.size, 40);
+        assert_eq!(cmd.flags, 0);
+        assert_eq!(cmd.r#type, 3);
+        assert_eq!(cmd.dev_id, 17);
+        assert_eq!(cmd.hwpt_id, 23);
+        assert_eq!(cmd.out_viommu_id, 0);
+        assert_eq!(cmd.data_len, 0);
+        assert_eq!(cmd.__reserved, 0);
+        assert_eq!(cmd.data_uptr, 0);
+    }
+
+    #[test]
+    fn realm_allocation_errors_are_not_parent_probe_results() {
+        for kind in [
+            0,
+            IOMMU_VIOMMU_TYPE_ARM_SMMUV3,
+            2,
+            IOMMU_VIOMMU_TYPE_ARM_REALM_SMMUV3,
+            u32::MAX,
+        ] {
+            assert_eq!(
+                classify_viommu_alloc(kind, Ok(59)),
+                Ok(ViommuAlloc::Allocated(59))
+            );
+            for errno in [
+                Errno::EINVAL,
+                Errno::EOPNOTSUPP,
+                Errno::EIO,
+                Errno::ENOMEM,
+                Errno::ENOTTY,
+            ] {
+                let expected = if kind == IOMMU_VIOMMU_TYPE_ARM_SMMUV3 && errno == Errno::EINVAL {
+                    Ok(ViommuAlloc::Incompatible)
+                } else {
+                    Err(errno)
+                };
+                assert_eq!(classify_viommu_alloc(kind, Err(errno)), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn s1_bypass_ste_is_little_endian() {
+        let data = IommuHwptArmSmmuv3::s1_bypass();
+        assert_eq!(size_of::<IommuHwptArmSmmuv3>(), 16);
+        assert_eq!(
+            data.as_bytes(),
+            &[9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn realm_helpers_preserve_ioctl_errno() {
+        let ctx = IommufdCtx::from_file(fs::File::open("/dev/null").unwrap());
+        let error = ctx.viommu_alloc_realm(17, 23).unwrap_err();
+        assert_eq!(error.errno, Errno::ENOTTY);
+        assert_eq!(error.dev_id, 17);
+        assert_eq!(error.hwpt_id, 23);
+        let error = ctx.ioas_set_huge_pages(71, false).unwrap_err();
+        assert_eq!(error.errno, Errno::ENOTTY);
+        assert_eq!(error.ioas_id, 71);
+        assert!(!error.enabled);
     }
 }

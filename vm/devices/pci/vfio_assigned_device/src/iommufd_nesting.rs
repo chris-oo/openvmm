@@ -91,11 +91,6 @@ pub fn query_host_caps(ctx: &IommufdCtx, dev_id: u32) -> anyhow::Result<smmu::Ho
 /// Nested STE double-words `[DW0, DW1]` for the persistent **abort** HWPT:
 /// `STE.V=1` (bit 0), `STE.Config=0b000` (abort). All other fields RES0.
 const ABORT_STE_DWORDS: [u64; 2] = [0b1, 0];
-/// Nested STE double-words `[DW0, DW1]` for the persistent **bypass** HWPT:
-/// `STE.V=1` (bit 0), `STE.Config=0b100` (S1 bypass over the S2 parent; bit 3).
-/// All other fields RES0.
-const BYPASS_STE_DWORDS: [u64; 2] = [0b1001, 0];
-
 /// Owns a newly allocated iommufd object until its ID is transferred into
 /// long-lived state. Uncommitted objects are destroyed on scope exit.
 struct PendingIommufdObject<'a> {
@@ -301,9 +296,7 @@ impl SmmuAccelState {
                 dev_id,
                 viommu.id,
                 vfio_sys::iommufd::IOMMU_HWPT_DATA_ARM_SMMUV3,
-                Some(&vfio_sys::iommufd::IommuHwptArmSmmuv3 {
-                    ste: BYPASS_STE_DWORDS,
-                }),
+                Some(&vfio_sys::iommufd::IommuHwptArmSmmuv3::s1_bypass()),
             )
             .context("failed to allocate bypass HWPT for accel SMMU")?,
             "bypass HWPT",

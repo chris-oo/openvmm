@@ -8,6 +8,14 @@ VFIO device assignment lets a guest VM directly access a physical PCI device (su
 VFIO device assignment is experimental. PCI config space, BAR MMIO passthrough, MSI-X interrupts (via irqfd), and DMA are functional. Devices such as NVMe controllers work end-to-end.
 ```
 
+```admonish note
+Arm CCA trusted device assignment is not yet enabled. The `vfio_sys` crate
+has low-level helpers for IOAS page-size policy, Realm vIOMMU allocation,
+and S1-bypass descriptors. These do not provide the KVM/VFIO ownership
+wiring, private/shared DMA coordination, or TDISP device lifecycle.
+Do not use the unsafe-interrupt workaround below for trusted assignment.
+```
+
 ## Overview
 
 OpenVMM running on a Linux host can assign physical PCI devices to guest VMs using VFIO. The device is bound to the `vfio-pci` kernel driver, then OpenVMM opens it via VFIO and presents it to the guest as a PCIe endpoint.
