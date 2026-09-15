@@ -107,6 +107,19 @@ describes the source definitions.
   injection remains the partition-creation default, including when no IGVM
   metadata is supplied. Alternate injection and secure AVIC are not supported.
 
+  For multi-VP SNP IGVM boots, `--processors` must match the processor count
+  encoded in the image. Hyper-V-enlightened MSHV guests can start APs using
+  Hyper-V APIC-to-VP lookup and processor-start hypercalls. The guest kernel
+  must allocate shared hypercall input and output buffers for this path.
+
+  The `snp-linux-direct*.json` generator profiles put all CPUs and RAM in
+  NUMA node 0. For these fixed-profile images, use `--memory` matching the
+  image's RAM size, not a multi-node `--numa` configuration. Set
+  `--processors N --vps-per-socket N` to match the image's VP count and
+  contiguous APIC IDs; leave the APIC ID offset at 0. SMT can remain `auto`.
+  These launch arguments do not rewrite the measured ACPI tables. Regenerate
+  the IGVM after changing its topology or updating the generator.
+
   SNP does not support UEFI, VTL2, or hugetlb-backed memory. In addition to
   the minimal emulated chipset and serial console, optional devices are
   limited to virtio devices attached through PCIe.
