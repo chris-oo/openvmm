@@ -767,6 +767,10 @@ impl Partition for KvmPartition {
         virt::InitialVpStateSource::Registers
     }
 
+    fn vfio_assignment_provider(&self) -> Option<Arc<dyn pci_core::vfio::VfioVmProvider>> {
+        Some(crate::vfio::provider(self.inner.clone()))
+    }
+
     fn supports_reset(&self) -> Option<&dyn ResetPartition<Error = Self::Error>> {
         // TODO: Support resetting SNP launch state and rebuilding the protected
         // guest before advertising reset support.

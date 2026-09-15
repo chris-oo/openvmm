@@ -611,6 +611,14 @@ pub trait Partition: 'static + Hv1 + Inspect + Send + Sync {
         None
     }
 
+    /// Returns lazy, owning VFIO association access, if the backend supports it.
+    ///
+    /// Obtaining the provider performs no kernel device allocation.
+    #[cfg(target_os = "linux")]
+    fn vfio_assignment_provider(&self) -> Option<Arc<dyn pci_core::vfio::VfioVmProvider>> {
+        None
+    }
+
     /// Get the partition capabilities for this partition.
     fn caps(&self) -> &PartitionCapabilities;
 

@@ -20,6 +20,8 @@ pub mod dma;
 pub mod microsoft;
 pub mod msi;
 pub mod spec;
+#[cfg(target_os = "linux")]
+pub mod vfio;
 
 /// Defines one of the 4 legacy PCI INTx shared interrupt pins
 #[expect(missing_docs)] // self explanatory variants
