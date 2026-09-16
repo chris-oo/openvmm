@@ -18,7 +18,7 @@ pub enum BarAddressConfig {
     GuestAssigned,
     /// Use the physical BAR address reported by the host.
     HostAssigned,
-    /// Use an explicitly supplied host physical address.
+    /// Use an explicitly supplied guest PCI BAR address.
     Fixed(u64),
 }
 
@@ -64,4 +64,26 @@ pub struct VfioCdevDeviceHandle {
 
 impl ResourceId<PciDeviceHandleKind> for VfioCdevDeviceHandle {
     const ID: &'static str = "vfio-cdev";
+}
+
+/// An exclusively owned native CCA assignment, never an ordinary DMA resource.
+///
+/// The VM must preserve the boot requester ID and BAR addresses. Each handle
+/// owns a fresh cdev and IOMMUFD context; neither file may have external aliases.
+#[derive(MeshPayload)]
+pub struct VfioRealmDeviceHandle {
+    /// Host PCI address.
+    pub pci_id: String,
+    /// Fresh VFIO cdev.
+    pub cdev: File,
+    /// Fresh IOMMUFD context.
+    pub iommufd: File,
+    /// Fixed `(segment << 16) | PCI_DEVID(bus, devfn)` identity.
+    pub requester_id: u32,
+    /// Fixed boot BAR addresses. Guest-assigned active BARs are unsupported.
+    pub bar_addresses: [BarAddressConfig; 6],
+}
+
+impl ResourceId<PciDeviceHandleKind> for VfioRealmDeviceHandle {
+    const ID: &'static str = "vfio-realm";
 }
