@@ -2379,6 +2379,7 @@ dependencies = [
  "opentmk_disk",
  "paste",
  "powershell_builder",
+ "roxmltree",
  "serde",
  "serde_json",
  "sha2",

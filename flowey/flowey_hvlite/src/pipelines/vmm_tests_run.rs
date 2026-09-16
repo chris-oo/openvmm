@@ -66,6 +66,16 @@ pub struct VmmTestsRunCli {
     #[clap(long, default_value = "all()")]
     filter: String,
 
+    /// Run one exact tests-binary test with native nextest inside one FVP boot.
+    /// Diagnostic mode: model shutdown failures still fail the invocation.
+    #[clap(
+        long,
+        value_name = "EXACT_TEST_NAME",
+        requires = "incubator",
+        conflicts_with = "filter"
+    )]
+    fvp_single_test: Option<String>,
+
     /// pass `--verbose` to cargo
     #[clap(long)]
     verbose: bool,
@@ -183,6 +193,11 @@ pub struct VmmTestsRunCli {
     #[clap(long)]
     cca_in_place_payload_root: Option<PathBuf>,
 
+    /// Unchanged run-20260914-3 guest root (Image and guest-initrd.cpio).
+    /// Only the FVP CCA Realm VFIO profile accepts this separate guest payload.
+    #[clap(long, conflicts_with_all = ["custom_kernel", "custom_kernel_modules"])]
+    cca_tdisp_guest_root: Option<PathBuf>,
+
     /// Licensed FVP platform root (fallback: INCUBATOR_FVP_PLATFORM_ROOT).
     #[clap(long)]
     fvp_platform_root: Option<PathBuf>,
@@ -240,6 +255,7 @@ impl IntoPipeline for VmmTestsRunCli {
             target,
             dir,
             filter,
+            fvp_single_test,
             verbose,
             install_missing_deps,
             release,
@@ -265,9 +281,20 @@ impl IntoPipeline for VmmTestsRunCli {
             cca_initrd_archive_sha256,
             cca_initrd_archive,
             cca_in_place_payload_root,
+            cca_tdisp_guest_root,
             fvp_platform_root,
             shrinkwrap_package_root,
         } = self;
+
+        let filter = if let Some(name) = &fvp_single_test {
+            anyhow::ensure!(
+                filter == "all()",
+                "--fvp-single-test cannot be combined with --filter"
+            );
+            flowey_lib_hvlite::run_fvp_single_boot::single_test_filter(name)?
+        } else {
+            filter
+        };
 
         // When --incubator is set, --target must also be specified
         // to indicate the cross-compilation target for the incubator.
@@ -313,6 +340,26 @@ impl IntoPipeline for VmmTestsRunCli {
                 classify_incubator_platform(&path)
             })
             .transpose()?;
+        flowey_lib_hvlite::cca_tdisp_guest::validate_options(
+            cca_tdisp_guest_root.is_some(),
+            incubator_platform,
+            custom_kernel.is_some(),
+            custom_kernel_modules.is_some(),
+        )?;
+        let cca_tdisp_guest_root = cca_tdisp_guest_root
+            .map(|root| {
+                flowey_lib_hvlite::cca_tdisp_guest::resolve(
+                    &repo_root.join(root),
+                    dir.as_deref()
+                        .unwrap_or(&repo_root.join("target").join("vmm_tests")),
+                )
+            })
+            .transpose()?;
+        anyhow::ensure!(
+            fvp_single_test.is_none()
+                || incubator_platform.is_some_and(|platform| platform.is_fvp()),
+            "--fvp-single-test requires an FVP incubator profile"
+        );
         let fvp_roots = if incubator_platform.is_some_and(|platform| platform.is_fvp()) {
             validate_fvp_target(FlowPlatform::host(backend_hint), &target.as_triple())?;
             anyhow::ensure!(
@@ -359,6 +406,7 @@ impl IntoPipeline for VmmTestsRunCli {
         let cca_platform_source = match incubator_platform {
             Some(
                 IncubatorPlatform::FvpCcaGuestMemfdInPlace
+                | IncubatorPlatform::FvpCcaRealmVfio
                 | IncubatorPlatform::QemuCcaGuestMemfdInPlace,
             ) => {
                 anyhow::ensure!(
@@ -725,6 +773,7 @@ impl IntoPipeline for VmmTestsRunCli {
                     selections: selections_from_resolved(filter, resolved, target_os),
                     release,
                     build_only,
+                    fvp_single_test,
                     copy_extras,
                     custom_kernel_modules,
                     custom_kernel,
@@ -745,6 +794,7 @@ impl IntoPipeline for VmmTestsRunCli {
                     incubator_profile,
                     incubator_platform,
                     cca_platform_source,
+                    cca_tdisp_guest_root,
                     fvp_roots,
                     done: ctx.new_done_handle(),
                 }
@@ -1065,6 +1115,7 @@ fn classify_incubator_platform(profile: &Path) -> anyhow::Result<IncubatorPlatfo
             Some(value) => match value.as_str() {
                 Some("cca-v15") => Ok(IncubatorPlatform::FvpCca),
                 Some("guest-memfd-in-place") => Ok(IncubatorPlatform::FvpCcaGuestMemfdInPlace),
+                Some("realm-vfio") => Ok(IncubatorPlatform::FvpCcaRealmVfio),
                 _ => anyhow::bail!("unsupported FVP platform tuple"),
             },
         },
@@ -1424,6 +1475,10 @@ mod tests {
                 "aarch64-fvp-cca-guest-memfd-in-place",
                 IncubatorPlatform::FvpCcaGuestMemfdInPlace,
             ),
+            (
+                "aarch64-fvp-cca-realm-vfio",
+                IncubatorPlatform::FvpCcaRealmVfio,
+            ),
         ] {
             let named = resolve_incubator(Some(name.into()), &target).unwrap();
             assert!(matches!(named, IncubatorProfileNameOrPath::Name(_)));
@@ -1448,6 +1503,101 @@ mod tests {
     }
 
     #[test]
+    fn cca_tdisp_guest_cli_rejects_custom_kernel_flags() {
+        use clap::Parser;
+        #[derive(clap::Parser)]
+        struct Args {
+            #[clap(flatten)]
+            run: VmmTestsRunCli,
+        }
+        let args = Args::try_parse_from([
+            "probe",
+            "--cca-tdisp-guest-root",
+            "run-20260914-3/share",
+            "--build-only",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.run.cca_tdisp_guest_root.as_deref(),
+            Some(Path::new("run-20260914-3/share"))
+        );
+        for option in ["--custom-kernel", "--custom-kernel-modules"] {
+            assert!(
+                Args::try_parse_from([
+                    "probe",
+                    "--cca-tdisp-guest-root",
+                    "share",
+                    option,
+                    "custom",
+                ])
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn cca_tdisp_guest_profile_guard_precedes_input_discovery() {
+        use clap::Parser;
+        #[derive(clap::Parser)]
+        struct Args {
+            #[clap(flatten)]
+            run: VmmTestsRunCli,
+        }
+        let args = Args::try_parse_from([
+            "probe",
+            "--cca-tdisp-guest-root",
+            "does-not-exist",
+            "--build-only",
+        ])
+        .unwrap();
+        let error = args
+            .run
+            .into_pipeline(PipelineBackendHint::Local)
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("requires the FVP CCA Realm VFIO profile"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn single_boot_cli_requires_incubator_and_an_exclusive_selection() {
+        use clap::Parser;
+        #[derive(clap::Parser)]
+        struct Args {
+            #[clap(flatten)]
+            run: VmmTestsRunCli,
+        }
+        let args = Args::try_parse_from([
+            "probe",
+            "--incubator",
+            "profile.toml",
+            "--fvp-single-test",
+            "module::case",
+            "--build-only",
+        ])
+        .unwrap();
+        assert_eq!(args.run.fvp_single_test.as_deref(), Some("module::case"));
+        assert!(args.run.build_only);
+        assert!(Args::try_parse_from(["probe", "--fvp-single-test", "case"]).is_err());
+        assert!(
+            Args::try_parse_from([
+                "probe",
+                "--incubator",
+                "profile.toml",
+                "--fvp-single-test",
+                "case",
+                "--filter",
+                "all()",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn parses_target_runner_with_arguments() {
         let runner = parse_target_runner(OsStr::new("qemu-aarch64 -L '/sys root'")).unwrap();
 
@@ -1457,6 +1607,13 @@ mod tests {
 
     #[test]
     fn classifies_incubator_profile_backend() {
+        let realm_vfio = classify_incubator_platform(
+            &crate::repo_root().join("petri/incubator/profiles/aarch64-fvp-cca-realm-vfio.toml"),
+        )
+        .unwrap();
+        assert_eq!(realm_vfio, IncubatorPlatform::FvpCcaRealmVfio);
+        assert!(realm_vfio.is_fvp());
+        assert!(realm_vfio.is_in_place());
         assert_eq!(
             classify_incubator_platform(
                 &crate::repo_root()

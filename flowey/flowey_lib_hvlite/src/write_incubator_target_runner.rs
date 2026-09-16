@@ -37,8 +37,21 @@ const NEXTEST_ARCHIVE_TMP_DIR: &str = "nextest-archive-tmp";
 const DEFAULT_INCUBATOR_RUST_LOG: &str = "info";
 // Incubator's FVP staging reads this inventory and adds the invoked nextest
 // binary in memory. Archives, cached files, and earlier outputs are not inputs.
-const FVP_SHARE_MANIFEST: &str = ".openvmm-fvp-share.json";
-const FVP_SHARE_INPUTS: &[&str] = &["pipette", "openvmm", "aarch64/Image", "aarch64/initrd"];
+pub(crate) const FVP_SHARE_MANIFEST: &str = ".openvmm-fvp-share.json";
+pub(crate) const FVP_SHARE_INPUTS: &[&str] =
+    &["pipette", "openvmm", "aarch64/Image", "aarch64/initrd"];
+
+pub(crate) fn fvp_share_inputs(cca_tdisp_guest: bool) -> Vec<&'static str> {
+    FVP_SHARE_INPUTS
+        .iter()
+        .chain(if cca_tdisp_guest {
+            crate::cca_tdisp_guest::SHARE_INPUTS
+        } else {
+            &[]
+        })
+        .copied()
+        .collect()
+}
 
 /// Incubator platform selected at Flowey graph construction time.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,17 +66,22 @@ pub enum IncubatorPlatform {
     FvpCca,
     /// Pinned local firmware and payload for in-place guest_memfd tests.
     FvpCcaGuestMemfdInPlace,
+    /// Pinned AHCI fixture for Realm host-object tests, using the local payload.
+    FvpCcaRealmVfio,
 }
 
 impl IncubatorPlatform {
     pub fn is_fvp(self) -> bool {
-        matches!(self, Self::FvpCca | Self::FvpCcaGuestMemfdInPlace)
+        matches!(
+            self,
+            Self::FvpCca | Self::FvpCcaGuestMemfdInPlace | Self::FvpCcaRealmVfio
+        )
     }
 
     pub fn is_in_place(self) -> bool {
         matches!(
             self,
-            Self::QemuCcaGuestMemfdInPlace | Self::FvpCcaGuestMemfdInPlace
+            Self::QemuCcaGuestMemfdInPlace | Self::FvpCcaGuestMemfdInPlace | Self::FvpCcaRealmVfio
         )
     }
 }
@@ -220,6 +238,8 @@ flowey_request! {
         pub firmware: Option<ReadVar<PathBuf>>,
         /// FVP uses only the prepared content directory as its guest share.
         pub fvp_roots: Option<FvpPlatformRoots>,
+        /// Presence selects the fixed extra guest inventory; dependency proves staging completed.
+        pub cca_tdisp_guest: Option<ReadVar<SideEffect>>,
         /// Path to the OpenVMM repo root. Must contain any repo-relative paths
         /// referenced by the runner's environment (e.g. `NEXTEST_WORKSPACE_ROOT`,
         /// `CARGO_MANIFEST_DIR`) so they fall under the computed incubator share
@@ -259,6 +279,7 @@ impl SimpleFlowNode for Node {
             initrd,
             firmware,
             fvp_roots,
+            cca_tdisp_guest,
             repo_root,
             test_content_dir,
             extra_share_paths,
@@ -267,9 +288,15 @@ impl SimpleFlowNode for Node {
             target,
             nextest_env,
         } = request;
+        anyhow::ensure!(
+            cca_tdisp_guest.is_none() || fvp_roots.is_some(),
+            "CCA TDISP guest sharing requires FVP"
+        );
+        let has_cca_tdisp_guest = cca_tdisp_guest.is_some();
 
         ctx.emit_rust_step("compute incubator target runner env", |ctx| {
             let incubator = incubator.claim(ctx);
+            cca_tdisp_guest.claim(ctx);
             let kernel = kernel.claim(ctx);
             let initrd = initrd.claim(ctx);
             let firmware = firmware.claim(ctx);
@@ -338,7 +365,12 @@ impl SimpleFlowNode for Node {
                 add_incubator_target_runner_env(&mut nextest, &target, &incubator_bin);
                 if let Some(roots) = &fvp_roots {
                     add_fvp_runner_env(&mut nextest, roots)?;
-                    for relative in FVP_SHARE_INPUTS {
+                    crate::cca_tdisp_guest::validate_staged(
+                        &test_content_dir,
+                        has_cca_tdisp_guest,
+                    )?;
+                    let inputs = fvp_share_inputs(has_cca_tdisp_guest);
+                    for relative in &inputs {
                         anyhow::ensure!(
                             fs_err::symlink_metadata(test_content_dir.join(relative))?.is_file(),
                             "FVP guest input must be a regular file: {relative}"
@@ -346,7 +378,7 @@ impl SimpleFlowNode for Node {
                     }
                     fs_err::write(
                         test_content_dir.join(FVP_SHARE_MANIFEST),
-                        serde_json::to_vec(FVP_SHARE_INPUTS)?,
+                        serde_json::to_vec(&inputs)?,
                     )?;
                 }
 
@@ -618,6 +650,18 @@ mod tests {
         assert_eq!(
             serde_json::to_value(FVP_SHARE_INPUTS).unwrap(),
             serde_json::json!(["pipette", "openvmm", "aarch64/Image", "aarch64/initrd"])
+        );
+        assert_eq!(fvp_share_inputs(false), FVP_SHARE_INPUTS);
+        assert_eq!(
+            fvp_share_inputs(true),
+            [
+                "pipette",
+                "openvmm",
+                "aarch64/Image",
+                "aarch64/initrd",
+                "cca-tdisp-guest/Image",
+                "cca-tdisp-guest/initrd",
+            ]
         );
     }
 

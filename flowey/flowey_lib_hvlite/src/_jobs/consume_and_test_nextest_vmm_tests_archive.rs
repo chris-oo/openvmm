@@ -21,6 +21,8 @@ pub struct CcaTestArtifacts {
     pub firmware: Option<ReadVar<PathBuf>>,
     pub qemu_binary: Option<ReadVar<PathBuf>>,
     pub fvp_roots: Option<crate::write_incubator_target_runner::FvpPlatformRoots>,
+    /// Checked original guest, separate from the L1 kernel and initrd.
+    pub cca_tdisp_guest_root: Option<PathBuf>,
 }
 
 #[expect(clippy::large_enum_variant)]
@@ -271,6 +273,14 @@ impl SimpleFlowNode for Node {
             }
         };
 
+        let cca_tdisp_guest = crate::cca_tdisp_guest::stage_for_run(
+            ctx,
+            cca_artifacts
+                .as_ref()
+                .and_then(|a| a.cca_tdisp_guest_root.clone()),
+            test_content_dir.clone(),
+        );
+
         let openvmm_repo_path = if test_content_dir_as_repo_root {
             test_content_dir.clone()
         } else {
@@ -339,6 +349,7 @@ impl SimpleFlowNode for Node {
             ctx.reqv(|v| crate::write_incubator_target_runner::Request {
                 incubator,
                 incubator_profile,
+                cca_tdisp_guest,
                 kernel: Some(kernel),
                 initrd: Some(initrd),
                 firmware,

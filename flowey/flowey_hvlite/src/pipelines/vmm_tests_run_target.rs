@@ -215,6 +215,7 @@ mod tests {
         for name in [
             "aarch64-fvp-cca",
             "aarch64-fvp-cca-guest-memfd-in-place",
+            "aarch64-fvp-cca-realm-vfio",
             "aarch64-qemu-cca",
             "aarch64-qemu-cca-guest-memfd-in-place",
         ] {

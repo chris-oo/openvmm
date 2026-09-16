@@ -229,13 +229,103 @@ These are in-process Virtio tests, not assigned-device or TDISP DMA tests.
 Both have passed on the pinned in-place FVP tuple. Neither has completed on
 the current in-place QEMU candidate.
 
+### Realm host-object preflight
+
+`realm_vfio_objects_cca_in_place` requires a separate DA-capable FVP fixture
+with `cca`, `guest_memfd_in_place`, and `cca_realm_vfio`. The fixture must
+prepare the modeled AHCI controller through the host TSM and VFIO cdev path,
+then publish `INCUBATOR_VFIO_BDF_CCA_REALM_VFIO`. The ordinary in-place
+Virtio profile does not provide this fixture.
+
+```admonish warning
+This DA fixture is not yet qualified. FVP 11.31.28 aborts during shutdown
+even after VFIO unbind and host TSM disconnect complete. Enumeration fails
+before the Realm-object test runs. A smaller host-only TSM connect/disconnect
+sequence also fails without VFIO, a Realm VM, or GDB; AHCI unbind alone exits
+cleanly. The corrupting operation remains unidentified.
+```
+
+The separate `aarch64-fvp-cca-realm-vfio.toml` profile selects the identities
+in `petri/incubator/platforms/fvp-cca-realm-vfio.yaml`. Provision its local
+inputs once, from the repository root:
+
+```bash
+python3 petri/incubator/platforms/provision-realm-vfio.py
+```
+
+This requires the recorded Stage A package under
+`target/cca-tdisp-stage-a/package`, including firmware, measurements and public
+sample certificate/key. The AHCI disk comes from the saved
+`runs/run-20260914-3/package/cca-3world/ahci-disk.img` under that Stage A tree,
+not the zero-filled firmware-build image. It creates the separate
+`target/cca-tdisp-stage-a/realm-vfio-reference-platform` package and overlay, refuses
+an existing destination, and does not rebuild firmware or change source
+inputs. These remain local test assets, not a published FVP release.
+
+The test runs natively on the AArch64 Linux host. It creates a dormant
+one-VP Realm using the real KVM backend and prepares in-place backing,
+GICv3 and ITS state. It does not map or populate RAM or run the VP.
+It then uses the production Realm object owner to prepare, attach with a
+synthetic requester ID, and explicitly close the IOMMUFD graph.
+
+Two cycles on the same partition reopen the VFIO cdev and IOMMUFD context
+to check that the prior binding was released. Both cycles and outer
+incubator shutdown must succeed. An ignored or enumeration-only run does
+not qualify the fixture. Cleanup errors remain failures, with the remaining
+owner state logged for recovery.
+
+This checks host-object creation and teardown only. It does not qualify
+guest PCI enumeration, BAR access, interrupts, private DMA, or TDISP LOCK/RUN.
+
+```bash
+NEXTEST_TEST_THREADS=1 PYTHONDONTWRITEBYTECODE=1 cargo xflowey vmm-tests-run \
+  --target linux-aarch64-musl \
+  --incubator petri/incubator/profiles/aarch64-fvp-cca-realm-vfio.toml \
+  --fvp-platform-root target \
+  --shrinkwrap-package-root target/cca-tdisp-stage-a/realm-vfio-reference-platform/package \
+  --cca-in-place-payload-root target/cca-tdisp-stage-a/test-platform/payload \
+  --dir vmm_test_results/realm-vfio-objects \
+  --filter 'binary(=tests) & test(realm_vfio_objects_cca_in_place)'
+```
+
+### Unchanged reference guest
+
+`tdisp_ahci::boot_linux_direct_cca_tdisp_ahci` uses the exact Image and initrd
+from Stage A run 3. The initrd already contains the guest TSM and 64 MiB disk
+read test, so this test adds neither pipette nor a guest helper. Flowey and
+the test check both input hashes. OpenVMM uses its own PL011 console arguments.
+This path is under implementation; no end-to-end pass has been established.
+
+Use the DA profile and roots above, add `--cca-tdisp-guest-root` pointing to
+`target/cca-tdisp-stage-a/runs/run-20260914-3/share`, and replace `--filter`
+with the exact single-boot selection:
+
+```bash
+--fvp-single-test \
+  aarch64_exclusive::tdisp_ahci::openvmm_linux_aarch64_boot_linux_direct_cca_tdisp_ahci
+```
+
+Single-boot execution runs native nextest enumeration and the selected test
+before L1 shutdown. It records guest execution, cleanup and model shutdown
+separately; model failure still fails the command. The original guest's
+unlock marker is not proof of host protected-map reclamation. I/O followed
+by failed cleanup is not a clean lifecycle or private-DMA qualification.
+
+The fixture must unbind its VFIO driver and disconnect its owned host TSM
+connection before L1 poweroff. Fixture cleanup errors and model shutdown
+failures remain failures even when a test command succeeds.
+
 ## Build now, run later
 
-Add `--build-only` to a command above to prepare the artifacts without
+For ordinary CCA runs, add `--build-only` to prepare the artifacts without
 running the tests. Run the generated `run.sh` on the same build host.
 It retains the resolved payload, firmware and FVP input paths, so keep those
 inputs at their original locations. This script is not a portable target-side
 test package.
+
+With `--fvp-single-test`, `--build-only` prepares the private test inputs
+without booting FVP or emitting a multi-boot `run.sh`. Run the original
+command without `--build-only` to execute that test.
 
 `vmm-tests-run-target --incubator` rejects CCA profiles before constructing
 the execution pipeline. Use `vmm-tests-run` or its generated host-side script;

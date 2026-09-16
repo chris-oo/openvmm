@@ -208,6 +208,8 @@ flowey_request! {
 
         /// Whether to run the tests or just build and archive
         pub build_only: bool,
+        /// Run this exact tests-binary test within one FVP invocation.
+        pub fvp_single_test: Option<String>,
         /// Copy extras to output dir (symbols, etc)
         pub copy_extras: bool,
 
@@ -235,6 +237,8 @@ flowey_request! {
             Option<crate::write_incubator_target_runner::IncubatorPlatform>,
         /// Coherent CCA platform artifact source.
         pub cca_platform_source: Option<CcaPlatformSource>,
+        /// Explicit root of the unchanged, pinned CCA TDISP guest.
+        pub cca_tdisp_guest_root: Option<PathBuf>,
         /// Licensed FVP toolchain and package input directories.
         pub fvp_roots: Option<crate::write_incubator_target_runner::FvpPlatformRoots>,
 
@@ -242,16 +246,28 @@ flowey_request! {
     }
 }
 
-fn validate_fvp_selections(selections: &VmmTestSelections) -> anyhow::Result<()> {
+fn validate_fvp_selections(
+    selections: &VmmTestSelections,
+    cca_tdisp_guest: bool,
+) -> anyhow::Result<()> {
     let allowed = BuildSelections {
         openvmm: true,
         pipette_linux: true,
         ..Default::default()
     };
-    anyhow::ensure!(
+    let no_agent = BuildSelections {
+        pipette_linux: false,
+        ..allowed.clone()
+    };
+    let valid_build = if cca_tdisp_guest {
+        selections.filter
+            == crate::run_fvp_single_boot::single_test_filter(crate::cca_tdisp_guest::TEST_NAME)?
+            && selections.build == no_agent
+    } else {
         selections.build == allowed
-            && selections.downloaded_artifacts.is_empty()
-            && !selections.needs_release_igvm,
+    };
+    anyhow::ensure!(
+        valid_build && selections.downloaded_artifacts.is_empty() && !selections.needs_release_igvm,
         "FVP CCA supports only direct-boot CCA artifacts; narrow --filter to the CCA tests"
     );
     Ok(())
@@ -525,21 +541,56 @@ mod tests {
 
     #[test]
     fn fvp_selects_only_source_matched_cca_binaries() {
-        validate_fvp_selections(&fvp_selections()).unwrap();
+        validate_fvp_selections(&fvp_selections(), false).unwrap();
         let mut selections = fvp_selections();
         selections.build.openhcl_standard = true;
-        assert!(validate_fvp_selections(&selections).is_err());
+        assert!(validate_fvp_selections(&selections, false).is_err());
         selections = fvp_selections();
         selections.build.guest_test_uefi = true;
-        assert!(validate_fvp_selections(&selections).is_err());
+        assert!(validate_fvp_selections(&selections, false).is_err());
         selections = fvp_selections();
         selections.needs_release_igvm = true;
-        assert!(validate_fvp_selections(&selections).is_err());
+        assert!(validate_fvp_selections(&selections, false).is_err());
         selections = fvp_selections();
         selections
             .downloaded_artifacts
             .push(KnownTestArtifacts::Alpine323Aarch64Vhd);
-        assert!(validate_fvp_selections(&selections).is_err());
+        assert!(validate_fvp_selections(&selections, false).is_err());
+    }
+
+    #[test]
+    fn fvp_no_agent_requires_the_pinned_guest_and_exact_da_selection() {
+        let mut selections = fvp_selections();
+        selections.build.pipette_linux = false;
+        selections.filter =
+            crate::run_fvp_single_boot::single_test_filter(crate::cca_tdisp_guest::TEST_NAME)
+                .unwrap();
+        validate_fvp_selections(&selections, true).unwrap();
+        assert!(validate_fvp_selections(&selections, false).is_err());
+        assert!(validate_fvp_selections(&fvp_selections(), true).is_err());
+        let exact = selections.filter.clone();
+        for filter in [
+            "all()",
+            "binary(=tests) & test(=some_other_no_agent_test)",
+            &format!("{exact} | test(other)"),
+        ] {
+            selections.filter = filter.into();
+            assert!(validate_fvp_selections(&selections, true).is_err());
+            selections.build.pipette_linux = true;
+            assert!(validate_fvp_selections(&selections, true).is_err());
+            selections.build.pipette_linux = false;
+        }
+        selections.filter = exact;
+        selections.build.guest_test_uefi = true;
+        assert!(validate_fvp_selections(&selections, true).is_err());
+        selections.build.guest_test_uefi = false;
+        selections.needs_release_igvm = true;
+        assert!(validate_fvp_selections(&selections, true).is_err());
+        selections.needs_release_igvm = false;
+        selections
+            .downloaded_artifacts
+            .push(KnownTestArtifacts::Alpine323Aarch64Vhd);
+        assert!(validate_fvp_selections(&selections, true).is_err());
     }
 }
 
@@ -578,6 +629,8 @@ impl SimpleFlowNode for Node {
         ctx.import::<crate::_jobs::build_and_publish_openhcl_igvm_from_recipe::Node>();
         ctx.import::<crate::_jobs::consume_and_test_nextest_vmm_tests_archive::Node>();
         ctx.import::<crate::build_flowey_hvlite::Node>();
+        ctx.import::<crate::run_fvp_single_boot::Node>();
+        ctx.import::<flowey_lib_common::publish_test_results::Node>();
     }
 
     fn process_request(request: Self::Request, ctx: &mut NodeCtx<'_>) -> anyhow::Result<()> {
@@ -588,6 +641,7 @@ impl SimpleFlowNode for Node {
             selections,
             release,
             build_only,
+            fvp_single_test,
             copy_extras,
             custom_kernel_modules,
             custom_kernel,
@@ -599,6 +653,7 @@ impl SimpleFlowNode for Node {
             incubator_profile,
             incubator_platform,
             mut cca_platform_source,
+            cca_tdisp_guest_root,
             fvp_roots,
             done,
         } = request;
@@ -623,6 +678,22 @@ impl SimpleFlowNode for Node {
         if let Some(source) = &mut cca_platform_source {
             source.protect_payload_from_output(&test_content_dir)?;
         }
+        crate::cca_tdisp_guest::validate_options(
+            cca_tdisp_guest_root.is_some(),
+            incubator_platform,
+            custom_kernel.is_some(),
+            custom_kernel_modules.is_some(),
+        )?;
+        let cca_tdisp_guest_root = cca_tdisp_guest_root
+            .map(|root| crate::cca_tdisp_guest::resolve(&root, &test_content_dir))
+            .transpose()?;
+        if let Some(name) = &fvp_single_test {
+            anyhow::ensure!(is_fvp, "single-boot execution requires FVP");
+            anyhow::ensure!(
+                selections.filter == crate::run_fvp_single_boot::single_test_filter(name)?,
+                "single-boot selection must match the exact requested test"
+            );
+        }
         let in_place = incubator_platform.is_some_and(|platform| platform.is_in_place());
         anyhow::ensure!(
             in_place
@@ -645,7 +716,7 @@ impl SimpleFlowNode for Node {
                         == target_lexicon::OperatingSystem::Linux,
                 "FVP CCA requires a Linux host and an AArch64 Linux target"
             );
-            validate_fvp_selections(&selections)?;
+            validate_fvp_selections(&selections, cca_tdisp_guest_root.is_some())?;
             cca_platform_source
                 .as_ref()
                 .context("FVP CCA requires configured payload artifacts")?
@@ -800,6 +871,7 @@ impl SimpleFlowNode for Node {
                 firmware: Some(platform.map(ctx, |output| output.firmware)),
                 qemu_binary: Some(qemu_binary),
                 fvp_roots: None,
+                cca_tdisp_guest_root: None,
             })
         } else {
             fvp_payload.map(|payload| CcaTestArtifacts {
@@ -809,6 +881,7 @@ impl SimpleFlowNode for Node {
                 firmware: None,
                 qemu_binary: None,
                 fvp_roots: fvp_roots.clone(),
+                cca_tdisp_guest_root,
             })
         };
 
@@ -996,6 +1069,7 @@ impl SimpleFlowNode for Node {
             output
         });
 
+        // The incubator's L1 runner needs pipette even when the L2 guest has no agent.
         let register_pipette_linux_musl = (build.pipette_linux || incubator_profile.is_some())
             .then(|| {
                 let output = ctx.reqv(|v| crate::build_pipette::Request {
@@ -1331,7 +1405,7 @@ impl SimpleFlowNode for Node {
             tpm_guest_tests_linux: register_tpm_guest_tests_linux,
         };
 
-        if build_only {
+        if build_only || fvp_single_test.is_some() {
             let initialized = ctx.reqv(|v| crate::init_vmm_tests_content_dir::Request {
                 test_content_dir: ReadVar::from_static(test_content_dir.clone()),
                 vmm_tests_target: target_triple.clone(),
@@ -1361,6 +1435,11 @@ impl SimpleFlowNode for Node {
                     .reqv(crate::download_openvmm_vmm_tests_artifacts::Request::GetDownloadFolder);
                 let test_content_dir_var =
                     ReadVar::from_static(test_content_dir.clone()).depending_on(ctx, &initialized);
+                let cca_tdisp_guest = crate::cca_tdisp_guest::stage_for_run(
+                    ctx,
+                    artifacts.cca_tdisp_guest_root,
+                    test_content_dir_var.clone(),
+                );
                 let (archive, nextest_vmm_tests_archive) = ctx.new_var();
                 let (incubator, incubator_write) = ctx.new_var();
                 ctx.req(crate::resolve_vmm_tests_pipeline_artifacts::Request {
@@ -1385,20 +1464,95 @@ impl SimpleFlowNode for Node {
                 });
                 let archive_file = archive.map(ctx, |x| x.archive_file);
                 let extra_env = ctx.reqv(|v| crate::write_incubator_target_runner::Request {
-                    incubator,
+                    incubator: incubator.clone(),
                     incubator_profile,
                     kernel: Some(artifacts.host_kernel),
                     initrd: Some(artifacts.initrd),
                     firmware: artifacts.firmware,
                     fvp_roots: artifacts.fvp_roots,
+                    cca_tdisp_guest: cca_tdisp_guest.clone(),
                     repo_root: repo_root.clone(),
-                    test_content_dir: test_content_dir_var,
+                    test_content_dir: test_content_dir_var.clone(),
                     extra_share_paths: vec![archive_file.clone(), config_file.clone()],
                     extra_env: Some(extra_env),
                     qemu_binary: artifacts.qemu_binary,
-                    target: target_triple,
+                    target: target_triple.clone(),
                     nextest_env: v,
                 });
+                if let Some(test_name) = fvp_single_test {
+                    let native_nextest = ctx.reqv(|v| {
+                        flowey_lib_common::download_cargo_nextest::Request::Get(
+                            target_triple.clone(),
+                            v,
+                        )
+                    });
+                    side_effects.push(ctx.emit_rust_step("stage native FVP nextest", |ctx| {
+                        let native_nextest = native_nextest.claim(ctx);
+                        let content = test_content_dir_var.claim(ctx);
+                        move |rt| {
+                            let content = rt.read(content);
+                            let nextest = content.join("cargo-nextest");
+                            fs_err::copy(rt.read(native_nextest), &nextest)?;
+                            nextest.make_executable()?;
+                            // Do not leave a prior multi-boot script beside a
+                            // single-boot-only artifact set.
+                            match fs_err::remove_file(content.join("run.sh")) {
+                                Ok(()) => {}
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(error) => return Err(error.into()),
+                            }
+                            Ok(())
+                        }
+                    }));
+                    if build_only {
+                        side_effects.push(extra_env.into_side_effect());
+                        ctx.emit_side_effect_step(side_effects, [done]);
+                        return Ok(());
+                    }
+                    let platform =
+                        incubator_platform.context("single-boot FVP requires a platform")?;
+                    let incubator_bin = incubator.map(ctx, |output| output.bin);
+                    let results = ctx.reqv(|results| crate::run_fvp_single_boot::Request {
+                        platform,
+                        cca_tdisp_guest,
+                        incubator: incubator_bin,
+                        env: extra_env,
+                        content_dir: test_content_dir,
+                        test_name,
+                        profile: nextest_profile,
+                        pre_run_deps: side_effects,
+                        results,
+                    });
+                    let test_results = results.map(ctx, |result| result.test_results());
+                    let publication_dir = results.map(ctx, |result| result.run_directory);
+                    let published =
+                        ctx.reqv(|done| flowey_lib_common::publish_test_results::Request {
+                            test_results,
+                            test_label,
+                            attachments: Default::default(),
+                            output_dir: Some(publication_dir),
+                            upload_logs_on_success: true,
+                            done,
+                        });
+                    ctx.emit_rust_step("report single-boot test and session outcomes", |ctx| {
+                        published.claim(ctx);
+                        done.claim(ctx);
+                        let results = results.claim(ctx);
+                        move |rt| {
+                            let result = rt.read(results);
+                            log::info!("native JUnit reports: {:?}", result.reported_test_outcome);
+                            anyhow::ensure!(
+                                result.errors.is_empty(),
+                                "single-boot FVP session failed: {}; evidence: {}",
+                                result.errors.join("; "),
+                                result.run_directory.display()
+                            );
+                            log::info!("single-boot test and FVP session completed successfully");
+                            Ok(())
+                        }
+                    });
+                    return Ok(());
+                }
                 let nextest_bin = ctx.reqv(|v| {
                     flowey_lib_common::download_cargo_nextest::Request::Get(
                         target_lexicon::Triple::host(),
