@@ -246,7 +246,7 @@ impl PreparedFvpRun {
     ) -> anyhow::Result<()> {
         check(deadline, cancellation)?;
         platform.revalidate_sources(deadline)?;
-        for (source, relative) in platform.sources().into_iter().zip([
+        for (source, relative) in platform.sources().zip([
             "package/cca-3world.yaml",
             "config/kvm_cca_planes.yaml",
             "inputs/bl1.bin",
@@ -263,6 +263,26 @@ impl PreparedFvpRun {
                 cancellation,
             )?;
             source.verify_snapshot(&self.root, Path::new(relative), deadline)?;
+        }
+        for (source, relative) in platform.fixture_sources() {
+            let relative = Path::new("package").join(relative);
+            let destination = self.root.join(&relative);
+            fs::create_dir_all(destination.parent().context("missing fixture parent")?)?;
+            source.revalidate(deadline)?;
+            copy_verified(
+                source.path(),
+                &destination,
+                Some(source.sha256()),
+                deadline,
+                cancellation,
+            )?;
+            source.verify_snapshot(&self.root, &relative, deadline)?;
+        }
+        if !platform.realm_vfio.is_empty() {
+            let fixture = self.root.join("package/cca-3world");
+            let template = fs::read_to_string(fixture.join("pci.json"))?;
+            let relocated = Self::relocate_fixture(&template, &fixture)?;
+            fs::write(fixture.join("pci_fixedup.json"), relocated)?;
         }
         for (source, relative) in [(payload.0, "inputs/Image"), (payload.1, "inputs/initrd")] {
             copy_verified(
@@ -457,7 +477,29 @@ impl PreparedFvpRun {
                 .arg(format!("{name}={}", self.root.join(relative).display()));
         }
         command.args(["--rtvar", "CMDLINE="]);
+        if config.platform == crate::profile::FvpPlatform::RealmVfio {
+            command.arg("--rtvar").arg(format!(
+                "PCI_HIERARCHY_FILE_FIXED={}",
+                self.root
+                    .join("package/cca-3world/pci_fixedup.json")
+                    .display()
+            ));
+        }
         Ok(())
+    }
+
+    fn relocate_fixture(template: &str, root: &Path) -> anyhow::Result<String> {
+        ensure!(safe_path(root), "unsafe FVP fixture path");
+        ensure!(
+            template.matches("@FIXTURE_ROOT@").count() == 4,
+            "unexpected FVP fixture paths"
+        );
+        let relocated = template.replace(
+            "@FIXTURE_ROOT@",
+            root.to_str().context("non-UTF8 fixture root")?,
+        );
+        let _: serde_json::Value = serde_json::from_str(&relocated)?;
+        Ok(relocated)
     }
 
     /// Remove snapshots only after the caller has proved owned-process cleanup.
@@ -1382,5 +1424,26 @@ command cp "$SEMIHOSTDIR/startup.nsh" "$CAPTURE"
                 .is_err()
         );
         prepared.cleanup().unwrap();
+    }
+    #[test]
+    fn realm_vfio_json_relocation_is_owned_and_exact() {
+        let template = include_str!("../../platforms/fvp-realm-vfio-pci.json");
+        let root = Path::new("/owned/package/cca-3world");
+        let text = PreparedFvpRun::relocate_fixture(template, root).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let bridges = value.as_object().unwrap();
+        assert_eq!(bridges.len(), 1);
+        let devices = bridges["rootport/rootport0"]["__downstream__"]
+            .as_object()
+            .unwrap();
+        assert_eq!(devices.len(), 1);
+        assert!(devices.contains_key("ahci/ahci1"));
+        assert_eq!(
+            devices["ahci/ahci1"]["image_path"],
+            "/owned/package/cca-3world/ahci-disk.img"
+        );
+        assert!(!text.contains("@FIXTURE_ROOT@"));
+        assert!(PreparedFvpRun::relocate_fixture(template, Path::new("/unsafe path")).is_err());
+        assert!(PreparedFvpRun::relocate_fixture("{}", root).is_err());
     }
 }

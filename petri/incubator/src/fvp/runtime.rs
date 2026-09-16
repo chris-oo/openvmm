@@ -53,6 +53,447 @@ use std::time::Duration;
 use std::time::Instant;
 
 const LOG_LIMIT: u64 = 16 * 1024 * 1024;
+const OUTCOME_REPORT: &str = "run-outcome.json";
+
+#[derive(Clone, Debug, Default, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum CommandExecutionReport {
+    #[default]
+    NotAttempted,
+    Unknown {
+        error: Option<String>,
+    },
+    Exited {
+        /// Exit code, or 128 plus signal number, as returned by the runner.
+        normalized_exit_code: i32,
+    },
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum CaptureOutcomeReport {
+    #[default]
+    NotAttempted,
+    Unknown {
+        error: Option<String>,
+    },
+    Succeeded,
+    Failed {
+        error: String,
+    },
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize)]
+struct CommandOutcomeReport {
+    execution: CommandExecutionReport,
+    capture: CaptureOutcomeReport,
+}
+
+impl CommandOutcomeReport {
+    fn start(&mut self) {
+        self.execution = CommandExecutionReport::Unknown { error: None };
+        self.capture = CaptureOutcomeReport::Unknown { error: None };
+    }
+
+    fn exited(&mut self, normalized_exit_code: i32) {
+        self.execution = CommandExecutionReport::Exited {
+            normalized_exit_code,
+        };
+    }
+
+    fn observe(&mut self, result: &anyhow::Result<CompletedCommand>) {
+        match result {
+            Ok(completion) => {
+                self.exited(completion.exit_code);
+                self.capture = match &completion.capture {
+                    Ok(()) => CaptureOutcomeReport::Succeeded,
+                    Err(error) => CaptureOutcomeReport::Failed {
+                        error: report_error(error),
+                    },
+                };
+            }
+            Err(error) => {
+                if matches!(self.execution, CommandExecutionReport::Unknown { .. }) {
+                    self.execution = CommandExecutionReport::Unknown {
+                        error: Some(report_error(error)),
+                    };
+                }
+                if matches!(self.capture, CaptureOutcomeReport::Unknown { .. }) {
+                    self.capture = CaptureOutcomeReport::Unknown {
+                        error: Some(report_error(error)),
+                    };
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum LauncherOutcomeReport {
+    #[default]
+    NotAttempted,
+    Unknown {
+        error: Option<String>,
+    },
+    Exited {
+        exit_code: Option<i32>,
+        signal: Option<i32>,
+        success: bool,
+    },
+}
+
+impl LauncherOutcomeReport {
+    fn observe(&mut self, result: &anyhow::Result<std::process::ExitStatus>) {
+        match result {
+            Ok(status) => {
+                *self = Self::Exited {
+                    exit_code: status.code(),
+                    signal: status.signal(),
+                    success: status.success(),
+                };
+            }
+            Err(error) if !matches!(self, Self::NotAttempted) => {
+                *self = Self::Unknown {
+                    error: Some(report_error(error)),
+                };
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum FinalizationOutcomeReport {
+    #[default]
+    NotAttempted,
+    Unknown,
+    Succeeded,
+    Failed {
+        error: String,
+    },
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum OverallOutcomeReport {
+    #[default]
+    Pending,
+    Succeeded {
+        exit_code: i32,
+    },
+    Failed {
+        exit_code: Option<i32>,
+        error: Option<String>,
+    },
+}
+
+impl OverallOutcomeReport {
+    fn from_result(result: &anyhow::Result<i32>) -> Self {
+        match result {
+            Ok(0) => Self::Succeeded { exit_code: 0 },
+            Ok(code) => Self::Failed {
+                exit_code: Some(*code),
+                error: None,
+            },
+            Err(error) => Self::Failed {
+                exit_code: None,
+                error: Some(report_error(error)),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct RunOutcomeReport {
+    schema_version: u32,
+    run_id: Option<String>,
+    run_output_dir: Option<PathBuf>,
+    guest_command: CommandOutcomeReport,
+    fixture_teardown: CommandOutcomeReport,
+    /// The supervised launcher is Shrinkwrap, not the FVP process itself.
+    launcher_status_source: &'static str,
+    launcher_shutdown: LauncherOutcomeReport,
+    finalization: FinalizationOutcomeReport,
+    overall: OverallOutcomeReport,
+    report_write_errors: Vec<String>,
+}
+
+impl RunOutcomeReport {
+    fn initial() -> Self {
+        Self {
+            schema_version: 2,
+            run_id: None,
+            run_output_dir: None,
+            guest_command: CommandOutcomeReport::default(),
+            fixture_teardown: CommandOutcomeReport::default(),
+            launcher_status_source: "shrinkwrap",
+            launcher_shutdown: LauncherOutcomeReport::default(),
+            finalization: FinalizationOutcomeReport::default(),
+            overall: OverallOutcomeReport::default(),
+            report_write_errors: Vec::new(),
+        }
+    }
+}
+
+struct ReservedResultFile {
+    directory: File,
+    root: PathBuf,
+    name: std::ffi::OsString,
+    file: File,
+}
+
+impl ReservedResultFile {
+    fn reserve(root: &Path, requested: &Path) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !requested
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir)),
+            "FVP result file must not contain parent traversal"
+        );
+        let root = super::lifecycle::resolve_existing_ancestor(&std::path::absolute(root)?)?;
+        let path = std::path::absolute(requested)?;
+        anyhow::ensure!(
+            path.parent() == Some(root.as_path()),
+            "FVP result file must be a direct child of the canonical output directory"
+        );
+        let name = path
+            .file_name()
+            .context("missing FVP result filename")?
+            .to_owned();
+        let directory = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_DIRECTORY)
+            .open(&root)?;
+        let anchored = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+            .open(anchored.join(&name))
+            .context("FVP result file must be fresh; existing files and symlinks are rejected")?;
+        let mut reserved = Self {
+            directory,
+            root,
+            name,
+            file,
+        };
+        reserved.publish(&RunOutcomeReport::initial(), &Deadline::new(seconds(5))?)?;
+        Ok(reserved)
+    }
+
+    fn publish(&mut self, report: &RunOutcomeReport, deadline: &Deadline) -> anyhow::Result<()> {
+        deadline.remaining()?;
+        let actual_root = std::fs::symlink_metadata(&self.root)?;
+        let held_root = self.directory.metadata()?;
+        anyhow::ensure!(
+            actual_root.is_dir()
+                && (actual_root.dev(), actual_root.ino()) == (held_root.dev(), held_root.ino()),
+            "FVP result directory identity changed"
+        );
+        let anchored = PathBuf::from(format!("/proc/self/fd/{}", self.directory.as_raw_fd()));
+        let path = anchored.join(&self.name);
+        let current = std::fs::symlink_metadata(&path)?;
+        let held = self.file.metadata()?;
+        anyhow::ensure!(
+            current.is_file()
+                && current.nlink() == 1
+                && (current.dev(), current.ino()) == (held.dev(), held.ino()),
+            "FVP reserved result file identity changed"
+        );
+        self.file = write_outcome_snapshot(&anchored, &path, report, deadline)?;
+        Ok(())
+    }
+}
+
+struct OutcomeLedger {
+    output: PathBuf,
+    budget: Duration,
+    report: RunOutcomeReport,
+    write_errors: anyhow::Result<()>,
+    result_file: Option<ReservedResultFile>,
+}
+
+impl OutcomeLedger {
+    fn new(output: &Path, run_id: &str, budget: Duration) -> Self {
+        Self {
+            output: output.to_owned(),
+            budget,
+            report: RunOutcomeReport {
+                run_id: Some(run_id.into()),
+                ..RunOutcomeReport::initial()
+            },
+            write_errors: Ok(()),
+            result_file: None,
+        }
+    }
+
+    // Reporting errors must not short-circuit ordered process completion.
+    fn checkpoint(&mut self, phase: &str) {
+        let output = self.output.clone();
+        let budget = self.budget;
+        let mut result_file = self.result_file.take();
+        self.checkpoint_with(phase, |report| {
+            write_outcome_copies(
+                &output,
+                result_file.as_mut(),
+                report,
+                &Deadline::new(budget)?,
+            )
+        });
+        self.result_file = result_file;
+    }
+
+    fn checkpoint_with(
+        &mut self,
+        phase: &str,
+        write: impl FnOnce(&RunOutcomeReport) -> anyhow::Result<()>,
+    ) -> bool {
+        match write(&self.report) {
+            Ok(()) => true,
+            Err(error) => {
+                let error = error.context(format!("FVP outcome report checkpoint {phase} failed"));
+                self.report.report_write_errors.push(report_error(&error));
+                self.write_errors = combine(
+                    std::mem::replace(&mut self.write_errors, Ok(())),
+                    Err(error),
+                );
+                false
+            }
+        }
+    }
+
+    fn finish(mut self, outcome: anyhow::Result<i32>) -> anyhow::Result<i32> {
+        let output = self.output.clone();
+        let budget = self.budget;
+        let mut result_file = self.result_file.take();
+        self.finish_with(outcome, |report| {
+            write_outcome_copies(
+                &output,
+                result_file.as_mut(),
+                report,
+                &Deadline::new(budget)?,
+            )
+        })
+    }
+
+    fn defer_final_report(mut self, outcome: anyhow::Result<i32>) -> anyhow::Result<i32> {
+        // Retained workspace state may seal the entire output tree for later
+        // recovery. Updating this file would invalidate that receipt.
+        let outcome = combine_guest_outcome(
+            outcome,
+            combine(
+                std::mem::replace(&mut self.write_errors, Ok(())),
+                Err(anyhow::anyhow!(
+                    "FVP per-run outcome report remains incomplete: retained workspace may have sealed outputs"
+                )),
+            ),
+        );
+        // The caller's direct-child result file is outside the sealed per-run
+        // tree, so it can still publish the final failure without changing it.
+        if let Some(mut result_file) = self.result_file.take() {
+            let budget = self.budget;
+            self.finish_with(outcome, |report| {
+                result_file.publish(report, &Deadline::new(budget)?)
+            })
+        } else {
+            outcome
+        }
+    }
+
+    fn finish_with(
+        mut self,
+        outcome: anyhow::Result<i32>,
+        mut write: impl FnMut(&RunOutcomeReport) -> anyhow::Result<()>,
+    ) -> anyhow::Result<i32> {
+        let mut outcome =
+            combine_guest_outcome(outcome, std::mem::replace(&mut self.write_errors, Ok(())));
+        self.report.overall = OverallOutcomeReport::from_result(&outcome);
+        if !self.checkpoint_with("final", &mut write) {
+            outcome =
+                combine_guest_outcome(outcome, std::mem::replace(&mut self.write_errors, Ok(())));
+            self.report.overall = OverallOutcomeReport::from_result(&outcome);
+            // One bounded retry may publish the reporting failure itself.
+            // A successful retry does not turn the run back into success.
+            self.checkpoint_with("final_failure", &mut write);
+        }
+        combine_guest_outcome(outcome, self.write_errors)
+    }
+}
+
+fn report_error(error: &anyhow::Error) -> String {
+    const LIMIT: usize = 4096;
+    let mut text = format!("{error:#}");
+    if text.len() <= LIMIT {
+        text
+    } else {
+        let mut boundary = LIMIT;
+        while !text.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        text.truncate(boundary);
+        text.push_str(" [truncated]");
+        text
+    }
+}
+
+fn write_outcome_report(
+    output: &Path,
+    report: &RunOutcomeReport,
+    deadline: &Deadline,
+) -> anyhow::Result<()> {
+    write_outcome_snapshot(output, &output.join(OUTCOME_REPORT), report, deadline).map(|_| ())
+}
+
+fn write_outcome_copies(
+    output: &Path,
+    result_file: Option<&mut ReservedResultFile>,
+    report: &RunOutcomeReport,
+    deadline: &Deadline,
+) -> anyhow::Result<()> {
+    let local = write_outcome_report(output, report, deadline);
+    let external = if let Some(result_file) = result_file {
+        if let Err(error) = &local {
+            let mut failed = report.clone();
+            failed.report_write_errors.push(report_error(error));
+            if !matches!(failed.overall, OverallOutcomeReport::Pending) {
+                failed.overall = OverallOutcomeReport::Failed {
+                    exit_code: None,
+                    error: Some(report_error(error)),
+                };
+            }
+            result_file.publish(&failed, deadline)
+        } else {
+            result_file.publish(report, deadline)
+        }
+    } else {
+        Ok(())
+    };
+    combine(local, external)
+}
+
+fn write_outcome_snapshot(
+    output: &Path,
+    destination: &Path,
+    report: &RunOutcomeReport,
+    deadline: &Deadline,
+) -> anyhow::Result<File> {
+    deadline.remaining()?;
+    let mut snapshot = tempfile::NamedTempFile::new_in(output)?;
+    serde_json::to_writer_pretty(&mut snapshot, report)?;
+    snapshot.write_all(b"\n")?;
+    snapshot.flush()?;
+    snapshot.as_file().sync_all()?;
+    deadline.remaining()?;
+    // Publish only a complete, flushed snapshot. There are no fallible steps
+    // after publication that could leave a success report for a failed write.
+    snapshot
+        .persist(destination)
+        .map_err(|error| error.error.into())
+}
 
 /// Run one nextest listing or test command in a fresh, validated FVP L1.
 pub fn run(
@@ -76,7 +517,7 @@ pub fn run(
         crate::profile::FvpPlatform::CcaV15 => {
             petri_artifacts_common::cca_payload::LINUX_IMAGE_SHA256
         }
-        crate::profile::FvpPlatform::GuestMemfdInPlace => {
+        crate::profile::FvpPlatform::GuestMemfdInPlace | crate::profile::FvpPlatform::RealmVfio => {
             petri_artifacts_common::cca_payload::guest_memfd_in_place::LINUX_IMAGE_SHA256
         }
     };
@@ -90,6 +531,12 @@ pub fn run(
         &config.output_dir,
         &[&sources.platform_root, &sources.package_root],
     )?;
+    let result_file = if let Some(path) = &config.result_file {
+        std::fs::create_dir_all(&output_base)?;
+        Some(ReservedResultFile::reserve(&output_base, path)?)
+    } else {
+        None
+    };
     verify_payload(&config.kernel, kernel_sha256, &initial, &cancellation)?;
     verify_payload(&config.initrd, INITRD_SHA256, &initial, &cancellation)?;
     let directory = RuntimeDirectory::open(
@@ -137,6 +584,9 @@ pub fn run(
         .create(&output)
         .context("cannot create durable FVP output directory")?;
     tracing::info!(path = %output.display(), %run_id, "FVP run output");
+    let mut ledger = OutcomeLedger::new(&output, &run_id, seconds(profile.deadlines.validation));
+    ledger.result_file = result_file;
+    ledger.checkpoint("created");
     let mut prepared: Option<PreparedFvpRun> = None;
     let mut identity = None;
     let mut pool = DefaultPool::new();
@@ -169,6 +619,8 @@ pub fn run(
             }
             return Err(error);
         }
+        ledger.report.run_output_dir = Some(output.clone());
+        ledger.checkpoint("workspace_registered");
         let staging = prepared
             .as_ref()
             .context("missing registered FVP staging")?;
@@ -180,6 +632,7 @@ pub fn run(
             network: crate::CcaHostNetwork::Dhcp {
                 timeout: seconds(profile.deadlines.dhcp),
             },
+            realm_vfio: profile.platform == crate::profile::FvpPlatform::RealmVfio,
         };
         let kernel_copy = snapshot_payload(
             &config.kernel,
@@ -397,50 +850,132 @@ pub fn run(
         let connected = client
             .as_ref()
             .context("FVP readiness did not establish pipette")?;
-        let exit_code = session.execute_test(seconds(profile.deadlines.test_execution), |deadline, cancellation| {
+        let completion = session.execute_test(seconds(profile.deadlines.test_execution), |deadline, cancellation| {
             Ok(pool.run_until(bounded(&driver, deadline, cancellation, async {
+                let realm_vfio = profile.platform == crate::profile::FvpPlatform::RealmVfio;
+                if realm_vfio {
+                    let ready = connected.command("/bin/cat")
+                        .arg("/run/incubator-cca-realm-vfio").output().await?;
+                    anyhow::ensure!(
+                        ready.status.code() == Some(0) && ready.stdout == b"0000:01:00.0\n",
+                        "FVP Realm VFIO host fixture did not complete provisioning"
+                    );
+                }
                 let mut command = connected.command(program);
                 command.args(arguments);
                 for (key, value) in &config.guest_env {
-                    anyhow::ensure!(key != "PETRI_CAPABILITIES", "FVP runtime capabilities cannot be supplied by the guest environment");
+                    anyhow::ensure!(
+                        key != "PETRI_CAPABILITIES" && !key.starts_with("INCUBATOR_VFIO_"),
+                        "FVP runtime capabilities and VFIO identity cannot be supplied by the guest environment"
+                    );
                     command.env(key, value);
                 }
                 command.env("PETRI_CAPABILITIES", profile.capabilities.join(","));
+                if realm_vfio {
+                    command.env("INCUBATOR_VFIO_BDF_CCA_REALM_VFIO", "0000:01:00.0");
+                }
                 if let Some(directory) = &config.guest_current_dir { command.current_dir(directory); }
                 command
                     .stdin(pipette_client::process::Stdio::null())
                     .stdout(pipette_client::process::Stdio::piped())
                     .stderr(pipette_client::process::Stdio::piped());
+                let stdout_target = host_output(&driver, &std::io::stdout())?;
+                let stderr_target = host_output(&driver, &std::io::stderr())?;
+                ledger.report.guest_command.start();
+                ledger.checkpoint("guest_command_start");
                 let mut child = command.spawn().await.context("failed to dispatch FVP guest command")?;
                 let stdout = child.stdout.take().context("missing FVP command stdout pipe")?;
                 let stderr = child.stderr.take().context("missing FVP command stderr pipe")?;
-                let stdout_target = host_output(&driver, &std::io::stdout())?;
-                let stderr_target = host_output(&driver, &std::io::stderr())?;
-                let (status, (), ()) = futures::try_join!(
-                    async { child.wait().await.context("failed to wait for FVP guest command") },
+                wait_and_drain(
+                    async {
+                        let status = child.wait().await.context("failed to wait for FVP guest command")?;
+                        let code = status.code().or_else(|| status.signal().map(|signal| 128 + signal))
+                            .context("FVP guest command returned no exit status")?;
+                        ledger.report.guest_command.exited(code);
+                        ledger.checkpoint("guest_command_exit");
+                        Ok(code)
+                    },
                     drain_command_output(stdout, output.join("command.stdout.log"), stdout_target, deadline, cancellation),
                     drain_command_output(stderr, output.join("command.stderr.log"), stderr_target, deadline, cancellation),
-                )?;
-                status.code().or_else(|| status.signal().map(|signal| 128 + signal))
-                    .context("FVP guest command returned no exit status")
+                ).await
             })))
-        })??;
+        }).and_then(|result| result);
+        ledger.report.guest_command.observe(&completion);
+        ledger.checkpoint("guest_command_result");
+        let completion = completion?;
+        // Only confirmed completion permits fixture teardown. Capture errors
+        // remain failures, but do not erase the confirmed process exit.
+        let exit_code = completion.outcome();
+        let mut teardown = Ok(());
         let shutdown =
             session.shutdown_scoped(seconds(profile.deadlines.guest_shutdown), |deadline| {
+                if profile.platform == crate::profile::FvpPlatform::RealmVfio {
+                    let completion = pool.run_until(bounded(&driver, deadline, &cancellation, async {
+                        ledger.report.fixture_teardown.start();
+                        ledger.checkpoint("fixture_teardown_start");
+                        let mut child = connected.command("/bin/sh")
+                            .arg("/run/incubator-cca-realm-vfio-teardown.sh")
+                            .stdin(pipette_client::process::Stdio::null())
+                            .stdout(pipette_client::process::Stdio::piped())
+                            .stderr(pipette_client::process::Stdio::piped())
+                            .spawn().await?;
+                        let stdout = child.stdout.take().context("missing fixture teardown stdout")?;
+                        let stderr = child.stderr.take().context("missing fixture teardown stderr")?;
+                        wait_and_drain(
+                            async {
+                                let status = child.wait().await.context("failed to wait for fixture teardown")?;
+                                let code = status.code().or_else(|| status.signal().map(|signal| 128 + signal))
+                                    .context("fixture teardown returned no exit status")?;
+                                ledger.report.fixture_teardown.exited(code);
+                                ledger.checkpoint("fixture_teardown_exit");
+                                Ok(code)
+                            },
+                            drain_command_output(stdout, output.join("fixture-teardown.stdout.log"),
+                                futures::io::sink(), deadline, &cancellation),
+                            drain_command_output(stderr, output.join("fixture-teardown.stderr.log"),
+                                futures::io::sink(), deadline, &cancellation),
+                        ).await
+                    }));
+                    ledger.report.fixture_teardown.observe(&completion);
+                    ledger.checkpoint("fixture_teardown_result");
+                    let completion = match completion {
+                        Ok(completion) => completion,
+                        // Do not power off with a possibly live teardown
+                        // process. The session's forced-cleanup path owns it.
+                        Err(error) => return Ok(Err(error)),
+                    };
+                    teardown = completion.outcome()
+                        .context("FVP fixture teardown output capture failed")
+                        .and_then(|status| {
+                        anyhow::ensure!(status == 0,
+                            "FVP Realm VFIO fixture teardown failed: {:?}; see fixture-teardown logs",
+                            status);
+                        Ok(())
+                    });
+                }
+                ledger.report.launcher_shutdown = LauncherOutcomeReport::Unknown { error: None };
+                ledger.checkpoint("launcher_shutdown_start");
                 Ok(pool.run_until(bounded(
                     &driver,
                     deadline,
                     &cancellation,
                     connected.power_off(),
                 )))
-            })?;
-        anyhow::ensure!(
-            shutdown.success(),
-            "FVP launcher failed during L1 shutdown: {shutdown}"
-        );
-        Ok(exit_code)
+            });
+        ledger.report.launcher_shutdown.observe(&shutdown);
+        ledger.checkpoint("launcher_shutdown_result");
+        let shutdown = shutdown.and_then(|shutdown| {
+            anyhow::ensure!(
+                shutdown.success(),
+                "FVP launcher failed during L1 shutdown: {shutdown}"
+            );
+            Ok(())
+        });
+        combine_guest_outcome(exit_code, combine(teardown, shutdown))
     })();
     drop(client);
+    ledger.report.finalization = FinalizationOutcomeReport::Unknown;
+    ledger.checkpoint("finalization_start");
     let finalization = finish_session(
         &mut session,
         prepared,
@@ -454,7 +989,18 @@ pub fn run(
             })
         },
     );
-    let exit_code = combine_guest_outcome(outcome, finalization)?;
+    ledger.report.finalization = match &finalization {
+        Ok(()) => FinalizationOutcomeReport::Succeeded,
+        Err(error) => FinalizationOutcomeReport::Failed {
+            error: report_error(error),
+        },
+    };
+    let outcome = combine_guest_outcome(outcome, finalization);
+    let exit_code = if session.state().workspace_path().is_none() {
+        ledger.finish(outcome)
+    } else {
+        ledger.defer_final_report(outcome)
+    }?;
     Ok(crate::run::IncubatorOutput {
         exit_code: Some(exit_code),
         elapsed: started.elapsed(),
@@ -560,36 +1106,114 @@ impl DhcpProgress {
     }
 }
 
+#[derive(Debug)]
+struct CompletedCommand {
+    exit_code: i32,
+    capture: anyhow::Result<()>,
+}
+
+impl CompletedCommand {
+    fn outcome(self) -> anyhow::Result<i32> {
+        combine_guest_outcome(Ok(self.exit_code), self.capture)
+    }
+}
+
+/// Capture failure must neither cancel wait nor strand a writer on a full pipe.
+/// An error result never authorizes the next normal shutdown step.
+async fn wait_and_drain(
+    wait: impl Future<Output = anyhow::Result<i32>>,
+    stdout: impl Future<Output = anyhow::Result<()>>,
+    stderr: impl Future<Output = anyhow::Result<()>>,
+) -> anyhow::Result<CompletedCommand> {
+    let (status, stdout, stderr) = futures::join!(wait, stdout, stderr);
+    let capture = combine(stdout, stderr);
+    match status {
+        Ok(exit_code) => Ok(CompletedCommand { exit_code, capture }),
+        Err(error) => combine(
+            Err(error.context("FVP command completion is unknown")),
+            capture,
+        ),
+    }
+}
+
 async fn drain_command_output(
-    mut pipe: mesh::pipe::ReadPipe,
+    pipe: mesh::pipe::ReadPipe,
     path: PathBuf,
-    mut terminal: impl AsyncWrite + Unpin,
+    terminal: impl AsyncWrite + Unpin,
     deadline: &Deadline,
     cancellation: &Cancellation,
 ) -> anyhow::Result<()> {
-    let mut file = File::create(path)?;
+    let file = File::create(&path).with_context(|| format!("cannot create {}", path.display()));
+    drain_command_output_to(pipe, file, terminal, deadline, cancellation).await
+}
+
+async fn drain_command_output_to(
+    mut pipe: mesh::pipe::ReadPipe,
+    file: anyhow::Result<impl Write>,
+    terminal: impl AsyncWrite + Unpin,
+    deadline: &Deadline,
+    cancellation: &Cancellation,
+) -> anyhow::Result<()> {
+    let (mut file, mut capture) = match file {
+        Ok(file) => (Some(file), Vec::new()),
+        Err(error) => (None, vec![error]),
+    };
+    let mut terminal = Some(terminal);
     let mut buffer = [0u8; 8192];
     let mut total = 0u64;
-    loop {
-        cancellation.check()?;
-        deadline.remaining()?;
-        let length = pipe.read(&mut buffer).await?;
-        if length == 0 {
-            break;
+    let mut limited = false;
+    let drained = async {
+        loop {
+            cancellation.check()?;
+            deadline.remaining()?;
+            let length = pipe
+                .read(&mut buffer)
+                .await
+                .context("cannot read FVP command output")?;
+            if length == 0 {
+                break;
+            }
+            total = total.saturating_add(length as u64);
+            if !limited && total > 128 * 1024 * 1024 {
+                limited = true;
+                capture.push(anyhow::anyhow!("FVP command output exceeds 128 MiB"));
+                file = None;
+                terminal = None;
+            }
+            if let Some(target) = &mut file {
+                if let Err(error) = target.write_all(&buffer[..length]) {
+                    capture.push(anyhow::Error::new(error).context("cannot write FVP capture log"));
+                    file = None;
+                }
+            }
+            if let Some(target) = &mut terminal {
+                if let Err(error) = target.write_all(&buffer[..length]).await {
+                    capture.push(
+                        anyhow::Error::new(error).context("cannot forward FVP command output"),
+                    );
+                    terminal = None;
+                }
+            }
         }
-        total += length as u64;
-        anyhow::ensure!(
-            total <= 128 * 1024 * 1024,
-            "FVP command output exceeds 128 MiB"
-        );
-        file.write_all(&buffer[..length])?;
-        terminal.write_all(&buffer[..length]).await?;
+        if let Some(file) = &mut file {
+            if let Err(error) = file.flush() {
+                capture.push(anyhow::Error::new(error).context("cannot flush FVP capture log"));
+            }
+        }
+        if let Some(terminal) = &mut terminal {
+            if let Err(error) = terminal.flush().await {
+                capture.push(anyhow::Error::new(error).context("cannot flush FVP command output"));
+            }
+        }
         deadline.remaining()?;
+        anyhow::Ok(())
     }
-    file.flush()?;
-    terminal.flush().await?;
-    deadline.remaining()?;
-    Ok(())
+    .await;
+    let mut captured = Ok(());
+    for error in capture {
+        captured = combine(captured, Err(error));
+    }
+    combine(drained, captured)
 }
 
 fn host_output(
@@ -1144,6 +1768,538 @@ mod tests {
     use super::*;
     use test_with_tracing::test;
 
+    fn outcome_directory() -> tempfile::TempDir {
+        let parent = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .unwrap()
+            .join("target/fvp-outcome-tests");
+        std::fs::create_dir_all(&parent).unwrap();
+        tempfile::tempdir_in(parent).unwrap()
+    }
+
+    fn read_outcome(path: &Path) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(path.join(OUTCOME_REPORT)).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn outcome_report_retains_guest_result_before_model_shutdown_failure() {
+        let directory = outcome_directory();
+        let mut ledger = OutcomeLedger::new(directory.path(), "run-id", seconds(5));
+        let guest = Ok(CompletedCommand {
+            exit_code: 0,
+            capture: Ok(()),
+        });
+        ledger.report.guest_command.observe(&guest);
+        ledger.checkpoint("guest_command_result");
+        let before = read_outcome(directory.path());
+        assert_eq!(before["schema_version"], 2);
+        assert_eq!(
+            before["guest_command"]["execution"]["normalized_exit_code"],
+            0
+        );
+        assert_eq!(before["guest_command"]["execution"]["state"], "exited");
+        assert_eq!(
+            before["fixture_teardown"]["execution"]["state"],
+            "not_attempted"
+        );
+        assert_eq!(before["launcher_shutdown"]["state"], "not_attempted");
+        assert_eq!(before["overall"]["state"], "pending");
+
+        ledger
+            .report
+            .fixture_teardown
+            .observe(&Ok(CompletedCommand {
+                exit_code: 0,
+                capture: Ok(()),
+            }));
+        ledger
+            .report
+            .launcher_shutdown
+            .observe(&Ok(std::process::ExitStatus::from_raw(134 << 8)));
+        ledger.report.finalization = FinalizationOutcomeReport::Succeeded;
+        assert!(
+            ledger
+                .finish(Err(anyhow::anyhow!("launcher shutdown failed")))
+                .is_err()
+        );
+        let final_report = read_outcome(directory.path());
+        assert_eq!(final_report["guest_command"], before["guest_command"]);
+        assert_eq!(
+            final_report["fixture_teardown"]["execution"]["normalized_exit_code"],
+            0
+        );
+        assert_eq!(final_report["launcher_status_source"], "shrinkwrap");
+        assert_eq!(final_report["launcher_shutdown"]["exit_code"], 134);
+        assert_eq!(final_report["launcher_shutdown"]["success"], false);
+        assert_eq!(final_report["finalization"]["state"], "succeeded");
+        assert_eq!(final_report["overall"]["state"], "failed");
+    }
+
+    #[test]
+    fn outcome_report_observed_exit_survives_capture_timeout() {
+        for fixture in [false, true] {
+            let directory = outcome_directory();
+            let result_path = directory.path().join("session-result.json");
+            let reserved = ReservedResultFile::reserve(directory.path(), &result_path).unwrap();
+            let output = directory.path().join("fvp-run");
+            std::fs::create_dir(&output).unwrap();
+            let mut ledger = OutcomeLedger::new(&output, "run-id", seconds(5));
+            ledger.result_file = Some(reserved);
+            if fixture {
+                ledger.report.fixture_teardown.start();
+            } else {
+                ledger.report.guest_command.start();
+            }
+            let result = DefaultPool::run_with(async |driver| {
+                let deadline = Deadline::new(Duration::from_millis(50)).unwrap();
+                let cancellation = Cancellation::default();
+                bounded(
+                    &driver,
+                    &deadline,
+                    &cancellation,
+                    wait_and_drain(
+                        async {
+                            if fixture {
+                                ledger.report.fixture_teardown.exited(17);
+                            } else {
+                                ledger.report.guest_command.exited(17);
+                            }
+                            ledger.checkpoint("observed_exit");
+                            Ok(17)
+                        },
+                        std::future::pending(),
+                        async { Ok(()) },
+                    ),
+                )
+                .await
+            });
+            assert!(result.is_err());
+            let key = if fixture {
+                "fixture_teardown"
+            } else {
+                "guest_command"
+            };
+            let observed = read_outcome(&output);
+            let external: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&result_path).unwrap()).unwrap();
+            assert_eq!(external[key], observed[key]);
+            assert_eq!(observed[key]["execution"]["state"], "exited");
+            assert_eq!(observed[key]["execution"]["normalized_exit_code"], 17);
+            assert_eq!(observed[key]["capture"]["state"], "unknown");
+            assert!(observed[key]["capture"]["error"].is_null());
+            if fixture {
+                ledger.report.fixture_teardown.observe(&result);
+            } else {
+                ledger.report.guest_command.observe(&result);
+            }
+            ledger.checkpoint("capture_timeout");
+            let report = read_outcome(&output);
+            assert_eq!(report[key]["execution"]["normalized_exit_code"], 17);
+            assert!(
+                report[key]["capture"]["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("deadline")
+            );
+        }
+    }
+
+    #[test]
+    fn outcome_result_file_rejects_collisions_symlinks_and_nondirect_paths() {
+        let directory = outcome_directory();
+        let root = directory.path();
+        let valid = root.join("session-result.json");
+        let _reserved = ReservedResultFile::reserve(root, &valid).unwrap();
+        let initial = std::fs::read(&valid).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&initial).unwrap();
+        assert_eq!(report["schema_version"], 2);
+        assert!(report["run_id"].is_null() && report["run_output_dir"].is_null());
+        assert!(ReservedResultFile::reserve(root, &valid).is_err());
+        assert_eq!(std::fs::read(&valid).unwrap(), initial);
+        std::fs::create_dir(root.join("nested")).unwrap();
+        let existing = root.join("existing");
+        std::fs::write(&existing, b"untouched").unwrap();
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&existing, &alias).unwrap();
+        let dangling = root.join("dangling");
+        std::os::unix::fs::symlink(root.join("missing"), &dangling).unwrap();
+        for invalid in [
+            root.to_owned(),
+            root.join("nested/result.json"),
+            existing.clone(),
+            alias,
+            dangling,
+            root.join("nested/../traversal.json"),
+            root.parent().unwrap().join("outside.json"),
+        ] {
+            assert!(
+                ReservedResultFile::reserve(root, &invalid).is_err(),
+                "{invalid:?}"
+            );
+        }
+        assert_eq!(std::fs::read(existing).unwrap(), b"untouched");
+        assert!(!root.join("traversal.json").exists());
+        assert!(!root.join("nested/result.json").exists());
+    }
+
+    #[test]
+    fn outcome_result_file_rejects_replacement_after_reservation() {
+        let directory = outcome_directory();
+        let root = directory.path().join("output");
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("session-result.json");
+        let mut reserved = ReservedResultFile::reserve(&root, &path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"foreign").unwrap();
+        assert!(
+            reserved
+                .publish(
+                    &RunOutcomeReport::initial(),
+                    &Deadline::new(seconds(5)).unwrap()
+                )
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"foreign");
+        std::fs::rename(&root, directory.path().join("original")).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(&path, b"replacement directory").unwrap();
+        assert!(
+            reserved
+                .publish(
+                    &RunOutcomeReport::initial(),
+                    &Deadline::new(seconds(5)).unwrap()
+                )
+                .is_err()
+        );
+        assert_eq!(std::fs::read(path).unwrap(), b"replacement directory");
+    }
+
+    #[test]
+    fn outcome_result_file_records_registered_path_and_retained_cleanup_failure() {
+        let directory = outcome_directory();
+        let path = directory.path().join("session-result.json");
+        let reserved = ReservedResultFile::reserve(directory.path(), &path).unwrap();
+        let output = directory.path().join("fvp-run");
+        std::fs::create_dir(&output).unwrap();
+        let mut ledger = OutcomeLedger::new(&output, "run-id", seconds(5));
+        ledger.result_file = Some(reserved);
+        ledger.report.run_output_dir = Some(output.clone());
+        ledger.report.guest_command.observe(&Ok(CompletedCommand {
+            exit_code: 0,
+            capture: Ok(()),
+        }));
+        ledger.report.finalization = FinalizationOutcomeReport::Unknown;
+        ledger.checkpoint("finalization_start");
+        let sealed = std::fs::read(output.join(OUTCOME_REPORT)).unwrap();
+        ledger.report.finalization = FinalizationOutcomeReport::Failed {
+            error: "retirement failed".into(),
+        };
+        assert!(
+            ledger
+                .defer_final_report(Err(anyhow::anyhow!("retirement failed")))
+                .is_err()
+        );
+        assert_eq!(std::fs::read(output.join(OUTCOME_REPORT)).unwrap(), sealed);
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(report["run_id"], "run-id");
+        assert_eq!(report["run_output_dir"], output.to_str().unwrap());
+        assert_eq!(
+            report["guest_command"]["execution"]["normalized_exit_code"],
+            0
+        );
+        assert_eq!(report["guest_command"]["capture"]["state"], "succeeded");
+        assert_eq!(report["finalization"]["state"], "failed");
+        assert_eq!(report["overall"]["state"], "failed");
+    }
+
+    #[test]
+    fn outcome_result_file_failure_is_retained_without_overwriting_foreign_data() {
+        let directory = outcome_directory();
+        let path = directory.path().join("session-result.json");
+        let reserved = ReservedResultFile::reserve(directory.path(), &path).unwrap();
+        let output = directory.path().join("fvp-run");
+        std::fs::create_dir(&output).unwrap();
+        let mut ledger = OutcomeLedger::new(&output, "run-id", seconds(5));
+        ledger.result_file = Some(reserved);
+        ledger.report.run_output_dir = Some(output.clone());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"foreign").unwrap();
+        ledger.report.guest_command.observe(&Ok(CompletedCommand {
+            exit_code: 0,
+            capture: Ok(()),
+        }));
+        ledger.checkpoint("guest_command_result");
+        ledger
+            .report
+            .fixture_teardown
+            .observe(&Ok(CompletedCommand {
+                exit_code: 0,
+                capture: Ok(()),
+            }));
+        ledger.report.finalization = FinalizationOutcomeReport::Succeeded;
+        let error = ledger.finish(Ok(0)).unwrap_err();
+        assert!(format!("{error:#}").contains("reserved result file identity changed"));
+        assert_eq!(std::fs::read(path).unwrap(), b"foreign");
+        let report = read_outcome(&output);
+        assert_eq!(
+            report["fixture_teardown"]["execution"]["normalized_exit_code"],
+            0
+        );
+        assert_eq!(report["overall"]["state"], "failed");
+        assert!(!report["report_write_errors"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn outcome_result_file_reports_a_failed_per_run_publication() {
+        let directory = outcome_directory();
+        let path = directory.path().join("session-result.json");
+        let reserved = ReservedResultFile::reserve(directory.path(), &path).unwrap();
+        let output = directory.path().join("fvp-run");
+        std::fs::create_dir_all(output.join(OUTCOME_REPORT)).unwrap();
+        let mut ledger = OutcomeLedger::new(&output, "run-id", seconds(5));
+        ledger.result_file = Some(reserved);
+        ledger.report.run_output_dir = Some(output.clone());
+        ledger.report.guest_command.observe(&Ok(CompletedCommand {
+            exit_code: 0,
+            capture: Ok(()),
+        }));
+        ledger.report.finalization = FinalizationOutcomeReport::Succeeded;
+        assert!(ledger.finish(Ok(0)).is_err());
+        assert!(output.join(OUTCOME_REPORT).is_dir());
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(
+            report["guest_command"]["execution"]["normalized_exit_code"],
+            0
+        );
+        assert_eq!(report["overall"]["state"], "failed");
+        assert!(!report["report_write_errors"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn outcome_report_distinguishes_unknown_from_not_attempted() {
+        let directory = outcome_directory();
+        let mut ledger = OutcomeLedger::new(directory.path(), "run-id", seconds(5));
+        ledger.checkpoint("created");
+        let created = read_outcome(directory.path());
+        assert_eq!(
+            created["guest_command"]["execution"]["state"],
+            "not_attempted"
+        );
+        assert_eq!(created["finalization"]["state"], "not_attempted");
+        ledger.report.guest_command.start();
+        ledger
+            .report
+            .guest_command
+            .observe(&Err(anyhow::anyhow!("wait transport lost")));
+        ledger.report.finalization = FinalizationOutcomeReport::Unknown;
+        ledger.checkpoint("unknown_completion");
+        let pending = read_outcome(directory.path());
+        assert_eq!(pending["guest_command"]["execution"]["state"], "unknown");
+        assert_eq!(
+            pending["guest_command"]["execution"]["error"],
+            "wait transport lost"
+        );
+        assert!(
+            pending["guest_command"]["execution"]
+                .get("normalized_exit_code")
+                .is_none()
+        );
+        assert_eq!(
+            pending["fixture_teardown"]["execution"]["state"],
+            "not_attempted"
+        );
+        assert_eq!(pending["launcher_shutdown"]["state"], "not_attempted");
+        assert_eq!(pending["finalization"]["state"], "unknown");
+        ledger.report.finalization = FinalizationOutcomeReport::Failed {
+            error: "resources not stopped".into(),
+        };
+        assert!(
+            ledger
+                .finish(Err(anyhow::anyhow!("resources not stopped")))
+                .is_err()
+        );
+        assert_eq!(
+            read_outcome(directory.path())["finalization"]["state"],
+            "failed"
+        );
+    }
+
+    #[test]
+    fn outcome_report_keeps_capture_errors_separate_from_exit_status() {
+        let directory = outcome_directory();
+        let mut ledger = OutcomeLedger::new(directory.path(), "run-id", seconds(5));
+        let guest = Ok(CompletedCommand {
+            exit_code: 23,
+            capture: Err(anyhow::anyhow!("guest capture ENOSPC")),
+        });
+        let teardown = Ok(CompletedCommand {
+            exit_code: 7,
+            capture: Err(anyhow::anyhow!("teardown capture ENOSPC")),
+        });
+        ledger.report.guest_command.observe(&guest);
+        ledger.report.fixture_teardown.observe(&teardown);
+        ledger
+            .report
+            .launcher_shutdown
+            .observe(&Ok(std::process::ExitStatus::from_raw(0)));
+        ledger.report.finalization = FinalizationOutcomeReport::Succeeded;
+        let error = ledger
+            .finish(combine_guest_outcome(
+                guest.and_then(CompletedCommand::outcome),
+                teardown.and_then(CompletedCommand::outcome).map(|_| ()),
+            ))
+            .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("exit code 23") && text.contains("exit code 7"));
+        let report = read_outcome(directory.path());
+        assert_eq!(
+            report["guest_command"]["execution"]["normalized_exit_code"],
+            23
+        );
+        assert_eq!(
+            report["guest_command"]["capture"]["error"],
+            "guest capture ENOSPC"
+        );
+        assert_eq!(
+            report["fixture_teardown"]["execution"]["normalized_exit_code"],
+            7
+        );
+        assert_eq!(
+            report["fixture_teardown"]["capture"]["error"],
+            "teardown capture ENOSPC"
+        );
+        assert_eq!(report["overall"]["state"], "failed");
+    }
+
+    #[test]
+    fn outcome_report_write_failure_does_not_skip_ordered_completion() {
+        let directory = outcome_directory();
+        let mut ledger = OutcomeLedger::new(directory.path(), "run-id", seconds(5));
+        ledger.report.guest_command.start();
+        assert!(!ledger.checkpoint_with("guest_command_start", |_| {
+            Err(anyhow::anyhow!("injected report write failure"))
+        }));
+        let cleanup_started = std::cell::Cell::new(false);
+        let (sender, receiver) = mesh::oneshot();
+        futures::executor::block_on(async {
+            let ordered = async {
+                let completion = wait_and_drain(
+                    async { receiver.await.context("wait failed") },
+                    async { Ok(()) },
+                    async { Ok(()) },
+                )
+                .await;
+                ledger.report.guest_command.observe(&completion);
+                ledger.checkpoint("guest_command_result");
+                let completion = completion?;
+                cleanup_started.set(true);
+                ledger
+                    .report
+                    .fixture_teardown
+                    .observe(&Ok(CompletedCommand {
+                        exit_code: 0,
+                        capture: Ok(()),
+                    }));
+                ledger.report.finalization = FinalizationOutcomeReport::Succeeded;
+                ledger.finish(completion.outcome())
+            };
+            let mut ordered = std::pin::pin!(ordered);
+            assert!(futures::poll!(&mut ordered).is_pending());
+            assert!(!cleanup_started.get());
+            sender.send(0);
+            let error = ordered.await.unwrap_err();
+            assert!(format!("{error:#}").contains("injected report write failure"));
+            assert!(cleanup_started.get());
+        });
+        let report = read_outcome(directory.path());
+        assert_eq!(report["guest_command"]["execution"]["state"], "exited");
+        assert_eq!(report["fixture_teardown"]["execution"]["state"], "exited");
+        assert_eq!(report["overall"]["state"], "failed");
+        assert_eq!(report["report_write_errors"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn outcome_report_final_write_failure_cannot_turn_into_success() {
+        for retry_succeeds in [false, true] {
+            let directory = outcome_directory();
+            let mut ledger = OutcomeLedger::new(directory.path(), "run-id", seconds(5));
+            ledger.report.guest_command.observe(&Ok(CompletedCommand {
+                exit_code: 0,
+                capture: Ok(()),
+            }));
+            ledger.report.finalization = FinalizationOutcomeReport::Succeeded;
+            ledger.checkpoint("before_final");
+            let mut attempts = 0;
+            let result = ledger.finish_with(Ok(0), |report| {
+                attempts += 1;
+                if attempts == 1 || !retry_succeeds {
+                    anyhow::bail!("injected final report ENOSPC");
+                }
+                write_outcome_report(directory.path(), report, &Deadline::new(seconds(5))?)
+            });
+            assert!(format!("{:#}", result.unwrap_err()).contains("final report ENOSPC"));
+            assert_eq!(attempts, 2);
+            assert_eq!(
+                read_outcome(directory.path())["overall"]["state"],
+                if retry_succeeds { "failed" } else { "pending" }
+            );
+        }
+    }
+
+    #[test]
+    fn outcome_report_publication_is_atomic_and_error_text_is_bounded() {
+        let directory = outcome_directory();
+        let mut ledger = OutcomeLedger::new(directory.path(), "run-id", seconds(5));
+        ledger.checkpoint("created");
+        let original = std::fs::read(directory.path().join(OUTCOME_REPORT)).unwrap();
+        ledger.report.guest_command.start();
+        assert!(
+            write_outcome_report(
+                directory.path(),
+                &ledger.report,
+                &Deadline::new(Duration::ZERO).unwrap()
+            )
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join(OUTCOME_REPORT)).unwrap(),
+            original
+        );
+        ledger.checkpoint("started");
+        assert_eq!(
+            read_outcome(directory.path())["guest_command"]["execution"]["state"],
+            "unknown"
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        let error = report_error(&anyhow::anyhow!("界".repeat(5000)));
+        assert!(error.len() <= 4096 + " [truncated]".len());
+        assert!(error.ends_with(" [truncated]"));
+    }
+
+    #[test]
+    fn outcome_report_does_not_modify_a_retained_output_receipt() {
+        let directory = outcome_directory();
+        let mut ledger = OutcomeLedger::new(directory.path(), "run-id", seconds(5));
+        ledger.report.finalization = FinalizationOutcomeReport::Unknown;
+        ledger.checkpoint("finalization_start");
+        let sealed = std::fs::read(directory.path().join(OUTCOME_REPORT)).unwrap();
+        ledger.report.finalization = FinalizationOutcomeReport::Failed {
+            error: "retirement failed".into(),
+        };
+        let error = ledger
+            .defer_final_report(Err(anyhow::anyhow!("retirement failed")))
+            .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("retirement failed") && text.contains("sealed outputs"));
+        assert_eq!(
+            std::fs::read(directory.path().join(OUTCOME_REPORT)).unwrap(),
+            sealed
+        );
+    }
+
     #[test]
     fn guest_failure_is_not_lost_when_finalization_also_fails() {
         assert_eq!(combine_guest_outcome(Ok(42), Ok(())).unwrap(), 42);
@@ -1158,6 +2314,26 @@ mod tests {
         .unwrap_err();
         let text = format!("{error:#}");
         assert!(text.contains("cancelled") && text.contains("cleanup failed"));
+    }
+
+    #[test]
+    fn realm_vfio_teardown_and_launcher_errors_cannot_pass_listing() {
+        for (teardown_failed, launcher_failed) in [(true, false), (false, true), (true, true)] {
+            let teardown = if teardown_failed {
+                Err(anyhow::anyhow!("TSM disconnect failed"))
+            } else {
+                Ok(())
+            };
+            let shutdown = if launcher_failed {
+                Err(anyhow::anyhow!("launcher exit 134"))
+            } else {
+                Ok(())
+            };
+            let error = combine_guest_outcome(Ok(0), combine(teardown, shutdown)).unwrap_err();
+            let text = format!("{error:#}");
+            assert_eq!(text.contains("TSM disconnect failed"), teardown_failed);
+            assert_eq!(text.contains("launcher exit 134"), launcher_failed);
+        }
     }
 
     #[test]
@@ -1270,6 +2446,143 @@ mod tests {
         })
         .unwrap();
         assert_eq!(std::fs::read(path).unwrap(), b"last output frame\n");
+    }
+
+    struct FailedCapture(std::rc::Rc<std::cell::Cell<usize>>);
+
+    impl Write for FailedCapture {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            self.0.set(self.0.get() + 1);
+            Err(std::io::Error::from_raw_os_error(nix::libc::ENOSPC))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn capture_write_failure_drains_and_does_not_cancel_pending_wait() {
+        for failure_on_open in [false, true] {
+            let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+            let file = if failure_on_open {
+                Err(anyhow::anyhow!("injected capture open failure"))
+            } else {
+                Ok(FailedCapture(calls.clone()))
+            };
+            let written = std::cell::Cell::new(false);
+            let deadline = Deadline::new(seconds(5)).unwrap();
+            let cancellation = Cancellation::default();
+            let (reader, mut writer) = mesh::pipe::pipe();
+            let (complete, completion) = mesh::oneshot();
+            futures::executor::block_on(async {
+                let wait = async {
+                    // More than one read buffer: capture failure must not
+                    // leave the simulated child blocked on its output pipe.
+                    writer.write_all(&vec![0u8; 256 * 1024]).await?;
+                    drop(writer);
+                    written.set(true);
+                    completion.await.context("wait transport failed")
+                };
+                let monitored = wait_and_drain(
+                    wait,
+                    drain_command_output_to(
+                        reader,
+                        file,
+                        futures::io::sink(),
+                        &deadline,
+                        &cancellation,
+                    ),
+                    async { Ok(()) },
+                );
+                let mut monitored = std::pin::pin!(monitored);
+                for _ in 0..128 {
+                    assert!(futures::poll!(&mut monitored).is_pending());
+                    if written.get() && (failure_on_open || calls.get() != 0) {
+                        break;
+                    }
+                }
+                assert!(written.get(), "capture failure blocked the child writer");
+                assert_eq!(calls.get(), usize::from(!failure_on_open));
+                // A short-circuiting join would have dropped this receiver.
+                complete.send(23);
+                let completed = monitored.await.unwrap();
+                assert_eq!(completed.exit_code, 23);
+                let error = completed.outcome().unwrap_err();
+                let text = format!("{error:#}");
+                assert!(text.contains("exit code 23"));
+                assert!(text.contains(if failure_on_open {
+                    "open failure"
+                } else {
+                    "capture log"
+                }));
+            });
+        }
+    }
+
+    #[test]
+    fn terminal_write_failure_is_discarded_until_confirmed_exit() {
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let deadline = Deadline::new(seconds(5)).unwrap();
+        let cancellation = Cancellation::default();
+        let (reader, writer) = mesh::pipe::pipe();
+        writer.write_nonblocking(&vec![0u8; 16384]).unwrap();
+        drop(writer);
+        let completed = futures::executor::block_on(wait_and_drain(
+            async { Ok(0) },
+            drain_command_output_to(
+                reader,
+                Ok(Vec::new()),
+                futures::io::AllowStdIo::new(FailedCapture(calls.clone())),
+                &deadline,
+                &cancellation,
+            ),
+            async { Ok(()) },
+        ))
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert!(format!("{:#}", completed.outcome().unwrap_err()).contains("cannot forward"));
+    }
+
+    #[test]
+    fn unknown_wait_outcome_never_authorizes_normal_shutdown() {
+        let next_step = std::cell::Cell::new(false);
+        let result = futures::executor::block_on(async {
+            let completed = wait_and_drain(
+                async { Err(anyhow::anyhow!("wait transport lost")) },
+                async { Err(anyhow::anyhow!("capture write failed")) },
+                async { Ok(()) },
+            )
+            .await?;
+            next_step.set(true);
+            completed.outcome()
+        });
+        let text = format!("{:#}", result.unwrap_err());
+        assert!(!next_step.get());
+        assert!(text.contains("completion is unknown"));
+        assert!(text.contains("wait transport lost") && text.contains("capture write failed"));
+    }
+
+    #[test]
+    fn pending_wait_after_capture_failure_uses_deadline_not_normal_shutdown() {
+        let next_step = std::cell::Cell::new(false);
+        DefaultPool::run_with(async |driver| {
+            let deadline = Deadline::new(Duration::from_millis(50)).unwrap();
+            let cancellation = Cancellation::default();
+            let result = bounded(&driver, &deadline, &cancellation, async {
+                let completed = wait_and_drain(
+                    std::future::pending(),
+                    async { Err(anyhow::anyhow!("capture write failed")) },
+                    async { Ok(()) },
+                )
+                .await?;
+                next_step.set(true);
+                completed.outcome()
+            })
+            .await;
+            assert!(format!("{:#}", result.unwrap_err()).contains("deadline"));
+        });
+        assert!(!next_step.get());
     }
 
     #[test]

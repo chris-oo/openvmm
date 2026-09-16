@@ -45,6 +45,10 @@ struct Args {
     /// Host directory for logs and captured output.
     #[clap(long, env = "INCUBATOR_OUTPUT_DIR")]
     output_dir: Option<PathBuf>,
+    /// Fresh result file directly under the canonical FVP output directory.
+    /// Relative paths are resolved from the host working directory.
+    #[clap(long, env = "INCUBATOR_FVP_RESULT_FILE")]
+    fvp_result_file: Option<PathBuf>,
     /// Guest path to the pipette binary.
     #[clap(long, env = "INCUBATOR_GUEST_PIPETTE")]
     guest_pipette: Option<String>,
@@ -108,8 +112,10 @@ fn main() -> anyhow::Result<()> {
         );
     } else {
         anyhow::ensure!(
-            args.fvp_platform_root.is_none() && args.shrinkwrap_package_root.is_none(),
-            "FVP platform roots require an FVP CCA profile"
+            args.fvp_platform_root.is_none()
+                && args.shrinkwrap_package_root.is_none()
+                && args.fvp_result_file.is_none(),
+            "FVP platform roots and result file require an FVP CCA profile"
         );
     }
 
@@ -192,6 +198,7 @@ fn main() -> anyhow::Result<()> {
                 initrd: initrd.context("missing FVP initrd")?,
                 share_dir,
                 output_dir,
+                result_file: args.fvp_result_file,
                 guest_pipette_path: guest_pipette,
                 guest_command: command,
                 guest_env,
@@ -312,4 +319,41 @@ fn kernel_or_initrd_from_env(arch: incubator::Arch, base_name: &str) -> anyhow::
 /// Read an environment variable, treating an empty value as unset.
 fn non_empty_env(var: &str) -> Option<std::ffi::OsString> {
     std::env::var_os(var).filter(|value| !value.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    #[test]
+    fn fvp_result_file_cli_and_environment_contract() {
+        let command = Args::command();
+        let option = command
+            .get_arguments()
+            .find(|argument| argument.get_id() == "fvp_result_file")
+            .unwrap();
+        assert_eq!(option.get_long(), Some("fvp-result-file"));
+        assert_eq!(
+            option.get_env(),
+            Some(std::ffi::OsStr::new("INCUBATOR_FVP_RESULT_FILE"))
+        );
+        assert!(!option.is_required_set());
+        let args = Args::try_parse_from([
+            "incubator",
+            "--profile",
+            "profile.toml",
+            "--share",
+            ".",
+            "--fvp-result-file",
+            "/output/session-result.json",
+            "--",
+            "/share/runner",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.fvp_result_file,
+            Some(PathBuf::from("/output/session-result.json"))
+        );
+    }
 }
