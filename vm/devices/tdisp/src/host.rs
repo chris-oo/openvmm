@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Synchronous, transport-independent host device coordination.
+//! Transport-independent host device coordination and asynchronous evidence.
 //!
 //! This module does not implement a Linux backend, guest transport, attestation
 //! verification, or an access gate. Adding it does not enable LOCK or RUN on
@@ -21,6 +21,16 @@
 //! implicit unlock or teardown on drop, no continuation support, and no generic
 //! backend accessor. The assignment owner must arrange explicit teardown and
 //! retain any resources needed to contain a quarantined device.
+//!
+//! [`Coordinator::into_evidence_service`](crate::host::Coordinator::into_evidence_service)
+//! consumes the coordinator to provide
+//! bounded blocking-pool execution for evidence and explicit teardown only.
+
+mod evidence;
+
+pub use evidence::EvidenceError;
+pub use evidence::EvidenceService;
+pub use evidence::EvidenceSink;
 
 use parking_lot::Mutex;
 use std::collections::TryReserveError;

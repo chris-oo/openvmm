@@ -12,10 +12,12 @@ use super::OperationError;
 use super::RealmDevice;
 use super::RealmPhase;
 use super::RealmState;
+use std::sync::Arc;
 use tdisp::host::Backend;
 use tdisp::host::ConfirmedState;
 use tdisp::host::Coordinator;
 use tdisp::host::DeviceState;
+use tdisp::host::EvidenceService;
 use tdisp::host::Object;
 use tdisp::host::Regenerate;
 use tdisp::host::SnapshotBudget;
@@ -101,7 +103,9 @@ pub struct PrepareError {
 /// be shared by all assigned devices in the VM. This owner exposes no file
 /// descriptor, raw backend, or state-changing request.
 ///
-/// Calls are synchronous. Run them away from critical async executor paths.
+/// Direct calls are synchronous. Run them away from critical async executor
+/// paths, or consume this owner with [`Self::into_evidence_service`] for bounded
+/// blocking-pool execution.
 /// Call [`Self::teardown`] explicitly, including after failures. Abandoning an
 /// owner invokes the underlying Realm object's cleanup fallback; a failed
 /// fallback retains its resource bundle until process exit, not clean reuse.
@@ -134,6 +138,19 @@ impl RealmDevice {
 }
 
 impl RealmTdispDevice {
+    /// Consume the verified exclusive owner into bounded asynchronous evidence.
+    ///
+    /// This preserves the binding checked by [`RealmDevice::into_tdisp`].
+    /// The caller retains the strong reference and registers only a weak
+    /// reference with its VM. Registration is not automatic.
+    ///
+    /// Cancellation after admission leaves the worker and sink alive until
+    /// completion. An abandoned guest operation must not resume. Explicit
+    /// teardown closes admission permanently and permits cleanup retry.
+    pub fn into_evidence_service(self) -> Arc<dyn EvidenceService> {
+        self.coordinator.into_evidence_service()
+    }
+
     /// Local evidence lifecycle state; not permission to access device BARs or DMA.
     pub fn state(&self) -> DeviceState {
         self.coordinator.state()

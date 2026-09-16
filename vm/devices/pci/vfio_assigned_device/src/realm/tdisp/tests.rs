@@ -2,9 +2,11 @@
 // Licensed under the MIT License.
 
 use super::*;
+use futures::executor::block_on;
 use nix::errno::Errno;
 use parking_lot::Mutex;
 use std::sync::Arc;
+use tdisp::host::EvidenceError;
 use tdisp::host::MeasurementRequest;
 use tdisp::host::SnapshotError;
 use test_with_tracing::test;
@@ -135,6 +137,63 @@ impl Drop for Fake {
     fn drop(&mut self) {
         self.0.lock().calls.push(Call::Drop);
     }
+}
+
+#[test]
+fn verified_owner_service_retains_native_cleanup_error_and_retries() {
+    use std::error::Error as _;
+
+    let _: fn(RealmTdispDevice) -> Arc<dyn EvidenceService> =
+        RealmTdispDevice::into_evidence_service;
+    let (device, model) = Fake::new();
+    let budget = SnapshotBudget::new(8);
+    let coordinator = prepare_backend(device, budget.clone())
+        .unwrap_or_else(|(error, _)| panic!("preparation failed: {error}"));
+    let service = coordinator.into_evidence_service();
+    assert_eq!(
+        block_on(service.object_size(Object::Certificate)).unwrap(),
+        8
+    );
+    assert_eq!(
+        model.lock().calls,
+        [
+            Call::Size(CcaObject::Certificate),
+            Call::Size(CcaObject::Certificate),
+            Call::Read(CcaObject::Certificate, 8),
+        ]
+    );
+    model.lock().close_failures = 1;
+    let error = block_on(service.teardown()).unwrap_err();
+    assert!(matches!(error, EvidenceError::Device(_)));
+    let error = error.source().unwrap().downcast_ref::<Error>().unwrap();
+    let backend = error
+        .source()
+        .unwrap()
+        .downcast_ref::<BackendError>()
+        .unwrap();
+    assert!(matches!(backend, BackendError::Cleanup { .. }));
+    assert!(backend.source().unwrap().is::<OperationError>());
+    assert_eq!(budget.used(), 0);
+    assert!(!model.lock().released);
+    assert!(!model.lock().calls.contains(&Call::Drop));
+    assert!(matches!(
+        block_on(service.object_size(Object::Certificate)),
+        Err(EvidenceError::Closed)
+    ));
+    block_on(service.teardown()).unwrap();
+    block_on(service.teardown()).unwrap();
+    assert!(model.lock().released);
+    assert_eq!(
+        model
+            .lock()
+            .calls
+            .iter()
+            .filter(|call| **call == Call::Close)
+            .count(),
+        2
+    );
+    drop(service);
+    assert_eq!(model.lock().calls.last(), Some(&Call::Drop));
 }
 
 #[test]
