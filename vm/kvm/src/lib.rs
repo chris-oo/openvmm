@@ -366,6 +366,8 @@ pub enum Error {
     SetGuestMemfdMemoryAttributes(#[source] nix::Error),
     #[error("PreFaultMemory")]
     PreFaultMemory(#[source] nix::Error),
+    #[error("invalid KVM prefault range or progress: gpa={gpa:#x}, size={size:#x}")]
+    InvalidPreFaultProgress { gpa: u64, size: u64 },
     #[error("CreateGuestMemfd")]
     CreateGuestMemfd(#[source] nix::Error),
     #[error("CreateVm")]
@@ -1435,6 +1437,51 @@ pub enum RoutingEntry {
 
 pub struct Processor<'a>(&'a Partition, u32);
 
+fn pre_fault_memory_all(
+    gpa: u64,
+    size: u64,
+    mut prefault: impl FnMut(&mut KvmPreFaultMemory) -> Result<()>,
+) -> Result<()> {
+    let invalid = || Error::InvalidPreFaultProgress { gpa, size };
+    let end = gpa.checked_add(size).ok_or_else(invalid)?;
+    if size == 0 || !gpa.is_multiple_of(4096) || !size.is_multiple_of(4096) {
+        return Err(invalid());
+    }
+    let mut range = KvmPreFaultMemory {
+        gpa,
+        size,
+        ..Default::default()
+    };
+    let mut retries = 0;
+    while range.size != 0 {
+        let previous = (range.gpa, range.size);
+        let result = prefault(&mut range);
+        if range.gpa.checked_add(range.size) != Some(end)
+            || range.gpa < previous.0
+            || range.size > previous.1
+            || !range.gpa.is_multiple_of(4096)
+            || !range.size.is_multiple_of(4096)
+            || range.flags != 0
+            || range.padding != [0; 5]
+        {
+            return Err(invalid());
+        }
+        match result {
+            Ok(()) if range.size < previous.1 => retries = 0,
+            Ok(()) => return Err(invalid()),
+            Err(Error::PreFaultMemory(errno))
+                if matches!(errno, nix::errno::Errno::EINTR | nix::errno::Errno::EAGAIN)
+                    && (range.gpa, range.size) == previous
+                    && retries < 16 =>
+            {
+                retries += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 impl<'a> Processor<'a> {
     /// Prefaults a range once, preserving KVM's progress and syscall error.
     ///
@@ -1446,6 +1493,15 @@ impl<'a> Processor<'a> {
         unsafe { ioctl::kvm_pre_fault_memory(self.get().vcpu.as_raw_fd(), range) }
             .map_err(Error::PreFaultMemory)?;
         Ok(())
+    }
+
+    /// Prefaults every page, checking each returned range before retrying.
+    ///
+    /// The caller must hold visibility stable and exclude holes and device
+    /// memory. Only unchanged EINTR/EAGAIN failures are retried, at most sixteen
+    /// times without progress. Any other failure leaves DMA readiness unknown.
+    pub fn pre_fault_memory_all(&self, gpa: u64, size: u64) -> Result<()> {
+        pre_fault_memory_all(gpa, size, |range| self.pre_fault_memory(range))
     }
 
     pub fn enable_synic(&self) -> Result<()> {
@@ -2544,6 +2600,99 @@ mod memory_abi_tests {
         assert_eq!(offset_of!(KvmMemoryAttributes2, error_offset), 32);
         assert_eq!(offset_of!(KvmMemoryAttributes2, reserved), 40);
         assert_eq!(KvmMemoryAttributes2::default().reserved, [0; 11]);
+    }
+
+    #[test]
+    fn prefault_consumes_checked_partial_progress() {
+        let mut calls = 0;
+        pre_fault_memory_all(0x4000, 0x3000, |range| {
+            assert_eq!(range.gpa, 0x4000 + calls * 0x1000);
+            assert_eq!(range.size, 0x3000 - calls * 0x1000);
+            calls += 1;
+            range.gpa += 0x1000;
+            range.size -= 0x1000;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn prefault_retries_only_bounded_unchanged_transient_errors() {
+        for errno in [nix::errno::Errno::EINTR, nix::errno::Errno::EAGAIN] {
+            let mut calls = 0;
+            let error = pre_fault_memory_all(0x4000, 0x1000, |_| {
+                calls += 1;
+                Err(Error::PreFaultMemory(errno))
+            })
+            .unwrap_err();
+            assert!(matches!(error, Error::PreFaultMemory(actual) if actual == errno));
+            assert_eq!(calls, 17);
+        }
+        let mut calls = 0;
+        pre_fault_memory_all(0x4000, 0x1000, |range| {
+            calls += 1;
+            if calls == 1 {
+                return Err(Error::PreFaultMemory(nix::errno::Errno::EINTR));
+            }
+            range.gpa += range.size;
+            range.size = 0;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn prefault_rejects_invalid_ranges_before_ioctl() {
+        for (gpa, size) in [(0, 0), (1, 4096), (4096, 1), (u64::MAX - 4095, 4096)] {
+            assert!(
+                pre_fault_memory_all(gpa, size, |_| panic!("invalid range reached ioctl")).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn prefault_rejects_zero_or_inconsistent_progress() {
+        for mutation in 0..7 {
+            let error = pre_fault_memory_all(0x4000, 0x2000, |range| {
+                match mutation {
+                    0 => {}
+                    1 => range.gpa += 4096,
+                    2 => range.size -= 4096,
+                    3 => {
+                        range.gpa += 1;
+                        range.size -= 1;
+                    }
+                    4 => {
+                        range.gpa -= 4096;
+                        range.size += 4096;
+                    }
+                    5 => range.flags = 1,
+                    6 => range.padding[0] = 1,
+                    _ => unreachable!(),
+                }
+                Ok(())
+            })
+            .unwrap_err();
+            assert!(matches!(error, Error::InvalidPreFaultProgress { .. }));
+        }
+    }
+
+    #[test]
+    fn prefault_does_not_retry_partial_errors_or_copyback_failure() {
+        for errno in [nix::errno::Errno::EINTR, nix::errno::Errno::EFAULT] {
+            let mut calls = 0;
+            let error = pre_fault_memory_all(0x4000, 0x2000, |range| {
+                calls += 1;
+                range.gpa += 4096;
+                range.size -= 4096;
+                Err(Error::PreFaultMemory(errno))
+            })
+            .unwrap_err();
+            assert!(matches!(error, Error::PreFaultMemory(actual) if actual == errno));
+            assert_eq!(calls, 1);
+        }
     }
 
     #[test]

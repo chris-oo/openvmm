@@ -2,6 +2,21 @@
 // Licensed under the MIT License.
 
 use super::*;
+
+#[test]
+fn invalid_measurement_format_does_not_issue_an_ioctl() {
+    let error = execute(
+        1,
+        CcaTsmRequest::RegenerateMeasurements {
+            flags: 2,
+            nonce: &[0; 32],
+        },
+        &mut [],
+        |_| panic!("invalid flags must not reach ioctl"),
+    )
+    .unwrap_err();
+    assert!(matches!(error, TsmRequestError::MeasurementFlags(2)));
+}
 use std::mem::align_of;
 use std::mem::offset_of;
 use test_with_tracing::test;
