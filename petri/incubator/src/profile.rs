@@ -362,6 +362,8 @@ pub enum FvpPlatform {
     CcaV15,
     /// Local kernel and firmware supporting in-place guest_memfd.
     GuestMemfdInPlace,
+    /// Pinned AHCI fixture for Realm host-object lifecycle tests only.
+    RealmVfio,
 }
 
 fn default_fvp_port_retries() -> u32 {
@@ -400,8 +402,11 @@ impl FvpCcaConfig {
         for capability in &self.capabilities {
             anyhow::ensure!(
                 capability == "cca"
-                    || (self.platform == FvpPlatform::GuestMemfdInPlace
-                        && capability == "guest_memfd_in_place"),
+                    || (matches!(
+                        self.platform,
+                        FvpPlatform::GuestMemfdInPlace | FvpPlatform::RealmVfio
+                    ) && capability == "guest_memfd_in_place")
+                    || (self.platform == FvpPlatform::RealmVfio && capability == "cca_realm_vfio"),
                 "unsupported FVP capability: {capability}"
             );
             anyhow::ensure!(
@@ -776,5 +781,32 @@ capabilities = ["unknown"]
         .unwrap_err();
 
         assert!(error.to_string().contains("unknown QEMU CCA capability"));
+    }
+    #[test]
+    fn realm_vfio_capability_requires_its_fixture() {
+        let text = include_str!("../profiles/aarch64-fvp-cca-realm-vfio.toml");
+        let profile = IncubatorProfile::from_toml(text).unwrap();
+        let IncubatorBackend::FvpCca(config) = profile.incubator else {
+            panic!("not FVP")
+        };
+        assert_eq!(config.platform, FvpPlatform::RealmVfio);
+        assert_eq!(
+            config.capabilities,
+            ["cca", "guest_memfd_in_place", "cca_realm_vfio"]
+        );
+        for platform in ["cca-v15", "guest-memfd-in-place"] {
+            assert!(
+                IncubatorProfile::from_toml(&text.replace(
+                    "platform = \"realm-vfio\"",
+                    &format!("platform = \"{platform}\"")
+                ))
+                .is_err()
+            );
+        }
+        for capability in ["vpci", "tdisp", "dma"] {
+            assert!(
+                IncubatorProfile::from_toml(&text.replace("cca_realm_vfio", capability)).is_err()
+            );
+        }
     }
 }

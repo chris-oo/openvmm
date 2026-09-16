@@ -114,6 +114,9 @@ pub struct FvpCcaIncubatorConfig {
     pub share_dir: PathBuf,
     /// Durable host-side results directory, not a Shrinkwrap workspace.
     pub output_dir: PathBuf,
+    /// Optional fresh direct child of the canonical output directory. Reserved
+    /// before launch and updated with the run identity and outcome ledger.
+    pub result_file: Option<PathBuf>,
     /// Pipette location under the guest share.
     pub guest_pipette_path: String,
     /// Guest command and arguments, already mapped under `/share`.

@@ -40,6 +40,8 @@ pub const PINNED_MANIFEST: &str = include_str!("../../platforms/fvp-cca-v15.yaml
 /// Explicit local in-place memory tuple; not an arbitrary manifest override.
 pub const IN_PLACE_MANIFEST: &str =
     include_str!("../../platforms/fvp-cca-guest-memfd-in-place.yaml");
+/// Single-AHCI host-object fixture; not guest DMA qualification.
+pub const REALM_VFIO_MANIFEST: &str = include_str!("../../platforms/fvp-cca-realm-vfio.yaml");
 /// Sorted, exact package identities, including the editable checkout revision.
 pub const PINNED_PIP_FREEZE: &str = include_str!("../../platforms/fvp-cca-v15.pip-freeze");
 
@@ -59,8 +61,21 @@ pub struct PlatformManifest {
     pub overlay: OverlayManifest,
     /// Firmware and device tree identities consumed at runtime.
     pub runtime: RuntimeManifest,
+    /// Additional package-root inputs for the single-AHCI host-object fixture.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub realm_vfio: Vec<FixtureAsset>,
     /// Approved provenance mapping for the firmware package.
     pub provenance: ProvenanceManifest,
+}
+
+/// One immutable fixture input under the package root.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FixtureAsset {
+    /// Contained relative regular-file path.
+    pub relative_path: PathBuf,
+    /// SHA-256 of the complete source bytes.
+    pub sha256: String,
 }
 
 /// Licensed model path and exact normalized version banner.
@@ -173,6 +188,8 @@ impl PlatformManifest {
                 serde_yaml::from_str(IN_PLACE_MANIFEST)
                     .context("invalid built-in in-place FVP platform manifest")
             }
+            crate::profile::FvpPlatform::RealmVfio => serde_yaml::from_str(REALM_VFIO_MANIFEST)
+                .context("invalid built-in Realm VFIO FVP platform manifest"),
         }
     }
 
@@ -198,7 +215,8 @@ impl PlatformManifest {
     fn require_pinned(&self) -> anyhow::Result<()> {
         ensure!(
             *self == Self::pinned()?
-                || *self == Self::for_platform(crate::profile::FvpPlatform::GuestMemfdInPlace)?,
+                || *self == Self::for_platform(crate::profile::FvpPlatform::GuestMemfdInPlace)?
+                || *self == Self::for_platform(crate::profile::FvpPlatform::RealmVfio)?,
             "unsupported FVP platform tuple; the complete pinned manifest must match"
         );
         Ok(())
@@ -285,6 +303,8 @@ pub struct PlatformSources {
     pub fip: VerifiedSource,
     /// Verified device tree source.
     pub dtb: VerifiedSource,
+    /// Verified AHCI fixture assets; empty on every default platform.
+    pub realm_vfio: Vec<VerifiedSource>,
     manifest: PlatformManifest,
 }
 
@@ -356,6 +376,11 @@ impl PlatformSources {
                 &manifest.runtime.dtb_relative_path,
                 &manifest.runtime.dtb_sha256,
             )?,
+            realm_vfio: manifest
+                .realm_vfio
+                .iter()
+                .map(|asset| source(&package_root, &asset.relative_path, &asset.sha256))
+                .collect::<anyhow::Result<_>>()?,
             platform_root,
             package_root,
             shrinkwrap_root,
@@ -364,8 +389,8 @@ impl PlatformSources {
         })
     }
 
-    /// All consumed platform files, in package, overlay, BL1, FIP, DTB order.
-    pub fn sources(&self) -> [&VerifiedSource; 5] {
+    /// All consumed platform files, followed by any pinned fixture inputs.
+    pub fn sources(&self) -> impl Iterator<Item = &VerifiedSource> {
         [
             &self.package,
             &self.overlay,
@@ -373,6 +398,15 @@ impl PlatformSources {
             &self.fip,
             &self.dtb,
         ]
+        .into_iter()
+        .chain(&self.realm_vfio)
+    }
+
+    /// Verified fixture source and contained destination under the owned package.
+    pub fn fixture_sources(&self) -> impl Iterator<Item = (&VerifiedSource, &Path)> {
+        self.realm_vfio
+            .iter()
+            .map(|source| (source, source.relative.as_path()))
     }
 
     /// Call immediately before staging. PR 3 must hash each resulting snapshot.
@@ -849,7 +883,8 @@ fn checkout_overlay_path(
     }
     ensure!(
         *manifest
-            == PlatformManifest::for_platform(crate::profile::FvpPlatform::GuestMemfdInPlace)?,
+            == PlatformManifest::for_platform(crate::profile::FvpPlatform::GuestMemfdInPlace)?
+            || *manifest == PlatformManifest::for_platform(crate::profile::FvpPlatform::RealmVfio)?,
         "FVP overlay must be inside the pinned Shrinkwrap checkout"
     );
     // The in-place tuple uses a separately hashed overlay but shares the
@@ -1239,6 +1274,56 @@ mod tests {
     }
 
     #[test]
+    fn realm_vfio_tuple_pins_all_fixture_inputs() {
+        let manifest =
+            PlatformManifest::for_platform(crate::profile::FvpPlatform::RealmVfio).unwrap();
+        assert_eq!(manifest.realm_vfio.len(), 5);
+        assert!(PlatformManifest::parse(REALM_VFIO_MANIFEST).is_err());
+        assert_eq!(
+            hex::encode(Sha256::digest(include_bytes!(
+                "../../platforms/fvp-realm-vfio-overlay.yaml"
+            ))),
+            manifest.overlay.sha256
+        );
+        assert_eq!(
+            hex::encode(Sha256::digest(include_bytes!(
+                "../../platforms/fvp-realm-vfio-pci.json"
+            ))),
+            manifest.realm_vfio[0].sha256
+        );
+        for index in 0..manifest.realm_vfio.len() {
+            let mut changed = manifest.clone();
+            changed.realm_vfio[index].sha256 = "0".repeat(64);
+            assert!(changed.require_pinned().is_err());
+        }
+        let mut removed = manifest.clone();
+        removed.realm_vfio.pop();
+        assert!(removed.require_pinned().is_err());
+        let in_place =
+            PlatformManifest::for_platform(crate::profile::FvpPlatform::GuestMemfdInPlace).unwrap();
+        let mut mixed = manifest;
+        mixed.package = in_place.package;
+        assert!(mixed.require_pinned().is_err());
+    }
+
+    #[test]
+    #[ignore = "requires locally provisioned Stage A Realm VFIO inputs"]
+    fn local_realm_vfio_sources_match_pins() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
+        let manifest =
+            PlatformManifest::for_platform(crate::profile::FvpPlatform::RealmVfio).unwrap();
+        let sources = PlatformSources::validate(
+            &manifest,
+            &root,
+            &root.join("cca-tdisp-stage-a/realm-vfio-platform/package"),
+            &deadline(),
+        )
+        .unwrap();
+        assert_eq!(sources.sources().count(), 10);
+        sources.revalidate_sources(&deadline()).unwrap();
+    }
+
+    #[test]
     #[ignore = "requires the pinned local in-place test platform"]
     fn local_in_place_platform_sources_match_pins() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
@@ -1315,13 +1400,12 @@ mod tests {
         let manifest = &sources.manifest;
         let paths: Vec<_> = sources
             .sources()
-            .iter()
             .map(|source| source.path().to_owned())
             .collect();
         // Only the private resolver can accept fixture hashes. The production
         // entry point must still reject this otherwise well-formed tuple.
         assert!(PlatformSources::validate(manifest, &platform, &package, &deadline()).is_err());
-        for (source, path) in sources.sources().iter().zip(&paths) {
+        for (source, path) in sources.sources().zip(&paths) {
             assert_eq!(source.path(), path);
             fs::write(path, b"modified").unwrap();
             assert!(sources.revalidate_sources(&deadline()).is_err());

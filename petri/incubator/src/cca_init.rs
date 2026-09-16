@@ -32,6 +32,8 @@ pub struct CcaInitConfig {
     pub mount_tag: String,
     /// Mutually exclusive static or DHCP configuration.
     pub network: CcaHostNetwork,
+    /// Provision only the pinned single-AHCI Realm host-object fixture.
+    pub realm_vfio: bool,
 }
 
 impl CcaInitConfig {
@@ -40,6 +42,7 @@ impl CcaInitConfig {
         Self {
             mount_tag: "host".into(),
             network: CcaHostNetwork::QemuStatic,
+            realm_vfio: false,
         }
     }
 
@@ -50,6 +53,7 @@ impl CcaInitConfig {
             network: CcaHostNetwork::Dhcp {
                 timeout: Duration::from_secs(30),
             },
+            realm_vfio: false,
         }
     }
 }
@@ -192,6 +196,32 @@ fn build_init_script(
     let tag = crate::qemu::shell_single_quote(&config.mount_tag);
     let share = crate::qemu::shell_single_quote(crate::GUEST_SHARE_ROOT);
     let network = network_script(&config.network)?;
+    let (vfio, vfio_shutdown) = if config.realm_vfio {
+        anyhow::ensure!(
+            config.mount_tag == "FM" && matches!(config.network, CcaHostNetwork::Dhcp { .. }),
+            "Realm VFIO requires the pinned FVP host"
+        );
+        (
+            format!(
+                "mkdir -p /run\n\
+                 mkdir -m 700 /run/incubator-cca-realm-vfio-state\n\
+                 test ! -e /run/incubator-cca-realm-vfio-teardown.sh\n\
+                 cat > /run/incubator-cca-realm-vfio-teardown.sh <<'INCUBATOR_TEARDOWN_EOF'\n\
+                 {}\nINCUBATOR_TEARDOWN_EOF\n\
+                 realm_vfio_teardown_ready=1\n{}",
+                include_str!("cca_realm_vfio_teardown.sh"),
+                include_str!("cca_realm_vfio.sh"),
+            ),
+            "if [ \"$realm_vfio_teardown_ready\" = 1 ]; then\n\
+                 if ! /bin/sh /run/incubator-cca-realm-vfio-teardown.sh >> \"$log_dir/incubator-realm-vfio-teardown.log\" 2>&1; then\n\
+                     echo 'CCA Realm VFIO fallback teardown failed' >&2\n\
+                     if [ \"$status\" -eq 0 ]; then status=1; fi\n\
+                 fi\n\
+             fi\n",
+        )
+    } else {
+        (String::new(), "")
+    };
     Ok(format!(
         "\
         #!/bin/sh\n\
@@ -199,10 +229,12 @@ fn build_init_script(
         dhcp_pid=\n\
         dhcp_dir=\n\
         log_dir=\n\
+        realm_vfio_teardown_ready=0\n\
         shutdown() {{\n\
             status=$?\n\
             trap - EXIT\n\
             trap '' TERM INT\n\
+            {vfio_shutdown}\
             if [ -n \"$dhcp_pid\" ]; then\n\
                 kill -KILL \"$dhcp_pid\" 2>/dev/null || :\n\
                 kill -KILL \"-$dhcp_pid\" 2>/dev/null || :\n\
@@ -239,6 +271,7 @@ fn build_init_script(
             ip address show\n\
             ip route show\n\
         }} > \"$log_dir/incubator-network.log\" 2>&1\n\
+        {vfio}\n\
         export HOME=/root\n\
         export SSL_CERT_FILE=/{certificates}\n\
         cd {share}\n\
@@ -267,7 +300,218 @@ mod tests {
             assert!(script.contains("trap shutdown EXIT"));
             assert!(script.contains("SSL_CERT_FILE="));
             assert!(!script.contains("kvm_cca_preflight"));
+            assert!(!script.contains("INCUBATOR REALM VFIO"));
         }
+    }
+
+    #[test]
+    fn realm_vfio_init_is_explicit_and_fail_closed() {
+        let mut config = CcaInitConfig::fvp();
+        config.realm_vfio = true;
+        let script = build_init_script("/share/pipette", &config, 0).unwrap();
+        let provision = script.find("INCUBATOR REALM VFIO START").unwrap();
+        let ready = script.find("INCUBATOR REALM VFIO READY").unwrap();
+        let pipette = script.find("'/share/pipette' --transport tcp").unwrap();
+        assert!(provision < ready && ready < pipette);
+        assert!(script.contains("set -eu"));
+        assert!(script.contains("test \"$#\" -eq 2"));
+        assert!(script.contains("0x0abc"));
+        assert!(script.contains("0xaced"));
+        assert!(script.contains("0x010601"));
+        assert!(!script.contains("/tsm/lock"));
+        assert!(!script.contains("/tsm/accept"));
+        assert!(!script.contains("|| true"));
+        #[cfg(target_os = "linux")]
+        {
+            use std::io::Write;
+            let mut child = std::process::Command::new("sh")
+                .arg("-n")
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(script.as_bytes())
+                .unwrap();
+            assert!(child.wait().unwrap().success());
+        }
+        config = CcaInitConfig::qemu();
+        config.realm_vfio = true;
+        assert!(build_init_script("/share/pipette", &config, 0).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn realm_vfio_teardown_fixture() -> tempfile::TempDir {
+        use std::fs;
+        let parent =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/realm-vfio-unit-tests");
+        fs::create_dir_all(&parent).unwrap();
+        let dir = tempfile::tempdir_in(parent).unwrap();
+        let device = dir.path().join("sys/bus/pci/devices/0000:01:00.0");
+        fs::create_dir_all(device.join("tsm")).unwrap();
+        fs::create_dir_all(device.join("vfio-dev/vfio0")).unwrap();
+        fs::create_dir_all(dir.path().join("vfio-pci")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("vfio-pci"), device.join("driver")).unwrap();
+        for (file, value) in [
+            ("vendor", "0x0abc"),
+            ("device", "0xaced"),
+            ("class", "0x010601"),
+            ("driver_override", "vfio-pci"),
+            ("tsm/connect", "tsm0"),
+            ("tsm/bound", ""),
+        ] {
+            fs::write(device.join(file), format!("{value}\n")).unwrap();
+        }
+        let state = dir.path().join("run/incubator-cca-realm-vfio-state");
+        fs::create_dir_all(&state).unwrap();
+        for (file, value) in [("tsm", "tsm0"), ("override", ""), ("bind", "")] {
+            fs::write(state.join(file), value).unwrap();
+        }
+        fs::write(dir.path().join("run/incubator-cca-realm-vfio"), "ready").unwrap();
+        // Model only sysfs writes. All identity reads, ownership guards, shell
+        // error handling, ordering, and completion checks use the real script.
+        let script = include_str!("cca_realm_vfio_teardown.sh")
+            .replace("/sys/", &format!("{}/sys/", dir.path().display()))
+            .replace("/run/", &format!("{}/run/", dir.path().display()))
+            .replace(
+                "    printf '%s\\n' \"$1\" > \"$2\"",
+                r#"    operation=${2##*/}
+    printf '%s\n' "$operation" >> "$state/operations"
+    if [ "${FAIL_OPERATION-}" = "$operation" ]; then return 7; fi
+    case "$operation" in
+        unbind)
+            rm "$device/driver"
+            rm -r "$device/vfio-dev"
+            ;;
+        disconnect) printf '\n' > "$device/tsm/connect" ;;
+        driver_override) printf '%s\n' "$1" > "$2" ;;
+        *) return 8 ;;
+    esac"#,
+            );
+        fs::write(dir.path().join("teardown.sh"), script).unwrap();
+        dir
+    }
+
+    #[cfg(target_os = "linux")]
+    fn run_realm_vfio_teardown(dir: &Path, failure: &str) -> std::process::Output {
+        std::process::Command::new("sh")
+            .arg(dir.join("teardown.sh"))
+            .env("FAIL_OPERATION", failure)
+            .output()
+            .unwrap()
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn realm_vfio_teardown_orders_release_and_is_idempotent() {
+        let fixture = realm_vfio_teardown_fixture();
+        let state = fixture.path().join("run/incubator-cca-realm-vfio-state");
+        let output = run_realm_vfio_teardown(fixture.path(), "");
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            std::fs::read_to_string(state.join("operations")).unwrap(),
+            "unbind\ndriver_override\ndisconnect\n"
+        );
+        assert!(state.join("complete").is_file());
+        assert!(!fixture.path().join("run/incubator-cca-realm-vfio").exists());
+        let repeated = run_realm_vfio_teardown(fixture.path(), "");
+        assert!(repeated.status.success(), "{repeated:?}");
+        assert_eq!(
+            std::fs::read_to_string(state.join("operations")).unwrap(),
+            "unbind\ndriver_override\ndisconnect\n"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn realm_vfio_teardown_preserves_errors_and_retries_partial_release() {
+        for (failure, expected) in [
+            ("unbind", "unbind\n"),
+            ("driver_override", "unbind\ndriver_override\n"),
+            ("disconnect", "unbind\ndriver_override\ndisconnect\n"),
+        ] {
+            let fixture = realm_vfio_teardown_fixture();
+            let state = fixture.path().join("run/incubator-cca-realm-vfio-state");
+            let output = run_realm_vfio_teardown(fixture.path(), failure);
+            assert_eq!(output.status.code(), Some(7), "{output:?}");
+            assert!(String::from_utf8_lossy(&output.stderr).contains("TEARDOWN FAILED"));
+            assert!(!state.join("complete").exists());
+            assert_eq!(
+                std::fs::read_to_string(state.join("operations")).unwrap(),
+                expected
+            );
+            let retried = run_realm_vfio_teardown(fixture.path(), "");
+            assert!(retried.status.success(), "{retried:?}");
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn realm_vfio_teardown_rejects_changed_identity_and_live_realm_binding() {
+        for (file, value) in [
+            ("vendor", "0xffff"),
+            ("device", "0xffff"),
+            ("class", "0x020000"),
+            ("tsm/connect", "tsm1"),
+            ("tsm/bound", "tsm0"),
+            ("driver_override", "ahci"),
+        ] {
+            let fixture = realm_vfio_teardown_fixture();
+            std::fs::write(
+                fixture
+                    .path()
+                    .join("sys/bus/pci/devices/0000:01:00.0")
+                    .join(file),
+                value,
+            )
+            .unwrap();
+            let output = run_realm_vfio_teardown(fixture.path(), "");
+            assert!(!output.status.success(), "{output:?}");
+            let state = fixture.path().join("run/incubator-cca-realm-vfio-state");
+            assert!(!state.join("complete").exists());
+            assert!(!state.join("operations").exists());
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn realm_vfio_teardown_handles_partial_setup_without_claiming_other_resources() {
+        for connected in ["", "tsm0"] {
+            let fixture = realm_vfio_teardown_fixture();
+            let device = fixture.path().join("sys/bus/pci/devices/0000:01:00.0");
+            let state = fixture.path().join("run/incubator-cca-realm-vfio-state");
+            std::fs::remove_file(state.join("bind")).unwrap();
+            std::fs::remove_file(state.join("override")).unwrap();
+            std::fs::remove_file(device.join("driver")).unwrap();
+            std::fs::write(device.join("driver_override"), "(null)").unwrap();
+            std::fs::write(device.join("tsm/connect"), connected).unwrap();
+            let output = run_realm_vfio_teardown(fixture.path(), "");
+            assert!(output.status.success(), "{output:?}");
+            if connected.is_empty() {
+                assert!(!state.join("operations").exists());
+            } else {
+                assert_eq!(
+                    std::fs::read_to_string(state.join("operations")).unwrap(),
+                    "disconnect\n"
+                );
+            }
+        }
+        let fixture = realm_vfio_teardown_fixture();
+        let state = fixture.path().join("run/incubator-cca-realm-vfio-state");
+        for flag in ["tsm", "bind", "override"] {
+            std::fs::remove_file(state.join(flag)).unwrap();
+        }
+        let output = run_realm_vfio_teardown(fixture.path(), "");
+        assert!(output.status.success(), "{output:?}");
+        assert!(!state.join("operations").exists());
+        assert!(
+            fixture
+                .path()
+                .join("sys/bus/pci/devices/0000:01:00.0/driver")
+                .exists()
+        );
     }
 
     #[test]
