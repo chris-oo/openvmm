@@ -1,0 +1,54 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# Reference AHCI fixture: not guest DMA or TDISP LOCK/RUN qualification.
+# Source package: 56bb44c6855d1661e948b32bf166db5e23beb19fa943be7a610b7155053c7083.
+# Only remove FIX_PCI_JSON prerun and SAMPLE_KEY rtvar. Rust stages all DA
+# inputs and resolves the pinned JSON template within each owned workspace.
+# The old private-DMA reference ended with four IOMMU_DESTROY EBUSY errors
+# and FVP heap abort 134. Those are failures, not qualification evidence.
+schema_version: 1
+fvp:
+  executable_in_container: /tools/FVP_Base_RevC_AEMvA_11.31_28/bin/FVP_Base_RevC-2xAEMvA
+  version_output: Fast Models [11.31.28 (Mar  1 2026)]
+shrinkwrap:
+  root_relative_path: cca-test/shrinkwrap
+  executable_relative_path: cca-test/shrinkwrap/venv/bin/shrinkwrap
+  checkout_revision: 1c6b7a5278b47be11cad3bcd3a20416fc43fd388
+  package_version: 2026.9.0.dev0
+  container:
+    tag: shrinkwraptool/base-slim:2026.9.0.dev0
+    digest: shrinkwraptool/base-slim@sha256:dc5ac44b4cd8d8142c8df0f7fab4b5ecb11f9a399c6b94320b14f07f1476ea99
+package:
+  root_input: shrinkwrap_package_root
+  yaml_relative_path: cca-3world.yaml
+  sha256: 7e46a163b6c117fd903e199c55a21d44139f06bfb39ac3045be70dc51dea8785
+overlay:
+  root_input: fvp_platform_root
+  relative_path: cca-tdisp-stage-a/realm-vfio-reference-platform/overlay.yaml
+  sha256: bd729901876bd7fbecba1b8526d7d40e70657ff9f280023aca3f52502db947f1
+runtime:
+  root_input: shrinkwrap_package_root
+  bl1_relative_path: cca-3world/bl1.bin
+  bl1_sha256: 7e05af43b84d1ca26134c4de572754cbae02f9aeaf042d13ff2b00c04076fe5f
+  fip_relative_path: cca-3world/fip.bin
+  fip_sha256: 7cb0bf5e6227de272180b8414870dafa8ca8363cb22110f7242d7bab21ded7ef
+  dtb_relative_path: cca-3world/dt_bootargs.dtb
+  dtb_sha256: 3a2e6b85fc1c10f17cab2f6ec7eadb63b18c6f3d08a74e38eeddc6f587ea3630
+realm_vfio:
+  - relative_path: cca-3world/pci.json
+    sha256: 7ffe3fb55b669d37302a3642eb2c3222ebb67d2a2cd2ab8d7ee792a35f39344d
+  - relative_path: cca-3world/measurements.json
+    sha256: b00220ce3b06618fa27e8efdfff98c59b222e3d6f6230753778df837694df637
+  - relative_path: cca-3world/sample_key/ecp384/bundle_responder.certchain.der
+    sha256: 3ba926d9a62805d775fc99ad7be130b3e4be8d72433b94f408cc5d2775d4f682
+  - relative_path: cca-3world/sample_key/ecp384/end_responder.key
+    sha256: 654c340cd764f74cb08ef5d4761b96f656cf4497866698586a5f44cb8d79e12c
+  - relative_path: cca-3world/ahci-disk.img
+    sha256: 281e519df3077b557c6b03f5da83c4e8d397219259615dd7c3308f89cae8f2a6
+provenance:
+  tf_a_revision: 38269bb73d34b4a31100adf208a27e4c28e7d611
+  tf_rmm_revision: 33bbaf7814fee335027bf4d2417d97b551838b70
+  tf_rmm_config: fvp_defcfg
+  edk2_revision: e425c4f3ccf023f01438d8c7f751ecadc036c9b8
+  dt_revision: 504267e5a417a7481329783924a5f2a475aca748
