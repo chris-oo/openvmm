@@ -15,6 +15,10 @@ tdisp_proto.workspace = true
 bitfield-struct.workspace = true
 zerocopy.workspace = true
 static_assertions.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+test_with_tracing.workspace = true
 
 [lints]
 workspace = true

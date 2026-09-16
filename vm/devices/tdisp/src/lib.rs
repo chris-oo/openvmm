@@ -37,6 +37,9 @@ pub mod serialize_proto;
 /// Serialization code from PCI standard structures reported from the TDISP device directly.
 pub mod devicereport;
 
+/// Transport-independent native host operations and snapshot coordination.
+pub mod host;
+
 #[cfg(test)]
 mod tests;
 
