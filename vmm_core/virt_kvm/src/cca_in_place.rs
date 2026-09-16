@@ -23,6 +23,8 @@ pub enum CcaInPlaceError {
     Write(#[from] sparse_mmap::SparseMappingError),
     #[error("ambiguous or repeated guest_memfd in-place memory fault")]
     AmbiguousFault,
+    #[error("guest buffer includes private CCA backing")]
+    PrivateBuffer,
 }
 
 pub(crate) fn validate_host_page_size(page_size: usize) -> Result<(), CcaInPlaceError> {
@@ -214,6 +216,22 @@ impl Visibility {
             ),
         )
         .collect();
+    }
+
+    pub(crate) fn require_shared(&self, range: MemoryRange) -> Result<(), CcaInPlaceError> {
+        checked_range(range.start(), range.len())?;
+        for (_, state) in memory_range::walk_ranges([(range, ())], self.ranges.iter().copied()) {
+            match state {
+                memory_range::RangeWalkResult::Left(()) => {
+                    return Err(CcaInPlaceError::InvalidRange);
+                }
+                memory_range::RangeWalkResult::Both((), true) => {
+                    return Err(CcaInPlaceError::PrivateBuffer);
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 }
 

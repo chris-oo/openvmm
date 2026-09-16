@@ -16,6 +16,8 @@ mod cca;
 mod cca_in_place;
 mod gsi;
 mod memory;
+#[cfg(any(guest_arch = "aarch64", test))]
+mod rhi;
 #[cfg(guest_arch = "x86_64")]
 mod snp;
 mod vfio;
@@ -177,6 +179,9 @@ struct KvmPartitionInner {
     cca_fatal: std::sync::atomic::AtomicBool,
     #[cfg(guest_arch = "aarch64")]
     shared_gpa_bit: Option<u64>,
+    #[cfg(guest_arch = "aarch64")]
+    #[inspect(skip)]
+    rhi: Mutex<rhi::Registry>,
     memory: Mutex<KvmMemoryRangeState>,
     memory_backing_mode: KvmMemoryBackingMode,
     #[inspect(iter_by_index)]

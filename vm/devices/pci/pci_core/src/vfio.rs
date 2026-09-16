@@ -5,6 +5,8 @@
 
 use std::os::fd::BorrowedFd;
 use std::sync::Arc;
+use std::sync::Weak;
+use tdisp::host::EvidenceService;
 
 /// A backend failure while creating or using the VM association service.
 #[derive(Debug, thiserror::Error)]
@@ -32,6 +34,23 @@ pub trait VfioVm: Send + Sync {
     fn add_file(&self, file: BorrowedFd<'_>) -> Result<(), VfioVmError>;
     /// Remove the same open file description after dependency teardown.
     fn remove_file(&self, file: BorrowedFd<'_>) -> Result<(), VfioVmError>;
+    /// Register evidence for a final guest requester ID before the first VP run.
+    ///
+    /// The caller must retain the strong service reference for the assigned
+    /// device's lifetime and use this device's own VM association. The VM keeps
+    /// only a weak reference, avoiding a cycle through the assignment owner.
+    /// This is an explicit evidence-only opt-in, not permission for DMA or BAR
+    /// access. Backends without native evidence routing reject the request.
+    fn register_evidence(
+        &self,
+        _requester_id: u32,
+        _service: Weak<dyn EvidenceService>,
+    ) -> Result<(), VfioVmError> {
+        Err(VfioVmError::new(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "native device evidence routing is not supported by this VM",
+        )))
+    }
 }
 
 /// Creates association access only when a device actually needs it.

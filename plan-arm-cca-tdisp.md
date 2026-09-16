@@ -796,9 +796,11 @@ copying a name from the reference VMM. [K3, V4]
 
 The x86 `Exit::Hypercall` remains separate from the new `Exit::ArmHypercall`,
 which carries Arm's `nr`/`flags`, not the x86 argument/result contract.
-`Processor::read_arm_smccc_arguments` and `write_arm_smccc_results` now use
-`KVM_GET_ONE_REG` and `KVM_SET_ONE_REG`, including results in x0-x3. The native
-guest request adapter still needs to call them. Kernel PSCI handling remains
+`Processor::read_arm_smccc_function`, `read_arm_smccc_arguments`, and
+`write_arm_smccc_results` use `KVM_GET_ONE_REG` and `KVM_SET_ONE_REG`, including
+results in x0-x3. The evidence adapter checks original x0 against the exit
+number: the pinned kernel narrows `hypercall.nr` to 32 bits, so that field
+alone cannot enforce full-value validation. Kernel PSCI handling remains
 unchanged. [O3, K2, V3]
 
 Install forwarding filters before first run for the two exact DA ranges:
@@ -809,15 +811,74 @@ Leave host-configuration calls at `0xc500004e..=0xc5000050` to KVM. Validate eac
 do not forward a broad range of unrelated SMCCC calls. [K2, V3]
 
 `Partition::set_arm_rhi_da_filters` now provides those exact, opt-in filters.
-It is not called by normal partition setup. `Exit::ArmTio` preserves the
+It is not called by normal partition setup. Explicit pre-run evidence service
+registration installs it. `Exit::ArmTio` preserves the
 seven-field trusted-I/O packet and starts with a rejecting response.
 `ArmTioExit::accept` refuses unknown reasons or flags; known mapping requests
 still require device/address-policy validation before acceptance. The Arm
-`virt_kvm` loop explicitly rejects/stops on the new unsupported exits until
-native guest request routing and TIO handling are implemented. No RHI feature
-bits, filters, or live assignment are enabled by these interfaces alone.
+`virt_kvm` loop rejects/stops on unregistered hypercalls and trusted-I/O exits.
+Registered evidence services enable only the two evidence feature bits and
+the size/read handlers below. Live state transitions and TIO acceptance remain
+disabled.
 
 ### Request translation
+
+#### Evidence routing ownership
+
+Connect the evidence-only service through the existing VM association handle.
+The VFIO caller retains a strong service reference; the partition registry
+holds only weak references keyed by the final guest requester ID. This avoids
+a cycle through the service's partition-owned VFIO association. Registration
+is explicit and allowed only before the first VP run. The first registration
+installs the exact RHI filters; a partial filter failure poisons the partition
+and cannot be retried. Ordinary VMs install no filters.
+
+Use the existing blocking worker pool for synchronous evidence operations.
+An asynchronous admission gate permits only one scheduled or executing
+worker per device; do not submit workers that wait for the device lock.
+Each admitted worker owns its permit, coordinator and sink until completion,
+even if the waiting future is cancelled. Cancellation while awaiting admission
+submits no work. Keep the device lock through snapshot selection and delivery
+to a host-provided output sink; do not allocate an unbudgeted copy of the
+object. Only host management exposes explicit teardown. Teardown closes
+admission, drains accepted work, and rejects queued reads before issuing
+cleanup. Failed cleanup retains the closed owner for explicit retry.
+
+Freeze registration under the registry mutex at entry to the first `run_vp`,
+before its initial await, even if no device was registered. Reject duplicate
+live requester IDs; expired weak references resolve as missing devices.
+Never reopen or replace registrations after freeze. Failed filter setup blocks
+both ordinary entry and `complete_exit`, which also invokes `KVM_RUN`.
+
+The KVM output sink accepts only selector-clear, nonempty RAM byte ranges.
+Under the partition memory lock, check current slot coverage, the in-place
+visibility ledger, and the fatal flag, then copy with `GuestMemory::write_at`.
+Keep that lock through the copy so conversion and slot removal cannot race
+validation. Do not hold the memory lock across an evidence ioctl. Lock order
+is device coordinator, then partition memory; conversion must not acquire the
+device coordinator while holding the memory lock.
+
+Initially route FEATURES, OBJECT_SIZE and OBJECT_READ only. FEATURES returns
+the two implemented evidence bits directly in x0. Reject unsupported calls,
+unknown function/flag bits, invalid requester/object IDs, overflowing offsets,
+and invalid shared buffers with explicit protocol results. Backend and copy
+failures retain typed diagnostics and never report a successful byte count.
+The full Linux DA base feature set remains unadvertised; regeneration,
+LOCK/RUN and TIO acceptance remain disabled.
+
+GET/SET_ONE_REG failures poison the partition; partial result writes must
+never reach guest re-entry. Preserve the existing stop contract, which waits
+for the current VP operation to complete. An abandoned RHI future also poisons
+the partition and forces peer VPs out of KVM, preventing re-entry while an
+admitted worker can still access guest memory. A failed guest copy may have
+written a prefix: report
+ACCESS_FAILED with other result registers zero, not atomic rollback.
+
+Verify registration/freeze races, partial filter failure, weak-reference/drop
+ordering, bounded admission, cancellation, teardown/queued-read ordering,
+conversion/unmap versus copies, and full-width register/ID decoding. A later
+live diagnostic must issue evidence calls directly: the pinned Linux driver
+rejects the partial FEATURES mask and will not exercise this path on boot.
 
 | RHI request | Host action |
 |---|---|
@@ -1600,6 +1661,35 @@ before stopping. The real Arm backend now compiles with the new variants.
 Packet/filter/register unit coverage does not establish live filter forwarding,
 register round-trips, or RMM completion behavior on FVP; those remain runtime
 qualification work for the guest request integration.
+
+### Native evidence routing design review: 2026-09-16
+
+Design review: **Minor revisions**, incorporated. Added bounded admission
+before blocking-pool submission, explicit cancellation and teardown draining,
+a partition-wide freeze before any VP await/entry, and fatal handling for
+partial register writes or abandoned requests. Guest copy failures explicitly
+permit a written prefix, but never a success result. The runtime diagnostic
+must call the partial evidence interface directly rather than infer routing
+coverage from an ordinary Linux boot.
+
+The routing implementation review found that the kernel's exit number loses
+the original x0 high bits, and that marking a fatal flag alone does not stop
+peer VPs already in KVM. The adapter now reads and checks original x0, and
+its request guard invokes partition-wide poisoning with VP interruption.
+The scoped corrective review found no significant issues. Live host-call
+completion and multi-VP cancellation/copy behavior remain unqualified.
+
+The asynchronous service review found that dropping a caller could cancel an
+admitted blocking task before the pool started it. Admitted tasks now detach
+before the caller awaits a separate completion channel. The worker retains
+its admission permit, coordinator, and sink. Deterministic tests cover queued
+size, read, and teardown cancellation; the corrective review found no
+significant issues.
+
+The ordinary in-place CCA boot regression passed on FVP in 261.233 seconds,
+nextest run `010f1be1-4c50-4733-9692-da96971659c5`. Results are retained under
+`vmm_test_results/rhi-default-boot`. This run used no evidence registration:
+it confirms default boot behavior, not native RHI dispatch or TDISP operation.
 
 The earlier single-boot design review returned **Minor revisions**. It required
 immediate exit recording before output draining, caller-known result locations,
