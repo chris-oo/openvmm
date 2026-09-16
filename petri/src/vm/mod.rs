@@ -244,6 +244,22 @@ pub struct PetriVmBuilder<T: PetriVmmBackend> {
 /// How long to wait on a single inspect before giving up on it.
 const INSPECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+fn agent_disk_required(
+    linux_direct: bool,
+    pipette_as_init: bool,
+    image: Option<&AgentImage>,
+) -> bool {
+    image.is_some_and(|image| {
+        if pipette_as_init {
+            image.has_extras()
+        } else if linux_direct {
+            image.contains_pipette() || image.has_extras()
+        } else {
+            true
+        }
+    })
+}
+
 impl<T: PetriVmmBackend> Debug for PetriVmBuilder<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PetriVmBuilder")
@@ -664,7 +680,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
             Firmware::Uefi { .. } | Firmware::OpenhclUefi { .. } => BootDeviceType::Scsi,
         };
 
-        Ok(Self {
+        let builder = Self {
             backend: artifacts.backend,
             config: PetriVmConfig {
                 name: test_name.to_string(),
@@ -713,11 +729,16 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
             no_vmbus: !T::SUPPORTS_VMBUS,
             no_hv: false,
             capture_inspect_on_failure: false,
-
             nested_test: artifacts
                 .nested_test
                 .map(|t| t.resolve(!T::SUPPORTS_FILE_SHARING))
                 .transpose()?,
+        };
+
+        Ok(if builder.no_vmbus {
+            builder.with_no_vmbus()
+        } else {
+            builder
         })
     }
 
@@ -900,14 +921,14 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
 
     /// Disable VMBus entirely.
     ///
-    /// This removes all VMBus storage controllers. For Linux guests,
-    /// virtio-vsock is used for pipette communication. For Windows guests,
+    /// This removes all VMBus storage controllers. For Linux guests with
+    /// pipette enabled, virtio-vsock is used for communication. For Windows guests,
     /// the caller must also configure TCP pipette transport via
     /// `modify_backend(|b| b.with_tcp_pipette_nic(port, mac_address))`. The
     /// guest must boot from a non-VMBus device (e.g. PCIe NVMe).
     pub fn with_no_vmbus(mut self) -> Self {
         self.no_vmbus = true;
-        if self.config.firmware.os_flavor() != OsFlavor::Windows {
+        if self.config.firmware.os_flavor() != OsFlavor::Windows && self.using_vtl0_pipette() {
             self.use_virtio_vsock = true;
         }
         self.config.vmbus_storage_controllers.clear();
@@ -1020,12 +1041,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
             ),
         };
 
-        // When using pipette-as-init, the VTL0 agent disk is only needed
-        // if it carries extra files (pipette itself is in the initrd).
-        if target_vtl == Vtl::Vtl0
-            && self.uses_pipette_as_init()
-            && !agent_image.is_some_and(|i| i.has_extras())
-        {
+        if target_vtl == Vtl::Vtl0 && !self.has_agent_disk() {
             return Ok(self);
         }
 
@@ -1219,14 +1235,14 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
 
     /// Whether the VTL0 agent disk will actually be added.
     ///
-    /// False when using pipette-as-init with no extra files (pipette is
-    /// in the initrd, so the CIDATA disk isn't needed).
+    /// Linux direct boot needs a disk only for a disk-based agent or extra
+    /// files. An unmodified, agent-free initrd does not need cloud-init media.
     fn has_agent_disk(&self) -> bool {
-        if self.uses_pipette_as_init() {
-            self.agent_image.as_ref().is_some_and(|i| i.has_extras())
-        } else {
-            self.agent_image.is_some()
-        }
+        agent_disk_required(
+            matches!(self.config.firmware, Firmware::LinuxDirect { .. }),
+            self.uses_pipette_as_init(),
+            self.agent_image.as_ref(),
+        )
     }
 
     /// Get properties about the vm for convenience
@@ -4374,6 +4390,15 @@ mod tests {
     use crate::VmbusStorageController;
     use crate::VmbusStorageType;
     use crate::Vtl;
+
+    #[test_with_tracing::test]
+    fn agent_free_linux_direct_does_not_add_empty_cloud_init_media() {
+        let image = AgentImage::new(OsFlavor::Linux);
+        assert!(!agent_disk_required(true, false, Some(&image)));
+        assert!(!agent_disk_required(true, true, Some(&image)));
+        assert!(!agent_disk_required(true, false, None));
+        assert!(agent_disk_required(false, false, Some(&image)));
+    }
 
     #[derive(Clone, Copy)]
     enum TestInspectBehavior {

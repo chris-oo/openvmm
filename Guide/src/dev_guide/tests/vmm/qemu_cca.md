@@ -294,6 +294,8 @@ NEXTEST_TEST_THREADS=1 PYTHONDONTWRITEBYTECODE=1 cargo xflowey vmm-tests-run \
 from Stage A run 3. The initrd already contains the guest TSM and 64 MiB disk
 read test, so this test adds neither pipette nor a guest helper. Flowey and
 the test check both input hashes. OpenVMM uses its own PL011 console arguments.
+Agent-free Linux direct boot skips empty agent media and the serial-agent
+RTS handshake; neither is required by this initrd.
 This path is under implementation; no end-to-end pass has been established.
 
 Use the DA profile and roots above, add `--cca-tdisp-guest-root` pointing to
