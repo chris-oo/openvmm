@@ -5,6 +5,7 @@
 //! or a TDISP state machine, and does not register DMA or guest BAR mappings.
 
 mod objects;
+pub mod tdisp;
 
 pub use objects::OperationError;
 pub use objects::RealmOperation;

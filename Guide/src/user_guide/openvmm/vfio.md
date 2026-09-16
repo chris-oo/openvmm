@@ -36,8 +36,17 @@ The additive `tdisp::host` core provides native lifecycle bookkeeping and
 evidence snapshots without changing the existing protobuf emulator. It
 serializes backend calls, quarantines uncertain mutations, and bounds both
 individual objects and the shared snapshot budget. Invalid state requests
-do not implicitly unlock a device. The Linux backend and guest RHI transport
-are not connected to this core yet, so it does not enable CCA device use.
+do not implicitly unlock a device.
+
+`RealmDevice::into_tdisp` verifies the CCA TDI binding with a read-only
+certificate-size request before transferring an attached assignment into
+this core. Attachment alone does not prove a TSM is configured. Failed
+verification returns the original owner for explicit recovery.
+The evidence owner retains the VFIO/IOMMUFD/KVM bundle, checks complete size
+replies and read lengths, and uses the existing ordered cleanup on teardown.
+It exposes no raw backend or state-changing request. Guest RHI transport,
+access revocation, and DMA coordination remain unconnected, so this does not
+enable CCA device use.
 
 ## Overview
 

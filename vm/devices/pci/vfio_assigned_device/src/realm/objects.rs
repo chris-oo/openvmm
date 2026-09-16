@@ -220,6 +220,19 @@ impl<B: Operations> ObjectOwner<B> {
         }
     }
 
+    pub fn with_attached<T>(
+        &mut self,
+        call: impl FnOnce(&mut B, u32) -> T,
+    ) -> Result<T, RealmPhase> {
+        let phase = self.state().phase;
+        if phase != RealmPhase::Attached {
+            return Err(phase);
+        }
+        let bundle = self.bundle.as_mut().expect("attached owner");
+        let vdevice = bundle.state.vdevice.expect("attached vdevice");
+        Ok(call(&mut bundle.operations, vdevice))
+    }
+
     pub fn attach(&mut self, rid: u32) -> Result<(), RealmSetupError> {
         if self.state().phase != RealmPhase::Prepared {
             return Err(RealmSetupError {

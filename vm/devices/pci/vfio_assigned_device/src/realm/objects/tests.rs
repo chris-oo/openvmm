@@ -160,6 +160,43 @@ fn cleanup() -> Vec<Call> {
     ]
 }
 
+#[test]
+fn native_requests_require_attached_owned_vdevice() {
+    let (fake, model) = Fake::new(Vec::new());
+    let mut owner = prepared(fake);
+    assert_eq!(
+        owner.with_attached(|_, _| panic!("prepared owner must not issue a request")),
+        Err::<(), _>(RealmPhase::Prepared)
+    );
+    owner.attach(RID).unwrap();
+    owner
+        .with_attached(|ops, vdevice| {
+            assert!(Arc::ptr_eq(&ops.model, &model));
+            assert_eq!(vdevice, VDEVICE);
+        })
+        .unwrap();
+    owner.close().unwrap();
+    assert_eq!(
+        owner.with_attached(|_, _| panic!("closed owner must not issue a request")),
+        Err::<(), _>(RealmPhase::Closed)
+    );
+}
+
+#[test]
+fn cleanup_failure_prevents_further_native_requests() {
+    let (fake, model) = Fake::new(vec![Call::Detach]);
+    let mut owner = prepared(fake);
+    owner.attach(RID).unwrap();
+    owner.close().unwrap_err();
+    assert_eq!(
+        owner.with_attached(|_, _| panic!("cleaning owner must not issue a request")),
+        Err::<(), _>(RealmPhase::Cleaning)
+    );
+    assert_eq!(owner.state().vdevice, Some(VDEVICE));
+    model.lock().failures.clear();
+    owner.close().unwrap();
+}
+
 fn prepared(fake: Fake) -> ObjectOwner<Fake> {
     match ObjectOwner::prepare(fake) {
         Ok(owner) => owner,
