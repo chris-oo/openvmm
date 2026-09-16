@@ -622,6 +622,23 @@ impl virt::Processor for KvmProcessor<'_> {
                             KvmRunVpError::UnsupportedMemoryFault { flags, gpa, size }.into(),
                         ));
                     }
+                    kvm::Exit::ArmHypercall { .. } => {
+                        if self.partition.memory_backing_mode.is_in_place() {
+                            self.partition.mark_cca_fatal();
+                        }
+                        return Err(dev.fatal_error(
+                            KvmRunVpError::UnhandledExit(format!("{exit:?}")).into(),
+                        ));
+                    }
+                    kvm::Exit::ArmTio(mut tio) => {
+                        tio.reject();
+                        if self.partition.memory_backing_mode.is_in_place() {
+                            self.partition.mark_cca_fatal();
+                        }
+                        return Err(dev.fatal_error(
+                            KvmRunVpError::UnhandledExit(format!("ArmTio({tio:?})")).into(),
+                        ));
+                    }
                     kvm::Exit::MmioWrite { address, data } => {
                         dev.write_mmio(self.vpindex, self.partition.mmio_address(address), data)
                             .await

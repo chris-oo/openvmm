@@ -48,6 +48,12 @@ It exposes no raw backend or state-changing request. Guest RHI transport,
 access revocation, and DMA coordination remain unconnected, so this does not
 enable CCA device use.
 
+The `kvm` crate also has opt-in native Arm hypercall filters, SMCCC register
+access, and trusted-I/O exit decoding. No filters are installed by default.
+Trusted-I/O exits start rejected, including unknown reasons or flags. Until
+guest request routing is connected, `virt_kvm` stops on these exits rather
+than approving device access.
+
 ## Overview
 
 OpenVMM running on a Linux host can assign physical PCI devices to guest VMs using VFIO. The device is bound to the `vfio-pci` kernel driver, then OpenVMM opens it via VFIO and presents it to the guest as a PCIe endpoint.

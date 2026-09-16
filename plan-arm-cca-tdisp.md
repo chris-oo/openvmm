@@ -794,10 +794,12 @@ Their command number is 0x96 and their outer layout is 48 bytes. Use Linux's
 names for new bindings and assert encoding/layout compatibility rather than
 copying a name from the reference VMM. [K3, V4]
 
-OpenVMM's existing `Exit::Hypercall` is x86-only. Arm KVM fills `nr`/`flags`,
-not the x86 argument/result contract. Add Arm-specific register handling via
-`KVM_GET_ONE_REG` and `KVM_SET_ONE_REG`, including results in x0-x3. Preserve
-the existing kernel PSCI handling. [O3, K2, V3]
+The x86 `Exit::Hypercall` remains separate from the new `Exit::ArmHypercall`,
+which carries Arm's `nr`/`flags`, not the x86 argument/result contract.
+`Processor::read_arm_smccc_arguments` and `write_arm_smccc_results` now use
+`KVM_GET_ONE_REG` and `KVM_SET_ONE_REG`, including results in x0-x3. The native
+guest request adapter still needs to call them. Kernel PSCI handling remains
+unchanged. [O3, K2, V3]
 
 Install forwarding filters before first run for the two exact DA ranges:
 `0xc500004b..=0xc500004d` and `0xc5000052..=0xc5000054`.
@@ -805,6 +807,15 @@ RHI uses SMCCC owner 5 (`STANDARD_HYP`), not owner 4. Derive these constants
 from the pinned definitions and test their full encoded values.
 Leave host-configuration calls at `0xc500004e..=0xc5000050` to KVM. Validate each function;
 do not forward a broad range of unrelated SMCCC calls. [K2, V3]
+
+`Partition::set_arm_rhi_da_filters` now provides those exact, opt-in filters.
+It is not called by normal partition setup. `Exit::ArmTio` preserves the
+seven-field trusted-I/O packet and starts with a rejecting response.
+`ArmTioExit::accept` refuses unknown reasons or flags; known mapping requests
+still require device/address-policy validation before acceptance. The Arm
+`virt_kvm` loop explicitly rejects/stops on the new unsupported exits until
+native guest request routing and TIO handling are implemented. No RHI feature
+bits, filters, or live assignment are enabled by these interfaces alone.
 
 ### Request translation
 
@@ -1579,6 +1590,16 @@ reporting the fresh binding's Unlocked state. Failed verification returns
 the original owner without cleanup or mutation. Constructor-boundary tests
 cover missing TSM/TDI, invalid phases, and incomplete or absent size replies.
 The scoped corrective review found no significant issues.
+
+### Arm KVM native transport interface review: 2026-09-16
+
+Review verified the pinned ABI interfaces and found an incomplete exhaustive
+exit match in the Arm `virt_kvm` consumer. This is fixed in the same change:
+unexpected native hypercalls stop the VM, and trusted-I/O exits remain rejected
+before stopping. The real Arm backend now compiles with the new variants.
+Packet/filter/register unit coverage does not establish live filter forwarding,
+register round-trips, or RMM completion behavior on FVP; those remain runtime
+qualification work for the guest request integration.
 
 The earlier single-boot design review returned **Minor revisions**. It required
 immediate exit recording before output draining, caller-known result locations,

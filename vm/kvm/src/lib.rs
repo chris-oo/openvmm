@@ -25,6 +25,9 @@ use thiserror::Error;
 mod vfio;
 pub use vfio::VfioDevice;
 
+#[cfg(any(target_arch = "aarch64", test))]
+pub mod arm;
+
 mod ioctl {
     #[cfg(any(target_arch = "aarch64", test))]
     use super::KvmArmRmiInitRipas;
@@ -2148,17 +2151,11 @@ impl<'a> VpRunner<'a> {
                 }
             }
             #[cfg(target_arch = "x86_64")]
-            KVM_EXIT_HYPERCALL => {
-                // SAFETY: this is the active union field.
-                let hypercall = unsafe { &mut self.run_data().__bindgen_anon_1.hypercall };
-                Exit::Hypercall {
-                    nr: hypercall.nr,
-                    args: hypercall.args,
-                    result: &mut hypercall.ret,
-                    // SAFETY: this is the active field for KVM_EXIT_HYPERCALL.
-                    flags: unsafe { hypercall.__bindgen_anon_1.flags },
-                }
-            }
+            KVM_EXIT_HYPERCALL => x86_hypercall_exit(self.run_data()),
+            #[cfg(target_arch = "aarch64")]
+            KVM_EXIT_HYPERCALL => arm::hypercall_exit(self.run_data()),
+            #[cfg(target_arch = "aarch64")]
+            arm::KVM_EXIT_ARM64_TIO_UAPI => arm::tio_exit(self.run_data()),
             #[cfg(target_arch = "x86_64")]
             KVM_EXIT_X86_WRMSR => {
                 // SAFETY: this is the active union field.
@@ -2253,6 +2250,19 @@ fn memory_fault_exit(run: &kvm_run) -> Exit<'_> {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+fn x86_hypercall_exit(run: &mut kvm_run) -> Exit<'_> {
+    // SAFETY: The caller checked that KVM reported KVM_EXIT_HYPERCALL.
+    let hypercall = unsafe { &mut run.__bindgen_anon_1.hypercall };
+    Exit::Hypercall {
+        nr: hypercall.nr,
+        args: hypercall.args,
+        result: &mut hypercall.ret,
+        // SAFETY: This is the active field for KVM_EXIT_HYPERCALL.
+        flags: unsafe { hypercall.__bindgen_anon_1.flags },
+    }
+}
+
 #[derive(Debug)]
 pub enum Exit<'a> {
     Interrupted,
@@ -2294,6 +2304,14 @@ pub enum Exit<'a> {
         result: &'a mut u64,
         flags: u64,
     },
+    /// Arm supplies arguments and results through ONE_REG, not this packet.
+    #[cfg(any(target_arch = "aarch64", test))]
+    ArmHypercall {
+        nr: u64,
+        flags: u64,
+    },
+    #[cfg(any(target_arch = "aarch64", test))]
+    ArmTio(arm::ArmTioExit<'a>),
     #[cfg(target_arch = "x86_64")]
     MsrRead {
         index: u32,
