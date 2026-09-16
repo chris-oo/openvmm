@@ -33,6 +33,7 @@ thiserror.workspace = true
 zerocopy.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
+futures.workspace = true
 nix.workspace = true
 test_with_tracing.workspace = true
 

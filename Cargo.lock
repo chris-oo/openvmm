@@ -8399,7 +8399,11 @@ name = "tdisp"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bitfield-struct 0.11.0",
+ "blocking",
+ "futures",
+ "mesh",
  "parking_lot",
  "prost",
  "static_assertions",
@@ -9589,6 +9593,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chipset_device",
+ "futures",
  "guestmem",
  "inspect",
  "membacking",

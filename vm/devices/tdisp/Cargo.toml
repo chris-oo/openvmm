@@ -8,6 +8,10 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
+blocking.workspace = true
+futures.workspace = true
+mesh.workspace = true
 parking_lot.workspace = true
 prost.workspace = true
 tracing.workspace = true
