@@ -266,6 +266,104 @@ The remaining IOMMUFD errors and model heap abort are separate observations;
 their causal relationship is unknown. Do not suppress either or treat the
 model's shutdown failure as a passing end-to-end test.
 
+### Minimal DA model shutdown reproduction
+
+The host-object fixture remains blocked before test execution. Its first
+enumeration boot reached host TSM connection, VFIO binding and pipette, but
+FVP aborted at poweroff. A retry explicitly unbound VFIO, cleared the driver
+override and disconnected the host TSM. All teardown steps completed,
+including `RMI_PDEV_STREAM_DISCONNECT -> RMI_SUCCESS`, yet the same heap
+diagnostic and model exit 134 remained. No Realm allocation owner ran.
+
+Three bounded diagnostic cases and two follow-up controls reduced the
+reproduction:
+
+| Case | Linux / TSM activity | Observed result |
+|---|---|---|
+| Single-AHCI model construction, no firmware or payload, one simulated instruction | Neither Linux nor TSM | Natural model exit 0, 1.41 s |
+| Minimal host using the pinned firmware/kernel and a tiny diagnostic init; no networking, 9P, pipette or test listing | Linux boots; AHCI stays bound; no TSM connect | Guest exit 0 and natural model exit 0, 11.58 s |
+| Same minimal host, adding AHCI-driver unbind and host TSM connect/disconnect, under GDB | Both TSM operations complete; guest powers down | Guest exit 0, then model SIGABRT with `corrupted size vs. prev_size`, 13.69 s |
+| Minimal host with AHCI unbind only, under the same GDB launcher | Linux completes; TSM connection stays empty | Guest, model and debugger exit 0, 11.63 s |
+| The third case's exact model arguments and boot inputs, without GDB | TSM connect/disconnect, RMI disconnect and SPDM session termination complete | Guest exit 0; heap-corruption diagnostic and natural model status 139, 19.80 s |
+
+GDB caught the third case's abort, killed the stopped inferior, and exited
+134. This is not a recorded natural model exit. The earlier attempt at that
+case exited 1 before Linux because the debugger launcher passed escaped
+brackets literally; correcting the launcher produced the result above.
+
+The captured stack detects corruption in `free()` during model destruction,
+below `scx::scx_evs_base::~scx_evs_base()`. Stripped model callers include
+`0x175920c`, `0x1545f0d`, and `0x1301081`; the AHCI worker was waiting in
+`pthread_cond_wait`. The stack identifies detection, not the original
+corrupting operation.
+
+This reproduction does not require VFIO, a Realm VM, the allocation owner,
+the test infrastructure, or GDB. AHCI unbind alone did not reproduce the
+failure; the host TSM connect/disconnect sequence did. This narrows the
+trigger for this fixture but does not identify the corrupting write or
+separate connection from disconnection as the triggering operation. The
+natural status 139 in the fifth case must not be relabeled as the earlier
+134 or as a debugger-controlled exit.
+Do not infer that a firmware rebuild or an allocation-owner change fixes it.
+The object-lifecycle runtime gate remains open.
+
+Commands, configuration differences, results and logs are retained under
+`target/cca-tdisp-stage-a/realm-vfio-debug/`, with the initial matrix in
+`summary.json` and follow-up controls in `controls-summary.json`.
+The successful minimal controls are diagnostic results, not TDISP or DMA
+qualification. No diagnostic process or container remains active.
+
+Per the implementation priority, defer further investigation of this model
+shutdown failure for now. Keep the model failure visible and separate from
+the test-command outcome; do not relabel it as clean shutdown. This deferral
+does not waive the Realm owner's allocation/cleanup checks, private-DMA
+evidence, or interrupt requirements. Actual Realm-object creation and cleanup
+still need runtime evidence, from the OpenVMM end-to-end test or an optional
+standalone diagnostic. Enumeration-only boots have not exercised them.
+
+### Single-boot diagnostic execution
+
+The standalone Realm-object preflight is optional diagnostic coverage, not
+a prerequisite for further implementation. The primary target is a VMM test
+that launches OpenVMM, boots the CCA guest, activates TDISP, and verifies
+device I/O. Actual object creation and cleanup can be checked as part of that
+test. Keep the independent preflight for isolating failures when useful.
+
+Add an explicit `--fvp-single-test <exact-name>` mode to
+`cargo xflowey vmm-tests-run`, mutually exclusive with a user-supplied filter.
+Keep the existing build/artifact discovery and pinned FVP validation, but
+run the native AArch64 cargo-nextest executable inside one L1 session.
+Enumeration and the one selected `tests`-binary test then occur before any
+L1 poweroff.
+The default per-test target-runner path remains unchanged.
+
+After artifact copies complete, create private per-invocation inputs and
+snapshot the native runner, test archive, and a derived nextest configuration
+alongside the existing FVP inputs. Use guest-local temporary storage, serial
+execution with no retries, an exact filter, and `--no-tests fail` so an empty
+or ignored-only selection cannot pass. Preserve native JUnit output inside
+the registered guest results directory, without modifying the source config.
+Validate complete JUnit and the exact non-skipped test identity before
+reporting its result. Build-only mode must never boot the model.
+
+Record confirmed command results as soon as wait observes exit, before output
+draining can time out. Use atomic, synced result updates and retain separate
+teardown, launcher-shutdown and finalization outcomes. A failed FVP shutdown
+must still fail the overall invocation, even if native tests pass. Use a fresh
+output directory per invocation to avoid accepting stale result files. Resolve
+JUnit through the invocation's registered output location, not a latest-run
+search. Publish available evidence before reporting overall failure; unsafe
+or incomplete result copying remains unavailable, not a pass. The execution
+deadline covers native enumeration and the selected test together. This mode
+is diagnostic progress, not clean-platform or trusted-DMA qualification.
+
+The single-boot path and runtime reports are implemented but have not yet
+been exercised together on FVP. Private run directories live under
+`fvp-single-boot-runs`, outside the shared `test_results` and `temp` trees
+that normal setup clears. The caller-known runtime report uses schema version
+2 with `run_id` and `run_output_dir`; a failed overall report must not erase a
+separately validated guest test result.
+
 ### Important refinements to the earlier findings
 
 - OpenVMM already has PCI passthrough, VFIO cdev, IOMMUFD, nested SMMUv3 support,
@@ -408,6 +506,20 @@ does not authenticate it. [O1, K5]
 
 No OpenHCL image, VMBus, VPCI device, protobuf CCA protocol tag, or emulated
 DOE device is required for the native Linux path.
+
+The additive `tdisp::host` core is now implemented, with native state/object
+types, explicit lifecycle transitions, quarantine on mutation errors, and
+bounded transition history. Whole-object acquisition rejects empty or
+oversized objects and inconsistent returned lengths. Snapshots use a shared
+RAII budget across devices, fallible allocation, and checked slices. Mutations
+and failed acquisition invalidate cached evidence. Legacy protobuf behavior
+remains unchanged.
+
+Typed `vfio_sys::iommufd::tsm` bindings now encode the pinned CCA request
+layouts, retain host buffers for synchronous calls, and preserve syscall
+errno, nonnegative residue and TSM code as separate results. Reads use only
+backend offset zero. These two components still need a Linux device
+coordinator and native guest transport; neither enables live CCA assignment.
 
 ## 5. Configuration and ownership
 
@@ -1220,9 +1332,12 @@ separately. Do not use repeated forced shutdown as a clean-reuse result.
 Stage C scaffolding and B can proceed using the recorded local candidate;
 publishing a qualified DA platform/test still requires the open Stage A gates.
 D depends on B;
-E can develop against fakes alongside D. F requires B, D and E. G requires
-the qualified C/F outputs. Interrupt work discovered in A is a prerequisite
-for F, not deferred cleanup.
+E can develop against fakes and typed ioctls alongside D. F requires B, D and
+E. G's completion requires qualified C/F outputs, but developing and attempting
+the end-to-end diagnostic can use validated candidate artifacts before clean
+reference-platform qualification. This does not relax F's implementation and
+access-control prerequisites for real LOCK/RUN. Interrupt work discovered in A
+is a prerequisite for F, not deferred cleanup.
 
 Use focused crate checks, clippy, rustdoc and unit tests while implementing.
 Use `cargo nextest run --profile agent -p <package>` for unit tests and
@@ -1421,3 +1536,27 @@ ownership, and drop-counter/wiring regression tests. Separate code reviews
 of the provider wiring and allocation owner found no significant issues.
 The FVP boot regression checks provider lifetime integration only, not
 hardware object creation or trusted DMA.
+
+### Direct OpenVMM execution priority: 2026-09-16
+
+Targeted plan review: **Minor revisions**, incorporated. Removed the remaining
+mandatory standalone-preflight wording and distinguished permission to develop
+and attempt end-to-end diagnostics from completed support qualification.
+Stage E proceeds with fakes and typed native TSM bindings. Actual lifecycle,
+interrupt and private-DMA evidence remain required; no live assignment or
+state transition is enabled by the new bindings alone.
+
+Independent code reviews of the native host core and typed CCA ioctl bindings
+found no significant issues. Scoped unit coverage includes legacy TDISP
+behavior, snapshot bounds/budget release, quarantine, ABI layouts, residue
+handling and errno propagation. The ioctl layout was also checked against
+the pinned C headers. These are implementation checks, not runtime TDISP or
+private-DMA qualification.
+
+The earlier single-boot design review returned **Minor revisions**. It required
+immediate exit recording before output draining, caller-known result locations,
+exact non-skipped test evidence, private input snapshots, and publication before
+overall failure reporting. A later code review found shared setup could delete
+an active invocation's files; the implementation now keeps its inputs, outputs,
+host temporary storage and publication directory outside shared cleanup trees.
+Live single-boot qualification remains outstanding.

@@ -32,6 +32,13 @@ not enable guest requests or make state changes safe. Access revocation,
 request serialization, and uncertain-completion handling belong to the
 device coordinator.
 
+The additive `tdisp::host` core provides native lifecycle bookkeeping and
+evidence snapshots without changing the existing protobuf emulator. It
+serializes backend calls, quarantines uncertain mutations, and bounds both
+individual objects and the shared snapshot budget. Invalid state requests
+do not implicitly unlock a device. The Linux backend and guest RHI transport
+are not connected to this core yet, so it does not enable CCA device use.
+
 ## Overview
 
 OpenVMM running on a Linux host can assign physical PCI devices to guest VMs using VFIO. The device is bound to the `vfio-pci` kernel driver, then OpenVMM opens it via VFIO and presents it to the guest as a PCIe endpoint.
