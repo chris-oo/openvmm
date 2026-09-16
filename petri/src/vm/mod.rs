@@ -194,6 +194,22 @@ pub struct PetriVmBuilder<T: PetriVmmBackend> {
     no_hv: bool,
 }
 
+fn agent_disk_required(
+    linux_direct: bool,
+    pipette_as_init: bool,
+    image: Option<&AgentImage>,
+) -> bool {
+    image.is_some_and(|image| {
+        if pipette_as_init {
+            image.has_extras()
+        } else if linux_direct {
+            image.contains_pipette() || image.has_extras()
+        } else {
+            true
+        }
+    })
+}
+
 impl<T: PetriVmmBackend> Debug for PetriVmBuilder<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PetriVmBuilder")
@@ -830,12 +846,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
             ),
         };
 
-        // When using pipette-as-init, the VTL0 agent disk is only needed
-        // if it carries extra files (pipette itself is in the initrd).
-        if target_vtl == Vtl::Vtl0
-            && self.uses_pipette_as_init()
-            && !agent_image.is_some_and(|i| i.has_extras())
-        {
+        if target_vtl == Vtl::Vtl0 && !self.has_agent_disk() {
             return self;
         }
 
@@ -1025,14 +1036,14 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
 
     /// Whether the VTL0 agent disk will actually be added.
     ///
-    /// False when using pipette-as-init with no extra files (pipette is
-    /// in the initrd, so the CIDATA disk isn't needed).
+    /// Linux direct boot needs a disk only for a disk-based agent or extra
+    /// files. An unmodified, agent-free initrd does not need cloud-init media.
     fn has_agent_disk(&self) -> bool {
-        if self.uses_pipette_as_init() {
-            self.agent_image.as_ref().is_some_and(|i| i.has_extras())
-        } else {
-            self.agent_image.is_some()
-        }
+        agent_disk_required(
+            matches!(self.config.firmware, Firmware::LinuxDirect { .. }),
+            self.uses_pipette_as_init(),
+            self.agent_image.as_ref(),
+        )
     }
 
     /// Get properties about the vm for convenience
@@ -3697,11 +3708,24 @@ pub(crate) fn petri_disk_cache_dir() -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::AgentImage;
+    use super::OsFlavor;
+    use super::agent_disk_required;
     use super::make_vm_safe_name;
     use crate::Drive;
     use crate::VmbusStorageController;
     use crate::VmbusStorageType;
     use crate::Vtl;
+    use test_with_tracing::test;
+
+    #[test]
+    fn agent_free_linux_direct_does_not_add_empty_cloud_init_media() {
+        let image = AgentImage::new(OsFlavor::Linux);
+        assert!(!agent_disk_required(true, false, Some(&image)));
+        assert!(!agent_disk_required(true, true, Some(&image)));
+        assert!(!agent_disk_required(true, false, None));
+        assert!(agent_disk_required(false, false, Some(&image)));
+    }
 
     #[test]
     fn test_short_names_unchanged() {

@@ -169,6 +169,11 @@ impl PetriVmConfigOpenVmm {
             mesh: &mesh,
             openvmm_path,
             uses_pipette_as_init: properties.uses_pipette_as_init,
+            needs_serial_agent: needs_linux_serial_agent(
+                firmware.is_linux_direct(),
+                properties.uses_pipette_as_init,
+                properties.using_vtl0_pipette,
+            ),
             enable_serial: properties.enable_serial,
             use_virtio_vsock: properties.use_virtio_vsock,
             no_vmbus: properties.no_vmbus,
@@ -365,8 +370,7 @@ impl PetriVmConfigOpenVmm {
             // Set so that we don't pull serial data until the guest is
             // ready. Otherwise, Linux will drop the input serial data
             // on the floor during boot.
-            if matches!(firmware, Firmware::LinuxDirect { .. }) && !properties.uses_pipette_as_init
-            {
+            if matches!(firmware, Firmware::LinuxDirect { .. }) && setup.needs_serial_agent {
                 chipset = chipset.with_serial_wait_for_rts();
             }
         }
@@ -787,6 +791,14 @@ impl PetriVmConfigOpenVmm {
     }
 }
 
+fn needs_linux_serial_agent(
+    linux_direct: bool,
+    pipette_as_init: bool,
+    using_pipette: bool,
+) -> bool {
+    linux_direct && using_pipette && !pipette_as_init
+}
+
 struct PetriVmConfigSetupCore<'a> {
     arch: MachineArch,
     firmware: &'a Firmware,
@@ -799,6 +811,7 @@ struct PetriVmConfigSetupCore<'a> {
     mesh: &'a Mesh,
     openvmm_path: &'a ResolvedArtifact,
     uses_pipette_as_init: bool,
+    needs_serial_agent: bool,
     enable_serial: bool,
     use_virtio_vsock: bool,
     no_vmbus: bool,
@@ -872,7 +885,7 @@ impl PetriVmConfigSetupCore<'_> {
             None
         };
 
-        if self.firmware.is_linux_direct() && !self.uses_pipette_as_init {
+        if self.needs_serial_agent {
             // Non-pipette-as-init Linux direct: create serial1 and a serial
             // agent so we can send shell commands to launch pipette.
             let (serial1_host, serial1) = self.create_serial_stream()?;
@@ -1607,6 +1620,21 @@ async fn vmbus_storage_controllers_to_openvmm(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_with_tracing::test;
+
+    #[test]
+    fn serial_handshake_is_only_for_disk_based_linux_agents() {
+        for linux_direct in [false, true] {
+            for pipette_as_init in [false, true] {
+                for using_pipette in [false, true] {
+                    assert_eq!(
+                        needs_linux_serial_agent(linux_direct, pipette_as_init, using_pipette),
+                        linux_direct && !pipette_as_init && using_pipette,
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn maps_cca_isolation() {
