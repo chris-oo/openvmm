@@ -1,0 +1,25 @@
+{
+  "rootport/rootport0": {
+    "device_number": 1,
+    "device_id": 3567,
+    "vendor_id": 5045,
+    "acs_supported": 1,
+    "rmeda_dvsec_enable": 1,
+    "ide_supported": 1,
+    "__downstream__": {
+      "ahci/ahci1": {
+        "endpoint.device": 0,
+        "endpoint.multi_function": 0,
+        "endpoint.function": 0,
+        "endpoint.doe_supported": 1,
+        "endpoint.ide_supported": 1,
+        "endpoint.tee_io_supported": 1,
+        "endpoint.certificate_der_filename": "@FIXTURE_ROOT@/sample_key/ecp384/bundle_responder.certchain.der",
+        "endpoint.private_key_filename": "@FIXTURE_ROOT@/sample_key/ecp384/end_responder.key",
+        "endpoint.measurement_block_filename": "@FIXTURE_ROOT@/measurements.json",
+        "endpoint.bit_mask_of_base_asym_alg": 128,
+        "image_path": "@FIXTURE_ROOT@/ahci-disk.img"
+      }
+    }
+  }
+}

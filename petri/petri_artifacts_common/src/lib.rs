@@ -46,6 +46,9 @@ pub mod capabilities {
     pub const CCA: &str = "cca";
     /// CCA host supports the qualified in-place guest_memfd memory mode.
     pub const GUEST_MEMFD_IN_PLACE: &str = "guest_memfd_in_place";
+    /// Pinned AHCI cdev connected to the host TSM for Realm object tests.
+    /// This does not qualify guest DMA or TDISP LOCK/RUN.
+    pub const CCA_REALM_VFIO: &str = "cca_realm_vfio";
 
     /// Support for resetting a partition running Windows.
     pub const WINDOWS_PARTITION_RESET: &str = "windows_partition_reset";
@@ -57,6 +60,7 @@ pub mod capabilities {
         VPCI,
         CCA,
         GUEST_MEMFD_IN_PLACE,
+        CCA_REALM_VFIO,
         WINDOWS_PARTITION_RESET,
         "test_disk",
         "edu_initiator",
