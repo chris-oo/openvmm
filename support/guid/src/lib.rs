@@ -2,10 +2,18 @@
 // Licensed under the MIT License.
 
 //! Provides the [`Guid`] type with the same layout as the Windows type `GUID`.
+//!
+//! Disable default features for allocation-free, `no_std` parsing and formatting.
+//! The default `random` feature enables random GUID generation. The default
+//! `std` feature enables Windows type conversions on Windows.
 
+#![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
 
-use std::str::FromStr;
+#[cfg(test)]
+extern crate std;
+
+use core::str::FromStr;
 use thiserror::Error;
 use zerocopy::FromBytes;
 use zerocopy::FromZeros;
@@ -74,6 +82,7 @@ macro_rules! guid {
 
 impl Guid {
     /// Return a new randomly-generated Version 4 UUID
+    #[cfg(feature = "random")]
     pub fn new_random() -> Self {
         let mut guid = Guid::default();
         getrandom::fill(guid.as_mut_bytes()).expect("rng failure");
@@ -157,8 +166,8 @@ impl Guid {
     }
 }
 
-impl std::fmt::Display for Guid {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Guid {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
             f,
             "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
@@ -177,14 +186,14 @@ impl std::fmt::Display for Guid {
     }
 }
 
-impl std::fmt::LowerHex for Guid {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(self, f)
+impl core::fmt::LowerHex for Guid {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Display::fmt(self, f)
     }
 }
 
-impl std::fmt::UpperHex for Guid {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::UpperHex for Guid {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
             f,
             "{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
@@ -203,9 +212,9 @@ impl std::fmt::UpperHex for Guid {
     }
 }
 
-impl std::fmt::Debug for Guid {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(self, f)
+impl core::fmt::Debug for Guid {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Display::fmt(self, f)
     }
 }
 
@@ -273,7 +282,7 @@ impl From<Guid> for [u8; 16] {
 }
 
 mod windows {
-    #![cfg(windows)]
+    #![cfg(all(windows, feature = "std"))]
     use super::Guid;
 
     impl From<Guid> for win_etw_provider::GUID {
@@ -335,6 +344,7 @@ mod windows {
 #[cfg(test)]
 mod tests {
     use super::Guid;
+    use std::format;
 
     #[test]
     fn test_display_guid() {
