@@ -518,8 +518,25 @@ remains unchanged.
 Typed `vfio_sys::iommufd::tsm` bindings now encode the pinned CCA request
 layouts, retain host buffers for synchronous calls, and preserve syscall
 errno, nonnegative residue and TSM code as separate results. Reads use only
-backend offset zero. These two components still need a Linux device
-coordinator and native guest transport; neither enables live CCA assignment.
+backend offset zero.
+
+`RealmDevice::into_tdisp` now connects these components for evidence reads.
+It consumes only an attached, exclusively owned assignment, retaining the
+original owner on a rejected transfer. Attachment can succeed without a TSM,
+so a read-only certificate-size request first verifies a configured CCA TSM
+and bound TDI. Successful CCA binding confirms UNLOCKED in the pinned kernel,
+and this owner has never issued a TSM mutation. This verifies binding
+provenance, not evidence authenticity. Complete positive size replies,
+nonzero TSM codes, and read residue are checked before the snapshot core can
+return guest slices.
+Requests cannot use a prepared, cleaning or closed object owner.
+
+Explicit teardown invalidates snapshots and uses the existing dependency-
+ordered object cleanup. A failed teardown retains the assignment and permits
+cleanup retry. The public evidence owner exposes neither backend aliases nor
+mutations; LOCK/RUN, reset, regeneration and MMIO validation remain disabled.
+Native guest RHI transport and access/DMA coordination are still required
+before live CCA assignment can be enabled.
 
 ## 5. Configuration and ownership
 
@@ -1552,6 +1569,16 @@ behavior, snapshot bounds/budget release, quarantine, ABI layouts, residue
 handling and errno propagation. The ioctl layout was also checked against
 the pinned C headers. These are implementation checks, not runtime TDISP or
 private-DMA qualification.
+
+### Owned Linux evidence adapter review: 2026-09-16
+
+The initial review found that a successful vdevice allocation can bypass CCA
+TDI creation when no TSM is configured. The adapter now requires a complete,
+positive certificate-size response through the CCA request path before
+reporting the fresh binding's Unlocked state. Failed verification returns
+the original owner without cleanup or mutation. Constructor-boundary tests
+cover missing TSM/TDI, invalid phases, and incomplete or absent size replies.
+The scoped corrective review found no significant issues.
 
 The earlier single-boot design review returned **Minor revisions**. It required
 immediate exit recording before output draining, caller-known result locations,
