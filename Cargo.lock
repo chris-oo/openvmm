@@ -2395,6 +2395,7 @@ dependencies = [
  "petri_artifacts_core",
  "petri_artifacts_vmm_test",
  "powershell_builder",
+ "roxmltree",
  "serde",
  "serde_json",
  "sha2",
