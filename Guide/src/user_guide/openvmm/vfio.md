@@ -44,15 +44,26 @@ this core. Attachment alone does not prove a TSM is configured. Failed
 verification returns the original owner for explicit recovery.
 The evidence owner retains the VFIO/IOMMUFD/KVM bundle, checks complete size
 replies and read lengths, and uses the existing ordered cleanup on teardown.
-It exposes no raw backend or state-changing request. Guest RHI transport,
-access revocation, and DMA coordination remain unconnected, so this does not
-enable CCA device use.
+It exposes no raw backend or state-changing request. Its asynchronous evidence
+service admits one blocking operation per device at a time and borrows the
+budgeted snapshot for delivery, rather than making another object copy.
+Explicit teardown closes admission and drains accepted operations.
 
-The `kvm` crate also has opt-in native Arm hypercall filters, SMCCC register
-access, and trusted-I/O exit decoding. No filters are installed by default.
-Trusted-I/O exits start rejected, including unknown reasons or flags. Until
-guest request routing is connected, `virt_kvm` stops on these exits rather
-than approving device access.
+Native RHI evidence routing is an explicit, pre-run opt-in through
+`VfioVm::register_evidence`. The caller keeps the service alive; the partition
+stores only a weak reference for its final requester ID. Registration freezes
+before the first VP run. No filters are installed for ordinary VMs.
+
+Registered CCA guests can request evidence sizes and reads. Buffer writes
+require selector-clear addresses, current RAM-slot coverage, and shared
+in-place backing. Validation and copying hold the same lock as memory
+conversion. Full function IDs, object IDs, offsets, and result counts are
+checked. An abandoned request or register-I/O failure stops the partition.
+
+Only the two evidence feature bits are advertised. The pinned Linux driver
+requires the full DA feature set, so an ordinary guest boot does not exercise
+this partial interface. Regeneration, LOCK/RUN, protected MMIO acceptance, and
+private DMA remain disabled. Trusted-I/O exits still default to rejection.
 
 ## Overview
 

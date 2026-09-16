@@ -21,24 +21,9 @@ use std::os::fd::AsRawFd;
 use std::os::fd::BorrowedFd;
 
 pub const KVM_EXIT_ARM64_TIO_UAPI: u32 = 44;
-pub const KVM_HYPERCALL_EXIT_SMC_UAPI: u64 = 1;
-pub const KVM_HYPERCALL_EXIT_16BIT_UAPI: u64 = 2;
-
-// arm-smccc-rhi.h: FAST_CALL, SMC_64, OWNER_STANDARD_HYP (5).
-const fn rhi_call(function: u16) -> u32 {
-    (1 << 31) | (1 << 30) | (5 << 24) | function as u32
-}
-
-open_enum! {
-    pub enum RhiDaFunction: u32 {
-        FEATURES = rhi_call(0x004b),
-        OBJECT_SIZE = rhi_call(0x004c),
-        OBJECT_READ = rhi_call(0x004d),
-        VDEV_GET_MEASUREMENTS = rhi_call(0x0052),
-        VDEV_GET_INTERFACE_REPORT = rhi_call(0x0053),
-        VDEV_SET_TDI_STATE = rhi_call(0x0054),
-    }
-}
+pub use crate::arm_smccc::KVM_HYPERCALL_EXIT_16BIT_UAPI;
+pub use crate::arm_smccc::KVM_HYPERCALL_EXIT_SMC_UAPI;
+pub use crate::arm_smccc::RhiDaFunction;
 
 /// The VM-fd SMCCC filter packet, including its reserved bytes.
 #[repr(C)]
@@ -75,11 +60,18 @@ fn smccc_filter_attr(filter: &KvmSmcccFilter) -> kvm_device_attr {
 }
 
 fn set_rhi_da_filters(fd: BorrowedFd<'_>) -> Result<()> {
-    for filter in &RHI_DA_FILTERS {
+    install_rhi_da_filters(|filter| {
         // SAFETY: This VM attribute takes the complete filter packet. Both the
         // packet and the fd remain valid until the synchronous ioctl returns.
         unsafe { ioctl::kvm_set_device_attr(fd.as_raw_fd(), &smccc_filter_attr(filter)) }
-            .map_err(Error::SetDeviceAttr)?;
+            .map(|_| ())
+            .map_err(Error::SetDeviceAttr)
+    })
+}
+
+fn install_rhi_da_filters(mut install: impl FnMut(&KvmSmcccFilter) -> Result<()>) -> Result<()> {
+    for filter in &RHI_DA_FILTERS {
+        install(filter)?;
     }
     Ok(())
 }
@@ -112,6 +104,10 @@ fn read_smccc_arguments(mut get: impl FnMut(u64) -> Result<u64>) -> Result<[u64;
     Ok(args)
 }
 
+fn read_smccc_function(mut get: impl FnMut(u64) -> Result<u64>) -> Result<u64> {
+    get(core_reg_id(0))
+}
+
 fn write_smccc_results(
     results: [u64; 4],
     mut set: impl FnMut(u64, u64) -> Result<()>,
@@ -124,9 +120,17 @@ fn write_smccc_results(
 
 #[cfg(target_arch = "aarch64")]
 impl Processor<'_> {
+    /// Reads the original full x0 while the vCPU is stopped.
+    ///
+    /// The kernel can narrow the function ID to 32 bits in
+    /// [`Exit::ArmHypercall`]. Read x0 as well when enforcing full-value checks.
+    pub fn read_arm_smccc_function(&self) -> Result<u64> {
+        read_smccc_function(|id| self.get_reg64(id))
+    }
+
     /// Reads SMCCC arguments x1-x7 while the vCPU is stopped.
     ///
-    /// The function ID comes from [`Exit::ArmHypercall`], not x0.
+    /// This does not include the original function ID in x0.
     pub fn read_arm_smccc_arguments(&self) -> Result<[u64; 7]> {
         read_smccc_arguments(|id| self.get_reg64(id))
     }
@@ -246,6 +250,39 @@ mod tests {
     use std::mem::size_of;
     use std::os::fd::AsFd;
     use test_with_tracing::test;
+
+    #[test]
+    fn function_register_preserves_bits_the_exit_number_can_lose() {
+        let full = (1u64 << 32) | u64::from(RhiDaFunction::OBJECT_READ.0);
+        assert_eq!(
+            read_smccc_function(|id| {
+                assert_eq!(id, 0x6030_0000_0010_0000);
+                Ok(full)
+            })
+            .unwrap(),
+            full
+        );
+        assert!(
+            read_smccc_function(|_| Err(Error::MissingCapability("function register"))).is_err()
+        );
+    }
+
+    #[test]
+    fn filter_installation_stops_at_the_first_error_without_retry() {
+        for fail_at in 0..=2 {
+            let mut attempted = Vec::new();
+            let result = install_rhi_da_filters(|filter| {
+                attempted.push(*filter);
+                if attempted.len() == fail_at + 1 {
+                    Err(Error::MissingCapability("injected filter error"))
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(result.is_err(), fail_at < 2);
+            assert_eq!(attempted, RHI_DA_FILTERS[..(fail_at + 1).min(2)]);
+        }
+    }
 
     #[test]
     fn rhi_da_full_function_encodings_and_filter_ranges() {

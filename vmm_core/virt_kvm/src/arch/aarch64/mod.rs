@@ -315,7 +315,7 @@ impl Kvm {
 #[derive(InspectMut)]
 pub struct KvmProcessor<'a> {
     #[inspect(skip)]
-    partition: &'a KvmPartitionInner,
+    partition: &'a Arc<KvmPartitionInner>,
     #[inspect(flatten)]
     inner: &'a KvmVpInner,
     #[inspect(skip)]
@@ -505,6 +505,10 @@ impl virt::Processor for KvmProcessor<'_> {
         stop: StopVp<'_>,
         dev: &impl CpuIo,
     ) -> Result<Infallible, VpHaltReason> {
+        let rhi_start = self.partition.rhi.lock().freeze();
+        if let Err(error) = rhi_start {
+            return Err(dev.fatal_error(error.into()));
+        }
         loop {
             self.inner.needs_yield.maybe_yield().await;
             stop.check()?;
@@ -622,13 +626,39 @@ impl virt::Processor for KvmProcessor<'_> {
                             KvmRunVpError::UnsupportedMemoryFault { flags, gpa, size }.into(),
                         ));
                     }
-                    kvm::Exit::ArmHypercall { .. } => {
-                        if self.partition.memory_backing_mode.is_in_place() {
-                            self.partition.mark_cca_fatal();
+                    kvm::Exit::ArmHypercall { nr, flags } => {
+                        let rhi_enabled = self.partition.rhi.lock().enabled();
+                        if !rhi_enabled {
+                            if self.partition.memory_backing_mode.is_in_place() {
+                                self.partition.mark_cca_fatal();
+                            }
+                            return Err(dev.fatal_error(
+                                KvmRunVpError::UnhandledExit(format!("{exit:?}")).into(),
+                            ));
                         }
-                        return Err(dev.fatal_error(
-                            KvmRunVpError::UnhandledExit(format!("{exit:?}")).into(),
-                        ));
+                        let partition = self.partition;
+                        let request =
+                            crate::rhi::RequestGuard::new(move || partition.mark_cca_fatal());
+                        let full_function = self
+                            .kvm
+                            .read_arm_smccc_function()
+                            .map_err(|error| dev.fatal_error(error.into()))?;
+                        let args = self
+                            .kvm
+                            .read_arm_smccc_arguments()
+                            .map_err(|error| dev.fatal_error(error.into()))?;
+                        let results = self
+                            .partition
+                            .handle_rhi(nr, full_function, flags, args)
+                            .await;
+                        if self.partition.cca_fatal.load(Ordering::Acquire) {
+                            return Err(
+                                dev.fatal_error(KvmRunVpError::CcaMemoryCleanupFailed.into())
+                            );
+                        }
+                        request
+                            .complete(self.kvm.write_arm_smccc_results(results))
+                            .map_err(|error| dev.fatal_error(error.into()))?;
                     }
                     kvm::Exit::ArmTio(mut tio) => {
                         tio.reject();
@@ -1074,6 +1104,7 @@ impl virt::ProtoPartition for KvmProtoPartition<'_> {
 
         let partition = Arc::new(KvmPartitionInner {
             vfio_device: Mutex::new(None),
+            rhi: Mutex::new(crate::rhi::Registry::default()),
             kvm: self.vm,
             memory: Default::default(),
             cca_launch_state: Mutex::new(crate::CcaLaunchState::NotStarted),

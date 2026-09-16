@@ -27,6 +27,7 @@ pub use vfio::VfioDevice;
 
 #[cfg(any(target_arch = "aarch64", test))]
 pub mod arm;
+pub mod arm_smccc;
 
 mod ioctl {
     #[cfg(any(target_arch = "aarch64", test))]

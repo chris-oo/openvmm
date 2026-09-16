@@ -52,6 +52,75 @@ pub enum MemoryError {
     CloneGuestMemfd(#[source] std::io::Error),
 }
 
+#[cfg(any(guest_arch = "aarch64", test))]
+#[derive(Debug, Error)]
+pub(crate) enum SharedBufferError {
+    #[error("native evidence requires in-place CCA backing")]
+    Unsupported,
+    #[error("CCA partition is marked fatal")]
+    Fatal,
+    #[error("invalid shared guest buffer: address={gpa:#x}, length={length}")]
+    InvalidRange { gpa: u64, length: usize },
+    #[error("shared buffer is not fully covered by current guestmemfd slots")]
+    Slots(#[source] MemoryError),
+    #[error("shared buffer visibility check failed")]
+    Visibility(#[source] crate::cca_in_place::CcaInPlaceError),
+    #[error("shared guest buffer copy failed; a prefix may have been written")]
+    Copy(#[source] guestmem::GuestMemoryError),
+}
+
+#[cfg(any(guest_arch = "aarch64", test))]
+fn shared_buffer_pages(
+    gpa: u64,
+    length: usize,
+    shared_bit: u64,
+) -> Result<MemoryRange, SharedBufferError> {
+    let invalid = || SharedBufferError::InvalidRange { gpa, length };
+    let end = gpa.checked_add(length as u64).ok_or_else(invalid)?;
+    if length == 0
+        || shared_bit < 4096
+        || !shared_bit.is_power_of_two()
+        || gpa >= shared_bit
+        || end > shared_bit
+    {
+        return Err(invalid());
+    }
+    let page_end = end.checked_add(4095).ok_or_else(invalid)? & !4095;
+    MemoryRange::try_new((gpa & !4095)..page_end).map_err(|_| invalid())
+}
+
+#[cfg(any(guest_arch = "aarch64", test))]
+fn with_shared_buffer(
+    memory: &parking_lot::Mutex<KvmMemoryRangeState>,
+    fatal: &std::sync::atomic::AtomicBool,
+    gpa: u64,
+    length: usize,
+    shared_bit: u64,
+    copy: impl FnOnce() -> Result<(), guestmem::GuestMemoryError>,
+) -> Result<(), SharedBufferError> {
+    let pages = shared_buffer_pages(gpa, length, shared_bit)?;
+    let state = memory.lock();
+    if fatal.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(SharedBufferError::Fatal);
+    }
+    guest_memfd_range_segments(pages, &state.ranges).map_err(SharedBufferError::Slots)?;
+    if state.ranges.iter().flatten().any(|slot| {
+        slot.range.overlaps(&pages)
+            && slot.private_state != Some(KvmGuestMemfdPrivateState::InPlace)
+    }) {
+        return Err(SharedBufferError::Unsupported);
+    }
+    state
+        .cca_visibility
+        .require_shared(pages)
+        .map_err(SharedBufferError::Visibility)?;
+    // The same lock guards conversion and slot removal. Keep it until the
+    // fault-safe copy finishes; never rely on a selector bit as sharing proof.
+    let result = copy().map_err(SharedBufferError::Copy);
+    drop(state);
+    result
+}
+
 #[derive(Debug, Inspect)]
 /// A registered KVM memory slot and its confidential-memory metadata.
 pub(crate) struct KvmMemoryRange {
@@ -261,6 +330,24 @@ impl KvmGuestMemfdPrivateState {
 }
 
 impl KvmPartitionInner {
+    #[cfg(guest_arch = "aarch64")]
+    pub(crate) fn write_rhi_shared(&self, gpa: u64, data: &[u8]) -> Result<(), SharedBufferError> {
+        if !self.memory_backing_mode.is_in_place()
+            || self.caps.isolation != virt::IsolationType::Cca
+        {
+            return Err(SharedBufferError::Unsupported);
+        }
+        let shared_bit = self.shared_gpa_bit.ok_or(SharedBufferError::Unsupported)?;
+        with_shared_buffer(
+            &self.memory,
+            &self.cca_fatal,
+            gpa,
+            data.len(),
+            shared_bit,
+            || self.gm.write_at(gpa, data),
+        )
+    }
+
     #[cfg(guest_arch = "aarch64")]
     pub(crate) fn handle_cca_in_place_memory_fault(
         &self,
@@ -1022,6 +1109,176 @@ impl virt::PartitionMemoryMap for KvmPartitionInner {
 mod tests {
     use super::*;
     use test_with_tracing::test;
+
+    fn shared_state(slots: Vec<MemoryRange>) -> parking_lot::Mutex<KvmMemoryRangeState> {
+        let mut visibility = crate::cca_in_place::Visibility::all_private(slots.clone()).unwrap();
+        for &slot in &slots {
+            visibility.record(slot, false);
+        }
+        parking_lot::Mutex::new(KvmMemoryRangeState {
+            ranges: slots
+                .into_iter()
+                .map(|range| {
+                    Some(KvmMemoryRange {
+                        range,
+                        host_addr: std::ptr::null_mut(),
+                        guest_memfd_offset: Some(0),
+                        private_state: Some(KvmGuestMemfdPrivateState::InPlace),
+                    })
+                })
+                .collect(),
+            cca_visibility: visibility,
+        })
+    }
+
+    #[test]
+    fn shared_buffer_byte_ranges_reject_aliases_and_overflow() {
+        let bit = 1 << 48;
+        assert_eq!(
+            shared_buffer_pages(0x1fff, 2, bit).unwrap(),
+            range(0x1000, 0x3000)
+        );
+        assert_eq!(
+            shared_buffer_pages(bit - 1, 1, bit).unwrap(),
+            range(bit - 4096, bit)
+        );
+        for (gpa, len, selector) in [
+            (0, 0, bit),
+            (bit, 1, bit),
+            (bit + 0x1000, 1, bit),
+            (bit - 1, 2, bit),
+            (u64::MAX, 2, bit),
+            (0x1000, 1, 0),
+            (0, 1, 1),
+            (0x1000, 1, 0x3000),
+        ] {
+            assert!(shared_buffer_pages(gpa, len, selector).is_err());
+        }
+    }
+
+    #[test]
+    fn shared_buffer_checks_all_slots_and_visibility_before_copy() {
+        use std::sync::atomic::AtomicBool;
+        let fatal = AtomicBool::new(false);
+        let memory = shared_state(vec![range(0x1000, 0x2000), range(0x2000, 0x3000)]);
+        let gm = guestmem::GuestMemory::allocate(0x4000);
+        with_shared_buffer(&memory, &fatal, 0x1fff, 2, 1 << 48, || {
+            assert!(memory.try_lock().is_none());
+            gm.write_at(0x1fff, &[0xa5, 0x5a])
+        })
+        .unwrap();
+        let mut bytes = [0; 2];
+        gm.read_at(0x1fff, &mut bytes).unwrap();
+        assert_eq!(bytes, [0xa5, 0x5a]);
+
+        memory.lock().ranges[0].as_mut().unwrap().private_state = Some(test_private_state());
+        assert!(matches!(
+            with_shared_buffer(&memory, &fatal, 0x1000, 1, 1 << 48, || panic!(
+                "separate backing"
+            )),
+            Err(SharedBufferError::Unsupported)
+        ));
+        memory.lock().ranges[0].as_mut().unwrap().private_state =
+            Some(KvmGuestMemfdPrivateState::InPlace);
+        memory
+            .lock()
+            .cca_visibility
+            .record(range(0x2000, 0x3000), true);
+        assert!(matches!(
+            with_shared_buffer(&memory, &fatal, 0x1fff, 2, 1 << 48, || panic!(
+                "private copy"
+            )),
+            Err(SharedBufferError::Visibility(
+                crate::cca_in_place::CcaInPlaceError::PrivateBuffer
+            ))
+        ));
+        memory
+            .lock()
+            .cca_visibility
+            .record(range(0x2000, 0x3000), false);
+        memory.lock().ranges[1] = None;
+        assert!(matches!(
+            with_shared_buffer(&memory, &fatal, 0x1fff, 2, 1 << 48, || panic!(
+                "removed slot"
+            )),
+            Err(SharedBufferError::Slots(_))
+        ));
+        let holes = shared_state(vec![range(0x1000, 0x2000), range(0x3000, 0x4000)]);
+        assert!(
+            with_shared_buffer(&holes, &fatal, 0x1fff, 0x1002, 1 << 48, || panic!(
+                "RAM hole"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn uninitialized_visibility_and_fatal_state_reject_access() {
+        use std::sync::atomic::AtomicBool;
+        let memory = shared_state(vec![range(0x1000, 0x2000)]);
+        memory.lock().cca_visibility = Default::default();
+        let fatal = AtomicBool::new(false);
+        assert!(matches!(
+            with_shared_buffer(&memory, &fatal, 0x1000, 1, 1 << 48, || panic!(
+                "unknown visibility"
+            )),
+            Err(SharedBufferError::Visibility(_))
+        ));
+        fatal.store(true, std::sync::atomic::Ordering::Release);
+        assert!(matches!(
+            with_shared_buffer(&memory, &fatal, 0x1000, 1, 1 << 48, || panic!("fatal copy")),
+            Err(SharedBufferError::Fatal)
+        ));
+    }
+
+    #[test]
+    fn conversion_cannot_race_shared_buffer_copy() {
+        use std::sync::atomic::AtomicBool;
+        let memory = shared_state(vec![range(0x1000, 0x2000)]);
+        let fatal = AtomicBool::new(false);
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        let (checked_tx, checked_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let memory_ref = &memory;
+            scope.spawn(move || {
+                start_rx.recv().unwrap();
+                assert!(memory_ref.try_lock().is_none());
+                checked_tx.send(()).unwrap();
+                memory_ref
+                    .lock()
+                    .cca_visibility
+                    .record(range(0x1000, 0x2000), true);
+            });
+            with_shared_buffer(&memory, &fatal, 0x1001, 2, 1 << 48, || {
+                start_tx.send(()).unwrap();
+                checked_rx.recv().unwrap();
+                Ok(())
+            })
+            .unwrap();
+        });
+        assert!(
+            with_shared_buffer(&memory, &fatal, 0x1001, 2, 1 << 48, || panic!(
+                "converted memory"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn shared_copy_fault_preserves_error_and_does_not_claim_rollback() {
+        let memory = shared_state(vec![range(0x1000, 0x2000)]);
+        let fatal = std::sync::atomic::AtomicBool::new(false);
+        let gm = guestmem::GuestMemory::allocate(0x2000);
+        let result = with_shared_buffer(&memory, &fatal, 0x1000, 2, 1 << 48, || {
+            gm.write_at(0x1000, &[0xa5])?;
+            gm.write_at(0x2000, &[0x5a])
+        });
+        assert!(matches!(result, Err(SharedBufferError::Copy(_))));
+        let mut prefix = [0];
+        gm.read_at(0x1000, &mut prefix).unwrap();
+        assert_eq!(prefix, [0xa5]);
+        assert!(!fatal.load(std::sync::atomic::Ordering::Acquire));
+    }
 
     #[test]
     fn in_place_requires_both_creation_flags_and_private_attributes() {

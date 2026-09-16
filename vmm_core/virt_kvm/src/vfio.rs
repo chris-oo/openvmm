@@ -94,6 +94,17 @@ impl VfioVm for KvmVfioAssignment {
     fn remove_file(&self, file: BorrowedFd<'_>) -> Result<(), VfioVmError> {
         KvmVfioAssignment::remove_file(self, file).map_err(VfioVmError::new)
     }
+
+    #[cfg(guest_arch = "aarch64")]
+    fn register_evidence(
+        &self,
+        requester_id: u32,
+        service: std::sync::Weak<dyn tdisp::host::EvidenceService>,
+    ) -> Result<(), VfioVmError> {
+        self.partition
+            .register_rhi_evidence(requester_id, service)
+            .map_err(VfioVmError::new)
+    }
 }
 
 #[cfg(test)]
