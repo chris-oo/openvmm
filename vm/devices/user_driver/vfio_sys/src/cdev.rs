@@ -93,27 +93,14 @@ impl CdevDevice {
     /// Returns the kernel-assigned device ID within the iommufd context.
     /// This must be called before any DMA operations.
     pub fn bind_iommufd(&self, iommufd_fd: RawFd) -> anyhow::Result<u32> {
-        let mut cmd = VfioDeviceBindIommufd {
-            argsz: size_of::<VfioDeviceBindIommufd>() as u32,
-            flags: 0,
-            iommufd: iommufd_fd,
-            out_devid: 0,
-        };
-        // SAFETY: Both fds are valid, struct correctly constructed.
-        unsafe {
-            ioctl::vfio_device_bind_iommufd(self.file.as_raw_fd(), &mut cmd)
-                .context("VFIO_DEVICE_BIND_IOMMUFD failed")?;
-        }
-        Ok(cmd.out_devid)
+        bind_iommufd(self.as_fd(), iommufd_fd)
     }
 
     /// Attach the device to an IOAS or HWPT by its iommufd object ID.
     ///
     /// Pass an IOAS ID for identity DMA translation, or a HWPT ID for
-    /// nested translation.
-    ///
-    /// Returns the attached page table ID (may differ from input if the
-    /// kernel auto-created a HWPT for the IOAS).
+    /// nested translation. Returns the attached page table ID, which can differ
+    /// from the input when the kernel creates a HWPT for an IOAS.
     pub fn attach_ioas(&self, pt_id: u32) -> anyhow::Result<u32> {
         attach_iommufd_pt(self.file.as_fd(), pt_id)
     }
@@ -125,14 +112,28 @@ impl CdevDevice {
         detach_iommufd_pt(self.file.as_fd())
     }
 
-    /// Convert to a standard [`Device`](super::Device) for config space,
-    /// BAR, IRQ, and mmap operations.
+    /// Transfer the same open file description to standard VFIO access.
     ///
-    /// The cdev fd supports the same `VFIO_DEVICE_*` ioctls as the legacy
-    /// group path, so the [`Device`](super::Device) type works unchanged.
+    /// The cdev supports the same `VFIO_DEVICE_*` ioctls as the legacy group
+    /// path. No file descriptor is duplicated.
     pub fn into_device(self) -> super::Device {
         super::Device { file: self.file }
     }
+}
+
+fn bind_iommufd(device: BorrowedFd<'_>, iommufd_fd: RawFd) -> anyhow::Result<u32> {
+    let mut cmd = VfioDeviceBindIommufd {
+        argsz: size_of::<VfioDeviceBindIommufd>() as u32,
+        flags: 0,
+        iommufd: iommufd_fd,
+        out_devid: 0,
+    };
+    // SAFETY: Both fds are valid, struct correctly constructed.
+    unsafe {
+        ioctl::vfio_device_bind_iommufd(device.as_raw_fd(), &mut cmd)
+            .context("VFIO_DEVICE_BIND_IOMMUFD failed")?;
+    }
+    Ok(cmd.out_devid)
 }
 
 impl AsRef<fs::File> for CdevDevice {
@@ -148,6 +149,11 @@ impl AsFd for CdevDevice {
 }
 
 impl super::Device {
+    /// Bind the same exclusively owned cdev open file description to IOMMUFD.
+    pub fn bind_iommufd(&self, iommufd_fd: RawFd) -> anyhow::Result<u32> {
+        bind_iommufd(self.as_fd(), iommufd_fd)
+    }
+
     /// Attach this VFIO device to an iommufd page table (IOAS or HWPT) by its
     /// object ID, via `VFIO_DEVICE_ATTACH_IOMMUFD_PT`.
     ///

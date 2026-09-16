@@ -237,6 +237,9 @@ pub struct TsmCompletion {
 /// Local validation, syscall failure, or an invalid kernel completion.
 #[derive(Debug, thiserror::Error)]
 pub enum TsmRequestError {
+    /// Rejected before ioctl; only the two native measurement formats exist.
+    #[error("unsupported native measurement flags {0:#x}")]
+    MeasurementFlags(u64),
     /// Rejected before issuing the ioctl.
     #[error("invalid CCA TSM response length {length}")]
     ResponseLength {
@@ -279,6 +282,11 @@ fn execute(
     response: &mut [u8],
     invoke: impl FnOnce(&mut TsmRequest) -> Result<libc::c_int, Errno>,
 ) -> Result<TsmCompletion, TsmRequestError> {
+    if let CcaTsmRequest::RegenerateMeasurements { flags, .. } = &request {
+        if *flags > 1 {
+            return Err(TsmRequestError::MeasurementFlags(*flags));
+        }
+    }
     let response_length_valid = match request {
         CcaTsmRequest::ObjectSize(_) => response.len() == 4,
         CcaTsmRequest::ReadObject(_) => !response.is_empty(),
