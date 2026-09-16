@@ -30,6 +30,27 @@ impl VfioVmError {
 /// The allocation owner must retain this service and the VFIO open file
 /// description until DMA is stopped and dependent IOMMUFD objects are gone.
 pub trait VfioVm: Send + Sync {
+    /// Check acknowledged hypervisor interrupt-route operations.
+    ///
+    /// Native assignment frontends must check after MSI updates, IRQ stop, and
+    /// destruction of every route owner. A failure is permanent: retain the
+    /// frontend/assignment ownership and do not report checked release.
+    fn check_interrupt_routes(&self) -> Result<(), VfioVmError> {
+        Err(VfioVmError::new(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "checked interrupt routes are not supported by this VM",
+        )))
+    }
+
+    /// Whether an assignment has made ordinary VM/RAM destruction unsafe.
+    ///
+    /// This is conservative and need not become false after guest shutdown.
+    /// Retain the whole VM memory owner until the containing model has ended
+    /// or the backend has positively established safe resource release.
+    fn requires_assignment_retention(&self) -> bool {
+        false
+    }
+
     /// Associate a VFIO cdev before binding it to IOMMUFD.
     fn add_file(&self, file: BorrowedFd<'_>) -> Result<(), VfioVmError>;
     /// Remove the same open file description after dependency teardown.
@@ -49,6 +70,27 @@ pub trait VfioVm: Send + Sync {
         Err(VfioVmError::new(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "native device evidence routing is not supported by this VM",
+        )))
+    }
+
+    /// Register a full native assignment after the private PCI address view
+    /// and checked device-access gate are configured.
+    ///
+    /// The service must own the CCA-aware shared DMA mappings. It must not use
+    /// an ordinary full-RAM DMA mapper. The VM prepares private RAM before any
+    /// VP enters KVM and advertises base RHI features only after that succeeds.
+    /// Protected mapping attempts remain retained when the kernel cannot
+    /// acknowledge removal. The caller must retain the entire VM and its RAM
+    /// owners on failed shutdown; this API does not promise clean teardown.
+    /// The caller retains the strong service reference through checked teardown.
+    fn register_assignment(
+        &self,
+        _requester_id: u32,
+        _service: Weak<dyn EvidenceService>,
+    ) -> Result<(), VfioVmError> {
+        Err(VfioVmError::new(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "native device assignment is not supported by this VM",
         )))
     }
 }

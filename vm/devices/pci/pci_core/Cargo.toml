@@ -26,5 +26,8 @@ zerocopy.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 tdisp.workspace = true
 
+[dev-dependencies]
+test_with_tracing.workspace = true
+
 [lints]
 workspace = true

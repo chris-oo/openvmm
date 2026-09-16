@@ -6423,6 +6423,7 @@ dependencies = [
  "pal_event",
  "parking_lot",
  "tdisp",
+ "test_with_tracing",
  "thiserror 2.0.16",
  "tracelimit",
  "tracing",
