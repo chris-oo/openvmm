@@ -1,0 +1,39 @@
+{
+  "schema": 1,
+  "container": "shrinkwraptool/base-slim@sha256:dc5ac44b4cd8d8142c8df0f7fab4b5ecb11f9a399c6b94320b14f07f1476ea99",
+  "model_version": "11.31.28",
+  "source_package_sha256": "7e46a163b6c117fd903e199c55a21d44139f06bfb39ac3045be70dc51dea8785",
+  "dtb_sha256": "3a2e6b85fc1c10f17cab2f6ec7eadb63b18c6f3d08a74e38eeddc6f587ea3630",
+  "dt_source": {
+    "url": "https://git.kernel.org/pub/scm/linux/kernel/git/devicetree/devicetree-rebasing.git",
+    "revision": "504267e5a417a7481329783924a5f2a475aca748",
+    "configuration": "fvp-base-revc.dts; empty bootargs/initrd; resolved Shrinkwrap reserved-memory/timer/PSCI/CPU/virtio overlay",
+    "policy": "Reuse only the exact hashed dt_bootargs.dtb. Do not rebuild the guest DT or kernel."
+  },
+  "sources": {
+    "rmm": {
+      "url": "https://github.com/TF-RMM/tf-rmm.git",
+      "revision": "33bbaf7814fee335027bf4d2417d97b551838b70"
+    },
+    "tfa": {
+      "url": "https://git.trustedfirmware.org/TF-A/trusted-firmware-a.git",
+      "revision": "38269bb73d34b4a31100adf208a27e4c28e7d611"
+    },
+    "edk2": {
+      "url": "https://gitlab.arm.com/linux-arm/edk2-cca.git",
+      "revision": "e425c4f3ccf023f01438d8c7f751ecadc036c9b8"
+    },
+    "edk2-platforms": {
+      "url": "https://gitlab.arm.com/linux-arm/edk2-platforms-cca.git",
+      "revision": "bc67cf53bc5eae9bab26497a4c6e7c8804fa014e"
+    },
+    "acpica": {
+      "url": "https://github.com/acpica/acpica.git",
+      "revision": "232ff3f8ae1a4da11c709f61d9154482cfe8e6df"
+    }
+  },
+  "lost_outputs_not_expected_rebuild_hashes": {
+    "bl1.bin": "7e05af43b84d1ca26134c4de572754cbae02f9aeaf042d13ff2b00c04076fe5f",
+    "fip.bin": "7cb0bf5e6227de272180b8414870dafa8ca8363cb22110f7242d7bab21ded7ef"
+  }
+}

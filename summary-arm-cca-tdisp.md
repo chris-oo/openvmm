@@ -1,6 +1,6 @@
 # Arm CCA TDISP: implementation summary
 
-Updated: 2026-09-16.
+Updated: 2026-09-17.
 
 **OpenVMM now runs the unchanged kvmtool reference guest through TDISP
 LOCK/RUN and a verified 64 MiB AHCI read on FVP.** The overall VMM test still
@@ -31,8 +31,8 @@ evidence.
 
 The kernel, initrd and patterned disk are byte-identical to reference run
 `run-20260914-3`. OpenVMM uses PL011 console arguments and `quiet` to reduce
-FVP console overhead. No guest helper, guest patch or firmware rebuild was
-needed. The L1 host payload remains separate from these guest artifacts.
+FVP console overhead. That run needed no guest helper, guest patch or firmware
+rebuild. The L1 host payload remains separate from these guest artifacts.
 
 The exact script and disk oracle are now stored in
 [`vmm_tests/vmm_tests/test_data/cca_tdisp/`](vmm_tests/vmm_tests/test_data/cca_tdisp/),
@@ -165,3 +165,33 @@ on `cca-assignment-deferred-shutdown`, unapproved and outside the execution
 commits. Parent-disconnect and constructor-failure review findings remain
 open. The recorded FVP run used the original combined tree, including that
 hold; source-level checks of the split chain are not a new runtime result.
+
+## Firmware recovery and committed-stack rerun
+
+After `cargo clean` removed the original FVP binaries, TF-A, RMM and EDK2
+were rebuilt from the same pinned source revisions. The verified artifacts,
+manifest and checksums now live in
+`.packages/cca-tdisp-fvp/artifacts/rebuild-20260917-verified/`, outside
+`target/`. The build recipe and source pins are tracked under
+`petri/incubator/platforms/rebuild-realm-firmware.{py,json}`.
+
+The rebuilt BL1/FIP have new hashes. The host kernel, original guest kernel,
+initrd and patterned disk were recovered without rebuilding them.
+`.packages/cca-tdisp-runtime/` holds the restored runtime inputs and toolchain.
+The plan records the recovery commands and all firmware output hashes.
+
+The full single-boot rerun on the committed execution stack, without the
+deferred shutdown hold, reproduced LOCK/RUN and the verified 64 MiB read.
+OpenVMM confirmed Locked at 104.591285510 s and Run at 106.941596290 s.
+The guest reported the expected hash and 132 AHCI MSI-X interrupts.
+
+The overall test still failed at the protected-mapping UNLOCK guard:
+`SingleStep` replaced the expected poweroff. Native nextest failed after
+541.041 s, fixture teardown failed at `realm-binding`, and the launcher
+returned 1. Result preservation succeeded. This is new protocol/I/O evidence
+with rebuilt firmware, not a clean-lifecycle pass or byte-identical replay.
+
+The new invocation is `single-boot-2987526-1789612384327479418` under
+`vmm_test_results/cca-tdisp-committed-stack/fvp-single-boot-runs/`.
+Its `outputs/session-result.json` records the separate outcomes. The plan
+records the exact FVP/nextest identities and evidence locations.

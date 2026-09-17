@@ -2,7 +2,7 @@
 
 Date: 2026-09-11
 
-Updated: 2026-09-16
+Updated: 2026-09-17
 
 Status: **native OpenVMM TDISP LOCK/RUN and a 64 MiB AHCI read are demonstrated
 on FVP with the unchanged kvmtool reference guest.** The read matched the
@@ -2054,3 +2054,135 @@ initrd into `vmm_tests/vmm_tests/test_data/cca_tdisp/`, with their hashes in
 `provenance.json`. `generate-reference-disk.py` reproduces the original
 64 MiB pattern and verifies its hash. No source script or guest command should
 exist only in `target/`; generated binaries remain separate from tracked source.
+
+## Durable FVP firmware recovery (2026-09-17)
+
+The deleted BL1/FIP could not be recovered from the surviving release or global
+caches. Those caches contain different firmware. With explicit approval,
+TF-A, RMM and EDK2 were rebuilt from the pinned source revisions, using the
+pinned container, GCC 15.2.1 and CMake 3.31.6. The exact DTB was reused.
+Neither the host nor guest Linux payload was rebuilt.
+
+The durable publication is
+`.packages/cca-tdisp-fvp/artifacts/rebuild-20260917-verified/`.
+It contains the firmware, `manifest.json` and `SHA256SUMS`. Sources, build
+logs and recipe inputs also remain under `.packages/cca-tdisp-fvp/`.
+These are ignored local artifacts, not large binaries added to version control.
+They survive `cargo clean`; keep a separate backup if the checkout is removed.
+
+| Artifact | Rebuilt SHA-256 |
+|---|---|
+| `bl1.bin` | `735c5a84430fb748db544c2d9c243a54959a160b2223c1588005c0a84ca1c0aa` |
+| `fip.bin` | `8877fc00cf6d69d35a16550417170b391d0b84e666a0ae116f66fb8eeeb8ccd9` |
+| `rmm.img` | `b88b2c90470e1beaf1dfec31f6258d56d7aeadfc9bb5f59fa6b51f9f8be4a61f` |
+| `FVP_AARCH64_EFI.fd` | `12ea09b6e2254b011a25e3bcbecd4e3221d42ca5e231502357e416a9ce6fa178` |
+
+The current Realm-VFIO profile pins the rebuilt BL1/FIP. They are not
+byte-identical to the lost original firmware. Historical results above still
+refer to the original firmware and must not be silently reattributed.
+
+### Repeatable recovery
+
+From the repository root, restore the unchanged payloads and DA assets from
+the preserved successful-I/O single-boot run. The helper checks every copied
+input and reconstructs the host configuration from its verified IKCONFIG:
+
+```bash
+python3 petri/incubator/platforms/restore-realm-test-inputs.py \
+  path/to/saved-single-boot-run .packages/cca-tdisp-runtime
+```
+
+It refuses existing destination payloads. It does not supply firmware or
+Shrinkwrap. When a firmware rebuild is needed, use a fresh run name:
+
+```bash
+python3 petri/incubator/platforms/rebuild-realm-firmware.py \
+  --source-package .packages/cca-tdisp-runtime/package/cca-3world.yaml \
+  --dtb path/to/verified/dt_bootargs.dtb \
+  --source-cache "$HOME/.shrinkwrap/build/source/cca-3world" \
+  --name NEW_BUILD_NAME --jobs 8
+```
+
+The recipe requires the pinned Docker image to be present. `--source-cache`
+is optional. It clones independent pinned sources, rebuilds EDK2 as well as
+RMM/TF-A, checks packaged contents, and publishes hashes with provenance.
+Do not replace the runtime profile's hashes without reviewing a new build.
+
+For the existing verified publication, stage its runtime firmware:
+
+```bash
+FW="$PWD/.packages/cca-tdisp-fvp/artifacts/rebuild-20260917-verified"
+RUNTIME="$PWD/.packages/cca-tdisp-runtime"
+(cd "$FW" && sha256sum --check SHA256SUMS)
+cp "$FW/bl1.bin" "$FW/fip.bin" "$FW/dt_bootargs.dtb" \
+  "$RUNTIME/package/cca-3world/"
+```
+
+Restore the exact editable tool environment in a fresh checkout:
+
+```bash
+TOOL="$PWD/.packages/cca-tdisp-runtime/cca-test/shrinkwrap"
+git clone https://git.gitlab.arm.com/tooling/shrinkwrap.git "$TOOL"
+git -C "$TOOL" checkout --detach 1c6b7a5278b47be11cad3bcd3a20416fc43fd388
+python3 -m venv "$TOOL/venv"
+"$TOOL/venv/bin/python" -m pip install --editable "$TOOL" \
+  'PyYAML==6.0.3' 'termcolor==3.3.0' 'tuxmake==1.43.0'
+rm -r -- "$TOOL/src/shrinkwraptool.egg-info"
+"$TOOL/venv/bin/python" -I -B -m pip freeze --disable-pip-version-check
+```
+
+Remove only that generated source metadata directory, not the installed
+`venv/` distribution metadata. The editable import continues to use the pinned
+source; the installed `direct_url.json` records its identity. The strict runner
+accepts `venv/` but rejects `.venv/`, generated source metadata, a non-editable
+wheel, or dependency versions outside `fvp-cca-v15.pip-freeze`.
+No validation guard was relaxed during recovery.
+
+### Committed-stack rerun
+
+Three restoration attempts stopped before model execution because of the
+virtualenv path, checkout cleanliness, and editable-package identity checks.
+They are tooling failures, not guest or TDISP results.
+
+The fourth attempt passed those checks and started native nextest:
+
+```text
+Execution stack: kwovwzpq (jj change ID)
+Invocation: single-boot-2987526-1789612384327479418
+FVP: 284acc4b7ad79c204c42fbf06ac2d7d734d71bbbe6a570dcd71f18750e8af464
+nextest: 2ad152d7-6f6b-4684-8fe3-2bd37f33d0fa
+```
+
+Results are under `vmm_test_results/cca-tdisp-committed-stack/`.
+The deferred hold is not included. The firmware profile and recovery files
+are the only additional runtime-input changes.
+
+The rerun completed and reproduced LOCK/RUN and the full I/O milestone:
+
+| Outcome | Result |
+|---|---|
+| Native LOCK | Confirmed at OpenVMM timestamp 104.591285510 s |
+| Native RUN | Confirmed at 106.941596290 s |
+| Guest acceptance | Original LOCK and ACCEPT markers present |
+| AHCI read | All 64 MiB read; hash `281e519df3077b557c6b03f5da83c4e8d397219259615dd7c3308f89cae8f2a6` matched |
+| Interrupts | 132 AHCI MSI-X interrupts |
+| UNLOCK | Rejected at the existing protected-mapping guard; no UNLOCK-returned marker |
+| Native nextest | One test failed after 541.041 s; suite command exit 100 |
+| Fixture teardown | Exit 1, `step=realm-binding` |
+| FVP launcher shutdown | Exit 1 |
+| Output preservation | Succeeded; no report-write errors |
+| Outer Flowey command | Exit 255; overall failure |
+
+Under the invocation's `outputs/fvp-284acc4b.../test_results/`, the selected
+test directory contains `openvmm.log`, `linux.log` and `petri.log`.
+`openvmm.log:131` records the protected-mapping guard error;
+`petri.log:22-27` records `SingleStep` instead of poweroff and the missing
+UNLOCK marker. `nextest-single-boot.xml:2-5` records the failed native test.
+The invocation's `outputs/session-result.json` records the separate command,
+fixture, launcher and preservation outcomes; the FVP output directory also
+contains `fixture-teardown.stderr.log` with the failing cleanup step.
+
+This is new runtime evidence for the committed execution stack without the
+provisional hold and with rebuilt firmware. It confirms that the split stack
+still reaches the intended LOCK/RUN and read/hash milestone. It does not
+qualify teardown, same-host reuse or instrumented private-buffer DMA.

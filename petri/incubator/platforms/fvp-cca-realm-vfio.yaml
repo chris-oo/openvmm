@@ -7,6 +7,9 @@
 # inputs and resolves the pinned JSON template within each owned workspace.
 # The old private-DMA reference ended with four IOMMU_DESTROY EBUSY errors
 # and FVP heap abort 134. Those are failures, not qualification evidence.
+# BL1/FIP were rebuilt from the same pinned sources on 2026-09-17 UTC after
+# cargo clean removed the original local build. See rebuild-realm-firmware.json
+# and .packages/cca-tdisp-fvp/artifacts/rebuild-20260917-verified/manifest.json.
 schema_version: 1
 fvp:
   executable_in_container: /tools/FVP_Base_RevC_AEMvA_11.31_28/bin/FVP_Base_RevC-2xAEMvA
@@ -30,9 +33,9 @@ overlay:
 runtime:
   root_input: shrinkwrap_package_root
   bl1_relative_path: cca-3world/bl1.bin
-  bl1_sha256: 7e05af43b84d1ca26134c4de572754cbae02f9aeaf042d13ff2b00c04076fe5f
+  bl1_sha256: 735c5a84430fb748db544c2d9c243a54959a160b2223c1588005c0a84ca1c0aa
   fip_relative_path: cca-3world/fip.bin
-  fip_sha256: 7cb0bf5e6227de272180b8414870dafa8ca8363cb22110f7242d7bab21ded7ef
+  fip_sha256: 8877fc00cf6d69d35a16550417170b391d0b84e666a0ae116f66fb8eeeb8ccd9
   dtb_relative_path: cca-3world/dt_bootargs.dtb
   dtb_sha256: 3a2e6b85fc1c10f17cab2f6ec7eadb63b18c6f3d08a74e38eeddc6f587ea3630
 realm_vfio:

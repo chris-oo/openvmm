@@ -238,16 +238,17 @@ then publish `INCUBATOR_VFIO_BDF_CCA_REALM_VFIO`. The ordinary in-place
 Virtio profile does not provide this fixture.
 
 ```admonish warning
-This DA fixture is not yet qualified. FVP 11.31.28 aborts during shutdown
-even after VFIO unbind and host TSM disconnect complete. Enumeration fails
-before the Realm-object test runs. A smaller host-only TSM connect/disconnect
+This DA fixture has no clean-lifecycle qualification. FVP 11.31.28 has aborted
+during shutdown even after VFIO unbind and host TSM disconnect complete.
+Earlier enumeration boots failed before the Realm-object test ran.
+A smaller host-only TSM connect/disconnect
 sequence also fails without VFIO, a Realm VM, or GDB; AHCI unbind alone exits
 cleanly. The corrupting operation remains unidentified.
 ```
 
 The separate `aarch64-fvp-cca-realm-vfio.toml` profile selects the identities
-in `petri/incubator/platforms/fvp-cca-realm-vfio.yaml`. Provision its local
-inputs once, from the repository root:
+in `petri/incubator/platforms/fvp-cca-realm-vfio.yaml`. The original Stage A
+provisioner remains available for historical inputs:
 
 ```bash
 python3 petri/incubator/platforms/provision-realm-vfio.py
@@ -261,6 +262,39 @@ not the zero-filled firmware-build image. It creates the separate
 `target/cca-tdisp-stage-a/realm-vfio-reference-platform` package and overlay, refuses
 an existing destination, and does not rebuild firmware or change source
 inputs. These remain local test assets, not a published FVP release.
+Its old BL1/FIP hashes do not match the current rebuilt-firmware profile.
+Use the durable recovery path below for that profile.
+
+### Durable firmware and test inputs
+
+Keep firmware outside `target/`. The verified rebuild is stored under
+`.packages/cca-tdisp-fvp/artifacts/rebuild-20260917-verified/`, with
+`manifest.json` and `SHA256SUMS`. It contains BL1, FIP, RMM, EDK2 and the
+reused DTB. `cargo clean` does not remove this directory.
+
+The tracked `petri/incubator/platforms/rebuild-realm-firmware.py` recipe and
+its adjacent JSON pins rebuild TF-A, RMM and EDK2 in the pinned container.
+They require the recorded package YAML and DTB, refuse an existing run name,
+and preserve sources, commands and output hashes outside `target/`.
+Rebuilt firmware is not byte-identical to the deleted original firmware.
+Do not change runtime hash pins merely to accept an unverified build.
+
+Recover the unchanged host/guest payloads and DA assets from a preserved
+single-boot run:
+
+```bash
+python3 petri/incubator/platforms/restore-realm-test-inputs.py \
+  path/to/saved-single-boot-run .packages/cca-tdisp-runtime
+```
+
+This checks input hashes and refuses existing destination payloads. Add the
+verified BL1, FIP and DTB to its `package/cca-3world/` directory separately.
+Restore the pinned Shrinkwrap checkout at `cca-test/shrinkwrap/` under the
+runtime root, with an editable install in `venv/`, not `.venv/`.
+The package set must match `petri/incubator/platforms/fvp-cca-v15.pip-freeze`.
+The repository-root `plan-arm-cca-tdisp.md` records the exact recovery commands.
+
+### Dormant Realm-object test
 
 The test runs natively on the AArch64 Linux host. It creates a dormant
 one-VP Realm using the real KVM backend and prepares in-place backing,
@@ -281,9 +315,9 @@ guest PCI enumeration, BAR access, interrupts, private DMA, or TDISP LOCK/RUN.
 NEXTEST_TEST_THREADS=1 PYTHONDONTWRITEBYTECODE=1 cargo xflowey vmm-tests-run \
   --target linux-aarch64-musl \
   --incubator petri/incubator/profiles/aarch64-fvp-cca-realm-vfio.toml \
-  --fvp-platform-root target \
-  --shrinkwrap-package-root target/cca-tdisp-stage-a/realm-vfio-reference-platform/package \
-  --cca-in-place-payload-root target/cca-tdisp-stage-a/test-platform/payload \
+  --fvp-platform-root .packages/cca-tdisp-runtime \
+  --shrinkwrap-package-root .packages/cca-tdisp-runtime/package \
+  --cca-in-place-payload-root .packages/cca-tdisp-runtime/host-payload \
   --dir vmm_test_results/realm-vfio-objects \
   --filter 'binary(=tests) & test(realm_vfio_objects_cca_in_place)'
 ```
@@ -302,10 +336,12 @@ The original guest script, disk hash oracle and provenance are checked in under
 overwriting an existing file. Keep source scripts in the repo: `target/` is
 disposable build output. The checked-in script is a byte-identical extraction
 from the validated initrd, not a replacement injected into the guest.
-This path is under implementation; no end-to-end pass has been established.
+The committed execution stack with rebuilt FVP firmware has demonstrated
+LOCK/RUN and a matching 64 MiB read. The full test still fails at the
+protected-mapping UNLOCK guard and during cleanup; there is no end-to-end pass.
 
 Use the DA profile and roots above, add `--cca-tdisp-guest-root` pointing to
-`target/cca-tdisp-stage-a/runs/run-20260914-3/share`, and replace `--filter`
+`.packages/cca-tdisp-runtime/guest-payload`, and replace `--filter`
 with the exact single-boot selection:
 
 ```bash
