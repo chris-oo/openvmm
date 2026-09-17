@@ -339,6 +339,210 @@ async fn virtio_net_cca_in_place(
     Ok(())
 }
 
+/// Exercise real Realm host-object allocation and teardown without guest access.
+///
+/// The partition is dormant: backing is prepared, but no RAM is mapped or
+/// populated and no VP runs. The synthetic requester ID exercises only the
+/// host namespace. This does not qualify PCI enumeration, interrupts, or DMA.
+// This preflight calls native Arm KVM, not a cross-architecture guest backend.
+// xtask-fmt allow-target-arch oneoff-petri-native-test-deps
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#[vmm_test_with(
+    openvmm,
+    requires(cca, guest_memfd_in_place, cca_realm_vfio),
+    configs(linux_direct_aarch64)
+)]
+async fn realm_vfio_objects_cca_in_place(
+    _config: PetriVmBuilder<OpenVmmPetriBackend>,
+    _: (),
+    driver: DefaultDriver,
+) -> anyhow::Result<()> {
+    use guestmem::GuestMemory;
+    use memory_range::MemoryRange;
+    use vfio_assigned_device::realm::RealmDevice;
+    use vfio_assigned_device::realm::RealmPhase;
+    use virt::Hypervisor;
+    use virt::Partition;
+    use virt::ProtoPartition;
+    use vm_topology::memory::MemoryLayout;
+    use vm_topology::memory::MemoryRangeWithNode;
+    use vm_topology::processor::TopologyBuilder;
+    use vm_topology::processor::aarch64::Aarch64PlatformConfig;
+    use vm_topology::processor::aarch64::GicItsInfo;
+    use vm_topology::processor::aarch64::GicMsiController;
+    use vm_topology::processor::aarch64::GicVersion;
+    use vmcore::vmtime::VmTime;
+    use vmcore::vmtime::VmTimeKeeper;
+
+    const RID: u32 = 0x100;
+    let bdf = incubator_vfio_bdf("cca-realm-vfio")?;
+    // This preflight is restricted to the single modeled AHCI fixture.
+    anyhow::ensure!(bdf == "0000:01:00.0", "unexpected Realm fixture BDF: {bdf}");
+    let sysfs = std::path::Path::new("/sys/bus/pci/devices").join(&bdf);
+    let class = fs_err::read_to_string(sysfs.join("class"))?;
+    anyhow::ensure!(
+        class.trim() == "0x010601",
+        "Realm fixture is not an AHCI controller"
+    );
+    let vendor = fs_err::read_to_string(sysfs.join("vendor"))?;
+    let device = fs_err::read_to_string(sysfs.join("device"))?;
+    anyhow::ensure!(
+        vendor.trim() == "0x0abc" && device.trim() == "0xaced",
+        "Realm fixture PCI identity does not match the pinned model"
+    );
+    let driver_path = fs_err::read_link(sysfs.join("driver"))?;
+    anyhow::ensure!(
+        driver_path.file_name() == Some(std::ffi::OsStr::new("vfio-pci")),
+        "Realm fixture is not bound to vfio-pci"
+    );
+
+    let mut hypervisor = virt_kvm::Kvm::new().context("open KVM for Realm preflight")?;
+    anyhow::ensure!(
+        hypervisor.recognizes_guest_memfd_in_place(),
+        "in-place backing is not recognized"
+    );
+    let topology = TopologyBuilder::new_aarch64(Aarch64PlatformConfig {
+        gic_distributor_base: 0xff000000,
+        gic_version: GicVersion::V3 {
+            redistributors_base: 0xff020000,
+        },
+        gic_msi: GicMsiController::Its(GicItsInfo {
+            its_base: 0xff040000,
+        }),
+        pmu_gsiv: None,
+        virt_timer_ppi: 20,
+        gic_nr_irqs: 256,
+    })
+    .build(1)?;
+    let layout = MemoryLayout::new_from_ranges(
+        &[MemoryRangeWithNode {
+            range: MemoryRange::new(0x40000000..0x40100000),
+            vnode: 0,
+        }],
+        &[],
+    )?;
+    let time_keeper = VmTimeKeeper::new(&driver, VmTime::from_100ns(0));
+    let time_source = time_keeper.builder().build(&driver).await?;
+    let mut proto = hypervisor
+        .new_partition(virt::ProtoPartitionConfig {
+            processor_topology: &topology,
+            hv_config: None,
+            vmtime: &time_source,
+            isolation: virt::ProtoPartitionIsolation::Cca,
+            nested_virt: false,
+            guest_memfd_in_place: true,
+            device_assignment_msi_iova_range: None,
+        })
+        .context("create dormant Realm prototype")?;
+    let backing = proto
+        .prepare_ram_backing(&layout)?
+        .context("Realm preflight requires in-place backing")?;
+    let memory = GuestMemory::empty();
+    let (partition, binders) = proto
+        .build(virt::PartitionConfig {
+            mem_layout: &layout,
+            guest_memory: &memory,
+            cpuid: &[],
+            vtl0_alias_map: None,
+            fault_resolver: None,
+        })
+        .context("build dormant Realm with GIC")?;
+    drop(binders);
+    anyhow::ensure!(
+        partition.caps().isolation == virt::IsolationType::Cca,
+        "preflight partition is not a Realm"
+    );
+    let provider = partition
+        .vfio_assignment_provider()
+        .context("KVM association provider is unavailable")?;
+
+    for cycle in 0..2 {
+        let cdev = open_vfio_cdev(&bdf)?;
+        let iommufd = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/iommu")
+            .context("open IOMMUFD for Realm preflight")?;
+        let mut objects =
+            RealmDevice::prepare(Some(provider.as_ref()), cdev, iommufd).map_err(|error| {
+                tracing::error!(cycle, error = ?error, "Realm object preparation failed");
+                anyhow::Error::new(error)
+            })?;
+        let prepared = objects.state();
+        tracing::info!(cycle, ?prepared, "Realm host objects prepared");
+        let prepared_ids = [
+            prepared.device,
+            prepared.ioas,
+            prepared.parent,
+            prepared.viommu,
+            prepared.child,
+        ];
+        anyhow::ensure!(
+            prepared.phase == RealmPhase::Prepared
+                && prepared.associated
+                && prepared_ids.iter().all(Option::is_some)
+                && std::collections::BTreeSet::from(prepared_ids).len() == prepared_ids.len()
+                && prepared.vdevice.is_none()
+                && !prepared.attach_attempted,
+            "unexpected prepared Realm object state"
+        );
+        objects.attach(RID).map_err(|error| {
+            tracing::error!(cycle, error = ?error, state = ?objects.state(), "Realm attachment failed");
+            anyhow::Error::new(error)
+        })?;
+        let attached = objects.state();
+        tracing::info!(cycle, ?attached, "Realm child HWPT attached");
+        anyhow::ensure!(
+            attached.phase == RealmPhase::Attached
+                && attached.vdevice.is_some()
+                && !prepared_ids.contains(&attached.vdevice)
+                && [
+                    attached.device,
+                    attached.ioas,
+                    attached.parent,
+                    attached.viommu,
+                    attached.child,
+                ] == prepared_ids
+                && attached.requester_id == Some(RID)
+                && attached.attach_attempted,
+            "unexpected attached Realm object state"
+        );
+        objects.close().map_err(|error| {
+            tracing::error!(cycle, error = ?error, state = ?objects.state(), "Realm cleanup failed");
+            anyhow::Error::new(error)
+        })?;
+        let closed = objects.state();
+        anyhow::ensure!(
+            closed.phase == RealmPhase::Closed
+                && !closed.associated
+                && !closed.attach_attempted
+                && [
+                    closed.device,
+                    closed.ioas,
+                    closed.parent,
+                    closed.viommu,
+                    closed.child,
+                    closed.vdevice,
+                    closed.requester_id,
+                ]
+                .iter()
+                .all(Option::is_none),
+            "Realm owner did not close completely"
+        );
+        tracing::info!(
+            cycle,
+            ?closed,
+            "Realm host-object lifecycle completed without guest execution"
+        );
+    }
+    drop(provider);
+    drop(partition);
+    drop(backing);
+    drop(time_source);
+    drop(time_keeper);
+    Ok(())
+}
+
 /// Boot Linux and verify the PMU interrupt is available.
 ///
 /// TODO: This is only supported on WHP and Hyper-V.
