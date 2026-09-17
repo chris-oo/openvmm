@@ -2,14 +2,22 @@
 
 Date: 2026-09-11
 
-Updated: 2026-09-15
+Updated: 2026-09-16
 
-Status: the OpenVMM guest_memfd in-place memory foundation is implemented.
-The paired CCA Virtio-vsock VMM test passes on FVP. The existing separate-backing
-test still passes on QEMU and FVP. Native OpenVMM TDISP assignment is not
-implemented. The local kvmtool reference has demonstrated one bounded
-private-buffer DMA read, but clean device teardown and negative isolation
-controls remain unqualified. See the runtime results below.
+Status: **native OpenVMM TDISP LOCK/RUN and a 64 MiB AHCI read are demonstrated
+on FVP with the unchanged kvmtool reference guest.** The read matched the
+reference disk hash. The complete VMM test still fails at UNLOCK and shutdown;
+this is a successful protocol/I/O milestone, not clean-lifecycle qualification.
+The execution implementation and tests have now been split into reviewed,
+validated commits. The provisional shutdown hold is retained separately as
+an unapproved deferred change.
+
+The guest_memfd in-place Virtio tests also pass on FVP. In-place QEMU debugging,
+OpenVMM private-buffer DMA measurement, negative isolation controls, teardown
+and same-host reuse remain separate work.
+
+See [the high-level component summary](summary-arm-cca-tdisp.md) for the
+implementation overview, runtime evidence, committed layers and pending splits.
 
 ## 1. Recommendation
 
@@ -33,9 +41,144 @@ This is not just a TDISP callback implementation. The main prerequisites are:
 4. Protected BAR access, usable interrupts, and conversion-aware shared DMA.
 5. A DA-capable FVP package, host provisioning, guest payload, and test.
 
-The existing Linux VFIO and FVP infrastructure is substantial and reusable.
-However, the current CCA configuration explicitly rejects VFIO devices. Merely
-removing that rejection would enable an unsupported memory and access path.
+The existing Linux VFIO and FVP infrastructure is reused. Ordinary `vfio` and
+`vfio-cdev` resources remain rejected for CCA. The distinct `vfio-realm`
+resource selects the native assignment, access and memory-coordination path;
+removing the ordinary resource guard is not the implementation.
+
+### Current milestone and remaining review
+
+The fifth unchanged-guest trial reached native Locked and Run states, reprobed
+AHCI at `0000:01:00.0`, and completed the original initrd's 64 MiB direct-read
+and hash check. Guest interrupt records show AHCI MSI-X delivery. UNLOCK then
+hit OpenVMM's conservative protected-mapping guard; the VP halted and the
+overall test failed. kvmtool implements UNLOCK through the native state ioctl.
+Our guard failure does not prove that the kernel cannot perform UNLOCK.
+
+The execution changes were assembled into dependency-ordered, buildable chunks:
+
+| Chunk | Main files | Review/commit status |
+|---|---|---|
+| Native TDISP operations and serialized RAM work | `vm/devices/tdisp/src/host*` | Committed as `mktoyytw`, including required caller-compatibility edits. |
+| KVM interrupt-route error handling | `vmm_core/virt_kvm/src/gsi.rs` and route-check forwarding | Committed as `lqzlyxul`. |
+| Realm VFIO backend and PCI frontend | `vm/devices/pci/vfio_assigned_device/` | Committed together as `nsvzyuut`; the private gate API and its frontend consumers form one warning-free boundary. |
+| Full RHI/TIO and RAM-conversion runtime | `vmm_core/virt_kvm/src/{rhi,memory,cca_in_place}.rs` and Arm dispatch | Committed as `tusnzrsq`. |
+| OpenVMM setup and private PCI resource view | `openvmm_core` worker/loader, `vm_topology`, ACPI test initializers | Committed as `yzoxvwlz`, without the provisional shutdown hold. |
+| Same-guest VMM test and preserved commands | `vmm_tests/.../aarch64_exclusive/tdisp_ahci.rs` and `test_data/cca_tdisp/` | Committed as `ykvolqkt`; the known failed overall runtime verdict remains explicit. |
+| Optional dormant-object test | `aarch64_exclusive.rs` and Arm-only dev-dependencies | Committed separately as `ozppvpsq`; not needed for the achieved guest milestone. |
+| Status and component documentation | This plan and `summary-arm-cca-tdisp.md` | Updated after the split and observed milestone. |
+
+The worker lifetime hold is provisional. Review found gaps on parent mesh
+disconnection and constructor failure; do not describe it as complete recovery
+or process-lifetime protection. Those shutdown/reuse changes are deferred, not
+covered by the successful guest I/O result. Apply the normal review and
+pre-commit checks to each final split; a review of the combined tree does not
+prove that every proposed intermediate commit builds independently. Each
+execution candidate above was therefore reconstructed and checked on its own.
+
+### Final split and commit procedure
+
+Preserve the complete reviewed working tree under a temporary local jj
+bookmark before changing the checkout. Build the commit chain from its parent
+in the existing workspace, restoring only the next chunk from that snapshot.
+This keeps all unsplit code and the captured runtime evidence available.
+Do not rewrite pushed changes or push the new chain.
+
+Record the source change and parent before leaving that checkpoint, and check
+that every intended source file is included. Ignored artifacts are not saved
+by jj: `cargo clean` removed `target/cca-tdisp-stage-a` on September 16, while
+the saved run evidence under `vmm_test_results/` remains. Check preserved
+input copies before any new FVP run; missing tools or artifacts block that
+run, not source-level validation.
+
+| Order | Proposed commit | Dependency and boundary |
+|---|---|---|
+| 1 | Native TDISP assignment operations and worker contract | `tdisp` API/coordinator/service plus the minimum existing-consumer compatibility edits for `raw`, `Unsupported` and admission closure. No live backend enablement. |
+| 2 | Checked KVM IRQ route lifetime | GSI route/error handling and the VM route-check implementation. Keep full RHI/DMA dispatch for a later commit. |
+| 3 | Realm access gate and native backend | Realm owner, TSM operations, shared-DMA mapping and backend tests. Keep PCI frontend tests out until their implementation lands. |
+| 4 | Realm PCI frontend and resolver | Trapped BAR/config access, MSI-X handling, fixed identity, service ownership and resolver wiring. Combine with order 3 when separating private APIs from their consumers prevents a clean, warning-free boundary. |
+| 5 | Full KVM RHI/TIO and RAM conversion | Remaining Arm dispatch, initial private preparation, serialized conversions and runtime tests. |
+| 6 | OpenVMM assembly and private PCI view | Resolver admission, retained RAM-region owner, dedicated-root validation, DT metadata and required ACPI test initializers. |
+| 7 | Optional dormant Realm-object diagnostic | Its function and Arm-only test dependencies, separate from the actual guest test and never an execution gate. |
+| 8 | Unchanged-guest TDISP/AHCI VMM test | Exact guest/disk checks, PCI setup and guest/kernel result interpretation. Keep the observed failed overall verdict. |
+| 9 | Milestone and component documentation | This plan and the standalone summary, updated with the resulting change IDs and validation state. |
+
+Keep provisional shutdown-hold changes isolated from these execution chunks.
+Review their bounded behavior separately. If blocking findings remain, retain
+them as a named deferred change rather than mark them approved or silently
+include them in an execution commit.
+
+Specifically, keep the RAM-region ownership wrapper in the assembly commit,
+but preserve the provisional `LoadedVm::run` shutdown hold as a separate,
+unapproved change atop the chain. The prior FVP run used the combined tree;
+excluding that hold is not behavior-neutral and must not inherit a fresh
+runtime-qualification claim. Do not lose it when restoring the worker file.
+
+Use hunk-level compatibility edits where files span commits. The IRQ chunk
+uses the already-committed route-check trait. The backend chunk includes its
+module declarations and dependencies but excludes the frontend-test module.
+The frontend chunk includes its manager binding and resolver. Full KVM
+registration and retention-query implementation remain in the runtime chunk.
+
+For each candidate, inspect its actual diff and obtain a focused review.
+Resolve findings, then run the modified packages' unit tests, clippy and
+rustdoc; check the Arm consumer when interfaces cross architectures.
+Run the full `cargo xtask fmt --fix` last and commit only after it succeeds.
+Use normal Cargo lockfile regeneration for the selected manifests so unrelated
+pending dependencies do not enter earlier commits.
+
+Inspect the final formatted diff before committing. If formatting makes
+semantic or out-of-scope changes, resolve them and rerun affected checks.
+Record each chunk's review and pass/fail/blocked status here. A failed candidate
+stays uncommitted for correction; never restore the next chunk over that work.
+Compile the test targets for both VMM-test commits, without mislabeling the
+known overall FVP failure as a passing unit/build check.
+
+At the end, compare the assembled tree with the preserved source. Account for
+every difference: compatibility edits later replaced by their final versions,
+review fixes, documentation updates and any explicitly deferred shutdown
+change. Remove the temporary bookmark only after all source changes are
+committed or otherwise explicitly retained.
+
+### Executed split validation
+
+The preserved source was change `sxturssr`, based on `xxuzxupu`. Before the
+integrated test correction below, the only source-code differences were the
+provisional shutdown hold and its tracking fields in `dispatch.rs` and
+`dispatch/realm_retention.rs`. That code is preserved in unapproved change
+`kwtwmymp`, on `cca-assignment-deferred-shutdown`, outside the execution
+commits. The RAM-region owner wrapper remains in `yzoxvwlz`.
+
+| Change | Candidate review | Validation before commit |
+|---|---|---|
+| `mktoyytw` | Focused review: no significant issues | 180 native tests across the API and existing consumers; native/Arm clippy, rustdoc, full formatter |
+| `lqzlyxul` | Focused review: no significant issues | 59 native tests; native/Arm clippy, rustdoc, full formatter |
+| `nsvzyuut` | Focused review: no significant issues | 88 native tests; native/Arm clippy, rustdoc, full formatter |
+| `tusnzrsq` | Focused review: no significant issues | 72 native tests; native/Arm clippy, rustdoc, full formatter |
+| `yzoxvwlz` | Execution-only review: no significant issues | 125 native tests across worker/topology/VMM core; native/Arm clippy, rustdoc, full formatter |
+| `ozppvpsq` | Direct review of the complete diagnostic and gating | Native/Arm test-target compilation through clippy; rustdoc, full formatter; no live diagnostic rerun |
+| `ykvolqkt` | Focused review: no significant issues | Native/Arm test-target compilation through clippy; rustdoc, full formatter; shell syntax and recovered-source hashes |
+| `tquwpomz`, `vosxqvox` | Direct review of the cancellation-test scheduling and assertion order | Final correction passed 20 stress iterations, then all 525 integrated tests; clippy, rustdoc, full formatter |
+
+The backend-only candidate initially passed 73 tests but left private APIs
+without production consumers. It was not committed with warning suppressions;
+the backend and frontend were combined and rechecked. Standalone
+`openvmm_core` checks retain the existing crypto-backend configuration warning.
+
+These are source-level checks of the split chain, not a new FVP execution.
+The successful LOCK/RUN/I/O evidence remains the recorded combined-tree run,
+whose full test failed at UNLOCK/shutdown. Missing `target/` artifacts after
+`cargo clean` prevented no source checks, but a new live run requires restored
+tool and input staging.
+
+The integrated run initially timed out in the queued-worker cancellation
+test. Its pre-polled retry used a no-op waker and could consume the mutex's
+only wake while the test waited on a second waiter. The final test drains and
+asserts the cancelled task's cleanup before creating its retry. This fixes the
+test race without letting the retry satisfy the cancelled-task assertion.
+Production code is unchanged. The final integrated result was 525 passing
+tests across ten packages; this correction is the additional intentional
+test-file difference from the preserved source.
 
 ## 2. Inputs and evidence
 
@@ -47,7 +190,7 @@ and the pinned kvmtool reference. Paths beginning with `../linux-cca`,
 
 | Input | Reference inspected | Qualification |
 |---|---|---|
-| OpenVMM | Plan baseline change ID `rukkunwr`, based on change ID `llntpwqp`, bookmark `cca-v15-fvp-upstream` | Later foundation changes are listed below; no OpenVMM DA runtime qualification |
+| OpenVMM | Plan baseline change ID `rukkunwr`, based on change ID `llntpwqp`, bookmark `cca-v15-fvp-upstream` | Current working tree demonstrates FVP LOCK/RUN and AHCI read/hash; lifecycle and private-buffer qualification remain open |
 | Host and Realm Linux | `../linux-cca`, `scratch/cca-tdisp-integration-v7`, `2b68f486fdbc8d2818309f91199dde46b2b7cdd6` | Matches the findings document |
 | kvmtool | `scratch/cca-tdisp-integration-v7`, `2e0928d1f945d68af388575e7bd4d6bfa7200120` | Pinned revision inspected initially; matching working tree independently reviewed in pass two |
 | TF-RMM | `../tf-rmm`, `33bbaf7814fee335027bf4d2417d97b551838b70` | Includes the DA overlay selecting both v7 branches |
@@ -91,8 +234,9 @@ The later foundation changes are `nkxtrrzo` (backing imports at file offsets),
 `pyrmwurs` (GNU/musl ioctl request types), `svvtpwvn` (partition-owned RAM
 preparation and imports), and `vxmksnus` (in-place launch and conversion).
 They supersede the corresponding baseline gaps described in section 6.
-Private prefaulting for assigned devices and coordinated IOAS mapping remain
-future work.
+At that foundation checkpoint, assigned-device private prefaulting and
+coordinated IOAS mapping were future work. They are now implemented in the
+full assignment path; measured private-buffer DMA qualification remains open.
 
 The follow-up fixes are change ID `wmumznmy` (guest-memory policy forwarding
 and vsock copy paths) and change ID `vwkkpkwp` (in-place naming, revocable
@@ -317,9 +461,9 @@ Per the implementation priority, defer further investigation of this model
 shutdown failure for now. Keep the model failure visible and separate from
 the test-command outcome; do not relabel it as clean shutdown. This deferral
 does not waive the Realm owner's allocation/cleanup checks, private-DMA
-evidence, or interrupt requirements. Actual Realm-object creation and cleanup
-still need runtime evidence, from the OpenVMM end-to-end test or an optional
-standalone diagnostic. Enumeration-only boots have not exercised them.
+evidence, or interrupt requirements. The full OpenVMM guest trial now exercises
+Realm-object creation and attachment. Clean object release remains unqualified;
+an enumeration-only boot or optional dormant preflight cannot establish it.
 
 ### Single-boot diagnostic execution
 
@@ -520,7 +664,8 @@ layouts, retain host buffers for synchronous calls, and preserve syscall
 errno, nonnegative residue and TSM code as separate results. Reads use only
 backend offset zero.
 
-`RealmDevice::into_tdisp` now connects these components for evidence reads.
+The initial `RealmDevice::into_tdisp` path connected these components for
+evidence reads.
 It consumes only an attached, exclusively owned assignment, retaining the
 original owner on a rejected transfer. Attachment can succeed without a TSM,
 so a read-only certificate-size request first verifies a configured CCA TSM
@@ -531,12 +676,11 @@ nonzero TSM codes, and read residue are checked before the snapshot core can
 return guest slices.
 Requests cannot use a prepared, cleaning or closed object owner.
 
-Explicit teardown invalidates snapshots and uses the existing dependency-
-ordered object cleanup. A failed teardown retains the assignment and permits
-cleanup retry. The public evidence owner exposes neither backend aliases nor
-mutations; LOCK/RUN, reset, regeneration and MMIO validation remain disabled.
-Native guest RHI transport and access/DMA coordination are still required
-before live CCA assignment can be enabled.
+Explicit teardown invalidates snapshots and uses dependency-ordered object
+cleanup where release is allowed. A failed teardown retains the assignment.
+The later full-assignment service adds native state, regeneration, MMIO and
+serialized RAM operations behind the frontend access gate. That path has now
+demonstrated LOCK/RUN and I/O; its UNLOCK/release restrictions remain open.
 
 ## 5. Configuration and ownership
 
@@ -761,6 +905,13 @@ do not eagerly pin/map the entire private guest_memfd into the shared IOAS.
 [O4, O6]
 
 Keep a range ledger for shared IOAS mappings and validate unmap coverage.
+
+The pinned kernel's `IOMMU_IOAS_MAP_FILE` path accepts shmem and hugetlb files,
+not guest_memfd. Match kvmtool by mapping newly shared RAM through a host
+virtual address with `IOMMU_IOAS_MAP`. Retain an owned guest_memfd mmap view
+and its file in the IOAS ledger before each request, including uncertain
+failures; release the view only after all corresponding IOAS unmaps succeed.
+This maps the existing shared backing, not a second RAM copy.
 No P2P BAR exports are needed in milestone one. Generic best-effort P2P mapping
 failure behavior must not become success for required CCA DMA mappings.
 
@@ -817,9 +968,10 @@ seven-field trusted-I/O packet and starts with a rejecting response.
 `ArmTioExit::accept` refuses unknown reasons or flags; known mapping requests
 still require device/address-policy validation before acceptance. The Arm
 `virt_kvm` loop rejects/stops on unregistered hypercalls and trusted-I/O exits.
-Registered evidence services enable only the two evidence feature bits and
-the size/read handlers below. Live state transitions and TIO acceptance remain
-disabled.
+Evidence-only registration still enables only the two evidence feature bits
+and size/read handlers. Full assignment registration additionally prepares
+private RAM and enables the base RHI operations and TIO mapping requests.
+The latter path is used by the demonstrated guest trial.
 
 ### Request translation
 
@@ -865,6 +1017,10 @@ and invalid shared buffers with explicit protocol results. Backend and copy
 failures retain typed diagnostics and never report a successful byte count.
 The full Linux DA base feature set remains unadvertised; regeneration,
 LOCK/RUN and TIO acceptance remain disabled.
+
+That paragraph describes the initial evidence-only stage. The full assignment
+path now advertises the base feature set after private-memory preparation and
+routes state, regeneration and TIO operations through the same admitted owner.
 
 GET/SET_ONE_REG failures poison the partition; partial result writes must
 never reach guest re-entry. Preserve the existing stop contract, which waits
@@ -972,7 +1128,9 @@ shared ECAM, virtio, and nonsecure interrupt views. The guest's ioremap hook
 selects mapping protection from RIPAS, so a private-address resource can use
 shared access before acceptance and protected access after validation and
 driver reprobe. Qualify the smallest address-view change first; a separate DA
-aperture or root is a candidate, not a demonstrated requirement. [K8]
+aperture or root was initially a candidate, not a general requirement. The
+current single-device implementation uses a dedicated root and passed the
+unchanged guest's LOCK/RUN and I/O sequence. [K8]
 Do not clear the shared bit only in the VMM's
 TIO handler: RMM checks the guest's RSI arguments before that exit. Test that
 the guest sends private IPAs for protected AHCI ranges, while shared device
@@ -1143,6 +1301,72 @@ error-handling shortcuts are not acceptable OpenVMM behavior.
 
 ## 10. The `vmm_test`
 
+### Current execution priority: unchanged reference guest
+
+The immediate milestone is LOCK/RUN and disk I/O in the isolated FVP instance.
+Defer shutdown, teardown and same-host reuse redesign until that execution
+path is understood. For this controlled trial, keep the test controller,
+OpenVMM and its RAM alive while observing the guest, then end the entire FVP
+instance. Do not make a new cleanup interface or a guest helper a prerequisite.
+This does not qualify parent-disconnect, forced process termination, physical
+hardware recovery or clean resource reclamation.
+
+Do not add a guest helper or require a separate evidence-only/preflight test.
+Complete the OpenVMM host path, then run the unmodified guest used in the
+successful Stage A run `run-20260914-3`. Its own initrd already runs the
+TSM lock/accept, 64 MiB direct read, hash check, unlock and poweroff sequence.
+The guest discovers AHCI by PCI class rather than a fixed guest BDF.
+
+The exact guest inputs are:
+
+| Input | SHA-256 |
+|---|---|
+| `runs/run-20260914-3/share/Image` | `6bef4c54ac93d8513ad7f125737c9ff0a8b0b7e34720e77253e2b63460002437` |
+| `runs/run-20260914-3/share/guest-initrd.cpio` | `d3ba987d83bd46a60cf2199d7989a7b940499065e1011125775034b5710dad92` |
+
+Paths are relative to `target/cca-tdisp-stage-a`. These are not the later
+instrumented `private2` guest or the ordinary Petri in-place payload.
+`--cca-tdisp-guest-root` stages them separately under `cca-tdisp-guest/`;
+it must not replace the L1 host kernel/initrd or rebuild firmware.
+Only platform console arguments change for OpenVMM's PL011 device.
+
+Provision a new `realm-vfio-reference-platform` package with the saved run-3
+AHCI disk, SHA-256
+`281e519df3077b557c6b03f5da83c4e8d397219259615dd7c3308f89cae8f2a6`.
+The firmware-build package's zero-filled disk is not a valid substitute for
+the guest's unchanged oracle. Preserve old inputs and reuse firmware without
+rebuilding. The newer L1 in-place kernel and ordinary Petri initrd remain
+host inputs, separate from the guest pair above.
+
+The initial Realm frontend uses intercepted shared BAR accesses, rather than
+the ordinary VFIO direct-map path. A single access gate can therefore drain
+and withdraw those accesses before LOCK without relying on the existing
+infallible BAR-unmap API. MSI-X table/PBA pages stay separately emulated.
+A dedicated static root supplies selector-clear BAR resource addresses while
+other roots and ECAM retain their shared views.
+
+Missing protected-unmap acknowledgement blocks a clean-release claim, not
+necessarily the bounded LOCK/RUN/I/O attempt. Do not remove tracked attempted
+protected mappings based on an ordinary guest exit or guest sysfs success.
+RMM checks actual mappings during acceptance, but Linux's mapping rollback
+can hide the original error. On uncertain release, stop guest execution and
+new operations, contain DMA, and retain all reachable backing and assignment
+dependencies. If that containment cannot be established, stop before enabling
+the device. An I/O result followed by failed unlock/teardown remains an overall
+failure, not a clean lifecycle or private-DMA qualification.
+
+The retention boundary applies to guest exit, timeout, cancellation, partial
+acceptance and OpenVMM teardown failure. Ordinary test cleanup must not
+destroy containment resources. If model termination is the recovery boundary,
+keep those resources until termination is confirmed. Establish this before
+device enable; do not infer containment from process exit.
+
+For this first trial, observe the original initrd's ordered READY, LOCK,
+ACCEPT, complete-image hash and UNLOCK markers through PL011. Do not inject
+pipette or drive its sysfs sequence externally. Record protocol/I/O completion,
+OpenVMM release and FVP shutdown separately; the latter two remain required
+for an overall pass.
+
 Add a test next to `boot_linux_direct_cca` in
 `vmm_tests/vmm_tests/tests/tests/aarch64_exclusive.rs`. Proposed name:
 `boot_linux_direct_cca_tdisp_ahci`. Reuse the base CCA test's small RAM/vCPU
@@ -1151,7 +1375,24 @@ ordinary VFIO test's pre-opened resource pattern, but construct the new
 CCA-aware resource. Do not use its plain `VfioCdevDeviceHandle` unchanged.
 [O9]
 
-### Test procedure
+### Follow-on instrumented qualification
+
+The expanded procedure below is for later private-DMA qualification. It is
+not a prerequisite to implementing the host path and attempting the unchanged
+reference guest above.
+
+### Summary after LOCK/RUN and I/O
+
+Once LOCK/RUN and device I/O work, add a high-level summary to this document
+of all changes by component: low-level KVM, `virt_kvm`, `tdisp`, VFIO/PCI and
+MSI-X, memory backing/conversion, OpenVMM setup and device tree, Petri/Flowey,
+and the FVP artifacts/tests. Explain how requests and ownership flow between
+them. Separate observed working behavior from the deferred kernel, shutdown,
+teardown, reuse and private-DMA qualification work, and link the relevant
+commits and runtime evidence. Do not write this as a completed milestone
+before the guest demonstrates LOCK/RUN and I/O.
+
+### Later measured test procedure
 
 1. Require the new DA fixture capability and read its validated L1 BDF.
    Capture source/artifact manifest, host kernel identity and VFIO IRQ data.
@@ -1358,21 +1599,23 @@ and physical hardware assurance remain separately qualified results.
 
 ### Invocation and selection
 
-After the proposed profile/capability/test are implemented and the new roots
-are provisioned, the intended command shape is:
+After full host integration is ready and the new roots are provisioned, use
+the exact reference guest and single-boot test:
 
 ```bash
-cargo xflowey vmm-tests-run \
+PYTHONDONTWRITEBYTECODE=1 cargo xflowey vmm-tests-run \
   --target linux-aarch64-musl \
-  --incubator petri/incubator/profiles/aarch64-fvp-cca-tdisp.toml \
-  --fvp-platform-root /absolute/path/to/qualified-da-platform \
-  --shrinkwrap-package-root /absolute/path/to/qualified-da-package \
-  --filter 'binary(=tests) & test(=aarch64_exclusive::openvmm_linux_aarch64_boot_linux_direct_cca_tdisp_ahci)'
+  --incubator petri/incubator/profiles/aarch64-fvp-cca-realm-vfio.toml \
+  --fvp-platform-root "$PWD/target" \
+  --shrinkwrap-package-root "$PWD/target/cca-tdisp-stage-a/realm-vfio-reference-platform/package" \
+  --cca-in-place-payload-root "$PWD/target/cca-tdisp-stage-a/test-platform/payload" \
+  --cca-tdisp-guest-root "$PWD/target/cca-tdisp-stage-a/runs/run-20260914-3/share" \
+  --dir "$PWD/vmm_test_results/cca-tdisp-exact-guest" \
+  --fvp-single-test aarch64_exclusive::tdisp_ahci::openvmm_linux_aarch64_boot_linux_direct_cca_tdisp_ahci
 ```
 
-This is **not runnable with the current profile/test implementation**. If
-payload selection needs an additional option, add it to this example during
-implementation rather than silently selecting the old v15 payload.
+Artifact staging and the test are implemented, but full host integration and
+runtime qualification are still pending. `--build-only` must not launch FVP.
 
 Require exactly one executed passing test. Zero-test, ignored-only and
 listing-only results are not success. Keep this test out of QEMU's current
@@ -1381,8 +1624,9 @@ listing-only results are not success. Keep this test out of QEMU's current
 The root execution-target plan is explicitly deferred. This work does not
 resume it or assume `targets(fvp_cca)` exists. Use the exact manual filter,
 a DA capability, and runtime fixture checks. Preserve existing in-incubator
-discovery behavior; no persistent FVP session or enumeration optimization is
-required.
+discovery behavior; the explicit single-boot path avoids the separate
+enumeration shutdown before the selected test. It does not suppress model
+shutdown failures or create a reusable persistent FVP session.
 
 ### Additional validation
 
@@ -1414,9 +1658,11 @@ transport/error plumbing, but do not replace a real FVP negative result.
 | G. End-to-end and lifecycle | Petri fixture; new test and helper/instrumentation; fault tests; Guide | Exact FVP test and required evidence pass with clean teardown; record any failures separately, never as overall success |
 
 Stage A has a protocol/read baseline and known MSI-X mode, but remains
-incomplete for confidential DMA and clean lifecycle. The next qualification
-task is the buffer-level test in section 10; investigate the two shutdown failures
-separately. Do not use repeated forced shutdown as a clean-reuse result.
+incomplete for confidential DMA and clean lifecycle. The immediate task is
+full host integration followed by the unchanged reference-guest trial.
+Section 10's buffer-level instrumentation is a later qualification task, not
+a gate on this attempt. Shutdown investigations remain deferred; do not use
+repeated forced shutdown as a clean-reuse result.
 
 Stage C scaffolding and B can proceed using the recorded local candidate;
 publishing a qualified DA platform/test still requires the open Stage A gates.
@@ -1691,10 +1937,120 @@ nextest run `010f1be1-4c50-4733-9692-da96971659c5`. Results are retained under
 `vmm_test_results/rhi-default-boot`. This run used no evidence registration:
 it confirms default boot behavior, not native RHI dispatch or TDISP operation.
 
+### Unchanged-guest trial review
+
+Design review: **Minor revisions**, incorporated. The original initrd's
+autonomous sequence is authoritative for the first trial; pipette-driven and
+instrumented procedures are follow-on qualification. The guest pair and
+patterned reference disk are pinned separately from the L1 payload. Retention
+must cover all failure and cancellation paths through the model recovery
+boundary, and protocol/I/O evidence remains separate from the overall verdict.
+
+Test review corrected the initial marker to `DA_STAGE_A_GUEST_READY` because
+`BOOT_PASS` belongs only to the separate boot-only phase. It also corrected
+the disk oracle to the original run-3 hash rather than the zero-filled firmware
+build artifact. A new package copies the saved patterned disk without changing
+the original packages or rebuilding firmware. The exact-guest Flowey staging
+review found no significant issues. Review alone does not establish a live
+LOCK/RUN or I/O result.
+
+The first live attempt executed the selected test, but failed in Petri
+configuration before guest boot: `wait for RTS not supported with this serial
+type`. Native nextest run `d28cc26d-2b44-46bd-90b2-8e2380b1415e` failed after
+307.384 seconds in FVP session
+`8ea70a314a443c46c36c7f3aa91ffe6176c45c993cee343932b1950a017278a2`.
+The wrapper separately recorded native command exit 100, successful fixture
+teardown, and failed launcher shutdown. This is not a TDISP execution result.
+The fix skips the unused serial-agent handshake and empty agent disk for
+agent-free Linux direct boot, leaving the original guest unchanged.
+
+The second attempt passed that setup stage and reached OpenVMM, but the test
+requested an invalid zero-sized high-MMIO allocation for the Realm root.
+Session `33bb16dc05b0b106533d9482809466c151e998a5ccb0e9d8613fcd588cf0d146`
+failed before guest execution. The test now retains the normal high-MMIO
+window instead of overriding its size to zero.
+
+The third attempt booted the unchanged guest kernel under OpenVMM. It stopped
+during early shared-memory setup after the 64 MiB SWIOTLB allocation, before
+the initrd's READY/LOCK sequence. Session
+`220a5b2cbaf32d1391bcb573b98a72532045c92c61e550dd73437685868696da`
+reported a shared-DMA mapping failure. The implementation used the incompatible
+file-pin ioctl described above; it now retains a mmap view and uses the same
+virtual-address mapping ioctl as kvmtool. The scoped correction review found
+no significant issues. At that point, LOCK/RUN and disk I/O had not yet been
+demonstrated.
+
+The fourth attempt passed early shared-memory setup and enumerated AHCI at
+`0000:01:00.0` with the expected six BARs. It reached the separate Virtio
+root's probe before the execution deadline, without reporting the prior DMA
+mapping error. Session
+`a1d137edf2c103493f298dc5cf7ce2aacbe7706de5196fa9bc58068630dab069`
+has no completed native JUnit result. The next trial adds `quiet` to the
+platform command line to reduce console overhead while retaining kernel
+errors and uses a longer execution window. Kernel, initrd and disk bytes
+remain unchanged.
+
+### Demonstrated LOCK/RUN and I/O: 2026-09-16
+
+The fifth trial completed the execution milestone with the unchanged run-3
+guest and patterned disk. FVP session
+`eb6b287c635f6e51633424680a74b0d1c68f6a850860ec34f24f57e976daf895`
+ran nextest invocation `c44737e2-2933-4a58-94d3-15e7193217c3`.
+
+The host log recorded `Locked` at 103.884 seconds and `Run` at 106.232 seconds
+relative to OpenVMM startup. The guest checked its kernel TSM attributes,
+reprobed AHCI, read 64 MiB using direct I/O and matched
+`281e519df3077b557c6b03f5da83c4e8d397219259615dd7c3308f89cae8f2a6`.
+Guest interrupt output recorded 132 AHCI MSI-X interrupts.
+
+UNLOCK then reached OpenVMM's protected-mapping guard and halted the VP.
+The native test failed after 530.835 seconds; native command exit was 100,
+fixture teardown exited 1, and the launcher also exited 1. Result preservation
+succeeded. Do not convert this failed overall verdict to a passing lifecycle
+test. kvmtool does issue native UNLOCK; our conservative guard is a separate
+implementation restriction, not proof that the kernel cannot unlock.
+
+Persistent evidence is under
+`vmm_test_results/cca-tdisp-exact-guest/fvp-single-boot-runs/`
+`single-boot-2630902-1789600632166144336/`. The `observed-io/` directory holds
+guest, OpenVMM and Petri logs; `outputs/session-result.json` and the finalized
+native JUnit keep the failure channels separate. The requested component
+summary is now in [summary-arm-cca-tdisp.md](summary-arm-cca-tdisp.md).
+
 The earlier single-boot design review returned **Minor revisions**. It required
 immediate exit recording before output draining, caller-known result locations,
 exact non-skipped test evidence, private input snapshots, and publication before
 overall failure reporting. A later code review found shared setup could delete
 an active invocation's files; the implementation now keeps its inputs, outputs,
 host temporary storage and publication directory outside shared cleanup trees.
-Live single-boot qualification remains outstanding.
+Live native execution and result preservation are now demonstrated. Clean
+fixture/model shutdown and lifecycle qualification remain outstanding.
+
+### Milestone summary review
+
+Review verdict: **Minor revisions**, incorporated. The review checked the
+guest and host milestones, the failed native JUnit verdict, separate session
+failure channels, and the distinction between implemented memory coordination
+and measured private-buffer DMA. Earlier checkpoint wording was corrected so
+it does not contradict the current result. Proposed commit boundaries still
+require compatibility edits and independent build validation.
+
+### Final commit-sequence review
+
+Review verdict: **Minor revisions**, incorporated. Preserve the full source
+checkpoint and ignored evidence separately; use hunk-level compatibility
+edits rather than overwriting earlier fixes with later files. Keep the RAM
+owner wrapper distinct from the unapproved shutdown hold, and retain that
+hold as a separate change. Inspect the post-format candidate and validate
+actual Arm consumers and test targets before committing.
+
+After `cargo clean`, the preserved guest Image, initrd and patterned disk
+under the successful run directory still match all three recorded hashes.
+The removed `target/` inputs and FVP tool staging must be restored before
+any new live run.
+
+The exact guest script and disk oracle have also been recovered from that
+initrd into `vmm_tests/vmm_tests/test_data/cca_tdisp/`, with their hashes in
+`provenance.json`. `generate-reference-disk.py` reproduces the original
+64 MiB pattern and verifies its hash. No source script or guest command should
+exist only in `target/`; generated binaries remain separate from tracked source.
