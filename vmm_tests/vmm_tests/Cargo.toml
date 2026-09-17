@@ -69,5 +69,13 @@ serde_json = { workspace = true, features = ["std"] }
 pipette_client.workspace = true
 serde = { workspace = true, features = ["std"] }
 
+[target.'cfg(all(target_os = "linux", target_arch = "aarch64"))'.dev-dependencies]
+guestmem.workspace = true
+virt.workspace = true
+virt_kvm.workspace = true
+vm_topology.workspace = true
+vmcore.workspace = true
+vfio_assigned_device.workspace = true
+
 [lints]
 workspace = true
