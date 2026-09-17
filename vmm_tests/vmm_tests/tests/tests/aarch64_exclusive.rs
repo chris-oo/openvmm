@@ -22,6 +22,9 @@ use vmm_test_macros::openvmm_test;
 use vmm_test_macros::vmm_test;
 use vmm_test_macros::vmm_test_with;
 
+#[cfg(target_os = "linux")]
+mod tdisp_ahci;
+
 /// Boot a Linux-direct CCA Realm and verify the pipette agent over virtio-vsock.
 #[vmm_test_with(openvmm, requires(cca), configs(linux_direct_aarch64))]
 async fn boot_linux_direct_cca(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Result<()> {

@@ -54,6 +54,7 @@ vmgs_resources.workspace = true
 
 anyhow.workspace = true
 fs-err.workspace = true
+sha2.workspace = true
 futures.workspace = true
 jiff.workspace = true
 tracing.workspace = true

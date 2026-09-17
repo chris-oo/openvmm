@@ -296,6 +296,12 @@ read test, so this test adds neither pipette nor a guest helper. Flowey and
 the test check both input hashes. OpenVMM uses its own PL011 console arguments.
 Agent-free Linux direct boot skips empty agent media and the serial-agent
 RTS handshake; neither is required by this initrd.
+The original guest script, disk hash oracle and provenance are checked in under
+`vmm_tests/vmm_tests/test_data/cca_tdisp/`. That directory also contains
+`generate-reference-disk.py`, which reproduces the patterned disk without
+overwriting an existing file. Keep source scripts in the repo: `target/` is
+disposable build output. The checked-in script is a byte-identical extraction
+from the validated initrd, not a replacement injected into the guest.
 This path is under implementation; no end-to-end pass has been established.
 
 Use the DA profile and roots above, add `--cca-tdisp-guest-root` pointing to
