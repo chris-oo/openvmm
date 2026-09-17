@@ -43,6 +43,9 @@ enum Failure {
 
 struct Service {
     closed: AtomicBool,
+    assignment: bool,
+    states: Mutex<Vec<ConfirmedState>>,
+    regenerations: Mutex<Vec<Regenerate>>,
     size: usize,
     count: usize,
     failure: Option<Failure>,
@@ -54,6 +57,9 @@ impl Service {
     fn new() -> Self {
         Self {
             closed: AtomicBool::new(false),
+            assignment: false,
+            states: Mutex::new(Vec::new()),
+            regenerations: Mutex::new(Vec::new()),
             size: 8,
             count: 3,
             failure: None,
@@ -63,7 +69,7 @@ impl Service {
     }
 
     fn check(&self) -> Result<(), EvidenceError> {
-        if self.closed.load(Ordering::Acquire) {
+        if self.closed.load(Ordering::SeqCst) {
             return Err(EvidenceError::Closed);
         }
         match self.failure {
@@ -93,12 +99,28 @@ impl Drop for Service {
 #[async_trait::async_trait]
 impl EvidenceService for Service {
     fn close_admission(&self) {
-        self.closed.store(true, Ordering::Release);
+        self.closed.store(true, Ordering::SeqCst);
+    }
+
+    fn supports_assignment(&self) -> bool {
+        self.assignment
+    }
+
+    async fn set_state(&self, state: ConfirmedState) -> Result<(), EvidenceError> {
+        self.check()?;
+        self.states.lock().push(state);
+        Ok(())
+    }
+
+    async fn regenerate(&self, request: Regenerate) -> Result<(), EvidenceError> {
+        self.check()?;
+        self.regenerations.lock().push(request);
+        Ok(())
     }
 
     async fn object_size(&self, object: Object) -> Result<usize, EvidenceError> {
-        self.calls.lock().push(object);
         self.check()?;
+        self.calls.lock().push(object);
         Ok(self.size)
     }
 
@@ -109,8 +131,8 @@ impl EvidenceService for Service {
         length: u64,
         sink: Arc<dyn EvidenceSink>,
     ) -> Result<usize, EvidenceError> {
-        self.calls.lock().push(object);
         self.check()?;
+        self.calls.lock().push(object);
         assert_eq!(offset, 2);
         assert_eq!(length, 3);
         sink.write(&[2, 3, 4]).map_err(EvidenceError::Access)?;
@@ -138,6 +160,192 @@ impl EvidenceSink for Sink {
 
 fn service() -> Arc<dyn EvidenceService> {
     Arc::new(Service::new())
+}
+
+#[test]
+fn fatal_request_closes_admission_before_pending_mutations_can_start() {
+    let service = Arc::new(Service::new());
+    let pending_state = service.set_state(ConfirmedState::Running);
+    let pending_regeneration = service.regenerate(Regenerate::InterfaceReport);
+    let pending_size = service.object_size(Object::Certificate);
+    let sink = Arc::new(Sink(Mutex::new(Vec::new()), false));
+    let pending_read = service.read_object(Object::Certificate, 2, 3, sink.clone());
+    drop(RequestGuard::new(|| service.close_admission()));
+    assert!(service.closed.load(Ordering::SeqCst));
+    assert!(matches!(ready(pending_state), Err(EvidenceError::Closed)));
+    assert!(matches!(
+        ready(pending_regeneration),
+        Err(EvidenceError::Closed)
+    ));
+    assert!(matches!(ready(pending_size), Err(EvidenceError::Closed)));
+    assert!(matches!(ready(pending_read), Err(EvidenceError::Closed)));
+    assert!(service.states.lock().is_empty());
+    assert!(service.regenerations.lock().is_empty());
+    assert!(service.calls.lock().is_empty());
+    assert!(sink.0.lock().is_empty());
+    ready(service.teardown()).unwrap();
+    assert!(matches!(
+        ready(service.set_state(ConfirmedState::Unlocked)),
+        Err(EvidenceError::Closed)
+    ));
+}
+
+#[test]
+fn tio_decode_checks_full_range_reason_flags_id_and_address_views() {
+    let request = decode_mapping(8, 0, 0x100, 0x4000, 0x8000, 0x9000, 1 << 40).unwrap();
+    assert_eq!(request.rid, 0x100);
+    assert_eq!(
+        request.range,
+        memory_range::MemoryRange::new(0x4000..0x8000)
+    );
+    assert_eq!(request.pa, 0x9000);
+    for (nr, flags, rid, base, top, pa, bit) in [
+        (9, 0, 0, 0x4000, 0x8000, 0x9000, 1 << 40),
+        (8, 1, 0, 0x4000, 0x8000, 0x9000, 1 << 40),
+        (8, 0, 1 << 32, 0x4000, 0x8000, 0x9000, 1 << 40),
+        (8, 0, 0, 0x8000, 0x4000, 0x9000, 1 << 40),
+        (8, 0, 0, 0x4000, 0x4000, 0x9000, 1 << 40),
+        (8, 0, 0, 0x4001, 0x8000, 0x9000, 1 << 40),
+        (8, 0, 0, 1 << 40, (1 << 40) + 4096, 0x9000, 1 << 40),
+        (8, 0, 0, 0x4000, 0x8000, u64::MAX - 4095, 1 << 40),
+        (8, 0, 0, 0x4000, 0x8000, 0x9001, 1 << 40),
+    ] {
+        assert!(decode_mapping(nr, flags, rid, base, top, pa, bit).is_err());
+    }
+}
+
+#[test]
+fn assignment_registration_does_not_advertise_before_ram_ready() {
+    let mut registry = Registry::default();
+    let evidence = service();
+    assert!(matches!(
+        registry.register_assignment(1, Arc::downgrade(&evidence), || panic!("evidence filter")),
+        Err(RegistrationError::EvidenceOnly)
+    ));
+    let mut service = Service::new();
+    service.assignment = true;
+    let service: Arc<dyn EvidenceService> = Arc::new(service);
+    registry
+        .register_assignment(1, Arc::downgrade(&service), || Ok(()))
+        .unwrap();
+    assert!(!registry.full_features());
+    assert!(registry.assignment_requested());
+    assert!(matches!(
+        registry.register_assignment(2, Arc::downgrade(&service), || panic!("second assignment")),
+        Err(RegistrationError::MultipleAssignments)
+    ));
+    registry.assignment_prepared();
+    assert!(registry.full_features());
+    assert_eq!(ASSIGNMENT_FEATURES, 0x3b);
+    drop(service);
+    assert!(!registry.full_features());
+}
+
+#[test]
+fn assignment_decoder_keeps_full_width_and_known_states() {
+    let function = u64::from(RhiDaFunction::VDEV_SET_TDI_STATE.0);
+    for (value, state) in [
+        (0, ConfirmedState::Unlocked),
+        (1, ConfirmedState::Locked),
+        (2, ConfirmedState::Running),
+    ] {
+        assert_eq!(
+            decode_assignment(function, 0, [0x100, value, 0, 0, 0, 0, 0]),
+            Ok(AssignmentRequest::SetState { rid: 0x100, state })
+        );
+    }
+    for value in [3, 1 << 32, u64::MAX] {
+        assert_eq!(
+            decode_assignment(function, 0, [0x100, value, 0, 0, 0, 0, 0]),
+            Err(INPUT)
+        );
+    }
+    assert_eq!(
+        decode_assignment(function | (1 << 32), 0, [0; 7]),
+        Err(NOT_SUPPORTED)
+    );
+    assert_eq!(
+        decode_assignment(function, 0, [1 << 32, 0, 0, 0, 0, 0, 0]),
+        Err(INVALID_VDEV_ID)
+    );
+    assert_eq!(decode_assignment(function, 4, [0; 7]), Err(INPUT));
+}
+
+#[test]
+fn measurement_parameters_use_nonce_at_0x100_and_only_hash_or_raw_flags() {
+    let mut bytes = [0xa5; MEASUREMENT_PARAMETER_SIZE];
+    bytes[0x100..].fill(0x73);
+    for (flags, raw) in [(0u64, false), (1, true)] {
+        bytes[..8].copy_from_slice(&flags.to_le_bytes());
+        let parameters = measurement_parameters(&bytes).unwrap();
+        assert_eq!(parameters.nonce, [0x73; 32]);
+        assert_eq!(parameters.raw, raw);
+    }
+    for flags in [2u64, 1 << 32, u64::MAX] {
+        bytes[..8].copy_from_slice(&flags.to_le_bytes());
+        assert_eq!(measurement_parameters(&bytes), Err(INPUT));
+    }
+}
+
+#[test]
+fn native_mutations_share_one_service_and_own_measurement_input() {
+    let mut native = Service::new();
+    native.assignment = true;
+    let native = Arc::new(native);
+    for request in [
+        AssignmentRequest::SetState {
+            rid: 7,
+            state: ConfirmedState::Locked,
+        },
+        AssignmentRequest::InterfaceReport { rid: 7 },
+        AssignmentRequest::Measurements {
+            rid: 7,
+            gpa: 0x2000,
+        },
+    ] {
+        assert_eq!(
+            ready(dispatch_assignment(
+                request,
+                |_| Some(native.clone()),
+                |gpa, bytes| {
+                    assert_eq!(gpa, 0x2000);
+                    assert_eq!(bytes.len(), 0x120);
+                    bytes[..8].copy_from_slice(&1u64.to_le_bytes());
+                    bytes[0x100..].fill(0x42);
+                    Ok(())
+                }
+            )),
+            (response(SUCCESS, 0), false)
+        );
+    }
+    assert_eq!(*native.states.lock(), [ConfirmedState::Locked]);
+    assert_eq!(
+        *native.regenerations.lock(),
+        [
+            Regenerate::InterfaceReport,
+            Regenerate::Measurements(MeasurementRequest {
+                nonce: [0x42; 32],
+                raw: true
+            }),
+        ]
+    );
+}
+
+#[test]
+fn native_mutation_failure_requires_vm_quarantine() {
+    let mut native = Service::new();
+    native.failure = Some(Failure::Device);
+    assert_eq!(
+        ready(dispatch_assignment(
+            AssignmentRequest::SetState {
+                rid: 7,
+                state: ConfirmedState::Running
+            },
+            |_| Some(Arc::new(native)),
+            |_, _| panic!("state change must not read guest memory"),
+        )),
+        (response(DEVICE, 0), true)
+    );
 }
 
 #[test]

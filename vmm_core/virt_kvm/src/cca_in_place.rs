@@ -25,8 +25,45 @@ pub enum CcaInPlaceError {
     AmbiguousFault,
     #[error("guest buffer includes private CCA backing")]
     PrivateBuffer,
+    #[error("invalid, overlapping, or unknown protected device mapping")]
+    InvalidProtectedMapping,
 }
 
+/// Conservative history of attempted protected mappings. Neither ioctl zero,
+/// a following exit, nor DEV -> EMPTY proves removal in the pinned kernel.
+/// Never remove these entries without a new, checked kernel interface.
+#[derive(Debug, Default)]
+pub(crate) struct ProtectedAttempts {
+    ranges: Vec<MemoryRange>,
+}
+
+impl ProtectedAttempts {
+    pub(crate) fn record(
+        &mut self,
+        range: MemoryRange,
+        pa: u64,
+        shared_bit: u64,
+    ) -> Result<(), CcaInPlaceError> {
+        checked_range(range.start(), range.len())?;
+        checked_range(pa, range.len())?;
+        if shared_bit < 4096
+            || !shared_bit.is_power_of_two()
+            || range.end() > shared_bit
+            || self.ranges.iter().any(|existing| existing.overlaps(&range))
+        {
+            return Err(CcaInPlaceError::InvalidProtectedMapping);
+        }
+        self.ranges.push(range);
+        self.ranges.sort_by_key(MemoryRange::start);
+        Ok(())
+    }
+
+    pub(crate) fn covers(&self, range: MemoryRange) -> bool {
+        checked_range(range.start(), range.len()).is_ok()
+            && memory_range::walk_ranges([(range, ())], self.ranges.iter().map(|r| (*r, ())))
+                .all(|(_, state)| !matches!(state, memory_range::RangeWalkResult::Left(())))
+    }
+}
 pub(crate) fn validate_host_page_size(page_size: usize) -> Result<(), CcaInPlaceError> {
     if page_size != 4096 {
         return Err(CcaInPlaceError::UnsupportedHostPageSize(page_size));
@@ -258,9 +295,25 @@ impl Visibility {
 pub(crate) struct FaultTracker {
     probe: Option<Fault>,
     unconfirmed_noop: Option<Fault>,
+    device_probe: Option<Fault>,
 }
 
 impl FaultTracker {
+    /// Permit one kernel completion attempt for a tracked non-RAM interval,
+    /// without treating it as a visibility change or acknowledged unmapping.
+    pub(crate) fn observe_device(
+        &mut self,
+        fault: Fault,
+        successful_exit: bool,
+    ) -> Result<(), CcaInPlaceError> {
+        checked_range(fault.gpa, fault.size)?;
+        if successful_exit || fault.flags != 0 || self.device_probe == Some(fault) {
+            return Err(CcaInPlaceError::AmbiguousFault);
+        }
+        self.device_probe = Some(fault);
+        Ok(())
+    }
+
     /// An ordinary exit proves that KVM finished the previous completion.
     /// An interrupt does not: immediate_exit can run before REC pre-entry.
     pub(crate) fn completed(&mut self) {
@@ -314,6 +367,43 @@ impl FaultTracker {
 mod tests {
     use super::*;
     use test_with_tracing::test;
+
+    #[test]
+    fn protected_attempts_cover_only_known_ranges_and_never_acknowledge_removal() {
+        let mut ledger = ProtectedAttempts::default();
+        let range = MemoryRange::new(0x4000..0x8000);
+        ledger.record(range, 0x9000, 1 << 40).unwrap();
+        ledger
+            .record(MemoryRange::new(0x8000..0x9000), 0x11000, 1 << 40)
+            .unwrap();
+        assert!(ledger.covers(range));
+        assert!(ledger.covers(MemoryRange::new(0x5000..0x9000)));
+        assert!(!ledger.covers(MemoryRange::new(0x3000..0x9000)));
+        assert!(!ledger.covers(MemoryRange::new(0x4000..0xa000)));
+        assert!(ledger.record(range, 0x9000, 1 << 40).is_err());
+        let mut tracker = FaultTracker::default();
+        let fault = Fault {
+            gpa: range.start(),
+            size: range.len(),
+            flags: 0,
+        };
+        tracker.observe_device(fault, false).unwrap();
+        assert!(tracker.observe_device(fault, false).is_err());
+        tracker.completed();
+        assert!(ledger.covers(range));
+        assert!(tracker.observe_device(fault, true).is_err());
+        assert!(
+            tracker
+                .observe_device(
+                    Fault {
+                        flags: kvm::KVM_MEMORY_EXIT_FLAG_PRIVATE_UAPI,
+                        ..fault
+                    },
+                    false
+                )
+                .is_err()
+        );
+    }
 
     #[test]
     fn requires_4k_host_pages() {
