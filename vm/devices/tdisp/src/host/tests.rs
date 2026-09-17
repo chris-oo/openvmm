@@ -306,11 +306,13 @@ fn all_mutations_invalidate_all_objects() {
         }
         assert_eq!(budget.used(), 16);
         match operation {
+            Mutation::Assignment => unreachable!(),
             Mutation::SetState(state) => device.set_state(state),
             Mutation::InterfaceReport => device.regenerate(Regenerate::InterfaceReport),
             Mutation::Measurements => {
                 device.regenerate(Regenerate::Measurements(MeasurementRequest {
                     nonce: [0xa5; 32],
+                    raw: false,
                 }))
             }
             Mutation::Reset => device.reset(),
@@ -433,7 +435,8 @@ fn explicit_transition_table_and_no_implicit_unlock() {
     assert!(
         device
             .regenerate(Regenerate::Measurements(MeasurementRequest {
-                nonce: [0; 32]
+                nonce: [0; 32],
+                raw: false,
             }))
             .is_err()
     );

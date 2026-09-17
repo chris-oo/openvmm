@@ -42,6 +42,7 @@ enum Failure {
 }
 
 struct Service {
+    closed: AtomicBool,
     size: usize,
     count: usize,
     failure: Option<Failure>,
@@ -52,6 +53,7 @@ struct Service {
 impl Service {
     fn new() -> Self {
         Self {
+            closed: AtomicBool::new(false),
             size: 8,
             count: 3,
             failure: None,
@@ -61,6 +63,9 @@ impl Service {
     }
 
     fn check(&self) -> Result<(), EvidenceError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(EvidenceError::Closed);
+        }
         match self.failure {
             None => Ok(()),
             Some(Failure::Device) => Err(EvidenceError::Device(
@@ -87,6 +92,10 @@ impl Drop for Service {
 
 #[async_trait::async_trait]
 impl EvidenceService for Service {
+    fn close_admission(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+
     async fn object_size(&self, object: Object) -> Result<usize, EvidenceError> {
         self.calls.lock().push(object);
         self.check()?;
@@ -109,6 +118,7 @@ impl EvidenceService for Service {
     }
 
     async fn teardown(&self) -> Result<(), EvidenceError> {
+        self.close_admission();
         Ok(())
     }
 }

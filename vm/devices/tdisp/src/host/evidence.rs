@@ -1,11 +1,14 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use super::AssignmentOperation;
 use super::Backend;
+use super::ConfirmedState;
 use super::Coordinator;
 use super::DeviceState;
 use super::Error;
 use super::Object;
+use super::Regenerate;
 use super::SnapshotError;
 use futures::lock::Mutex;
 use futures::lock::OwnedMutexGuard;
@@ -27,6 +30,9 @@ pub trait EvidenceSink: Send + Sync {
 /// Evidence failure with the original diagnostic source retained.
 #[derive(Debug, thiserror::Error)]
 pub enum EvidenceError {
+    /// The owner does not provide live assignment operations.
+    #[error("native assignment operation is unsupported")]
+    Unsupported,
     /// Only native snapshot slicing failures map to this variant.
     #[error("invalid evidence range")]
     InvalidRange(#[source] SnapshotError),
@@ -52,7 +58,7 @@ impl<E: std::error::Error + Send + Sync + 'static> From<Error<E>> for EvidenceEr
     }
 }
 
-/// Exclusively owned evidence access with one admitted worker per device.
+/// Exclusively owned device access with one admitted worker per device.
 ///
 /// Waiting for admission creates no worker or object copy. After admission,
 /// cancellation does not stop the worker: it retains the owner, permit and sink
@@ -67,6 +73,31 @@ impl<E: std::error::Error + Send + Sync + 'static> From<Error<E>> for EvidenceEr
 /// succeeds; routing registries should hold only weak references.
 #[async_trait::async_trait]
 pub trait EvidenceService: Send + Sync {
+    /// Permanently reject new work without waiting for a worker or taking its
+    /// coordinator lock. Accepted work still owns its resources until it
+    /// finishes. This must be safe to call from a fatal-error/drop path.
+    fn close_admission(&self);
+
+    /// Whether this service routes live native assignment operations.
+    fn supports_assignment(&self) -> bool {
+        false
+    }
+
+    /// Change state through the same exclusive owner used for evidence.
+    async fn set_state(&self, _state: ConfirmedState) -> Result<(), EvidenceError> {
+        Err(EvidenceError::Unsupported)
+    }
+
+    /// Regenerate an object with owned request parameters.
+    async fn regenerate(&self, _request: Regenerate) -> Result<(), EvidenceError> {
+        Err(EvidenceError::Unsupported)
+    }
+
+    /// Change assignment mappings without creating another state machine.
+    async fn assignment(&self, _operation: AssignmentOperation) -> Result<(), EvidenceError> {
+        Err(EvidenceError::Unsupported)
+    }
+
     /// Acquire a bounded whole snapshot and return its verified size.
     async fn object_size(&self, object: Object) -> Result<usize, EvidenceError>;
 
@@ -86,17 +117,20 @@ pub trait EvidenceService: Send + Sync {
 struct Service<B: Backend> {
     owner: Arc<Mutex<Coordinator<B>>>,
     closed: AtomicBool,
+    assignment: bool,
 }
 
 impl<B: Backend + Send + 'static> Coordinator<B> {
-    /// Consume the exclusive coordinator into an evidence-only worker service.
+    /// Consume the exclusive coordinator into a bounded worker service.
     ///
-    /// No backend aliases or mutations are exposed. The coordinator's existing
-    /// snapshot budget remains shared; sinks borrow snapshots without copying.
+    /// No backend aliases are exposed. Native mutations use the same admission
+    /// and quarantine policy as evidence. The snapshot budget remains shared.
     pub fn into_evidence_service(self) -> Arc<dyn EvidenceService> {
+        let assignment = self.supports_assignment();
         Arc::new(Service {
             owner: Arc::new(Mutex::new(self)),
             closed: AtomicBool::new(false),
+            assignment,
         })
     }
 }
@@ -142,6 +176,38 @@ async fn run<R: Send + 'static>(
 
 #[async_trait::async_trait]
 impl<B: Backend + Send + 'static> EvidenceService for Service<B> {
+    fn close_admission(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+    }
+
+    fn supports_assignment(&self) -> bool {
+        self.assignment
+    }
+
+    async fn set_state(&self, state: ConfirmedState) -> Result<(), EvidenceError> {
+        if !self.assignment {
+            return Err(EvidenceError::Unsupported);
+        }
+        let mut owner = self.admit().await?;
+        run(move || owner.set_state(state).map_err(EvidenceError::from)).await
+    }
+
+    async fn regenerate(&self, request: Regenerate) -> Result<(), EvidenceError> {
+        if !self.assignment {
+            return Err(EvidenceError::Unsupported);
+        }
+        let mut owner = self.admit().await?;
+        run(move || owner.regenerate(request).map_err(EvidenceError::from)).await
+    }
+
+    async fn assignment(&self, operation: AssignmentOperation) -> Result<(), EvidenceError> {
+        if !self.assignment {
+            return Err(EvidenceError::Unsupported);
+        }
+        let mut owner = self.admit().await?;
+        run(move || owner.assignment(operation).map_err(EvidenceError::from)).await
+    }
+
     async fn object_size(&self, object: Object) -> Result<usize, EvidenceError> {
         let mut owner = self.admit().await?;
         run(move || owner.object_size(object).map_err(EvidenceError::from)).await
@@ -164,7 +230,7 @@ impl<B: Backend + Send + 'static> EvidenceService for Service<B> {
     }
 
     async fn teardown(&self) -> Result<(), EvidenceError> {
-        self.closed.store(true, Ordering::SeqCst);
+        self.close_admission();
         let mut owner = self.owner.clone().lock_owned().await;
         run(move || {
             if owner.state() == DeviceState::TornDown {
