@@ -21,6 +21,8 @@ pub enum RealmPhase {
 /// Operation at which setup or cleanup failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RealmOperation {
+    /// Confirm all frontend and protected-memory access is revoked.
+    RevokeAccess,
     /// Obtain partition-owned association access.
     Provider,
     /// Associate the VFIO file with KVM.
@@ -168,6 +170,16 @@ pub(super) struct PrepareFailure<B: Operations> {
 }
 
 impl<B: Operations> ObjectOwner<B> {
+    #[cfg(test)]
+    pub(super) fn closed_for_test() -> Self {
+        Self { bundle: None }
+    }
+
+    pub(super) fn retain(&mut self) {
+        if let Some(bundle) = self.bundle.take() {
+            std::mem::forget(bundle);
+        }
+    }
     pub fn prepare(operations: B) -> Result<Self, PrepareFailure<B>> {
         let mut owner = Self {
             bundle: Some(Box::new(Bundle {
@@ -320,7 +332,7 @@ impl<B: Operations> Drop for ObjectOwner<B> {
                 .expect("failed cleanup retains its bundle");
             tracelimit::error_ratelimited!(
                 error = ?error, state = ?bundle.state,
-                "Realm cleanup failed; retaining remaining resources until process exit"
+                "Realm cleanup failed; retaining resources; keep DMA-reachable RAM and this process alive until the device/model domain stops"
             );
             // Dropping individual handles now could release dependencies out of
             // order. Explicit close/recovery is the normal, retryable path.

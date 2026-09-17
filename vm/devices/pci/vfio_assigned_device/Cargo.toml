@@ -18,6 +18,7 @@ parking_lot.workspace = true
 pci_core.workspace = true
 pci_resources.workspace = true
 smmu.workspace = true
+sparse_mmap.workspace = true
 tdisp.workspace = true
 vfio_sys.workspace = true
 vfio-bindings.workspace = true

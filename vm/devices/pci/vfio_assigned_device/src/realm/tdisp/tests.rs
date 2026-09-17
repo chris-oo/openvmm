@@ -13,6 +13,9 @@ use test_with_tracing::test;
 
 #[derive(Debug, PartialEq, Eq)]
 enum Call {
+    SetState(CcaTdiState),
+    Report,
+    Measurements(u64, [u8; 32]),
     Size(CcaObject),
     Read(CcaObject, usize),
     Close,
@@ -32,7 +35,7 @@ struct Model {
     released: bool,
 }
 
-struct Fake(Arc<Mutex<Model>>);
+struct Fake(Arc<Mutex<Model>>, Option<Arc<AccessGate>>);
 
 impl Fake {
     fn new() -> (Self, Arc<Mutex<Model>>) {
@@ -54,11 +57,14 @@ impl Fake {
             close_failures: 0,
             released: false,
         }));
-        (Self(model.clone()), model)
+        (Self(model.clone(), None), model)
     }
 }
 
 impl EvidenceDevice for Fake {
+    fn access(&self) -> Option<Arc<AccessGate>> {
+        self.1.clone()
+    }
     fn phase(&self) -> RealmPhase {
         self.0.lock().phase
     }
@@ -74,6 +80,15 @@ impl EvidenceDevice for Fake {
             CcaTsmRequest::ObjectSize(object) => model.calls.push(Call::Size(*object)),
             CcaTsmRequest::ReadObject(object) => {
                 model.calls.push(Call::Read(*object, response.len()))
+            }
+            CcaTsmRequest::SetState(state) if self.1.is_some() => {
+                model.calls.push(Call::SetState(*state))
+            }
+            CcaTsmRequest::RegenerateInterfaceReport if self.1.is_some() => {
+                model.calls.push(Call::Report)
+            }
+            CcaTsmRequest::RegenerateMeasurements { flags, nonce } if self.1.is_some() => {
+                model.calls.push(Call::Measurements(*flags, **nonce));
             }
             _ => panic!("evidence backend issued a mutation"),
         }
@@ -95,6 +110,10 @@ impl EvidenceDevice for Fake {
                 assert!(response.iter().all(|&byte| byte == 0));
                 let len = response.len().min(model.contents.len());
                 response[..len].copy_from_slice(&model.contents[..len]);
+                Ok(model.read_result)
+            }
+            _ if self.1.is_some() => {
+                assert!(self.1.as_ref().unwrap().state.try_lock().is_none());
                 Ok(model.read_result)
             }
             _ => panic!("evidence backend issued a mutation"),
@@ -137,6 +156,78 @@ impl Drop for Fake {
     fn drop(&mut self) {
         self.0.lock().calls.push(Call::Drop);
     }
+}
+
+#[test]
+fn native_mutations_hold_access_gate_and_preserve_nonce_format() {
+    let (mut fake, model) = Fake::new();
+    let gate = Arc::new(AccessGate::new(8));
+    gate.state.lock().private_ready = true;
+    fake.1 = Some(gate.clone());
+    let mut owner = prepare_backend(fake, SnapshotBudget::new(8))
+        .unwrap_or_else(|(error, _)| panic!("{error}"));
+    owner.object_size(Object::Certificate).unwrap();
+    owner.set_state(ConfirmedState::Locked).unwrap();
+    assert!(gate.state.lock().protected_blocked);
+    for raw in [false, true] {
+        owner
+            .regenerate(Regenerate::Measurements(MeasurementRequest {
+                nonce: [0x5a; 32],
+                raw,
+            }))
+            .unwrap();
+        assert!(
+            model
+                .lock()
+                .calls
+                .contains(&Call::Measurements(u64::from(raw), [0x5a; 32]))
+        );
+    }
+    owner.regenerate(Regenerate::InterfaceReport).unwrap();
+    owner.set_state(ConfirmedState::Running).unwrap();
+    owner.set_state(ConfirmedState::Unlocked).unwrap();
+    assert!(!gate.state.lock().protected_blocked);
+}
+
+#[test]
+fn every_native_mutation_failure_quarantines_frontend_access() {
+    for (residue, tsm_code, syscall) in
+        [(1, 0, None), (0, 9, None), (0, 0, Some((Errno::EFAULT, 7)))]
+    {
+        let (mut fake, model) = Fake::new();
+        let gate = Arc::new(AccessGate::new(8));
+        gate.state.lock().private_ready = true;
+        fake.1 = Some(gate.clone());
+        let mut owner = prepare_backend(fake, SnapshotBudget::new(8))
+            .unwrap_or_else(|(error, _)| panic!("{error}"));
+        model.lock().read_result = TsmCompletion { residue, tsm_code };
+        model.lock().request_error = syscall;
+        assert!(owner.set_state(ConfirmedState::Locked).is_err());
+        assert!(gate.state.lock().deny_all);
+        assert!(matches!(owner.state(), DeviceState::Quarantined { .. }));
+        let calls = model.lock().calls.len();
+        assert!(owner.set_state(ConfirmedState::Unlocked).is_err());
+        assert_eq!(calls, model.lock().calls.len());
+    }
+}
+
+#[test]
+fn native_lock_requires_private_import_and_unlock_requires_no_protected_mappings() {
+    let (mut fake, model) = Fake::new();
+    let gate = Arc::new(AccessGate::new(8));
+    fake.1 = Some(gate.clone());
+    let mut backend = EvidenceBackend { device: fake };
+    assert!(backend.set_state(ConfirmedState::Locked).is_err());
+    assert!(model.lock().calls.is_empty());
+    {
+        let mut access = gate.state.lock();
+        access.deny_all = false;
+        access.private_ready = true;
+        access.protected.push(0x1000..0x2000);
+    }
+    assert!(backend.set_state(ConfirmedState::Unlocked).is_err());
+    assert!(model.lock().calls.is_empty());
+    assert!(gate.state.lock().deny_all);
 }
 
 #[test]
@@ -194,6 +285,224 @@ fn verified_owner_service_retains_native_cleanup_error_and_retries() {
     );
     drop(service);
     assert_eq!(model.lock().calls.last(), Some(&Call::Drop));
+}
+
+#[test]
+fn live_service_routes_mutations_and_frontend_failure_invalidates_cached_evidence() {
+    let (mut fake, model) = Fake::new();
+    let gate = Arc::new(AccessGate::new(8));
+    gate.state.lock().private_ready = true;
+    fake.1 = Some(gate.clone());
+    let budget = SnapshotBudget::new(8);
+    let owner =
+        prepare_backend(fake, budget.clone()).unwrap_or_else(|(error, _)| panic!("{error}"));
+    let service = owner.into_evidence_service();
+    assert!(service.supports_assignment());
+    block_on(service.set_state(ConfirmedState::Locked)).unwrap();
+    block_on(
+        service.regenerate(Regenerate::Measurements(MeasurementRequest {
+            nonce: [0x13; 32],
+            raw: true,
+        })),
+    )
+    .unwrap();
+    block_on(service.object_size(Object::Certificate)).unwrap();
+    assert_eq!(budget.used(), 8);
+    gate.state.lock().deny_all = true;
+    assert!(block_on(service.object_size(Object::Certificate)).is_err());
+    assert_eq!(budget.used(), 0);
+    assert!(
+        model
+            .lock()
+            .calls
+            .contains(&Call::Measurements(1, [0x13; 32]))
+    );
+}
+
+#[test]
+fn full_evidence_transport_errors_quarantine_before_returning() {
+    for failure in 0..6 {
+        let (mut fake, model) = Fake::new();
+        let gate = Arc::new(AccessGate::new(8));
+        gate.state.lock().private_ready = true;
+        fake.1 = Some(gate.clone());
+        let mut owner = prepare_backend(fake, SnapshotBudget::new(8))
+            .unwrap_or_else(|(error, _)| panic!("{error}"));
+        {
+            let mut model = model.lock();
+            match failure {
+                0 => model.request_error = Some((Errno::EIO, 7)),
+                1 => model.size_result.tsm_code = 9,
+                2 => model.size_result.residue = 1,
+                3 => model.read_result.tsm_code = 11,
+                4 => model.read_result.residue = 1,
+                _ => model.write_size = false,
+            }
+        }
+        assert!(matches!(
+            owner.object_size(Object::Certificate),
+            Err(Error::Backend(_))
+        ));
+        assert!(matches!(owner.state(), DeviceState::Quarantined { .. }));
+        assert!(gate.state.lock().deny_all);
+        let calls = model.lock().calls.len();
+        assert!(owner.set_state(ConfirmedState::Locked).is_err());
+        assert!(
+            owner
+                .assignment(AssignmentOperation::PreparePrivateMemory)
+                .is_err()
+        );
+        assert_eq!(model.lock().calls.len(), calls);
+    }
+}
+
+#[test]
+fn full_evidence_failure_permanently_closes_service_admission() {
+    let (mut fake, model) = Fake::new();
+    let gate = Arc::new(AccessGate::new(8));
+    gate.state.lock().private_ready = true;
+    fake.1 = Some(gate.clone());
+    let owner = prepare_backend(fake, SnapshotBudget::new(8))
+        .unwrap_or_else(|(error, _)| panic!("{error}"));
+    let service = owner.into_evidence_service();
+    gate.bind_service(Arc::downgrade(&service)).unwrap();
+    model.lock().read_result.residue = 1;
+    assert!(block_on(service.object_size(Object::Certificate)).is_err());
+    assert!(matches!(
+        block_on(service.set_state(ConfirmedState::Locked)),
+        Err(EvidenceError::Closed)
+    ));
+    assert!(matches!(
+        block_on(service.assignment(AssignmentOperation::PreparePrivateMemory)),
+        Err(EvidenceError::Closed)
+    ));
+}
+
+#[test]
+fn local_evidence_budget_and_slice_failures_do_not_quarantine() {
+    for budget in [4, 8] {
+        let (mut fake, _) = Fake::new();
+        let gate = Arc::new(AccessGate::new(8));
+        gate.state.lock().private_ready = true;
+        fake.1 = Some(gate.clone());
+        let mut owner = prepare_backend(fake, SnapshotBudget::new(budget))
+            .unwrap_or_else(|(error, _)| panic!("{error}"));
+        assert!(matches!(
+            owner.read_object(Object::Certificate, 9, 1),
+            Err(Error::Snapshot(
+                SnapshotError::BudgetExceeded { .. } | SnapshotError::InvalidRange { .. }
+            ))
+        ));
+        assert!(!gate.state.lock().deny_all);
+        owner.set_state(ConfirmedState::Locked).unwrap();
+    }
+}
+
+struct PrepareRam {
+    ignore_failure: bool,
+    fail: bool,
+    panic: bool,
+}
+
+#[test]
+fn tio_host_address_must_match_the_fixed_bar_translation() {
+    for pa_base in [0x9000, 0x8001, u64::MAX] {
+        let gate = Arc::new(AccessGate::new(8));
+        {
+            let mut state = gate.state.lock();
+            state.protected_blocked = true;
+            state.bars.push(super::super::access::BarRange {
+                guest: 0x1000..0x3000,
+                host: 0x8000,
+            });
+        }
+        let mut device = RealmDevice {
+            owner: super::super::objects::ObjectOwner::closed_for_test(),
+            access: Some(gate.clone()),
+        };
+        let error = EvidenceDevice::assignment(
+            &mut device,
+            AssignmentOperation::ValidateMmio {
+                base: 0x1000,
+                top: 0x2000,
+                pa_base,
+            },
+        )
+        .unwrap_err();
+        let BackendError::Assignment(error) = error else {
+            panic!("unexpected error")
+        };
+        assert!(matches!(
+            error.downcast_ref::<AccessError>(),
+            Some(AccessError::InvalidMmio)
+        ));
+        let mut state = gate.state.lock();
+        assert!(state.protected.is_empty());
+        assert!(state.deny_all);
+        // This synthetic owner never issued a hardware LOCK.
+        state.protected_blocked = false;
+    }
+}
+
+impl tdisp::host::RamWork for PrepareRam {
+    fn run(
+        &self,
+        dma: &mut dyn tdisp::host::SharedDma,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        dma.prepare_private_memory()?;
+        assert!(!self.panic, "injected callback panic");
+        if self.ignore_failure {
+            assert!(dma.prepare_private_memory().is_err());
+        }
+        if self.fail {
+            return Err(Box::new(std::io::Error::other("conversion failed")));
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn ram_work_uses_borrowed_admission_and_latches_ignored_dma_failure() {
+    for (ignore_failure, fail) in [(false, false), (true, false), (false, true)] {
+        let gate = Arc::new(AccessGate::new(8));
+        let mut device = RealmDevice {
+            owner: super::super::objects::ObjectOwner::closed_for_test(),
+            access: Some(gate.clone()),
+        };
+        let result = EvidenceDevice::assignment(
+            &mut device,
+            AssignmentOperation::ConvertRam(Arc::new(PrepareRam {
+                ignore_failure,
+                fail,
+                panic: false,
+            })),
+        );
+        assert_eq!(result.is_err(), ignore_failure || fail);
+        let state = gate.state.lock();
+        assert!(state.private_ready);
+        assert_eq!(state.deny_all, ignore_failure || fail);
+    }
+}
+
+#[test]
+fn ram_work_unwind_revokes_frontend_access() {
+    let gate = Arc::new(AccessGate::new(8));
+    let mut device = RealmDevice {
+        owner: super::super::objects::ObjectOwner::closed_for_test(),
+        access: Some(gate.clone()),
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        EvidenceDevice::assignment(
+            &mut device,
+            AssignmentOperation::ConvertRam(Arc::new(PrepareRam {
+                ignore_failure: false,
+                fail: false,
+                panic: true,
+            })),
+        )
+    }));
+    assert!(result.is_err());
+    assert!(gate.state.lock().deny_all);
 }
 
 #[test]
