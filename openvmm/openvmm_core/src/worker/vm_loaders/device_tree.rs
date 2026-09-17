@@ -644,7 +644,11 @@ fn pcie_ranges(bridge: &PcieHostBridge, shared_gpa_bit: Option<u64>) -> Vec<u32>
     ] {
         if !window.is_empty() {
             let start = window.start();
-            let cpu_start = shared_mmio_address(start, shared_gpa_bit);
+            let cpu_start = if bridge.cca_private_mmio {
+                start
+            } else {
+                shared_mmio_address(start, shared_gpa_bit)
+            };
             let len = window.len();
             ranges.extend_from_slice(&[
                 space,
@@ -1117,6 +1121,7 @@ mod tests {
             vnode: None,
             preserve_bars: false,
             preserve_boot_config: true,
+            cca_private_mmio: false,
         }
     }
 
@@ -1306,67 +1311,72 @@ mod tests {
     }
 
     #[test]
-    fn shared_pci_resource_view() {
+    fn realm_pci_resource_view_does_not_change_other_roots() {
         let topology = TopologyBuilder::new_aarch64(arm_platform())
             .build(1)
             .unwrap();
         let bit = 1 << 48;
-        let bridge = pcie_bridge();
-        let dt = DeviceTreeBuilder::new(
-            &topology,
-            RAM,
-            PL011S,
-            std::slice::from_ref(&bridge),
-            0x10000,
-            DeviceTreeBootType::LinuxDirect(LinuxDirectBoot {
-                cca: true,
-                shared_gpa_bit: Some(bit),
-                ..linux_boot()
-            }),
-        )
-        .with_console(Some(UartId::Pl0110))
-        .build()
-        .unwrap();
-        let ecam = bridge.ecam_range.start() | bit;
-        let pcie = node(&dt, &format!("/pcie@{ecam:x}"));
-        assert_eq!(u64_property(&pcie, "reg"), [ecam, bridge.ecam_range.len()]);
-        let low_cpu = bridge.low_mmio.start() | bit;
-        let high_cpu = bridge.high_mmio.start() | bit;
-        assert_eq!(
-            u32_property(&pcie, "ranges"),
-            [
-                0x0200_0000,
-                0,
-                0x9000_0000,
-                (low_cpu >> 32) as u32,
-                low_cpu as u32,
-                0,
-                0x1000_0000,
-                0x0300_0000,
-                0x12,
-                0,
-                (high_cpu >> 32) as u32,
-                high_cpu as u32,
-                2,
-                0,
-            ]
-        );
-        let (serial_base, serial_size, _) = uart_resources(UartId::Pl0110);
-        let path = format!("/openvmm/uart@{:x}", serial_base | bit);
-        assert_eq!(stdout_path(&dt), path);
-        assert_eq!(
-            u64_property(&node(&dt, &path), "reg"),
-            [serial_base | bit, serial_size]
-        );
-        assert_eq!(
-            u64_property(&node(&dt, "/openvmm/vmbus"), "ranges"),
-            [
-                mmio().low.start() | bit,
-                mmio().low.len(),
-                mmio().high.start() | bit,
-                mmio().high.len(),
-            ]
-        );
+        for private in [false, true] {
+            let bridge = PcieHostBridge {
+                cca_private_mmio: private,
+                ..pcie_bridge()
+            };
+            let dt = DeviceTreeBuilder::new(
+                &topology,
+                RAM,
+                PL011S,
+                std::slice::from_ref(&bridge),
+                0x10000,
+                DeviceTreeBootType::LinuxDirect(LinuxDirectBoot {
+                    cca: true,
+                    shared_gpa_bit: Some(bit),
+                    ..linux_boot()
+                }),
+            )
+            .with_console(Some(UartId::Pl0110))
+            .build()
+            .unwrap();
+            let ecam = bridge.ecam_range.start() | bit;
+            let pcie = node(&dt, &format!("/pcie@{ecam:x}"));
+            assert_eq!(u64_property(&pcie, "reg"), [ecam, bridge.ecam_range.len()]);
+            let low_cpu = bridge.low_mmio.start() | if private { 0 } else { bit };
+            let high_cpu = bridge.high_mmio.start() | if private { 0 } else { bit };
+            assert_eq!(
+                u32_property(&pcie, "ranges"),
+                [
+                    0x0200_0000,
+                    0,
+                    0x9000_0000,
+                    (low_cpu >> 32) as u32,
+                    low_cpu as u32,
+                    0,
+                    0x1000_0000,
+                    0x0300_0000,
+                    0x12,
+                    0,
+                    (high_cpu >> 32) as u32,
+                    high_cpu as u32,
+                    2,
+                    0,
+                ]
+            );
+            let (serial_base, serial_size, _) = uart_resources(UartId::Pl0110);
+            let path = format!("/openvmm/uart@{:x}", serial_base | bit);
+            assert_eq!(stdout_path(&dt), path);
+            assert_eq!(
+                u64_property(&node(&dt, &path), "reg"),
+                [serial_base | bit, serial_size]
+            );
+            assert_eq!(
+                u64_property(&node(&dt, "/openvmm/vmbus"), "ranges"),
+                [
+                    mmio().low.start() | bit,
+                    mmio().low.len(),
+                    mmio().high.start() | bit,
+                    mmio().high.len(),
+                ]
+            );
+        }
     }
 
     #[test]

@@ -46,4 +46,8 @@ pub struct PcieHostBridge {
     /// re-enumerating. Required when something references a device by a fixed
     /// BDF, e.g. an SRAT generic-initiator entry.
     pub preserve_boot_config: bool,
+    /// Expose selector-clear CPU addresses for this CCA assigned-device
+    /// root's BAR windows. ECAM and interrupt-controller views remain shared.
+    /// The worker requires a dedicated, static Realm-device root.
+    pub cca_private_mmio: bool,
 }
