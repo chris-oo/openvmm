@@ -319,12 +319,14 @@ fn cancelled_admitted_workers_execute_after_pool_queueing() {
     ));
     resume.send(()).unwrap();
     block_on(blocker);
+    // Drive the registered retry before adding another waiter: its no-op
+    // waker would otherwise consume the mutex's first wake without polling.
+    block_on(retry).unwrap();
     let drained = block_on(service.owner.clone().lock_owned());
     assert_eq!(model.lock().cleanups, 1);
     assert_eq!(drained.state(), DeviceState::TornDown);
     assert_eq!(budget.used(), 0);
     drop(drained);
-    block_on(retry).unwrap();
     assert_eq!(model.lock().cleanups, 1);
 }
 
