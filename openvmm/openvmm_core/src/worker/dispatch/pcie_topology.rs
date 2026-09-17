@@ -15,6 +15,72 @@ use pci_core::spec::caps::pci_express::MaxEndEndTlpPrefixes;
 use pcie::GenericPciePortDefinition;
 use pcie::PciePortSettings;
 
+/// The initial trusted-assignment path isolates one static endpoint's BAR
+/// resource view from the ordinary shared Virtio roots.
+pub(super) fn realm_root_index(
+    roots: &[PcieRootComplexConfig],
+    devices: &[(&str, &str)],
+    in_place_cca: bool,
+) -> anyhow::Result<Option<u32>> {
+    let realm_devices: Vec<_> = devices
+        .iter()
+        .filter(|(_, resource)| *resource == "vfio-realm")
+        .collect();
+    if realm_devices.is_empty() {
+        return Ok(None);
+    }
+    anyhow::ensure!(in_place_cca, "Realm PCI assignment requires in-place CCA");
+    anyhow::ensure!(
+        realm_devices.len() == 1,
+        "only one Realm PCI device is supported"
+    );
+    let (port_name, _) = *realm_devices[0];
+    let mut matching_roots = roots
+        .iter()
+        .filter(|root| root.ports.iter().any(|port| port.name == port_name));
+    let root = matching_roots
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Realm device port '{port_name}' has no root"))?;
+    anyhow::ensure!(
+        matching_roots.next().is_none(),
+        "Realm device port is ambiguous"
+    );
+    anyhow::ensure!(
+        roots
+            .iter()
+            .filter(|candidate| candidate.index == root.index)
+            .count()
+            == 1,
+        "Realm root index must not be shared by another root"
+    );
+    anyhow::ensure!(
+        root.ports.len() == 1
+            && root.preserve_bars
+            && root.cxl.is_none()
+            && root.iommu.is_none()
+            && root.end_bus
+                == root
+                    .start_bus
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("Realm root has no endpoint bus"))?,
+        "Realm device requires a dedicated two-bus root with preserved BARs and no CXL or guest IOMMU"
+    );
+    let port = &root.ports[0];
+    anyhow::ensure!(
+        !port.hotplug && !port.cxl && !port.pasid,
+        "Realm device port must be static without CXL or PASID"
+    );
+    anyhow::ensure!(
+        devices
+            .iter()
+            .filter(|(name, _)| *name == port_name)
+            .count()
+            == 1,
+        "Realm device port must contain only its assigned endpoint"
+    );
+    Ok(Some(root.index))
+}
+
 /// Builds port PCIe settings from manifest flags.
 ///
 /// When CXL is enabled, emit a default Flex Bus capability advertising both
@@ -129,5 +195,61 @@ mod tests {
     fn rejects_overlapping_ranges_on_same_segment() {
         let rcs = [rc("rc0", 0, 0, 4), rc("rc1", 0, 4, 8)];
         assert!(validate_pcie_root_complexes(&rcs).is_err());
+    }
+
+    fn realm_root() -> PcieRootComplexConfig {
+        let mut root = rc("realm", 0, 0, 1);
+        root.preserve_bars = true;
+        root.ports.push(PciePortConfig {
+            name: "realm-port".into(),
+            devfn: Some(0),
+            hotplug: false,
+            acs_capabilities_supported: None,
+            cxl: false,
+            pasid: false,
+        });
+        root
+    }
+
+    #[test]
+    fn realm_resource_view_requires_an_isolated_static_root() {
+        let devices = [("realm-port", "vfio-realm"), ("control-port", "virtio")];
+        let root = realm_root();
+        assert_eq!(realm_root_index(&[root], &devices, true).unwrap(), Some(0));
+        assert!(realm_root_index(&[realm_root()], &devices, false).is_err());
+        assert!(realm_root_index(&[realm_root(), rc("other", 1, 0, 1)], &devices, true).is_err());
+        assert!(realm_root_index(&[], &devices, true).is_err());
+        assert_eq!(
+            realm_root_index(&[], &[("control", "virtio")], false).unwrap(),
+            None
+        );
+        assert!(
+            realm_root_index(
+                &[realm_root()],
+                &[("realm-port", "vfio-realm"), ("realm-port", "virtio"),],
+                true
+            )
+            .is_err()
+        );
+        assert!(
+            realm_root_index(
+                &[realm_root()],
+                &[("realm-port", "vfio-realm"), ("other", "vfio-realm"),],
+                true
+            )
+            .is_err()
+        );
+        for mutation in 0..5 {
+            let mut root = realm_root();
+            match mutation {
+                0 => root.preserve_bars = false,
+                1 => root.ports[0].hotplug = true,
+                2 => root.ports[0].pasid = true,
+                3 => root.ports[0].cxl = true,
+                4 => root.end_bus = 2,
+                _ => unreachable!(),
+            }
+            assert!(realm_root_index(&[root], &devices, true).is_err());
+        }
     }
 }

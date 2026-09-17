@@ -9,6 +9,8 @@ mod ioapic_iommu_wiring;
 mod pcie_topology;
 mod pcie_wiring;
 mod ram_backing;
+#[cfg(target_os = "linux")]
+mod realm_retention;
 mod smmu_wiring;
 
 use crate::emuplat;
@@ -465,7 +467,7 @@ pub(crate) struct InitializedVm {
     vps: Vec<Box<dyn BindHvliteVp>>,
     vmtime_keeper: VmTimeKeeper,
     vmtime_source: VmTimeSource,
-    memory_manager: GuestMemoryManager,
+    memory_manager: Arc<GuestMemoryManager>,
     gm: GuestMemory,
     device_gm: GuestMemory,
     #[cfg(guest_arch = "aarch64")]
@@ -799,7 +801,7 @@ struct LoadedVmInner {
     partition: Arc<dyn HvlitePartition>,
     chipset_devices: ChipsetDevices,
     _vmtime: SpawnedUnit<VmTimeKeeper>,
-    memory_manager: GuestMemoryManager,
+    memory_manager: Arc<GuestMemoryManager>,
     gm: GuestMemory,
     _device_gm: GuestMemory,
     #[cfg(guest_arch = "aarch64")]
@@ -847,6 +849,8 @@ struct LoadedVmInner {
     /// VFIO cdev + iommufd manager inspect handle (Linux only).
     #[cfg(target_os = "linux")]
     vfio_cdev_inspect: Option<vfio_assigned_device::manager::VfioCdevManagerClient>,
+    #[cfg(target_os = "linux")]
+    _realm_teardown: vfio_assigned_device::resolver::RealmTeardownHandle,
 
     // relay halt messages to the client, which decides what to do about them.
     halt_recv: mesh::Receiver<HaltReason>,
@@ -1014,9 +1018,9 @@ fn validate_cca_memory_config(vnode: usize, memory: &MemoryConfig) -> anyhow::Re
 }
 
 fn validate_cca_pcie_resource(resource_id: &str) -> anyhow::Result<()> {
-    if resource_id != "virtio" {
+    if !matches!(resource_id, "virtio" | "vfio-realm") {
         anyhow::bail!(
-            "KVM CCA guest_memfd only supports in-process virtio devices on PCIe root ports"
+            "KVM CCA guest_memfd requires in-process Virtio or the distinct Realm PCI resource"
         );
     }
     Ok(())
@@ -1759,7 +1763,7 @@ impl InitializedVm {
             vps,
             vmtime_keeper,
             vmtime_source,
-            memory_manager,
+            memory_manager: Arc::new(memory_manager),
             gm,
             device_gm,
             #[cfg(guest_arch = "aarch64")]
@@ -2405,6 +2409,16 @@ impl InitializedVm {
         }
         let mut deferred_msi_conns: Vec<DeferredMsiConn> = Vec::new();
 
+        let cca_realm_root_index = pcie_topology::realm_root_index(
+            &cfg.pcie_root_complexes,
+            &cfg.pcie_devices
+                .iter()
+                .map(|device| (device.port_name.as_str(), device.resource.id()))
+                .collect::<Vec<_>>(),
+            cfg.hypervisor.guest_memfd_in_place
+                && cfg.hypervisor.with_isolation == Some(openvmm_defs::config::IsolationType::Cca),
+        )?;
+
         let (mut pcie_host_bridges, pcie_root_complexes) = {
             pcie_topology::validate_pcie_root_complexes(&cfg.pcie_root_complexes)?;
             let mut pcie_host_bridges = Vec::new();
@@ -2559,6 +2573,7 @@ impl InitializedVm {
                     cxl,
                     vnode: rc.vnode,
                     preserve_bars: rc.preserve_bars,
+                    cca_private_mmio: cca_realm_root_index == Some(rc.index),
                     // Pinned BARs require the guest to preserve their assigned
                     // addresses. UEFI also consumes OpenVMM's preassigned PCI
                     // configuration, so tell the guest OS not to reallocate it
@@ -2715,7 +2730,22 @@ impl InitializedVm {
         // Register the VFIO resolver, which spawns a container manager task
         // internally to share containers across assigned devices.
         #[cfg(target_os = "linux")]
-        let (vfio_inspect, vfio_cdev_inspect) = {
+        let (vfio_inspect, vfio_cdev_inspect, realm_teardown) = {
+            let realm_provider = select_realm_vfio_provider(&cfg.hypervisor, || {
+                partition.vfio_assignment_provider()
+            })
+            .map(|provider| realm_retention::retain_provider(provider, memory_manager.clone()));
+            let realm_resolver = vfio_assigned_device::resolver::VfioRealmDeviceResolver::new(
+                realm_provider.clone(),
+                tdisp::host::SnapshotBudget::new(64 * 1024 * 1024),
+            );
+            let realm_teardown = realm_resolver.teardown_handle();
+            resolver.add_async_resolver::<
+                vm_resource::kind::PciDeviceHandleKind,
+                _,
+                vfio_assigned_device_resources::VfioRealmDeviceHandle,
+                _,
+            >(realm_resolver);
             let dma_mapper_client = memory_manager.dma_mapper_client();
             let vfio_resolver = vfio_assigned_device::resolver::VfioDeviceResolver::new(
                 driver_source.builder().build("vfio-container-mgr"),
@@ -2739,9 +2769,7 @@ impl InitializedVm {
                 driver_source.builder().build("vfio-cdev-mgr"),
                 dma_mapper_client,
             )
-            .with_realm_assignment_provider(select_realm_vfio_provider(&cfg.hypervisor, || {
-                partition.vfio_assignment_provider()
-            }));
+            .with_realm_assignment_provider(realm_provider);
             let cdev_handle = cdev_resolver.inspect_handle();
             resolver.add_async_resolver::<
                 vm_resource::kind::PciDeviceHandleKind,
@@ -2750,7 +2778,7 @@ impl InitializedVm {
                 _,
             >(cdev_resolver);
 
-            (Some(handle), Some(cdev_handle))
+            (Some(handle), Some(cdev_handle), realm_teardown)
         };
 
         // Instantiate SMMU devices and build port-level lookup maps.
@@ -3418,6 +3446,8 @@ impl InitializedVm {
                 vfio_inspect,
                 #[cfg(target_os = "linux")]
                 vfio_cdev_inspect,
+                #[cfg(target_os = "linux")]
+                _realm_teardown: realm_teardown,
                 halt_recv,
                 client_notify_send,
                 chipset: chipset.chipset.clone(),

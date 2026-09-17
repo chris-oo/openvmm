@@ -45,6 +45,14 @@ struct Aarch64EfiInfo {
     mmap_desc_ver: u32,
 }
 
+fn pci_mmio_cpu_address(bridge: &PcieHostBridge, shared_gpa_bit: Option<u64>, address: u64) -> u64 {
+    if bridge.cca_private_mmio {
+        address
+    } else {
+        shared_gpa_bit.map_or(address, |bit| address | bit)
+    }
+}
+
 #[derive(Debug)]
 pub struct KernelConfig<'a> {
     pub kernel: &'a std::fs::File,
@@ -569,7 +577,7 @@ fn build_dt(
         let mut ranges: Vec<u32> = Vec::new();
 
         let low_start = bridge.low_mmio.start();
-        let low_cpu_start = shared_addr(low_start);
+        let low_cpu_start = pci_mmio_cpu_address(bridge, shared_gpa_bit, low_start);
         let low_len = bridge.low_mmio.len();
         if low_len > 0 {
             ranges.extend_from_slice(&[
@@ -584,7 +592,7 @@ fn build_dt(
         }
 
         let high_start = bridge.high_mmio.start();
-        let high_cpu_start = shared_addr(high_start);
+        let high_cpu_start = pci_mmio_cpu_address(bridge, shared_gpa_bit, high_start);
         let high_len = bridge.high_mmio.len();
         if high_len > 0 {
             ranges.extend_from_slice(&[
@@ -1156,6 +1164,36 @@ mod tests {
                     .unwrap(),
                 method
             );
+        }
+    }
+
+    #[test]
+    fn realm_pci_resource_view_does_not_change_other_roots() {
+        let mut bridge = PcieHostBridge {
+            index: 0,
+            segment: 0,
+            start_bus: 0,
+            end_bus: 1,
+            ecam_range: MemoryRange::new(0x1000_0000..0x1020_0000),
+            low_mmio: MemoryRange::new(0x5000_0000..0x5010_0000),
+            high_mmio: MemoryRange::new(0x2_0000_0000..0x2_0010_0000),
+            cxl: None,
+            vnode: None,
+            preserve_bars: true,
+            preserve_boot_config: true,
+            cca_private_mmio: false,
+        };
+        let bit = 1 << 48;
+        for address in [bridge.low_mmio.start(), bridge.high_mmio.start()] {
+            assert_eq!(pci_mmio_cpu_address(&bridge, None, address), address);
+            assert_eq!(
+                pci_mmio_cpu_address(&bridge, Some(bit), address),
+                address | bit
+            );
+        }
+        bridge.cca_private_mmio = true;
+        for address in [bridge.low_mmio.start(), bridge.high_mmio.start()] {
+            assert_eq!(pci_mmio_cpu_address(&bridge, Some(bit), address), address);
         }
     }
 
