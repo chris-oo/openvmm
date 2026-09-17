@@ -15,6 +15,7 @@ use pci_resources::ResolvedPciDevice;
 use std::sync::Arc;
 use vfio_assigned_device_resources::VfioCdevDeviceHandle;
 use vfio_assigned_device_resources::VfioDeviceHandle;
+use vfio_assigned_device_resources::VfioRealmDeviceHandle;
 use vm_resource::AsyncResolveResource;
 use vm_resource::ResourceResolver;
 use vm_resource::kind::PciDeviceHandleKind;
@@ -26,6 +27,200 @@ use vm_resource::kind::PciDeviceHandleKind;
 pub struct VfioDeviceResolver {
     client: VfioManagerClient,
     _task: pal_async::task::Task<()>,
+}
+
+/// Native CCA resolver. It never registers an ordinary DMA mapper or IOAS manager.
+///
+/// VM assembly must configure the static root's private BAR address view before
+/// resolving this resource. Full registration remains pending until the VM
+/// completes private RAM preparation.
+pub struct VfioRealmDeviceResolver {
+    provider: Option<Arc<dyn pci_core::vfio::VfioVmProvider>>,
+    budget: tdisp::host::SnapshotBudget,
+    teardown: RealmTeardownHandle,
+}
+
+/// Strong assignment ownership retained independently of the PCI frontend.
+///
+/// Stop all VPs and frontends before teardown. Release the frontend device
+/// graph while keeping the partition and memory/membacking owners alive, then
+/// call [`Self::teardown`]. On any error, retain this handle and the whole VM,
+/// including its worker and DMA-reachable RAM, until the device/model domain
+/// ends. Dropping this handle is not a checked cleanup operation.
+#[derive(Clone, Default)]
+pub struct RealmTeardownHandle {
+    state: Arc<parking_lot::Mutex<RealmServices>>,
+}
+
+#[derive(Default)]
+struct RealmServices {
+    closing: bool,
+    devices: std::collections::BTreeMap<u32, Arc<dyn tdisp::host::EvidenceService>>,
+}
+
+impl std::fmt::Debug for RealmTeardownHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = self.state.lock();
+        f.debug_struct("RealmTeardownHandle")
+            .field("closing", &state.closing)
+            .field("requester_ids", &state.devices.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+/// Checked teardown failed; the handle retains every assignment service.
+#[derive(Debug, thiserror::Error)]
+#[error("Realm device {requester_id:#x} teardown failed; retain the VM and its backing")]
+pub struct RealmTeardownError {
+    /// Device whose cleanup first failed. All registered cleanups were attempted.
+    pub requester_id: u32,
+    /// Original typed device/coordinator failure.
+    #[source]
+    pub source: tdisp::host::EvidenceError,
+}
+
+impl RealmTeardownHandle {
+    /// Permanently stop new device work without waiting for admitted workers.
+    ///
+    /// This does not revoke DMA or release any resources.
+    pub fn close_admission(&self) {
+        let mut state = self.state.lock();
+        state.closing = true;
+        for service in state.devices.values() {
+            service.close_admission();
+        }
+    }
+
+    fn retain(
+        &self,
+        requester_id: u32,
+        service: Arc<dyn tdisp::host::EvidenceService>,
+    ) -> anyhow::Result<()> {
+        let mut state = self.state.lock();
+        anyhow::ensure!(!state.closing, "Realm assignment admission is closed");
+        anyhow::ensure!(
+            !state.devices.contains_key(&requester_id),
+            "duplicate Realm requester ID {requester_id:#x}"
+        );
+        state.devices.insert(requester_id, service);
+        Ok(())
+    }
+
+    /// Close admission and attempt every device's checked teardown.
+    ///
+    /// Success releases the retained service references. Failure or cancellation
+    /// retains them for explicit retry; it is not permission to drop VM backing.
+    pub async fn teardown(&self) -> Result<(), RealmTeardownError> {
+        self.close_admission();
+        let devices = {
+            let mut state = self.state.lock();
+            state.closing = true;
+            state
+                .devices
+                .iter()
+                .map(|(&rid, service)| (rid, service.clone()))
+                .collect::<Vec<_>>()
+        };
+        let mut first_error = None;
+        for (requester_id, service) in devices {
+            if let Err(source) = service.teardown().await {
+                tracelimit::error_ratelimited!(
+                    requester_id,
+                    error = ?source,
+                    "Realm teardown failed; retaining assignment and VM backing is required"
+                );
+                if first_error.is_none() {
+                    first_error = Some(RealmTeardownError {
+                        requester_id,
+                        source,
+                    });
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        self.state.lock().devices.clear();
+        Ok(())
+    }
+}
+
+impl VfioRealmDeviceResolver {
+    /// Retain the lazy VM provider and the VM-wide evidence storage budget.
+    pub fn new(
+        provider: Option<Arc<dyn pci_core::vfio::VfioVmProvider>>,
+        budget: tdisp::host::SnapshotBudget,
+    ) -> Self {
+        Self {
+            provider,
+            budget,
+            teardown: RealmTeardownHandle::default(),
+        }
+    }
+
+    /// Capture independent strong ownership before installing this resolver.
+    pub fn teardown_handle(&self) -> RealmTeardownHandle {
+        self.teardown.clone()
+    }
+}
+
+#[async_trait]
+impl AsyncResolveResource<PciDeviceHandleKind, VfioRealmDeviceHandle> for VfioRealmDeviceResolver {
+    type Output = ResolvedPciDevice;
+    type Error = anyhow::Error;
+
+    async fn resolve(
+        &self,
+        _resolver: &ResourceResolver,
+        resource: VfioRealmDeviceHandle,
+        input: ResolvePciDeviceHandleParams<'_>,
+    ) -> Result<Self::Output, Self::Error> {
+        let VfioRealmDeviceHandle {
+            pci_id,
+            cdev,
+            iommufd,
+            requester_id,
+            bar_addresses,
+        } = resource;
+        anyhow::ensure!(
+            requester_id >> 16 == 0,
+            "initial Realm fixture requires PCI segment zero"
+        );
+        anyhow::ensure!(
+            matches!(
+                input.dma_target.passthrough(),
+                pci_core::dma::DmaPassthrough::Allowed
+            ),
+            "Realm S1-bypass assignment cannot sit behind a guest IOMMU"
+        );
+        let mut owner =
+            crate::realm::RealmDevice::prepare(self.provider.as_deref(), cdev, iommufd)?;
+        owner.attach(requester_id)?;
+        let (device, association) = owner.frontend_access().map_err(|phase| {
+            anyhow::anyhow!("Realm frontend requires attachment, got {phase:?}")
+        })?;
+        let gate = Arc::new(crate::realm::access::AccessGate::with_interrupts(
+            requester_id,
+            association.clone(),
+        ));
+        owner.set_access_gate(gate.clone());
+        let mut frontend = VfioAssignedPciDevice::from_realm(
+            device,
+            gate,
+            pci_id,
+            input.register_mmio,
+            input.dma_target.msi_target(),
+            bar_addresses,
+        )
+        .await?;
+        let service = owner
+            .into_tdisp(self.budget.clone())?
+            .into_evidence_service();
+        frontend.install_realm_service(service.clone())?;
+        self.teardown.retain(requester_id, service.clone())?;
+        association.register_assignment(requester_id, Arc::downgrade(&service))?;
+        Ok(frontend.into())
+    }
 }
 
 impl VfioDeviceResolver {
@@ -307,12 +502,91 @@ impl AsyncResolveResource<PciDeviceHandleKind, VfioCdevDeviceHandle> for VfioCde
 
 #[cfg(test)]
 mod realm_guard_tests {
-    use super::validate_ordinary_cdev_path;
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
     use test_with_tracing::test;
 
     #[test]
     fn realm_provider_cannot_fall_back_to_ordinary_dma_mapping() {
         validate_ordinary_cdev_path(false).unwrap();
         assert!(validate_ordinary_cdev_path(true).is_err());
+    }
+
+    struct TeardownService {
+        fail: AtomicBool,
+        calls: AtomicUsize,
+        closed: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl tdisp::host::EvidenceService for TeardownService {
+        fn close_admission(&self) {
+            self.closed.store(true, Ordering::SeqCst);
+        }
+
+        async fn object_size(
+            &self,
+            _: tdisp::host::Object,
+        ) -> Result<usize, tdisp::host::EvidenceError> {
+            Err(tdisp::host::EvidenceError::Unsupported)
+        }
+
+        async fn read_object(
+            &self,
+            _: tdisp::host::Object,
+            _: u64,
+            _: u64,
+            _: Arc<dyn tdisp::host::EvidenceSink>,
+        ) -> Result<usize, tdisp::host::EvidenceError> {
+            Err(tdisp::host::EvidenceError::Unsupported)
+        }
+
+        async fn teardown(&self) -> Result<(), tdisp::host::EvidenceError> {
+            assert!(self.closed.load(Ordering::SeqCst));
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(tdisp::host::EvidenceError::Device(Box::new(
+                    std::io::Error::other("cleanup failed"),
+                )));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn teardown_handle_retains_all_services_on_failure_and_retries() {
+        let handle = RealmTeardownHandle::default();
+        let first = Arc::new(TeardownService {
+            fail: AtomicBool::new(true),
+            calls: AtomicUsize::new(0),
+            closed: AtomicBool::new(false),
+        });
+        let second = Arc::new(TeardownService {
+            fail: AtomicBool::new(false),
+            calls: AtomicUsize::new(0),
+            closed: AtomicBool::new(false),
+        });
+        let weak_first = Arc::downgrade(&first);
+        let weak_second = Arc::downgrade(&second);
+        handle.retain(0x100, first.clone()).unwrap();
+        handle.retain(0x200, second.clone()).unwrap();
+        assert!(handle.retain(0x100, second.clone()).is_err());
+        drop(first);
+        drop(second);
+        let error = futures::executor::block_on(handle.teardown()).unwrap_err();
+        assert_eq!(error.requester_id, 0x100);
+        let first = weak_first.upgrade().unwrap();
+        let second = weak_second.upgrade().unwrap();
+        assert_eq!(first.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second.calls.load(Ordering::SeqCst), 1);
+        first.fail.store(false, Ordering::SeqCst);
+        assert!(handle.retain(0x300, first.clone()).is_err());
+        drop(first);
+        drop(second);
+        futures::executor::block_on(handle.teardown()).unwrap();
+        assert!(weak_first.upgrade().is_none());
+        assert!(weak_second.upgrade().is_none());
     }
 }

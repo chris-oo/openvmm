@@ -1,11 +1,17 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Owned, unmapped Realm assignment objects. This is not a PCI device resolver
-//! or a TDISP state machine, and does not register DMA or guest BAR mappings.
+//! Owned Realm assignment objects and native TDISP integration.
+//!
+//! Public preparation leaves the IOAS empty. The separate Realm PCI resolver
+//! attaches a fixed frontend and an access gate before publishing live services.
 
+pub(crate) mod access;
 mod objects;
 pub mod tdisp;
+
+#[cfg(test)]
+mod frontend_tests;
 
 pub use objects::OperationError;
 pub use objects::RealmOperation;
@@ -45,12 +51,16 @@ pub struct RealmPrepareError {
 /// Requires exclusive lifecycle control of a fresh, unbound, unassociated VFIO open file
 /// description. Duplicate descriptors can delay final unbinding.
 /// Call [`Self::close`] explicitly. Failed cleanup retains the remaining state;
-/// abandoning it while cleanup still fails quarantines the bundle until process
-/// exit, with an error log. This is not clean teardown.
+/// abandoning it while cleanup still fails retains the bundle for the process
+/// lifetime, with an error log. This is not clean teardown or proof that DMA
+/// stopped. The caller must keep the process and all DMA-reachable RAM alive
+/// until the external device/model domain has stopped; process exit is not a
+/// substitute for device containment.
 #[derive(Debug)]
 #[must_use = "retain Realm objects until explicit close or recovery"]
 pub struct RealmDevice {
     owner: ObjectOwner<LinuxOperations>,
+    access: Option<Arc<access::AccessGate>>,
 }
 
 impl RealmDevice {
@@ -78,15 +88,21 @@ impl RealmDevice {
                 recovery: None,
             })?;
         let operations = LinuxOperations {
-            cdev: Some(CdevDevice::from_file(cdev)),
+            cdev: Some(Arc::new(CdevDevice::from_file(cdev).into_device())),
             context: IommufdCtx::from_file(iommufd),
             association,
         };
         ObjectOwner::prepare(operations)
-            .map(|owner| Self { owner })
+            .map(|owner| Self {
+                owner,
+                access: None,
+            })
             .map_err(|failure| RealmPrepareError {
                 error: failure.error,
-                recovery: failure.recovery.map(|owner| Self { owner }),
+                recovery: failure.recovery.map(|owner| Self {
+                    owner,
+                    access: None,
+                }),
             })
     }
 
@@ -103,6 +119,17 @@ impl RealmDevice {
         self.owner.state()
     }
 
+    pub(crate) fn frontend_access(
+        &mut self,
+    ) -> Result<(Arc<vfio_sys::Device>, Arc<dyn VfioVm>), RealmPhase> {
+        self.owner
+            .with_attached(|ops, _| (ops.cdev().clone(), ops.association.clone()))
+    }
+
+    pub(crate) fn set_access_gate(&mut self, gate: Arc<access::AccessGate>) {
+        self.access = Some(gate);
+    }
+
     /// Detach, destroy owned objects in dependency order, remove the KVM file
     /// association, and close the VFIO file before releasing other handles.
     ///
@@ -110,19 +137,53 @@ impl RealmDevice {
     /// preparation or attachment may resume once cleanup has started. The
     /// caller must stop any future DMA/access before calling this method.
     pub fn close(&mut self) -> Result<(), OperationError> {
+        if let Some(access) = &self.access {
+            let mut state = access.state.lock();
+            state.deny_all = true;
+            access
+                .check_interrupts(&mut state)
+                .map_err(|error| OperationError {
+                    operation: RealmOperation::RevokeAccess,
+                    source: error.into(),
+                })?;
+            let error = state.quiescent_for_cleanup().err().or_else(|| {
+                (!state.shared.is_empty()).then_some(access::AccessError::InvalidShared)
+            });
+            if let Some(error) = error {
+                return Err(OperationError {
+                    operation: RealmOperation::RevokeAccess,
+                    source: error.into(),
+                });
+            }
+        }
         self.owner.close()
+    }
+}
+
+impl Drop for RealmDevice {
+    fn drop(&mut self) {
+        if let Err(error) = self.close() {
+            tracelimit::error_ratelimited!(
+                error = ?error,
+                "Realm access cleanup failed; retaining assignment and backing"
+            );
+            self.owner.retain();
+            if let Some(access) = self.access.take() {
+                std::mem::forget(access);
+            }
+        }
     }
 }
 
 // Final successful release order: cdev (which unbinds), IOMMUFD, then VM.
 struct LinuxOperations {
-    cdev: Option<CdevDevice>,
+    cdev: Option<Arc<vfio_sys::Device>>,
     context: IommufdCtx,
     association: Arc<dyn VfioVm>,
 }
 
 impl LinuxOperations {
-    fn cdev(&self) -> &CdevDevice {
+    fn cdev(&self) -> &Arc<vfio_sys::Device> {
         self.cdev
             .as_ref()
             .expect("live Realm owner requires its VFIO file")
@@ -177,11 +238,11 @@ impl Operations for LinuxOperations {
     }
 
     fn attach(&mut self, child: u32) -> anyhow::Result<u32> {
-        self.cdev().attach_ioas(child)
+        self.cdev().attach_pt(child)
     }
 
     fn detach(&mut self) -> anyhow::Result<()> {
-        self.cdev().detach_ioas()
+        self.cdev().detach_pt()
     }
 
     fn destroy(&mut self, id: u32) -> anyhow::Result<()> {

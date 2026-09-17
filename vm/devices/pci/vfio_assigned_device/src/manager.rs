@@ -1361,6 +1361,15 @@ impl Drop for VfioCdevBindingState {
 pub(crate) enum VfioBinding {
     Group(VfioDeviceBinding),
     Cdev(VfioCdevBindingState),
+    Realm(RealmBinding),
+}
+
+#[derive(Inspect)]
+pub(crate) struct RealmBinding {
+    #[inspect(skip)]
+    pub gate: Arc<crate::realm::access::AccessGate>,
+    #[inspect(skip)]
+    pub service: Option<Arc<dyn tdisp::host::EvidenceService>>,
 }
 
 impl VfioBinding {
@@ -1370,7 +1379,7 @@ impl VfioBinding {
     pub(crate) fn dmabuf_registry(&self) -> Option<&Arc<DmaBufRegistry>> {
         match self {
             VfioBinding::Cdev(state) => Some(&state.dmabuf_registry),
-            VfioBinding::Group(_) => None,
+            VfioBinding::Group(_) | VfioBinding::Realm(_) => None,
         }
     }
 

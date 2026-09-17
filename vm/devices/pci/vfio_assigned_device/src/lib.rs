@@ -11,6 +11,13 @@
 //! allowing the guest to access device registers without VM exits. A
 //! `MemoryMapper` is required for VFIO device assignment; mapping failures are
 //! fatal.
+//!
+//! Native Realm assignment is a separate resource and resolver. It uses this
+//! frontend's intercepted BAR path before LOCK, with a synchronous shared access
+//! gate and no protected shared direct aliases. The kernel owns protected MMIO
+//! mappings. Fixed BARs and the boot requester ID cannot be reassigned.
+//! Failed or short Realm BAR/config transfers revoke access and service
+//! admission. IRQ release requires both VFIO and VM route acknowledgement.
 
 #![cfg(target_os = "linux")]
 
@@ -21,6 +28,7 @@ pub mod resolver;
 
 use anyhow::Context as _;
 use chipset_device::ChipsetDevice;
+use chipset_device::io::IoError;
 use chipset_device::io::IoResult;
 use chipset_device::mmio::MmioIntercept;
 use chipset_device::pci::ByteEnabledDwordRead;
@@ -229,9 +237,103 @@ pub(crate) struct VfioAssignedPciDevice {
     /// before the manager is notified of device removal.
     accel_stream: Option<iommufd_nesting::AccelStream>,
 
+    #[inspect(skip)]
+    realm_release: Option<RealmFrontendRelease>,
+    realm_irq_suspended: bool,
+
     /// VFIO binding. Keeps the container/group (legacy) or iommufd/IOAS
     /// (cdev) fds alive and cleans up on drop.
     binding: manager::VfioBinding,
+}
+
+struct RealmFrontendRelease {
+    gate: Arc<realm::access::AccessGate>,
+    released: bool,
+}
+
+impl Drop for RealmFrontendRelease {
+    fn drop(&mut self) {
+        if !self.released || std::thread::panicking() {
+            self.gate.state.lock().deny_all = true;
+            self.gate.close_admission();
+            return;
+        }
+        let mut state = self.gate.state.lock();
+        if self.gate.check_interrupts(&mut state).is_ok() {
+            state.frontend_live = false;
+        }
+    }
+}
+
+struct RealmDropGuard<'a> {
+    device: &'a mut VfioAssignedPciDevice,
+    gate: Arc<realm::access::AccessGate>,
+    acknowledged: bool,
+}
+
+impl Drop for RealmDropGuard<'_> {
+    fn drop(&mut self) {
+        if self.acknowledged {
+            return;
+        }
+        self.gate.state.lock().deny_all = true;
+        self.gate.close_admission();
+        if let Some(msix) = self.device.msix.take() {
+            std::mem::forget(msix);
+        }
+        std::mem::forget(self.device.vfio_device.device.clone());
+        if let manager::VfioBinding::Realm(binding) = &self.device.binding {
+            if let Some(service) = &binding.service {
+                std::mem::forget(service.clone());
+            }
+        }
+    }
+}
+
+impl Drop for VfioAssignedPciDevice {
+    fn drop(&mut self) {
+        let Some(gate) = self.realm_gate() else {
+            return;
+        };
+        let mut guard = RealmDropGuard {
+            device: self,
+            gate,
+            acknowledged: false,
+        };
+        let mut access = guard.gate.state.lock();
+        access.deny_all = true;
+        guard.gate.close_admission();
+        if std::thread::panicking() {
+            return;
+        }
+        if guard.device.msix.as_ref().is_some_and(|msix| msix.enabled)
+            && !guard.device.realm_irq_suspended
+        {
+            if let Err(error) = guard.device.vfio_device.device.unmap_msix() {
+                let error = access.record_irq_error(error);
+                tracelimit::error_ratelimited!(
+                    error = ?error,
+                    "Realm IRQ cleanup failed; retaining frontend and assignment"
+                );
+                return;
+            }
+            access.irq_error = None;
+        }
+        if guard.gate.check_interrupts(&mut access).is_err() {
+            return;
+        }
+        if let Some(msix) = &guard.device.msix {
+            msix.emulator.release_interrupt_routes();
+        }
+        if guard.gate.check_interrupts(&mut access).is_err() {
+            return;
+        }
+        drop(guard.device.msix.take());
+        if let Some(release) = &mut guard.device.realm_release {
+            release.released = true;
+        }
+        guard.acknowledged = true;
+    }
 }
 
 #[derive(Inspect)]
@@ -299,6 +401,87 @@ impl VfioPciDevice {
 }
 
 impl VfioAssignedPciDevice {
+    fn stop_realm_frontend(&mut self) -> anyhow::Result<()> {
+        let Some(gate) = self.realm_gate() else {
+            return Ok(());
+        };
+        let mut access = gate.state.lock();
+        access.stopped = true;
+        if self.msix.as_ref().is_some_and(|msix| msix.enabled) && !self.realm_irq_suspended {
+            if let Err(error) = self.vfio_device.device.unmap_msix() {
+                gate.close_admission();
+                return Err(access.record_irq_error(error).into());
+            }
+            access.irq_error = None;
+            self.realm_irq_suspended = true;
+        }
+        gate.check_interrupts(&mut access)?;
+        Ok(())
+    }
+
+    fn start_realm_frontend(&mut self) -> anyhow::Result<()> {
+        let Some(gate) = self.realm_gate() else {
+            return Ok(());
+        };
+        let mut access = gate.state.lock();
+        gate.check_interrupts(&mut access)?;
+        anyhow::ensure!(!access.deny_all, "Realm frontend remains quarantined");
+        if self.realm_irq_suspended {
+            // A failure can follow partial installation; subsequent cleanup
+            // must retry VFIO unmap rather than assume no routes were created.
+            self.realm_irq_suspended = false;
+            if let Err(error) = self.msix_enable() {
+                gate.close_admission();
+                return Err(access.record_irq_error(error).into());
+            }
+        }
+        gate.check_interrupts(&mut access)?;
+        access.stopped = false;
+        Ok(())
+    }
+
+    fn realm_gate(&self) -> Option<Arc<realm::access::AccessGate>> {
+        match &self.binding {
+            manager::VfioBinding::Realm(binding) => Some(binding.gate.clone()),
+            _ => None,
+        }
+    }
+
+    pub(crate) async fn from_realm(
+        device: Arc<vfio_sys::Device>,
+        gate: Arc<realm::access::AccessGate>,
+        pci_id: String,
+        register_mmio: &mut (dyn chipset_device::mmio::RegisterMmioIntercept + Send),
+        msi_target: &MsiTarget,
+        bar_addresses: [BarAddressConfig; 6],
+    ) -> anyhow::Result<Self> {
+        Self::from_device(
+            device,
+            manager::VfioBinding::Realm(manager::RealmBinding {
+                gate,
+                service: None,
+            }),
+            pci_id,
+            register_mmio,
+            msi_target,
+            None,
+            bar_addresses,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) fn install_realm_service(
+        &mut self,
+        service: Arc<dyn tdisp::host::EvidenceService>,
+    ) -> anyhow::Result<()> {
+        if let manager::VfioBinding::Realm(binding) = &mut self.binding {
+            binding.gate.bind_service(Arc::downgrade(&service))?;
+            binding.service = Some(service);
+        }
+        Ok(())
+    }
+
     /// Create a new VFIO assigned PCI device.
     ///
     /// Reads BAR flags from config space and derives BAR masks from the VFIO
@@ -323,7 +506,7 @@ impl VfioAssignedPciDevice {
             pci_id,
             register_mmio,
             msi_target,
-            memory_mapper,
+            Some(memory_mapper),
             bar_addresses,
             // Legacy group/type1 path never does nested S1 (rejected earlier).
             None,
@@ -348,7 +531,7 @@ impl VfioAssignedPciDevice {
             pci_id,
             register_mmio,
             msi_target,
-            memory_mapper,
+            Some(memory_mapper),
             bar_addresses,
             accel_stream,
         )
@@ -361,10 +544,16 @@ impl VfioAssignedPciDevice {
         pci_id: String,
         register_mmio: &mut (dyn chipset_device::mmio::RegisterMmioIntercept + Send),
         msi_target: &MsiTarget,
-        memory_mapper: &dyn MemoryMapper,
+        memory_mapper: Option<&dyn MemoryMapper>,
         bar_addresses: [BarAddressConfig; 6],
         accel_stream: Option<iommufd_nesting::AccelStream>,
     ) -> anyhow::Result<Self> {
+        if matches!(binding, manager::VfioBinding::Realm(_)) {
+            anyhow::ensure!(
+                memory_mapper.is_none() && accel_stream.is_none(),
+                "Realm frontend forbids ordinary shared BAR mappings and guest-SMMU nesting"
+            );
+        }
         let config_info = vfio_device
             .region_info(vfio_bindings::bindings::vfio::VFIO_PCI_CONFIG_REGION_INDEX)
             .context("failed to get VFIO config region info")?;
@@ -461,6 +650,11 @@ impl VfioAssignedPciDevice {
         if let Some(msix) = &msix {
             subtract_msix_regions(&mut bar_mmap_areas, msix);
         }
+        if matches!(binding, manager::VfioBinding::Realm(_)) {
+            // No protected shared direct-map alias is ever created. Intercepts
+            // take the coordinator's gate, so LOCK acknowledges revocation.
+            bar_mmap_areas.iter_mut().for_each(Vec::clear);
+        }
 
         // Create direct BAR mappings for mmappable regions. Each
         // mmappable sub-region gets a guest memory mapping backed by the
@@ -503,10 +697,11 @@ impl VfioAssignedPciDevice {
             for &area in areas {
                 let name = format!("vfio-{pci_id}-bar{i}-{area}");
                 let (memory, mapped_region) = memory_mapper
+                    .context("shared direct BAR mapping requires a memory mapper")?
                     .new_region(area.len() as usize, name)
                     .with_context(|| {
-                    format!("failed to create BAR {i} direct mapping region for {pci_id}")
-                })?;
+                        format!("failed to create BAR {i} direct mapping region for {pci_id}")
+                    })?;
                 mapped_region
                     .map(
                         0,
@@ -581,8 +776,67 @@ impl VfioAssignedPciDevice {
         // configured host-assigned or fixed physical addresses.
         let bars = apply_bar_addresses(&pci_id, &bar_flags, &bar_masks, &bar_addresses)?;
         let bar_reset_defaults = bars;
+        if let manager::VfioBinding::Realm(binding) = &binding {
+            let physical = read_physical_bar_ranges(&pci_id)?;
+            let parsed = BarMappings::parse(&bars, &bar_masks);
+            let mut access = binding.gate.state.lock();
+            binding.gate.check_interrupts(&mut access)?;
+            for (index, region) in bar_regions.iter().enumerate() {
+                let Some(region) = region else { continue };
+                let base = parsed
+                    .get(index as u8)
+                    .context("Realm BAR needs a fixed boot address")?;
+                anyhow::ensure!(
+                    bar_addresses[index] != BarAddressConfig::GuestAssigned,
+                    "Realm BAR {index} requires fixed guest and known host addresses"
+                );
+                let physical = physical[index].context("Realm BAR has no host resource")?;
+                anyhow::ensure!(
+                    physical.len() == region.size,
+                    "Realm BAR {index} differs from its host resource size"
+                );
+                let guest = realm::access::interval(base, region.size)
+                    .context("Realm BAR must contain whole 4 KiB granules")?;
+                anyhow::ensure!(
+                    physical.start().is_multiple_of(realm::access::GRANULE)
+                        && !access
+                            .bars
+                            .iter()
+                            .any(|bar| realm::access::overlaps(&guest, &bar.guest)),
+                    "invalid or overlapping Realm BAR {index}"
+                );
+                access.bars.push(realm::access::BarRange {
+                    guest,
+                    host: physical.start(),
+                });
+            }
+            let msix = msix
+                .as_ref()
+                .context("native Realm frontend currently requires MSI-X")?;
+            for (index, range) in [
+                (msix.table_bar, &msix.table_range),
+                (msix.pba_bar, &msix.pba_range),
+            ] {
+                let region = bar_regions
+                    .get(index as usize)
+                    .and_then(Option::as_ref)
+                    .context("MSI-X references an absent BAR")?;
+                anyhow::ensure!(
+                    range.start < range.end && range.end <= region.size,
+                    "MSI-X outside BAR"
+                );
+                let base = parsed
+                    .get(index)
+                    .context("MSI-X BAR is not boot assigned")?;
+                let granule = realm::access::GRANULE;
+                let start = base + (range.start & !(granule - 1));
+                let end = base + range.end.div_ceil(granule) * granule;
+                access.nonsecure.push(start..end);
+            }
+            access.frontend_live = true;
+        }
 
-        Ok(Self {
+        let mut assigned = Self {
             pci_id,
             vfio_device,
             bar_masks,
@@ -602,19 +856,55 @@ impl VfioAssignedPciDevice {
             bar_direct_maps,
             config_patches,
             accel_stream,
+            realm_release: match &binding {
+                manager::VfioBinding::Realm(binding) => Some(RealmFrontendRelease {
+                    gate: binding.gate.clone(),
+                    released: false,
+                }),
+                _ => None,
+            },
+            realm_irq_suspended: false,
             binding,
-        })
+        };
+        if assigned.realm_gate().is_some() {
+            // Preserve boot config, including the device's physical command
+            // value. No VFIO reset or guest BAR assignment is performed.
+            let mut command = 0;
+            assigned.vfio_device.read_config(
+                HeaderType00::STATUS_COMMAND.0,
+                ByteEnabledDwordRead::with_all_bytes_enabled(&mut command),
+            )?;
+            assigned.mmio_enabled = cfg_space::Command::from_bits(command as u16).mmio_enabled();
+            assigned.update_bar_mappings();
+        }
+        Ok(assigned)
     }
 
-    fn read_phys_config(&self, offset: u16, mut value: ByteEnabledDwordRead<'_>) {
+    fn read_phys_config(
+        &self,
+        offset: u16,
+        mut value: ByteEnabledDwordRead<'_>,
+        access: Option<(&realm::access::AccessGate, &mut realm::access::AccessState)>,
+    ) -> IoResult {
+        if access.is_some() {
+            let (byte_offset, len) = value.byte_enable().to_byte_offset_len();
+            if u64::from(offset) + byte_offset as u64 + len as u64 > self.vfio_device.config_size {
+                return IoResult::Err(IoError::InvalidRegister);
+            }
+        }
         if let Err(e) = self.vfio_device.read_config(offset, value.reborrow()) {
             tracelimit::warn_ratelimited!(
                 offset,
                 error = e.as_ref() as &dyn std::error::Error,
                 "VFIO config space read failed"
             );
+            if let Some((gate, state)) = access {
+                gate.fail_io(state, e);
+                return IoResult::Err(IoError::NoResponse);
+            }
             value.set(!0);
         }
+        IoResult::Ok
     }
 
     fn write_phys_config(&self, offset: u16, value: ByteEnabledDwordWrite) {
@@ -692,23 +982,40 @@ impl VfioAssignedPciDevice {
 
     /// Map a BAR + offset to an MsixEmulator offset, if the access falls
     /// within the MSI-X table or PBA region.
-    fn msix_emulator_offset(&self, bar: u8, offset: u64) -> Option<u64> {
-        let msix = self.msix.as_ref()?;
+    fn msix_emulator_offset(
+        &self,
+        bar: u8,
+        offset: u64,
+        length: usize,
+    ) -> Result<Option<u64>, IoError> {
+        let Some(msix) = self.msix.as_ref() else {
+            return Ok(None);
+        };
+        let end = offset
+            .checked_add(length as u64)
+            .ok_or(IoError::InvalidAccessSize)?;
+        let range = offset..end;
 
         // Check MSI-X table region.
-        if bar == msix.table_bar && msix.table_range.contains(&offset) {
+        if bar == msix.table_bar && realm::access::overlaps(&range, &msix.table_range) {
+            if offset < msix.table_range.start || end > msix.table_range.end {
+                return Err(IoError::InvalidAccessSize);
+            }
             // Emulator table starts at offset 0.
-            return Some(offset - msix.table_range.start);
+            return Ok(Some(offset - msix.table_range.start));
         }
 
         // Check PBA region.
-        if bar == msix.pba_bar && msix.pba_range.contains(&offset) {
+        if bar == msix.pba_bar && realm::access::overlaps(&range, &msix.pba_range) {
+            if offset < msix.pba_range.start || end > msix.pba_range.end {
+                return Err(IoError::InvalidAccessSize);
+            }
             // In the emulator, PBA starts right after the table.
             let emu_pba_start = msix.table_range.end - msix.table_range.start;
-            return Some(emu_pba_start + (offset - msix.pba_range.start));
+            return Ok(Some(emu_pba_start + (offset - msix.pba_range.start)));
         }
 
-        None
+        Ok(None)
     }
 
     /// Set up irqfd-backed MSI-X interrupt delivery when the guest enables MSI-X.
@@ -731,6 +1038,10 @@ impl VfioAssignedPciDevice {
             .map(|int| int.event())
             .collect::<Option<Vec<_>>>()
             .context("failed to allocate irqfd routes for MSI-X vectors")?;
+
+        if let Some(gate) = self.realm_gate() {
+            gate.interrupt_status()?;
+        }
 
         self.vfio_device
             .device
@@ -771,7 +1082,12 @@ impl VfioAssignedPciDevice {
     /// treated as unmapped so the diff naturally tears everything down.
     fn update_bar_mappings(&mut self) {
         let new_bars = if self.mmio_enabled && self.in_d0 {
-            BarMappings::parse(&self.bars, &self.bar_masks)
+            let bars = if matches!(self.binding, manager::VfioBinding::Realm(_)) {
+                &self.bar_reset_defaults
+            } else {
+                &self.bars
+            };
+            BarMappings::parse(bars, &self.bar_masks)
         } else {
             BarMappings::default()
         };
@@ -998,6 +1314,38 @@ fn read_physical_bar_addresses(pci_id: &str) -> anyhow::Result<[u64; 6]> {
     }
 
     Ok(addresses)
+}
+
+fn read_physical_bar_ranges(pci_id: &str) -> anyhow::Result<[Option<MemoryRange>; 6]> {
+    let path = format!("/sys/bus/pci/devices/{pci_id}/resource");
+    let text = std::fs::read_to_string(&path).with_context(|| format!("failed to read {path}"))?;
+    parse_physical_bar_ranges(&text)
+}
+
+fn parse_physical_bar_ranges(text: &str) -> anyhow::Result<[Option<MemoryRange>; 6]> {
+    let mut ranges = [None; 6];
+    let mut lines = text.lines();
+    for range in &mut ranges {
+        let line = lines.next().context("missing host PCI resource")?;
+        let mut words = line.split_whitespace();
+        let mut value = || -> anyhow::Result<u64> {
+            let word = words.next().context("missing host resource field")?;
+            Ok(u64::from_str_radix(
+                word.strip_prefix("0x").unwrap_or(word),
+                16,
+            )?)
+        };
+        let start = value()?;
+        let end = value()?;
+        let flags = value()?;
+        if flags & 0x200 == 0 || (start == 0 && end == 0) {
+            continue;
+        }
+        let top = end.checked_add(1).context("host BAR range overflow")?;
+        anyhow::ensure!(start != 0 && start < top, "invalid host BAR range");
+        *range = Some(MemoryRange::new(start..top));
+    }
+    Ok(ranges)
 }
 
 /// Abstraction over PCI config space reads, allowing the capability
@@ -1287,56 +1635,63 @@ fn discover_capabilities(
 
 /// Read from the MSI-X emulator at the given offset, handling sub-DWORD
 /// accesses by aligning to u32 boundaries.
-fn read_msix_emulator(emulator: &MsixEmulator, offset: u64, data: &mut [u8]) {
-    let aligned = offset & !3;
-    let shift = (offset & 3) as usize;
-    let val = emulator.read_u32(aligned);
-    let bytes = val.to_le_bytes();
-    let first_chunk = data.len().min(4 - shift);
-    data[..first_chunk].copy_from_slice(&bytes[shift..shift + first_chunk]);
-
-    // Handle reads that span a u32 boundary.
-    if first_chunk < data.len() {
-        let next_val = emulator.read_u32(aligned + 4);
-        let next_bytes = next_val.to_le_bytes();
-        let remaining = data.len() - first_chunk;
-        data[first_chunk..first_chunk + remaining].copy_from_slice(&next_bytes[..remaining]);
+fn read_msix_emulator(emulator: &MsixEmulator, mut offset: u64, mut data: &mut [u8]) {
+    while !data.is_empty() {
+        let shift = (offset & 3) as usize;
+        let length = data.len().min(4 - shift);
+        let bytes = emulator.read_u32(offset & !3).to_le_bytes();
+        data[..length].copy_from_slice(&bytes[shift..shift + length]);
+        data = &mut data[length..];
+        let Some(next) = offset.checked_add(length as u64) else {
+            return;
+        };
+        offset = next;
     }
 }
 
 /// Write to the MSI-X emulator at the given offset, handling sub-DWORD
 /// accesses via read-modify-write.
-fn write_msix_emulator(emulator: &mut MsixEmulator, offset: u64, data: &[u8]) {
-    let aligned = offset & !3;
-    let shift = (offset & 3) as usize;
-    let first_chunk = data.len().min(4 - shift);
-
-    if first_chunk == 4 && shift == 0 {
-        // Fast path: aligned u32 write.
-        let val = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-        emulator.write_u32(aligned, val);
-    } else {
-        // Read-modify-write for sub-DWORD access.
-        let mut current = emulator.read_u32(aligned).to_le_bytes();
-        current[shift..shift + first_chunk].copy_from_slice(&data[..first_chunk]);
-        emulator.write_u32(aligned, u32::from_le_bytes(current));
-    }
-
-    // Handle writes that span a u32 boundary.
-    if first_chunk < data.len() {
-        let remaining = data.len() - first_chunk;
-        let mut next = emulator.read_u32(aligned + 4).to_le_bytes();
-        next[..remaining].copy_from_slice(&data[first_chunk..]);
-        emulator.write_u32(aligned + 4, u32::from_le_bytes(next));
+fn write_msix_emulator(emulator: &mut MsixEmulator, mut offset: u64, mut data: &[u8]) {
+    while !data.is_empty() {
+        let aligned = offset & !3;
+        let shift = (offset & 3) as usize;
+        let length = data.len().min(4 - shift);
+        let mut bytes = if length == 4 {
+            [0; 4]
+        } else {
+            emulator.read_u32(aligned).to_le_bytes()
+        };
+        bytes[shift..shift + length].copy_from_slice(&data[..length]);
+        emulator.write_u32(aligned, u32::from_le_bytes(bytes));
+        data = &data[length..];
+        let Some(next) = offset.checked_add(length as u64) else {
+            return;
+        };
+        offset = next;
     }
 }
 
 impl ChangeDeviceState for VfioAssignedPciDevice {
-    fn start(&mut self) {}
+    fn start(&mut self) {
+        if let Err(error) = self.start_realm_frontend() {
+            tracelimit::error_ratelimited!(error = ?error, "Realm frontend start failed");
+        }
+    }
 
-    async fn stop(&mut self) {}
+    async fn stop(&mut self) {
+        if let Err(error) = self.stop_realm_frontend() {
+            tracelimit::error_ratelimited!(error = ?error, "Realm frontend stop failed; assignment retained");
+        }
+    }
 
     async fn reset(&mut self) {
+        if let Some(gate) = self.realm_gate() {
+            gate.state.lock().deny_all = true;
+            tracelimit::error_ratelimited!(
+                "Realm function reset is unsupported; access quarantined"
+            );
+            return;
+        }
         // Tear down MSI-X irqfd routes before resetting state.
         if self.msix.as_ref().is_some_and(|m| m.enabled) {
             self.msix_disable();
@@ -1367,6 +1722,8 @@ impl ChangeDeviceState for VfioAssignedPciDevice {
             config_patches: _, // immutable — built at init
             binding: _,        // lifetime handle — no reset needed
             ref mut accel_stream,
+            realm_release: _,
+            realm_irq_suspended: _,
         } = *self;
 
         // The reset clears the captured BDF, so the StreamID derived from it
@@ -1427,6 +1784,16 @@ impl PciConfigSpace for VfioAssignedPciDevice {
 
         let offset = address.byte_offset();
         let rid = (u16::from(address.bus) << 8) | u16::from(address.devfn);
+        if let Some(gate) = self.realm_gate() {
+            if u32::from(rid) != gate.requester_id {
+                gate.state.lock().deny_all = true;
+                tracelimit::error_ratelimited!(
+                    rid,
+                    "Realm requester ID changed; access quarantined"
+                );
+                return IoResult::Err(IoError::InvalidRegister);
+            }
+        }
 
         if self.accel_stream.is_some()
             && Self::is_function_reset_write(
@@ -1454,6 +1821,19 @@ impl PciConfigSpace for VfioAssignedPciDevice {
     }
 
     fn pci_cfg_read(&mut self, offset: u16, mut value: ByteEnabledDwordRead<'_>) -> IoResult {
+        let gate = self.realm_gate();
+        let mut access = gate.as_ref().map(|gate| gate.state.lock());
+        if let Some((gate, state)) = gate.as_deref().zip(access.as_deref_mut()) {
+            if gate.check_interrupts(state).is_err() {
+                return IoResult::Err(IoError::NoResponse);
+            }
+        }
+        if access
+            .as_ref()
+            .is_some_and(|state| state.deny_all || state.stopped)
+        {
+            return IoResult::Err(IoError::NoResponse);
+        }
         match HeaderType00(offset) {
             // BAR registers: return locally cached values.
             HeaderType00::BAR0
@@ -1474,7 +1854,13 @@ impl PciConfigSpace for VfioAssignedPciDevice {
                 let msix = self.msix.as_ref().unwrap();
                 // The low word (if targeted) comes from hardware.
                 if let Some(v) = value.restrict(PciConfigByteEnable::LOW_WORD) {
-                    self.read_phys_config(offset.0, v);
+                    if let result @ IoResult::Err(_) = self.read_phys_config(
+                        offset.0,
+                        v,
+                        gate.as_deref().zip(access.as_deref_mut()),
+                    ) {
+                        return result;
+                    }
                 }
                 // The high word (if targeted) comes from the emulator.
                 if let Some(v) = value.restrict(PciConfigByteEnable::HIGH_WORD) {
@@ -1484,7 +1870,13 @@ impl PciConfigSpace for VfioAssignedPciDevice {
             // Everything else: read from physical device, applying any
             // config space patches.
             _ => {
-                self.read_phys_config(offset, value.reborrow());
+                if let result @ IoResult::Err(_) = self.read_phys_config(
+                    offset,
+                    value.reborrow(),
+                    gate.as_deref().zip(access.as_deref_mut()),
+                ) {
+                    return result;
+                }
                 if let Some(patch) = self.config_patches.get(&offset) {
                     let hw = value.extract();
                     let patched = (hw & !patch.mask) | (patch.value & patch.mask);
@@ -1503,6 +1895,85 @@ impl PciConfigSpace for VfioAssignedPciDevice {
     }
 
     fn pci_cfg_write(&mut self, offset: u16, value: ByteEnabledDwordWrite) -> IoResult {
+        let gate = self.realm_gate();
+        let mut access = gate.as_ref().map(|gate| gate.state.lock());
+        if let Some((gate, state)) = gate.as_deref().zip(access.as_deref_mut()) {
+            if gate.check_interrupts(state).is_err() {
+                return IoResult::Err(IoError::NoResponse);
+            }
+        }
+        if let Some((gate, access)) = gate.as_deref().zip(access.as_deref_mut()) {
+            if access.deny_all || access.stopped {
+                return IoResult::Err(IoError::NoResponse);
+            }
+            if (HeaderType00::BAR0.0..=HeaderType00::BAR5.0).contains(&offset) {
+                let index = (offset - HeaderType00::BAR0.0) as usize / 4;
+                let requested = value.merge(self.bars[index]);
+                let masked = (requested & self.bar_masks[index]) | self.bar_flags[index];
+                if requested == u32::MAX {
+                    self.bars[index] = self.bar_masks[index];
+                } else if masked == self.bar_reset_defaults[index] {
+                    self.bars[index] = masked;
+                } else {
+                    return IoResult::Err(IoError::InvalidRegister);
+                }
+                // Probes change only config readback, never the bound address.
+                return IoResult::Ok;
+            }
+            let msix_control = self
+                .msix
+                .as_ref()
+                .is_some_and(|msix| offset == msix.cap_offset);
+            if offset != HeaderType00::STATUS_COMMAND.0 && !msix_control {
+                // PM, FLR, capability and vendor writes cannot change binding.
+                return IoResult::Err(IoError::InvalidRegister);
+            }
+            if msix_control {
+                let msix = self.msix.as_ref().expect("checked MSI-X capability");
+                let was_enabled = msix.enabled;
+                let enabled = if value.valid_mask() & 0x8000_0000 != 0 {
+                    value.extract() & 0x8000_0000 != 0
+                } else {
+                    was_enabled
+                };
+                let result = if enabled && !was_enabled {
+                    // An ioctl failure may follow partial IRQ installation.
+                    self.msix
+                        .as_mut()
+                        .expect("checked MSI-X capability")
+                        .enabled = true;
+                    self.msix_enable()
+                } else if !enabled && was_enabled {
+                    self.vfio_device.device.unmap_msix()
+                } else {
+                    Ok(())
+                };
+                if let Err(error) = result {
+                    let error = access.record_irq_error(error);
+                    gate.close_admission();
+                    tracelimit::error_ratelimited!(error = ?error, "Realm MSI-X change failed");
+                    return IoResult::Err(IoError::NoResponse);
+                }
+                let msix = self.msix.as_mut().expect("checked MSI-X capability");
+                msix.capability.write(0, value);
+                msix.enabled = enabled;
+                if gate.check_interrupts(access).is_err() {
+                    return IoResult::Err(IoError::NoResponse);
+                }
+            } else {
+                if let Err(error) = self.vfio_device.write_config(offset, value) {
+                    let error = gate.fail_io(access, error);
+                    tracelimit::error_ratelimited!(error = ?error, "Realm command write failed");
+                    return IoResult::Err(IoError::NoResponse);
+                }
+                if value.valid_mask() & 2 != 0 {
+                    self.mmio_enabled =
+                        cfg_space::Command::from_bits(value.extract_low()).mmio_enabled();
+                    self.update_bar_mappings();
+                }
+            }
+            return IoResult::Ok;
+        }
         match HeaderType00(offset) {
             // Command register: track MMIO enable/disable.
             HeaderType00::STATUS_COMMAND => {
@@ -1672,23 +2143,59 @@ impl PciConfigSpace for VfioAssignedPciDevice {
 
 impl MmioIntercept for VfioAssignedPciDevice {
     fn mmio_read(&mut self, addr: u64, data: &mut [u8]) -> IoResult {
+        let gate = self.realm_gate();
+        let mut access = gate.as_ref().map(|gate| gate.state.lock());
+        if let Some((gate, state)) = gate.as_deref().zip(access.as_deref_mut()) {
+            if gate.check_interrupts(state).is_err() {
+                return IoResult::Err(IoError::NoResponse);
+            }
+        }
+        if access
+            .as_ref()
+            .is_some_and(|state| !state.permits_mmio(addr, data.len()))
+        {
+            return IoResult::Err(IoError::NoResponse);
+        }
         if let Some((bar, offset)) = self.active_bars.find(addr) {
             // Check if this access falls in the MSI-X table or PBA.
-            if let Some(emu_offset) = self.msix_emulator_offset(bar, offset) {
+            let emu_offset = match self.msix_emulator_offset(bar, offset, data.len()) {
+                Ok(offset) => offset,
+                Err(error) => return IoResult::Err(error),
+            };
+            if let Some(emu_offset) = emu_offset {
                 let msix = self.msix.as_ref().expect("msix must be present");
                 read_msix_emulator(&msix.emulator, emu_offset, data);
+                if let Some((gate, state)) = gate.as_deref().zip(access.as_deref_mut()) {
+                    if gate.check_interrupts(state).is_err() {
+                        return IoResult::Err(IoError::NoResponse);
+                    }
+                }
                 return IoResult::Ok;
             }
 
             // Proxy to physical device BAR via pread.
             if let Some(region) = &self.bar_regions[bar as usize] {
-                if offset + data.len() as u64 <= region.size {
-                    match self
+                if offset
+                    .checked_add(data.len() as u64)
+                    .is_some_and(|end| end <= region.size)
+                {
+                    let result = self
                         .vfio_device
                         .device
                         .file()
-                        .read_at(data, region.vfio_offset + offset)
-                    {
+                        .read_at(data, region.vfio_offset + offset);
+                    if let Some((gate, state)) = gate.as_deref().zip(access.as_deref_mut()) {
+                        return complete_realm_bar_transfer(
+                            gate,
+                            state,
+                            result,
+                            data.len(),
+                            "read",
+                            bar,
+                            offset,
+                        );
+                    }
+                    match result {
                         Ok(n) if n == data.len() => return IoResult::Ok,
                         Ok(n) => {
                             tracelimit::warn_ratelimited!(
@@ -1711,28 +2218,67 @@ impl MmioIntercept for VfioAssignedPciDevice {
                 );
             }
         }
+        if gate.is_some() {
+            return IoResult::Err(IoError::InvalidRegister);
+        }
         data.fill(!0);
         IoResult::Ok
     }
 
     fn mmio_write(&mut self, addr: u64, data: &[u8]) -> IoResult {
+        let gate = self.realm_gate();
+        let mut access = gate.as_ref().map(|gate| gate.state.lock());
+        if let Some((gate, state)) = gate.as_deref().zip(access.as_deref_mut()) {
+            if gate.check_interrupts(state).is_err() {
+                return IoResult::Err(IoError::NoResponse);
+            }
+        }
+        if access
+            .as_ref()
+            .is_some_and(|state| !state.permits_mmio(addr, data.len()))
+        {
+            return IoResult::Err(IoError::NoResponse);
+        }
         if let Some((bar, offset)) = self.active_bars.find(addr) {
             // Check if this access falls in the MSI-X table or PBA.
-            if let Some(emu_offset) = self.msix_emulator_offset(bar, offset) {
+            let emu_offset = match self.msix_emulator_offset(bar, offset, data.len()) {
+                Ok(offset) => offset,
+                Err(error) => return IoResult::Err(error),
+            };
+            if let Some(emu_offset) = emu_offset {
                 let msix = self.msix.as_mut().expect("msix must be present");
                 write_msix_emulator(&mut msix.emulator, emu_offset, data);
+                if let Some((gate, state)) = gate.as_deref().zip(access.as_deref_mut()) {
+                    if gate.check_interrupts(state).is_err() {
+                        return IoResult::Err(IoError::NoResponse);
+                    }
+                }
                 return IoResult::Ok;
             }
 
             // Proxy to physical device BAR via pwrite.
             if let Some(region) = &self.bar_regions[bar as usize] {
-                if offset + data.len() as u64 <= region.size {
-                    match self
+                if offset
+                    .checked_add(data.len() as u64)
+                    .is_some_and(|end| end <= region.size)
+                {
+                    let result = self
                         .vfio_device
                         .device
                         .file()
-                        .write_at(data, region.vfio_offset + offset)
-                    {
+                        .write_at(data, region.vfio_offset + offset);
+                    if let Some((gate, state)) = gate.as_deref().zip(access.as_deref_mut()) {
+                        return complete_realm_bar_transfer(
+                            gate,
+                            state,
+                            result,
+                            data.len(),
+                            "write",
+                            bar,
+                            offset,
+                        );
+                    }
+                    match result {
                         Ok(n) if n == data.len() => return IoResult::Ok,
                         Ok(n) => {
                             tracelimit::warn_ratelimited!(
@@ -1765,8 +2311,41 @@ impl MmioIntercept for VfioAssignedPciDevice {
                 );
             }
         }
+        if gate.is_some() {
+            return IoResult::Err(IoError::InvalidRegister);
+        }
         IoResult::Ok
     }
+}
+
+fn checked_bar_transfer(
+    result: std::io::Result<usize>,
+    expected: usize,
+    operation: &str,
+) -> anyhow::Result<()> {
+    let actual = result?;
+    anyhow::ensure!(
+        actual == expected,
+        "short BAR {operation}: {actual} of {expected} bytes"
+    );
+    Ok(())
+}
+
+fn complete_realm_bar_transfer(
+    gate: &realm::access::AccessGate,
+    state: &mut realm::access::AccessState,
+    result: std::io::Result<usize>,
+    expected: usize,
+    operation: &str,
+    bar: u8,
+    offset: u64,
+) -> IoResult {
+    if let Err(error) = checked_bar_transfer(result, expected, operation) {
+        let error = gate.fail_io(state, error);
+        tracelimit::error_ratelimited!(bar, offset, operation, error = ?error, "Realm BAR access failed");
+        return IoResult::Err(IoError::NoResponse);
+    }
+    IoResult::Ok
 }
 
 impl SaveRestore for VfioAssignedPciDevice {
