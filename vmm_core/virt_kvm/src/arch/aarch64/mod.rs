@@ -1252,6 +1252,9 @@ const GIC_IRQ_BASE: u32 = 0x20;
 
 impl virt::irqcon::ControlGic for KvmPartitionInner {
     fn set_spi_irq(&self, irq_id: u32, high: bool) {
+        if !self.irq_operations_allowed() {
+            return;
+        }
         if !(GIC_IRQ_BASE..self.gic_nr_irqs).contains(&irq_id) {
             tracelimit::warn_ratelimited!(
                 irq_id,
@@ -1272,6 +1275,7 @@ impl virt::irqcon::ControlGic for KvmPartitionInner {
                 err = &err as &dyn std::error::Error,
                 "failed to set SPI IRQ",
             );
+            self.record_irq_delivery_failure(irq_id, "set SPI level", err);
         }
     }
 }
@@ -1367,6 +1371,9 @@ struct GicItsSignalMsi {
 
 impl pci_core::msi::SignalMsi for GicItsSignalMsi {
     fn signal_msi(&self, devid: Option<u32>, address: u64, data: u32) {
+        if !self.kvm.irq_operations_allowed() {
+            return;
+        }
         if address != self.translater_addr {
             tracelimit::warn_ratelimited!(
                 address,
@@ -1395,6 +1402,8 @@ impl pci_core::msi::SignalMsi for GicItsSignalMsi {
                 err = &err as &dyn std::error::Error,
                 "failed to signal MSI via ITS"
             );
+            self.kvm
+                .record_irq_delivery_failure(data, "signal ITS MSI", err);
         }
     }
 }
