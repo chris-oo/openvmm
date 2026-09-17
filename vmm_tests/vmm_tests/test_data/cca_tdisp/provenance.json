@@ -1,0 +1,17 @@
+{
+  "reference_run": "run-20260914-3",
+  "guest_script": {
+    "path_in_initrd": "da-guest-init.sh",
+    "mode": "0755",
+    "sha256": "2c14615a699b797c62a33751ed47c9dfef86e842fa0ab2b23c553a472385b6f6"
+  },
+  "disk_oracle": {
+    "path_in_initrd": "da-ahci.sha256",
+    "sha256": "6ba590e7b220456ef1c6af1a0d4d898fbfa2e9f7c847dc98c231250949e7e931"
+  },
+  "guest_image_sha256": "6bef4c54ac93d8513ad7f125737c9ff0a8b0b7e34720e77253e2b63460002437",
+  "guest_initrd_sha256": "d3ba987d83bd46a60cf2199d7989a7b940499065e1011125775034b5710dad92",
+  "disk_size": 67108864,
+  "disk_sha256": "281e519df3077b557c6b03f5da83c4e8d397219259615dd7c3308f89cae8f2a6",
+  "script_recovery": "Byte-identical extraction from the preserved reference guest initrd; the guest image and initrd were not rebuilt."
+}
