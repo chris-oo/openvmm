@@ -50,6 +50,14 @@ pub enum MemoryError {
     #[cfg(guest_arch = "aarch64")]
     #[error("failed to clone guestmemfd")]
     CloneGuestMemfd(#[source] std::io::Error),
+    #[cfg(any(guest_arch = "aarch64", test))]
+    #[error(
+        "assignment RAM mappings are frozen; retain the VM memory owner until DMA is contained"
+    )]
+    AssignmentRamFrozen,
+    #[cfg(any(guest_arch = "aarch64", test))]
+    #[error("CCA assignment DMA mapping failed")]
+    AssignmentDma(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
 #[cfg(any(guest_arch = "aarch64", test))]
@@ -65,7 +73,7 @@ pub(crate) enum SharedBufferError {
     Slots(#[source] MemoryError),
     #[error("shared buffer visibility check failed")]
     Visibility(#[source] crate::cca_in_place::CcaInPlaceError),
-    #[error("shared guest buffer copy failed; a prefix may have been written")]
+    #[error("shared guest buffer copy failed; a prefix may have been copied")]
     Copy(#[source] guestmem::GuestMemoryError),
 }
 
@@ -141,6 +149,65 @@ pub(crate) struct KvmMemoryRangeState {
     #[cfg(any(guest_arch = "aarch64", test))]
     #[inspect(skip)]
     pub(crate) cca_visibility: crate::cca_in_place::Visibility,
+    #[cfg(any(guest_arch = "aarch64", test))]
+    #[inspect(skip)]
+    assignment_prepared: bool,
+    #[cfg(any(guest_arch = "aarch64", test))]
+    #[inspect(skip)]
+    assignment_frozen: bool,
+    #[cfg(any(guest_arch = "aarch64", test))]
+    #[inspect(skip)]
+    pub(crate) protected_attempts: crate::cca_in_place::ProtectedAttempts,
+}
+
+#[cfg(guest_arch = "aarch64")]
+#[derive(Clone, Copy)]
+enum AssignmentAction {
+    Prepare,
+    Fault {
+        vpindex: u32,
+        fault: crate::cca_in_place::Fault,
+        successful_exit: bool,
+    },
+}
+
+#[cfg(guest_arch = "aarch64")]
+struct AssignmentWork {
+    partition: Arc<KvmPartitionInner>,
+    action: AssignmentAction,
+}
+
+#[cfg(guest_arch = "aarch64")]
+impl tdisp::host::RamWork for AssignmentWork {
+    fn run(
+        &self,
+        operations: &mut dyn tdisp::host::SharedDma,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let result = match self.action {
+            AssignmentAction::Prepare => self.partition.prepare_assignment_ram(operations),
+            AssignmentAction::Fault {
+                vpindex,
+                fault,
+                successful_exit,
+            } => self
+                .partition
+                .vps
+                .get(vpindex as usize)
+                .ok_or(KvmError::InvalidState("invalid assignment VP"))
+                .and_then(|vp| {
+                    self.partition.handle_cca_in_place_memory_fault_inner(
+                        &mut vp.cca_fault.lock(),
+                        fault,
+                        successful_exit,
+                        Some((vpindex, operations)),
+                    )
+                }),
+        };
+        if result.is_err() {
+            self.partition.mark_cca_fatal();
+        }
+        result.map_err(Into::into)
+    }
 }
 
 impl KvmMemoryRangeState {
@@ -331,6 +398,155 @@ impl KvmGuestMemfdPrivateState {
 
 impl KvmPartitionInner {
     #[cfg(guest_arch = "aarch64")]
+    pub(crate) fn record_protected_attempt(
+        &self,
+        request: crate::rhi::MappingRequest,
+    ) -> Result<(), KvmError> {
+        let mut state = self.memory.lock();
+        if self.cca_fatal.load(std::sync::atomic::Ordering::Acquire)
+            || !state.assignment_prepared
+            || self
+                .ram_ranges
+                .iter()
+                .any(|range| range.overlaps(&request.range))
+            || state
+                .ranges
+                .iter()
+                .flatten()
+                .any(|slot| slot.range.overlaps(&request.range))
+        {
+            return Err(crate::cca_in_place::CcaInPlaceError::InvalidProtectedMapping.into());
+        }
+        state.protected_attempts.record(
+            request.range,
+            request.pa,
+            self.shared_gpa_bit.ok_or(KvmError::InvalidCcaMemoryFault)?,
+        )?;
+        Ok(())
+    }
+
+    #[cfg(guest_arch = "aarch64")]
+    async fn assignment_memory_work(
+        self: &Arc<Self>,
+        action: AssignmentAction,
+    ) -> Result<(), KvmError> {
+        let guard = crate::rhi::RequestGuard::new(|| self.mark_cca_fatal());
+        let service = self
+            .cca_assignment_service
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or(tdisp::host::EvidenceError::Closed)?;
+        service
+            .assignment(tdisp::host::AssignmentOperation::ConvertRam(Arc::new(
+                AssignmentWork {
+                    partition: self.clone(),
+                    action,
+                },
+            )))
+            .await?;
+        if self.cca_fatal.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(crate::cca_in_place::CcaInPlaceError::AmbiguousFault.into());
+        }
+        guard.complete(Ok(()))?;
+        Ok(())
+    }
+
+    #[cfg(guest_arch = "aarch64")]
+    pub(crate) async fn prepare_assignment_memory(self: &Arc<Self>) -> Result<(), KvmError> {
+        if self.cca_assignment_service.get().is_none() {
+            return Ok(());
+        }
+        self.assignment_memory_work(AssignmentAction::Prepare)
+            .await?;
+        self.rhi.lock().assignment_prepared();
+        Ok(())
+    }
+
+    #[cfg(guest_arch = "aarch64")]
+    fn prepare_assignment_ram(
+        &self,
+        operations: &mut dyn tdisp::host::SharedDma,
+    ) -> Result<(), KvmError> {
+        if *self.cca_launch_state.lock() != crate::CcaLaunchState::Populated
+            || !self.memory_backing_mode.is_in_place()
+            || self.vps.is_empty()
+        {
+            return Err(KvmError::InvalidState(
+                "assignment requires populated in-place RAM and a VP",
+            ));
+        }
+        let mut state = self.memory.lock();
+        if self.cca_fatal.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(crate::cca_in_place::CcaInPlaceError::AmbiguousFault.into());
+        }
+        if state.assignment_prepared {
+            return Ok(());
+        }
+        for range in &self.ram_ranges {
+            guest_memfd_range_segments(*range, &state.ranges)?;
+        }
+        if state.in_place_ram_slots().is_empty() {
+            return Err(KvmError::InvalidState("assignment has no RAM slots"));
+        }
+        let slots = state.in_place_ram_slots();
+        for &range in &slots {
+            if !state.cca_visibility.changes(range, true)?.is_empty() {
+                return Err(KvmError::InvalidState(
+                    "assignment RAM is not private after import",
+                ));
+            }
+        }
+        state.assignment_frozen = true;
+        if let Err(error) = prepare_private_assignment(&slots, operations, |range| {
+            self.kvm
+                .vp(0)
+                .pre_fault_memory_all(range.start(), range.len())
+        }) {
+            self.mark_cca_fatal();
+            return Err(error.into());
+        }
+        state.assignment_prepared = true;
+        Ok(())
+    }
+
+    #[cfg(guest_arch = "aarch64")]
+    pub(crate) async fn handle_cca_assignment_fault(
+        self: &Arc<Self>,
+        vpindex: u32,
+        fault: crate::cca_in_place::Fault,
+        successful_exit: bool,
+    ) -> Result<(), KvmError> {
+        self.assignment_memory_work(AssignmentAction::Fault {
+            vpindex,
+            fault,
+            successful_exit,
+        })
+        .await
+    }
+
+    #[cfg(guest_arch = "aarch64")]
+    pub(crate) fn read_rhi_shared(
+        &self,
+        gpa: u64,
+        data: &mut [u8],
+    ) -> Result<(), SharedBufferError> {
+        if !self.memory_backing_mode.is_in_place()
+            || self.caps.isolation != virt::IsolationType::Cca
+        {
+            return Err(SharedBufferError::Unsupported);
+        }
+        let shared_bit = self.shared_gpa_bit.ok_or(SharedBufferError::Unsupported)?;
+        with_shared_buffer(
+            &self.memory,
+            &self.cca_fatal,
+            gpa,
+            data.len(),
+            shared_bit,
+            || self.gm.read_at(gpa, data),
+        )
+    }
+
+    #[cfg(guest_arch = "aarch64")]
     pub(crate) fn write_rhi_shared(&self, gpa: u64, data: &[u8]) -> Result<(), SharedBufferError> {
         if !self.memory_backing_mode.is_in_place()
             || self.caps.isolation != virt::IsolationType::Cca
@@ -355,6 +571,17 @@ impl KvmPartitionInner {
         fault: crate::cca_in_place::Fault,
         successful_exit: bool,
     ) -> Result<(), KvmError> {
+        self.handle_cca_in_place_memory_fault_inner(tracker, fault, successful_exit, None)
+    }
+
+    #[cfg(guest_arch = "aarch64")]
+    fn handle_cca_in_place_memory_fault_inner(
+        &self,
+        tracker: &mut crate::cca_in_place::FaultTracker,
+        fault: crate::cca_in_place::Fault,
+        successful_exit: bool,
+        mut assignment: Option<(u32, &mut dyn tdisp::host::SharedDma)>,
+    ) -> Result<(), KvmError> {
         let mut state = self.memory.lock();
         let result = (|| {
             if self.cca_fatal.load(std::sync::atomic::Ordering::Acquire) {
@@ -362,6 +589,15 @@ impl KvmPartitionInner {
             }
             let range = crate::cca_in_place::checked_range(fault.gpa, fault.size)?;
             // Validate slot coverage even for probes and no-op requests.
+            if guest_memfd_range_segments(range, &state.ranges).is_err()
+                && assignment.is_some()
+                && state.protected_attempts.covers(range)
+            {
+                // Re-entry may let KVM handle DEV -> EMPTY. This is not a
+                // completion acknowledgment: never remove the attempted range.
+                tracker.observe_device(fault, successful_exit)?;
+                return Ok(());
+            }
             guest_memfd_range_segments(range, &state.ranges)?;
             let action = tracker.observe(fault, successful_exit, &state.cca_visibility)?;
             if action == crate::cca_in_place::FaultAction::Convert {
@@ -369,7 +605,40 @@ impl KvmPartitionInner {
                 let changes = state.cca_visibility.changes(range, private)?;
                 for change in changes {
                     let segments = guest_memfd_range_segments(change, &state.ranges)?;
-                    self.convert_cca_segments(&segments, private)?;
+                    if let Some((vpindex, operations)) = assignment.as_mut() {
+                        let KvmMemoryBackingMode::GuestMemfd(backing) = &self.memory_backing_mode
+                        else {
+                            return Err(KvmError::InvalidCcaMemoryFault);
+                        };
+                        let file = Arc::new(
+                            backing
+                                .file
+                                .try_clone()
+                                .map_err(MemoryError::CloneGuestMemfd)?,
+                        );
+                        let shared_bit =
+                            self.shared_gpa_bit.ok_or(KvmError::InvalidCcaMemoryFault)?;
+                        convert_assignment_segments(
+                            &segments,
+                            private,
+                            shared_bit,
+                            file,
+                            *operations,
+                            |attributes| {
+                                kvm::set_guest_memfd_memory_attributes(
+                                    backing.file.as_fd(),
+                                    attributes,
+                                )
+                            },
+                            |range| {
+                                self.kvm
+                                    .vp(*vpindex)
+                                    .pre_fault_memory_all(range.start(), range.len())
+                            },
+                        )?;
+                    } else {
+                        self.convert_cca_segments(&segments, private)?;
+                    }
                     state.cca_visibility.record(change, private);
                 }
             }
@@ -397,6 +666,18 @@ impl KvmPartitionInner {
         let range = MemoryRange::new(addr..addr + size as u64);
         let backing = self.memory_backing(range)?;
         let mut state = self.memory.lock();
+        #[cfg(guest_arch = "aarch64")]
+        if state.assignment_frozen
+            && (self.ram_ranges.iter().any(|ram| ram.overlaps(&range))
+                || state
+                    .ranges
+                    .iter()
+                    .flatten()
+                    .any(|slot| slot.host_addr == data && slot.guest_memfd_offset.is_some()))
+        {
+            self.mark_cca_fatal();
+            return Err(MemoryError::AssignmentRamFrozen.into());
+        }
 
         // Memory slots cannot be resized but can be moved within the guest
         // address space. Find the existing slot if there is one.
@@ -796,20 +1077,7 @@ fn convert_in_place_segments(
     private: bool,
     mut set_attributes: impl FnMut(&mut kvm::KvmMemoryAttributes2) -> Result<(), kvm::Error>,
 ) -> Result<(), MemoryError> {
-    // Validate all offsets before the first ioctl, including packed NUMA
-    // offsets that are not consecutive in guest-physical order.
-    for segment in segments {
-        let size = segment.range.len();
-        if size == 0
-            || !size.is_multiple_of(hvdef::HV_PAGE_SIZE)
-            || !segment
-                .guest_memfd_offset
-                .is_multiple_of(hvdef::HV_PAGE_SIZE)
-            || segment.guest_memfd_offset.checked_add(size).is_none()
-        {
-            return Err(MemoryError::InvalidMapGpaRange);
-        }
-    }
+    validate_conversion_segments(segments)?;
     for segment in segments {
         let mut attributes = kvm::KvmMemoryAttributes2 {
             offset: segment.guest_memfd_offset,
@@ -825,6 +1093,92 @@ fn convert_in_place_segments(
         // is diagnostic, not a safe restart point.
         set_attributes(&mut attributes)?;
     }
+    Ok(())
+}
+
+#[cfg(any(guest_arch = "aarch64", test))]
+fn validate_conversion_segments(segments: &[KvmMemoryRangeSegment]) -> Result<(), MemoryError> {
+    // Validate all offsets before the first ioctl, including packed NUMA
+    // offsets that are not consecutive in guest-physical order.
+    for segment in segments {
+        let size = segment.range.len();
+        if size == 0
+            || !segment.range.start().is_multiple_of(hvdef::HV_PAGE_SIZE)
+            || !size.is_multiple_of(hvdef::HV_PAGE_SIZE)
+            || !segment
+                .guest_memfd_offset
+                .is_multiple_of(hvdef::HV_PAGE_SIZE)
+            || segment.guest_memfd_offset.checked_add(size).is_none()
+        {
+            return Err(MemoryError::InvalidMapGpaRange);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(guest_arch = "aarch64", test))]
+fn convert_assignment_segments(
+    segments: &[KvmMemoryRangeSegment],
+    private: bool,
+    shared_bit: u64,
+    file: Arc<File>,
+    operations: &mut dyn tdisp::host::SharedDma,
+    mut set_attributes: impl FnMut(&mut kvm::KvmMemoryAttributes2) -> Result<(), kvm::Error>,
+    mut prefault: impl FnMut(MemoryRange) -> Result<(), kvm::Error>,
+) -> Result<(), MemoryError> {
+    validate_conversion_segments(segments)?;
+    if shared_bit < 4096
+        || !shared_bit.is_power_of_two()
+        || segments.iter().any(|s| {
+            s.range.end() > shared_bit
+                || (s.range.start() | shared_bit)
+                    .checked_add(s.range.len())
+                    .is_none()
+        })
+    {
+        return Err(MemoryError::InvalidMapGpaRange);
+    }
+
+    for segment in segments {
+        let iova = segment.range.start() | shared_bit;
+        let length = segment.range.len();
+        if private {
+            operations
+                .unmap(iova, length)
+                .map_err(MemoryError::AssignmentDma)?;
+        }
+        convert_in_place_segments(std::slice::from_ref(segment), private, &mut set_attributes)?;
+        if private {
+            prefault(segment.range)?;
+        } else {
+            operations
+                .map(tdisp::host::SharedMapping {
+                    file: file.clone(),
+                    file_offset: segment.guest_memfd_offset,
+                    iova,
+                    length,
+                })
+                .map_err(MemoryError::AssignmentDma)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(guest_arch = "aarch64", test))]
+fn prepare_private_assignment(
+    slots: &[MemoryRange],
+    operations: &mut dyn tdisp::host::SharedDma,
+    mut prefault: impl FnMut(MemoryRange) -> Result<(), kvm::Error>,
+) -> Result<(), MemoryError> {
+    if slots.is_empty() || crate::cca_in_place::validate_imports(slots.iter().copied()).is_err() {
+        return Err(MemoryError::InvalidMapGpaRange);
+    }
+    for &slot in slots {
+        prefault(slot)?;
+    }
+    operations
+        .prepare_private_memory()
+        .map_err(MemoryError::AssignmentDma)?;
     Ok(())
 }
 
@@ -1039,6 +1393,17 @@ impl virt::PartitionMemoryMap for KvmPartitionInner {
     fn unmap_range(&self, addr: u64, size: u64) -> anyhow::Result<()> {
         let range = MemoryRange::new(addr..addr + size);
         let mut state = self.memory.lock();
+        #[cfg(guest_arch = "aarch64")]
+        if state.assignment_frozen
+            && state
+                .ranges
+                .iter()
+                .flatten()
+                .any(|slot| slot.guest_memfd_offset.is_some() && slot.range.overlaps(&range))
+        {
+            self.mark_cca_fatal();
+            return Err(MemoryError::AssignmentRamFrozen.into());
+        }
         for (slot, entry) in state.ranges.iter_mut().enumerate() {
             let Some(kvm_range) = entry else { continue };
             if range.contains(&kvm_range.range) {
@@ -1110,6 +1475,294 @@ mod tests {
     use super::*;
     use test_with_tracing::test;
 
+    #[derive(Debug, PartialEq, Eq)]
+    enum DmaStep {
+        Prepare,
+        Unmap(u64, u64),
+        Attributes(u64, u64, bool),
+        Prefault(u64, u64),
+        Map(u64, u64, u64),
+    }
+
+    struct DmaOps(Arc<parking_lot::Mutex<Vec<DmaStep>>>);
+
+    impl tdisp::host::SharedDma for DmaOps {
+        fn map(
+            &mut self,
+            mapping: tdisp::host::SharedMapping,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.0.lock().push(DmaStep::Map(
+                mapping.iova,
+                mapping.length,
+                mapping.file_offset,
+            ));
+            Ok(())
+        }
+
+        fn unmap(
+            &mut self,
+            iova: u64,
+            length: u64,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.0.lock().push(DmaStep::Unmap(iova, length));
+            Ok(())
+        }
+
+        fn prepare_private_memory(
+            &mut self,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.0.lock().push(DmaStep::Prepare);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn assignment_prefaults_only_all_supplied_ram_before_dma_readiness() {
+        let steps = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let slots = [range(0x1000, 0x3000), range(0x8000, 0xa000)];
+        prepare_private_assignment(&slots, &mut DmaOps(steps.clone()), |range| {
+            steps
+                .lock()
+                .push(DmaStep::Prefault(range.start(), range.len()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            *steps.lock(),
+            [
+                DmaStep::Prefault(0x1000, 0x2000),
+                DmaStep::Prefault(0x8000, 0x2000),
+                DmaStep::Prepare,
+            ]
+        );
+        steps.lock().clear();
+        assert!(
+            prepare_private_assignment(&slots, &mut DmaOps(steps.clone()), |_| {
+                Err(kvm::Error::MissingCapability("injected prefault failure"))
+            })
+            .is_err()
+        );
+        assert!(steps.lock().is_empty());
+        assert!(
+            prepare_private_assignment(&[], &mut DmaOps(steps.clone()), |_| panic!("empty RAM"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn assignment_conversion_uses_selector_and_packed_file_offsets_in_order() {
+        let steps = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let segments = [
+            KvmMemoryRangeSegment {
+                range: range(0x1000, 0x2000),
+                host_addr: std::ptr::null_mut(),
+                guest_memfd_offset: 0x7000,
+            },
+            KvmMemoryRangeSegment {
+                range: range(0x3000, 0x4000),
+                host_addr: std::ptr::null_mut(),
+                guest_memfd_offset: 0xa000,
+            },
+        ];
+        let file = Arc::new(File::open("/dev/null").unwrap());
+        let selector = 1 << 40;
+        for private in [true, false] {
+            steps.lock().clear();
+            convert_assignment_segments(
+                &segments,
+                private,
+                selector,
+                file.clone(),
+                &mut DmaOps(steps.clone()),
+                |attributes| {
+                    steps.lock().push(DmaStep::Attributes(
+                        attributes.offset,
+                        attributes.size,
+                        attributes.attributes != 0,
+                    ));
+                    Ok(())
+                },
+                |range| {
+                    steps
+                        .lock()
+                        .push(DmaStep::Prefault(range.start(), range.len()));
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let mut expected = Vec::new();
+            for segment in segments {
+                if private {
+                    expected.push(DmaStep::Unmap(
+                        selector | segment.range.start(),
+                        segment.range.len(),
+                    ));
+                }
+                expected.push(DmaStep::Attributes(
+                    segment.guest_memfd_offset,
+                    segment.range.len(),
+                    private,
+                ));
+                if private {
+                    expected.push(DmaStep::Prefault(
+                        segment.range.start(),
+                        segment.range.len(),
+                    ));
+                } else {
+                    expected.push(DmaStep::Map(
+                        selector | segment.range.start(),
+                        segment.range.len(),
+                        segment.guest_memfd_offset,
+                    ));
+                }
+            }
+            assert_eq!(*steps.lock(), expected);
+        }
+    }
+
+    #[test]
+    fn assignment_conversion_stops_after_failed_attributes_without_remapping() {
+        let steps = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let segment = KvmMemoryRangeSegment {
+            range: range(0x1000, 0x2000),
+            host_addr: std::ptr::null_mut(),
+            guest_memfd_offset: 0x7000,
+        };
+        for private in [true, false] {
+            steps.lock().clear();
+            assert!(
+                convert_assignment_segments(
+                    &[segment],
+                    private,
+                    1 << 40,
+                    Arc::new(File::open("/dev/null").unwrap()),
+                    &mut DmaOps(steps.clone()),
+                    |_| Err(kvm::Error::MissingCapability("partial conversion")),
+                    |_| panic!("prefault after failed attributes"),
+                )
+                .is_err()
+            );
+            if private {
+                assert_eq!(*steps.lock(), [DmaStep::Unmap((1 << 40) | 0x1000, 0x1000)]);
+            } else {
+                assert!(steps.lock().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn assignment_dma_and_prefault_failures_stop_the_transaction() {
+        struct RejectDma;
+        impl tdisp::host::SharedDma for RejectDma {
+            fn map(
+                &mut self,
+                _: tdisp::host::SharedMapping,
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                Err(std::io::Error::other("injected map failure").into())
+            }
+            fn unmap(
+                &mut self,
+                _: u64,
+                _: u64,
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                Err(std::io::Error::other("injected unmap failure").into())
+            }
+            fn prepare_private_memory(
+                &mut self,
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                Err(std::io::Error::other("injected readiness failure").into())
+            }
+        }
+        let segments = [
+            KvmMemoryRangeSegment {
+                range: range(0x1000, 0x2000),
+                host_addr: std::ptr::null_mut(),
+                guest_memfd_offset: 0,
+            },
+            KvmMemoryRangeSegment {
+                range: range(0x2000, 0x3000),
+                host_addr: std::ptr::null_mut(),
+                guest_memfd_offset: 0x1000,
+            },
+        ];
+        let file = Arc::new(File::open("/dev/null").unwrap());
+        assert!(
+            convert_assignment_segments(
+                &segments,
+                true,
+                1 << 40,
+                file.clone(),
+                &mut RejectDma,
+                |_| panic!("attributes after unmap failure"),
+                |_| panic!("prefault after unmap failure"),
+            )
+            .is_err()
+        );
+        let mut attributes = 0;
+        assert!(
+            convert_assignment_segments(
+                &segments,
+                false,
+                1 << 40,
+                file.clone(),
+                &mut RejectDma,
+                |_| {
+                    attributes += 1;
+                    Ok(())
+                },
+                |_| panic!("prefault shared RAM"),
+            )
+            .is_err()
+        );
+        assert_eq!(attributes, 1);
+        let steps = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        attributes = 0;
+        assert!(
+            convert_assignment_segments(
+                &segments,
+                true,
+                1 << 40,
+                file,
+                &mut DmaOps(steps.clone()),
+                |_| {
+                    attributes += 1;
+                    Ok(())
+                },
+                |_| Err(kvm::Error::MissingCapability(
+                    "injected private prefault failure"
+                )),
+            )
+            .is_err()
+        );
+        assert_eq!(attributes, 1);
+        assert_eq!(*steps.lock(), [DmaStep::Unmap((1 << 40) | 0x1000, 0x1000)]);
+    }
+
+    #[test]
+    fn assignment_conversion_rejects_alias_and_offset_overflow_before_dma() {
+        let steps = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        for (start, offset) in [(1 << 40, 0), (0x1000, u64::MAX - 0xfff)] {
+            let segment = KvmMemoryRangeSegment {
+                range: range(start, start + 0x1000),
+                host_addr: std::ptr::null_mut(),
+                guest_memfd_offset: offset,
+            };
+            assert!(
+                convert_assignment_segments(
+                    &[segment],
+                    true,
+                    1 << 40,
+                    Arc::new(File::open("/dev/null").unwrap()),
+                    &mut DmaOps(steps.clone()),
+                    |_| panic!("invalid conversion attributes"),
+                    |_| panic!("invalid conversion prefault"),
+                )
+                .is_err()
+            );
+        }
+        assert!(steps.lock().is_empty());
+    }
+
     fn shared_state(slots: Vec<MemoryRange>) -> parking_lot::Mutex<KvmMemoryRangeState> {
         let mut visibility = crate::cca_in_place::Visibility::all_private(slots.clone()).unwrap();
         for &slot in &slots {
@@ -1128,6 +1781,7 @@ mod tests {
                 })
                 .collect(),
             cca_visibility: visibility,
+            ..Default::default()
         })
     }
 
@@ -1412,6 +2066,9 @@ mod tests {
             ],
             ..Default::default()
         };
+        assert!(!state.assignment_prepared);
+        assert!(!state.assignment_frozen);
+        assert!(!state.protected_attempts.covers(range(0x1000, 0x2000)));
         assert_eq!(state.in_place_ram_slots(), [range(0x1000, 0x3000)]);
         state.cca_visibility =
             crate::cca_in_place::Visibility::all_private(state.in_place_ram_slots()).unwrap();

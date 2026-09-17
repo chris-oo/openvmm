@@ -212,7 +212,7 @@ pub struct KvmVpInner {
     eval: AtomicBool,
     vp_info: Aarch64VpInfo,
     #[inspect(skip)]
-    cca_fault: Mutex<crate::cca_in_place::FaultTracker>,
+    pub(crate) cca_fault: Mutex<crate::cca_in_place::FaultTracker>,
 }
 
 impl KvmVpInner {
@@ -509,6 +509,9 @@ impl virt::Processor for KvmProcessor<'_> {
         if let Err(error) = rhi_start {
             return Err(dev.fatal_error(error.into()));
         }
+        if let Err(error) = self.partition.prepare_assignment_memory().await {
+            return Err(dev.fatal_error(error.into()));
+        }
         loop {
             self.inner.needs_yield.maybe_yield().await;
             stop.check()?;
@@ -571,11 +574,20 @@ impl virt::Processor for KvmProcessor<'_> {
                         && source as i32 == libc::EFAULT =>
                     {
                         if self.partition.memory_backing_mode.is_in_place() {
-                            if let Err(err) = self.partition.handle_cca_in_place_memory_fault(
-                                &mut self.inner.cca_fault.lock(),
-                                crate::cca_in_place::Fault { gpa, size, flags },
-                                false,
-                            ) {
+                            let assignment = self.partition.rhi.lock().assignment_requested();
+                            let fault = crate::cca_in_place::Fault { gpa, size, flags };
+                            let result = if assignment {
+                                self.partition
+                                    .handle_cca_assignment_fault(self.vpindex.index(), fault, false)
+                                    .await
+                            } else {
+                                self.partition.handle_cca_in_place_memory_fault(
+                                    &mut self.inner.cca_fault.lock(),
+                                    fault,
+                                    false,
+                                )
+                            };
+                            if let Err(err) = result {
                                 return Err(dev.fatal_error(err.into()));
                             }
                             pending_exit = false;
@@ -612,11 +624,20 @@ impl virt::Processor for KvmProcessor<'_> {
                     kvm::Exit::MemoryFault { flags, gpa, size }
                         if self.partition.memory_backing_mode.is_in_place() =>
                     {
-                        if let Err(err) = self.partition.handle_cca_in_place_memory_fault(
-                            &mut self.inner.cca_fault.lock(),
-                            crate::cca_in_place::Fault { gpa, size, flags },
-                            true,
-                        ) {
+                        let assignment = self.partition.rhi.lock().assignment_requested();
+                        let fault = crate::cca_in_place::Fault { gpa, size, flags };
+                        let result = if assignment {
+                            self.partition
+                                .handle_cca_assignment_fault(self.vpindex.index(), fault, true)
+                                .await
+                        } else {
+                            self.partition.handle_cca_in_place_memory_fault(
+                                &mut self.inner.cca_fault.lock(),
+                                fault,
+                                true,
+                            )
+                        };
+                        if let Err(err) = result {
                             return Err(dev.fatal_error(err.into()));
                         }
                         pending_exit = false;
@@ -661,13 +682,10 @@ impl virt::Processor for KvmProcessor<'_> {
                             .map_err(|error| dev.fatal_error(error.into()))?;
                     }
                     kvm::Exit::ArmTio(mut tio) => {
-                        tio.reject();
-                        if self.partition.memory_backing_mode.is_in_place() {
-                            self.partition.mark_cca_fatal();
-                        }
-                        return Err(dev.fatal_error(
-                            KvmRunVpError::UnhandledExit(format!("ArmTio({tio:?})")).into(),
-                        ));
+                        self.partition
+                            .handle_tio(&mut tio)
+                            .await
+                            .map_err(|error| dev.fatal_error(error.into()))?;
                     }
                     kvm::Exit::MmioWrite { address, data } => {
                         dev.write_mmio(self.vpindex, self.partition.mmio_address(address), data)
@@ -1105,6 +1123,7 @@ impl virt::ProtoPartition for KvmProtoPartition<'_> {
         let partition = Arc::new(KvmPartitionInner {
             vfio_device: Mutex::new(None),
             rhi: Mutex::new(crate::rhi::Registry::default()),
+            cca_assignment_service: std::sync::OnceLock::new(),
             kvm: self.vm,
             memory: Default::default(),
             cca_launch_state: Mutex::new(crate::CcaLaunchState::NotStarted),

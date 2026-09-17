@@ -94,12 +94,30 @@ impl VfioVm for KvmVfioAssignment {
             .map_err(VfioVmError::new)
     }
 
+    #[cfg(guest_arch = "aarch64")]
+    fn requires_assignment_retention(&self) -> bool {
+        // Never use Weak::upgrade here: an expired service does not prove
+        // that DMA or uncertain protected mappings have been released.
+        self.partition.cca_assignment_service.get().is_some()
+    }
+
     fn add_file(&self, file: BorrowedFd<'_>) -> Result<(), VfioVmError> {
         KvmVfioAssignment::add_file(self, file).map_err(VfioVmError::new)
     }
 
     fn remove_file(&self, file: BorrowedFd<'_>) -> Result<(), VfioVmError> {
         KvmVfioAssignment::remove_file(self, file).map_err(VfioVmError::new)
+    }
+
+    #[cfg(guest_arch = "aarch64")]
+    fn register_assignment(
+        &self,
+        requester_id: u32,
+        service: std::sync::Weak<dyn tdisp::host::EvidenceService>,
+    ) -> Result<(), VfioVmError> {
+        self.partition
+            .register_rhi_assignment(requester_id, service)
+            .map_err(VfioVmError::new)
     }
 
     #[cfg(guest_arch = "aarch64")]

@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Evidence-only native RHI routing. Registration is explicit and pre-run.
+//! Native RHI routing. Registration and full assignment are explicit and pre-run.
 
 use kvm::arm_smccc::KVM_HYPERCALL_EXIT_16BIT_UAPI;
 use kvm::arm_smccc::KVM_HYPERCALL_EXIT_SMC_UAPI;
@@ -10,11 +10,14 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Weak;
 use std::sync::atomic::Ordering;
+use tdisp::host::ConfirmedState;
 use tdisp::host::EvidenceError;
 use tdisp::host::EvidenceService;
 use tdisp::host::EvidenceSink;
 use tdisp::host::MAX_OBJECT_SIZE;
+use tdisp::host::MeasurementRequest;
 use tdisp::host::Object;
+use tdisp::host::Regenerate;
 
 const NOT_SUPPORTED: u64 = u64::MAX;
 const SUCCESS: u64 = 0;
@@ -25,6 +28,100 @@ const DEVICE: u64 = 6;
 const INVALID_OFFSET: u64 = 7;
 const ACCESS_FAILED: u64 = 8;
 const EVIDENCE_FEATURES: u64 = (1 << 0) | (1 << 1);
+const ASSIGNMENT_FEATURES: u64 = EVIDENCE_FEATURES | (1 << 3) | (1 << 4) | (1 << 5);
+const MEASUREMENT_PARAMETER_SIZE: usize = 0x120;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MappingRequest {
+    pub(crate) rid: u32,
+    pub(crate) range: memory_range::MemoryRange,
+    pub(crate) pa: u64,
+}
+
+fn decode_mapping(
+    nr: u64,
+    flags: u64,
+    rid: u64,
+    base: u64,
+    top: u64,
+    pa: u64,
+    shared_bit: u64,
+) -> Result<MappingRequest, crate::cca_in_place::CcaInPlaceError> {
+    use crate::cca_in_place::CcaInPlaceError;
+    let invalid = || CcaInPlaceError::InvalidProtectedMapping;
+    if nr != 8 || flags != 0 {
+        return Err(invalid());
+    }
+    let length = top.checked_sub(base).ok_or_else(invalid)?;
+    let range = crate::cca_in_place::checked_range(base, length)?;
+    crate::cca_in_place::checked_range(pa, length)?;
+    if shared_bit < 4096 || !shared_bit.is_power_of_two() || top > shared_bit {
+        return Err(invalid());
+    }
+    Ok(MappingRequest {
+        rid: u32::try_from(rid).map_err(|_| invalid())?,
+        range,
+        pa,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssignmentRequest {
+    SetState { rid: u32, state: ConfirmedState },
+    InterfaceReport { rid: u32 },
+    Measurements { rid: u32, gpa: u64 },
+}
+
+fn decode_assignment(nr: u64, flags: u64, args: [u64; 7]) -> Result<AssignmentRequest, u64> {
+    if flags & !(KVM_HYPERCALL_EXIT_SMC_UAPI | KVM_HYPERCALL_EXIT_16BIT_UAPI) != 0 {
+        return Err(INPUT);
+    }
+    let function = RhiDaFunction(u32::try_from(nr).map_err(|_| NOT_SUPPORTED)?);
+    if !matches!(
+        function,
+        RhiDaFunction::VDEV_SET_TDI_STATE
+            | RhiDaFunction::VDEV_GET_INTERFACE_REPORT
+            | RhiDaFunction::VDEV_GET_MEASUREMENTS
+    ) {
+        return Err(NOT_SUPPORTED);
+    }
+    let rid = u32::try_from(args[0]).map_err(|_| INVALID_VDEV_ID)?;
+    match function {
+        RhiDaFunction::VDEV_SET_TDI_STATE => {
+            let state = match args[1] {
+                0 => ConfirmedState::Unlocked,
+                1 => ConfirmedState::Locked,
+                2 => ConfirmedState::Running,
+                _ => return Err(INPUT),
+            };
+            Ok(AssignmentRequest::SetState { rid, state })
+        }
+        RhiDaFunction::VDEV_GET_INTERFACE_REPORT => Ok(AssignmentRequest::InterfaceReport { rid }),
+        _ => {
+            let gpa = args[1];
+            gpa.checked_add(MEASUREMENT_PARAMETER_SIZE as u64)
+                .ok_or(INPUT)?;
+            Ok(AssignmentRequest::Measurements { rid, gpa })
+        }
+    }
+}
+
+fn measurement_parameters(
+    bytes: &[u8; MEASUREMENT_PARAMETER_SIZE],
+) -> Result<MeasurementRequest, u64> {
+    let mut flags = [0; 8];
+    flags.copy_from_slice(&bytes[..8]);
+    let flags = u64::from_le_bytes(flags);
+    if flags > 1 {
+        return Err(INPUT);
+    }
+    let mut nonce = [0; 32];
+    nonce.copy_from_slice(&bytes[0x100..]);
+    Ok(MeasurementRequest {
+        nonce,
+        raw: flags == 1,
+    })
+}
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RegistrationError {
@@ -41,6 +138,10 @@ pub(crate) enum RegistrationError {
     Expired,
     #[error("RHI filter setup failed; this VM cannot run")]
     Filters(#[source] kvm::Error),
+    #[error("only one full native assignment is supported per VM")]
+    MultipleAssignments,
+    #[error("the service does not implement native assignment")]
+    EvidenceOnly,
 }
 
 #[derive(Default)]
@@ -49,6 +150,8 @@ pub(crate) struct Registry {
     enabled: bool,
     failed: bool,
     devices: BTreeMap<u32, Weak<dyn EvidenceService>>,
+    assignment: Option<u32>,
+    assignment_ready: bool,
 }
 
 impl Registry {
@@ -93,6 +196,46 @@ impl Registry {
 
     fn lookup(&self, rid: u32) -> Option<Arc<dyn EvidenceService>> {
         self.devices.get(&rid).and_then(Weak::upgrade)
+    }
+
+    pub(crate) fn assignment_service(&self) -> Option<Arc<dyn EvidenceService>> {
+        self.assignment.and_then(|rid| self.lookup(rid))
+    }
+
+    pub(crate) fn assignment_requested(&self) -> bool {
+        self.assignment.is_some()
+    }
+
+    pub(crate) fn assignment_prepared(&mut self) {
+        self.assignment_ready = true;
+    }
+
+    fn full_features(&self) -> bool {
+        self.assignment_ready && self.enabled() && self.assignment_service().is_some()
+    }
+
+    fn register_assignment(
+        &mut self,
+        rid: u32,
+        service: Weak<dyn EvidenceService>,
+        install_filters: impl FnOnce() -> Result<(), kvm::Error>,
+    ) -> Result<(), RegistrationError> {
+        if self.started {
+            return Err(RegistrationError::Frozen);
+        }
+        if self.assignment.is_some() {
+            return Err(RegistrationError::MultipleAssignments);
+        }
+        if !service
+            .upgrade()
+            .ok_or(RegistrationError::Expired)?
+            .supports_assignment()
+        {
+            return Err(RegistrationError::EvidenceOnly);
+        }
+        self.register(rid, service, install_filters)?;
+        self.assignment = Some(rid);
+        Ok(())
     }
 }
 
@@ -200,6 +343,51 @@ fn service_error(error: EvidenceError) -> [u64; 4] {
     response(status, 0)
 }
 
+async fn dispatch_assignment(
+    request: AssignmentRequest,
+    lookup: impl FnOnce(u32) -> Option<Arc<dyn EvidenceService>>,
+    read: impl FnOnce(u64, &mut [u8]) -> Result<(), crate::memory::SharedBufferError>,
+) -> ([u64; 4], bool) {
+    let rid = match request {
+        AssignmentRequest::SetState { rid, .. }
+        | AssignmentRequest::InterfaceReport { rid }
+        | AssignmentRequest::Measurements { rid, .. } => rid,
+    };
+    let Some(service) = lookup(rid) else {
+        return (response(INVALID_VDEV_ID, 0), false);
+    };
+    let result = match request {
+        AssignmentRequest::SetState { state, .. } => service.set_state(state).await,
+        AssignmentRequest::InterfaceReport { .. } => {
+            service.regenerate(Regenerate::InterfaceReport).await
+        }
+        AssignmentRequest::Measurements { gpa, .. } => {
+            let mut bytes = [0; MEASUREMENT_PARAMETER_SIZE];
+            if let Err(error) = read(gpa, &mut bytes) {
+                tracelimit::warn_ratelimited!(
+                    error = &error as &dyn std::error::Error,
+                    "RHI measurement parameter read failed"
+                );
+                return (response(ACCESS_FAILED, 0), false);
+            }
+            let parameters = match measurement_parameters(&bytes) {
+                Ok(parameters) => parameters,
+                Err(status) => return (response(status, 0), false),
+            };
+            service
+                .regenerate(Regenerate::Measurements(parameters))
+                .await
+        }
+    };
+    match result {
+        Ok(()) => (response(SUCCESS, 0), false),
+        Err(error) => {
+            let fatal = matches!(error, EvidenceError::Device(_) | EvidenceError::Closed);
+            (service_error(error), fatal)
+        }
+    }
+}
+
 async fn dispatch(
     nr: u64,
     full_function: u64,
@@ -263,6 +451,77 @@ async fn dispatch(
 
 #[cfg(guest_arch = "aarch64")]
 impl crate::KvmPartitionInner {
+    pub(crate) async fn handle_tio(
+        self: &Arc<Self>,
+        tio: &mut kvm::arm::ArmTioExit<'_>,
+    ) -> Result<(), crate::KvmError> {
+        tio.reject();
+        let guard = RequestGuard::new(|| self.mark_cca_fatal());
+        let request = decode_mapping(
+            tio.nr.0,
+            tio.flags,
+            tio.vdev_id,
+            tio.gpa_base,
+            *tio.gpa_top,
+            tio.pa_base,
+            self.shared_gpa_bit
+                .ok_or(crate::KvmError::InvalidCcaMemoryFault)?,
+        )?;
+        let service = {
+            let registry = self.rhi.lock();
+            if !registry.full_features() || registry.assignment != Some(request.rid) {
+                return Err(EvidenceError::Unsupported.into());
+            }
+            registry.assignment_service().ok_or(EvidenceError::Closed)?
+        };
+        self.record_protected_attempt(request)?;
+        service
+            .assignment(tdisp::host::AssignmentOperation::ValidateMmio {
+                base: request.range.start(),
+                top: request.range.end(),
+                pa_base: request.pa,
+            })
+            .await?;
+        if self.cca_fatal.load(Ordering::Acquire) {
+            return Err(crate::cca_in_place::CcaInPlaceError::AmbiguousFault.into());
+        }
+        // Zero only permits KVM's independent RMM validation on re-entry.
+        // The attempted mapping remains retained, even after later exits.
+        *tio.gpa_top = request.range.end();
+        tio.accept()
+            .map_err(|_| crate::KvmError::InvalidCcaMemoryFault)?;
+        guard.complete(Ok(()))?;
+        Ok(())
+    }
+
+    pub(crate) fn register_rhi_assignment(
+        &self,
+        rid: u32,
+        service: Weak<dyn EvidenceService>,
+    ) -> Result<(), RegistrationError> {
+        if !self.memory_backing_mode.is_in_place()
+            || self.caps.isolation != virt::IsolationType::Cca
+        {
+            return Err(RegistrationError::Unsupported);
+        }
+        if self.cca_fatal.load(Ordering::Acquire) {
+            return Err(RegistrationError::Failed);
+        }
+        let mut registry = self.rhi.lock();
+        let result = registry
+            .register_assignment(rid, service.clone(), || self.kvm.set_arm_rhi_da_filters());
+        if registry.failed {
+            self.mark_cca_fatal();
+        }
+        result?;
+        // The OnceLock lets fatal paths close admission without acquiring the
+        // registry lock while holding the memory ledger or coordinator.
+        self.cca_assignment_service
+            .set(service)
+            .map_err(|_| RegistrationError::MultipleAssignments)?;
+        Ok(())
+    }
+
     pub(crate) fn register_rhi_evidence(
         &self,
         rid: u32,
@@ -295,6 +554,39 @@ impl crate::KvmPartitionInner {
         flags: u64,
         args: [u64; 7],
     ) -> [u64; 4] {
+        if nr != full_function {
+            return response(NOT_SUPPORTED, 0);
+        }
+        if self.rhi.lock().full_features() {
+            if nr == u64::from(RhiDaFunction::FEATURES.0) {
+                return match decode(nr, flags, args) {
+                    Ok(Request::Features) => response(ASSIGNMENT_FEATURES, 0),
+                    Err(status) => response(status, 0),
+                    _ => response(NOT_SUPPORTED, 0),
+                };
+            }
+            match decode_assignment(full_function, flags, args) {
+                Ok(request) => {
+                    let (result, fatal) = dispatch_assignment(
+                        request,
+                        |rid| {
+                            let registry = self.rhi.lock();
+                            (registry.assignment == Some(rid))
+                                .then(|| registry.lookup(rid))
+                                .flatten()
+                        },
+                        |gpa, data| self.read_rhi_shared(gpa, data),
+                    )
+                    .await;
+                    if fatal {
+                        self.mark_cca_fatal();
+                    }
+                    return result;
+                }
+                Err(NOT_SUPPORTED) => {}
+                Err(status) => return response(status, 0),
+            }
+        }
         struct Sink {
             partition: Arc<crate::KvmPartitionInner>,
             gpa: u64,

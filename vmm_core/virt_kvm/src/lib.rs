@@ -104,6 +104,9 @@ pub enum KvmError {
     #[cfg(guest_arch = "aarch64")]
     #[error("unsupported CCA memory fault flags: {0:#x}")]
     UnsupportedCcaMemoryFaultFlags(u64),
+    #[cfg(guest_arch = "aarch64")]
+    #[error("CCA device-assignment operation failed")]
+    CcaAssignment(#[from] tdisp::host::EvidenceError),
     #[error("misaligned gic base address")]
     Misaligned,
     #[error("host does not support GICv2 or GICv3")]
@@ -182,6 +185,9 @@ struct KvmPartitionInner {
     #[cfg(guest_arch = "aarch64")]
     #[inspect(skip)]
     rhi: Mutex<rhi::Registry>,
+    #[cfg(guest_arch = "aarch64")]
+    #[inspect(skip)]
+    cca_assignment_service: std::sync::OnceLock<std::sync::Weak<dyn tdisp::host::EvidenceService>>,
     memory: Mutex<KvmMemoryRangeState>,
     memory_backing_mode: KvmMemoryBackingMode,
     #[inspect(iter_by_index)]
@@ -302,6 +308,13 @@ impl KvmPartitionInner {
     #[cfg(guest_arch = "aarch64")]
     fn mark_cca_fatal(&self) {
         self.cca_fatal.store(true, Ordering::Release);
+        if let Some(service) = self
+            .cca_assignment_service
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+        {
+            service.close_admission();
+        }
         for vp in &self.vps {
             self.kvm.vp(vp.vp_info().base.vp_index.index()).force_exit();
         }
