@@ -311,22 +311,20 @@ fn cancelled_admitted_workers_execute_after_pool_queueing() {
     assert_eq!(model.lock().cleanups, 0);
     assert_eq!(budget.used(), 8);
     drop(teardown);
-    let mut retry = service.teardown();
-    assert!(poll(retry.as_mut()).is_pending());
     assert!(matches!(
         block_on(service.object_size(Object::Certificate)),
         Err(EvidenceError::Closed)
     ));
     resume.send(()).unwrap();
     block_on(blocker);
-    // Drive the registered retry before adding another waiter: its no-op
-    // waker would otherwise consume the mutex's first wake without polling.
-    block_on(retry).unwrap();
+    // Drain before creating a retry, so only the cancelled task can perform
+    // cleanup and no unpolled retry can consume the mutex's wake.
     let drained = block_on(service.owner.clone().lock_owned());
     assert_eq!(model.lock().cleanups, 1);
     assert_eq!(drained.state(), DeviceState::TornDown);
     assert_eq!(budget.used(), 0);
     drop(drained);
+    block_on(service.teardown()).unwrap();
     assert_eq!(model.lock().cleanups, 1);
 }
 
