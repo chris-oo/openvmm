@@ -87,6 +87,13 @@ impl KvmVfioAssignment {
 }
 
 impl VfioVm for KvmVfioAssignment {
+    #[cfg(guest_arch = "aarch64")]
+    fn check_interrupt_routes(&self) -> Result<(), VfioVmError> {
+        self.partition
+            .check_assignment_interrupt_routes()
+            .map_err(VfioVmError::new)
+    }
+
     fn add_file(&self, file: BorrowedFd<'_>) -> Result<(), VfioVmError> {
         KvmVfioAssignment::add_file(self, file).map_err(VfioVmError::new)
     }
