@@ -531,7 +531,10 @@ fn mutation_methods_do_not_issue_ioctls() {
     }
     for request in [
         Regenerate::InterfaceReport,
-        Regenerate::Measurements(MeasurementRequest { nonce: [0x41; 32] }),
+        Regenerate::Measurements(MeasurementRequest {
+            nonce: [0x41; 32],
+            raw: false,
+        }),
     ] {
         assert!(matches!(
             backend.regenerate(&request),

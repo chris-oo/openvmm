@@ -188,6 +188,7 @@ fn decode(nr: u64, flags: u64, args: [u64; 7]) -> Result<Request, u64> {
 
 fn service_error(error: EvidenceError) -> [u64; 4] {
     let status = match &error {
+        EvidenceError::Unsupported => NOT_SUPPORTED,
         EvidenceError::InvalidRange(_) => INVALID_OFFSET,
         EvidenceError::Access(_) => ACCESS_FAILED,
         EvidenceError::Device(_) | EvidenceError::Closed => DEVICE,

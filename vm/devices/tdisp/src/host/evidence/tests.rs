@@ -132,6 +132,25 @@ impl Backend for Fake {
     }
 }
 
+#[test]
+fn evidence_only_service_rejects_every_assignment_entry() {
+    let (service, model) = service(&SnapshotBudget::new(8));
+    assert!(!service.supports_assignment());
+    assert!(matches!(
+        block_on(service.set_state(ConfirmedState::Locked)),
+        Err(EvidenceError::Unsupported)
+    ));
+    assert!(matches!(
+        block_on(service.regenerate(Regenerate::InterfaceReport)),
+        Err(EvidenceError::Unsupported)
+    ));
+    assert!(matches!(
+        block_on(service.assignment(AssignmentOperation::PreparePrivateMemory)),
+        Err(EvidenceError::Unsupported)
+    ));
+    assert_eq!(model.lock().reads, 0);
+}
+
 fn service(budget: &SnapshotBudget) -> (Arc<Service<Fake>>, Arc<SyncMutex<Model>>) {
     let model = Arc::new(SyncMutex::new(Model {
         size: 8,
@@ -140,6 +159,7 @@ fn service(budget: &SnapshotBudget) -> (Arc<Service<Fake>>, Arc<SyncMutex<Model>
     let coordinator = Coordinator::new(Fake(model.clone()), budget.clone()).unwrap();
     (
         Arc::new(Service {
+            assignment: false,
             owner: Arc::new(Mutex::new(coordinator)),
             closed: AtomicBool::new(false),
         }),
@@ -170,6 +190,38 @@ impl EvidenceSink for Sink {
 
 fn poll<F: Future + ?Sized>(future: Pin<&mut F>) -> Poll<F::Output> {
     future.poll(&mut Context::from_waker(Waker::noop()))
+}
+
+#[test]
+fn synchronous_close_does_not_lock_coordinator_and_rejects_queued_mutations() {
+    let (mut service, model) = service(&SnapshotBudget::new(8));
+    Arc::get_mut(&mut service).unwrap().assignment = true;
+    let owner = block_on(service.owner.clone().lock_owned());
+    let mut queued = service.set_state(ConfirmedState::Locked);
+    assert!(poll(queued.as_mut()).is_pending());
+
+    let (sent, received) = mpsc::channel();
+    let closer = service.clone();
+    let thread = std::thread::spawn(move || {
+        closer.close_admission();
+        sent.send(()).unwrap();
+    });
+    received
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("synchronous admission close must not wait for the coordinator");
+    thread.join().unwrap();
+    assert!(service.closed.load(Ordering::SeqCst));
+    assert!(matches!(
+        block_on(service.object_size(Object::Certificate)),
+        Err(EvidenceError::Closed)
+    ));
+
+    drop(owner);
+    assert!(matches!(block_on(queued), Err(EvidenceError::Closed)));
+    let model = model.lock();
+    assert_eq!(model.sizes, 0);
+    assert_eq!(model.reads, 0);
+    assert_eq!(model.cleanups, 0);
 }
 
 #[test]

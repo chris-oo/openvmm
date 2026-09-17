@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Transport-independent host device coordination and asynchronous evidence.
+//! Transport-independent host coordination, evidence, and native assignment.
 //!
 //! This module does not implement a Linux backend, guest transport, attestation
 //! verification, or an access gate. Adding it does not enable LOCK or RUN on
@@ -23,8 +23,8 @@
 //! retain any resources needed to contain a quarantined device.
 //!
 //! [`Coordinator::into_evidence_service`](crate::host::Coordinator::into_evidence_service)
-//! consumes the coordinator to provide
-//! bounded blocking-pool execution for evidence and explicit teardown only.
+//! consumes the coordinator for bounded blocking-pool execution. Assignment
+//! operations remain unavailable unless the backend explicitly implements them.
 
 mod evidence;
 
@@ -90,11 +90,98 @@ impl Object {
 
 /// Owned measurement input. Guest layout and flag decoding belong in adapters.
 ///
-/// No optional measurement flags are implemented by this core.
+/// The raw/hash choice has native meaning, not a protobuf wire discriminant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeasurementRequest {
     /// Challenge bytes, copied from validated guest memory by the adapter.
     pub nonce: [u8; 32],
+    /// Request raw measurements (format 1), rather than hashes (format 0).
+    pub raw: bool,
+}
+
+/// Shared RAM backing retained until an acknowledged IOAS unmap.
+#[derive(Clone, Debug)]
+pub struct SharedMapping {
+    /// The VM's coherent shared backing, not a replacement RAM allocation.
+    pub file: Arc<std::fs::File>,
+    /// Offset in the backing file.
+    pub file_offset: u64,
+    /// Shared device-visible address, including the negotiated IPA selector.
+    pub iova: u64,
+    /// Page-aligned mapping length.
+    pub length: u64,
+}
+
+/// DMA access borrowed from an already admitted assignment owner.
+///
+/// These calls must not acquire coordinator admission again. A failed call
+/// quarantines access even if the RAM work subsequently returns success.
+pub trait SharedDma {
+    /// Map coherent shared backing and retain its ownership through unmap.
+    fn map(
+        &mut self,
+        mapping: SharedMapping,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    /// Withdraw a fully tracked device-visible interval before making it private.
+    fn unmap(
+        &mut self,
+        iova: u64,
+        length: u64,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    /// Confirm initial private import and prefault completed while the IOAS was empty.
+    fn prepare_private_memory(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+}
+
+/// One complete host-owned RAM conversion or initial preparation operation.
+///
+/// Runs synchronously on the assignment's blocking worker, with coordinator
+/// admission and the frontend access gate already held. Obtain the VM memory
+/// ledger only inside this call: the lock order is device, then memory.
+/// Never call the device's asynchronous service from this method.
+pub trait RamWork: Send + Sync {
+    /// Complete all DMA withdrawal, backing conversion and prefault/mapping work.
+    fn run(&self, dma: &mut dyn SharedDma) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+}
+
+/// Assignment changes serialized with evidence and state transitions.
+pub enum AssignmentOperation {
+    /// Execute a complete RAM operation under one coordinator admission.
+    ConvertRam(Arc<dyn RamWork>),
+    /// Revoke access after an external conversion or completion failure.
+    ///
+    /// This deliberately returns an error and leaves the coordinator quarantined.
+    Quarantine,
+    /// Stage protected device memory using only tracked BAR address translation.
+    ///
+    /// Success permits subsequent kernel/RMM validation; it is not proof that
+    /// the guest accepted the mapping. Some kernels mask partial-map failures.
+    ValidateMmio {
+        /// First guest address.
+        base: u64,
+        /// Exclusive upper guest address.
+        top: u64,
+        /// Host address requested by the kernel/RMM exit. The backend must
+        /// compare it with its fixed BAR translation before issuing a request.
+        pa_base: u64,
+    },
+    /// Record a kernel-completed DEV-to-EMPTY invalidation.
+    InvalidateMmio {
+        /// First guest address.
+        base: u64,
+        /// Exclusive upper guest address.
+        top: u64,
+    },
+    /// Acknowledge initial private import before admitting shared IOAS mappings.
+    PreparePrivateMemory,
+    /// Add shared RAM; retain its backing through unmap.
+    MapShared(SharedMapping),
+    /// Withdraw a complete tracked shared interval.
+    UnmapShared {
+        /// First device-visible address.
+        iova: u64,
+        /// Mapping length.
+        length: u64,
+    },
 }
 
 /// Supported regeneration requests. Other objects cannot be regenerated here.
@@ -109,6 +196,8 @@ pub enum Regenerate {
 /// Mutation recorded in the latest transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mutation {
+    /// Change assignment mappings or acknowledge private-memory preparation.
+    Assignment,
     /// Change the confirmed interface state.
     SetState(ConfirmedState),
     /// Regenerate an interface report.
@@ -145,6 +234,23 @@ pub struct Transition {
 pub trait Backend {
     /// Typed platform failure, retained as the error source.
     type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Check containment failures recorded by a synchronized frontend.
+    ///
+    /// This must not issue a mutation or clear an earlier failure.
+    fn check_access(&self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// Whether this backend implements native assignment operations.
+    fn supports_assignment(&self) -> bool {
+        false
+    }
+
+    /// Perform an assignment change. `None` means unsupported without mutation.
+    fn assignment(&mut self, _operation: AssignmentOperation) -> Option<Result<(), Self::Error>> {
+        None
+    }
 
     /// Query the initial confirmed state without modifying it.
     fn state(&mut self) -> Result<ConfirmedState, Self::Error>;
@@ -289,6 +395,9 @@ pub enum SnapshotError {
 /// Native coordinator failure. No variant represents successful completion.
 #[derive(Debug, thiserror::Error)]
 pub enum Error<E: std::error::Error + 'static> {
+    /// This owner does not implement native assignment operations.
+    #[error("native assignment operation is unsupported")]
+    Unsupported,
     /// A request was rejected locally without issuing any mutation.
     #[error("operation is not allowed in state {state:?}")]
     InvalidState {
@@ -328,6 +437,27 @@ pub struct Coordinator<B: Backend> {
 }
 
 impl<B: Backend> Coordinator<B> {
+    /// Whether the exclusively owned backend supports native assignment.
+    pub fn supports_assignment(&self) -> bool {
+        self.backend.supports_assignment()
+    }
+
+    /// Serialize a mapping change with the same quarantine and snapshot policy.
+    pub fn assignment(&mut self, operation: AssignmentOperation) -> Result<(), Error<B::Error>> {
+        let state = self.confirmed()?;
+        if !self.backend.supports_assignment() {
+            return Err(Error::Unsupported);
+        }
+        self.mutate(
+            Mutation::Assignment,
+            DeviceState::Confirmed(state),
+            |backend| {
+                backend
+                    .assignment(operation)
+                    .expect("assignment-capable backend implements assignment operations")
+            },
+        )
+    }
     /// Take exclusive backend ownership and query its initial confirmed state.
     ///
     /// Failure drops the backend without implicit teardown. The assignment owner
@@ -353,7 +483,14 @@ impl<B: Backend> Coordinator<B> {
         self.last_transition
     }
 
-    fn confirmed(&self) -> Result<ConfirmedState, Error<B::Error>> {
+    fn confirmed(&mut self) -> Result<ConfirmedState, Error<B::Error>> {
+        if let DeviceState::Confirmed(last_confirmed) = self.state {
+            if let Err(error) = self.backend.check_access() {
+                self.invalidate();
+                self.state = DeviceState::Quarantined { last_confirmed };
+                return Err(Error::Backend(error));
+            }
+        }
         match self.state {
             DeviceState::Confirmed(state) => Ok(state),
             state => Err(Error::InvalidState { state }),
@@ -457,6 +594,10 @@ impl<B: Backend> Coordinator<B> {
                 Ok(snapshot) => self.snapshots[index] = Some(snapshot),
                 Err(error) => {
                     self.invalidate();
+                    // A synchronized physical frontend can latch containment
+                    // failure during a read. Preserve the original read error,
+                    // but reflect that quarantine before releasing admission.
+                    let _ = self.confirmed();
                     return Err(error);
                 }
             }
