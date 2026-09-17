@@ -2,7 +2,7 @@
 
 Date: 2026-09-11
 
-Updated: 2026-09-17
+Updated: 2026-09-18
 
 Status: **native OpenVMM TDISP LOCK/RUN and a 64 MiB AHCI read are demonstrated
 on FVP with the unchanged kvmtool reference guest.** The read matched the
@@ -11,6 +11,12 @@ this is a successful protocol/I/O milestone, not clean-lifecycle qualification.
 The execution implementation and tests have now been split into reviewed,
 validated commits. The provisional shutdown hold is retained separately as
 an unapproved deferred change.
+
+**Current implementation priority: share the host-side TDISP infrastructure
+with microsoft/openvmm#4416.** The rebase is complete; the refactor is not.
+Section 4 is the authoritative design and commit sequence for that work.
+The original bring-up stages elsewhere in this document remain context and
+qualification history, not instructions to repeat the rebase or implementation.
 
 The guest_memfd in-place Virtio tests also pass on FVP. In-place QEMU debugging,
 OpenVMM private-buffer DMA measurement, negative isolation controls, teardown
@@ -47,6 +53,24 @@ resource selects the native assignment, access and memory-coordination path;
 removing the ordinary resource guard is not the implementation.
 
 ### Current milestone and remaining review
+
+The rebased `cca-kvm-tdisp` baseline is change ID `tkorwyzw`, above merge
+`tmqyvsty` and MPIDR fix `vvutrqnt`. Conflict repairs were squashed into their
+owning changes. The final tree passed 609 host unit tests and 71 Arm KVM tests.
+The full FVP rerun reproduced LOCK/RUN, the original 64 MiB read/hash and
+132 AHCI MSI-X interrupts, then failed at the existing UNLOCK guard and
+cleanup. The shared-core refactor must preserve this milestone without
+claiming a full lifecycle pass.
+
+```text
+Invocation: single-boot-3788265-1789703740648468672
+FVP: 5cc6553999afe3350aba6fd08580b9a1fa9b0ffb879157b87bdabc4db4412891
+nextest: 1f3af87c-fee9-4359-86cb-b0e78714760d
+Evidence: vmm_test_results/cca-tdisp-rebased-stack/fvp-single-boot-runs/
+          single-boot-3788265-1789703740648468672/
+```
+
+The following split records describe the completed original implementation.
 
 The fifth unchanged-guest trial reached native Locked and Run states, reprobed
 AHCI at `0000:01:00.0`, and completed the original initrd's 64 MiB direct-read
@@ -587,12 +611,13 @@ it is not implemented as ordinary OpenVMM MMIO emulation. [K3-K5]
 
 ## 4. Integrating with `vm/devices/tdisp`
 
-### What it does today
+### Current rebased infrastructure
 
 `TdispHostDeviceInterface` supplies negotiate, bind, start, unbind, and report
-callbacks. `TdispHostDeviceTargetEmulator` accepts `GuestToHostCommand` and
+callbacks, plus the PR's MMIO Block/Unblock hook.
+`TdispHostDeviceTargetEmulator` accepts `GuestToHostCommand` and
 uses `TdispHostStateMachine` to call those callbacks. VPCI deserializes a
-protobuf message, obtains `ChipsetDevice::supports_tdisp()`, and dispatches
+protobuf message, obtains `ChipsetDevice::supports_tdisp_host()`, and dispatches
 it. Synthetic NVMe can provide that interface. OpenHCL has a matching client.
 [O1-O2]
 
@@ -611,20 +636,20 @@ The current state machine also:
 - Has no physical-device quarantine state for an operation whose outcome is
   unknown. [O1]
 
-These are reasons to preserve the existing emulator's behavior, not to make
-the Linux guest pretend to negotiate an OpenHCL protocol.
+The successful flows and intentional invalid-command cleanup policy must
+remain compatible. Failed mutations need explicit uncertainty handling.
+Do not make the Linux guest pretend to negotiate an OpenHCL protocol.
 
-### Proposed split
+### Implemented additive baseline
 
-Add a transport-independent host module under `vm/devices/tdisp`, with native
-operation types and lifecycle bookkeeping. The exact Rust names below are
-proposals:
+The original implementation added a separate native host module under
+`vm/devices/tdisp`. These pieces now exist:
 
-| Proposed piece | Responsibility |
+| Existing piece | Responsibility |
 |---|---|
 | `tdisp::host::DeviceState` / transition helper | Confirmed device state, transition-in-progress, quarantined outcome, transition history |
 | Native object/request types | Object identity, read offset/length, regeneration flags/nonce; no raw user pointers |
-| `vfio_assigned_device::cca` coordinator | Own the per-device state, access gate, stable guest identity, IOMMUFD binding and backend operations |
+| `vfio_assigned_device::realm::tdisp` backend and assignment owner | Own the access gate, stable guest identity, IOMMUFD binding and backend operations |
 | `virt_kvm` RHI adapter | Decode Arm registers and shared buffers; translate native results to RHI |
 | Existing protobuf/VPCI adapter | Remains the OpenHCL/synthetic-device frontend |
 
@@ -633,13 +658,10 @@ validation. Do not create a separate TDISP state machine inside each exit
 handler. Keep Linux ioctl code in `vfio_sys`/the VFIO backend, not in `tdisp`.
 Keep Arm calling-convention code out of the generic device crate.
 
-Initially leave `TdispHostDeviceTargetEmulator` and its tests intact. Reuse its
-state vocabulary and report support through explicit conversions. Extract
-small shared transition predicates where their semantics truly match. A later
-migration of the legacy emulator to the new core must preserve its existing
-wire results and invalid-request behavior; it is not a prerequisite for CCA.
-This additive approach avoids changing OpenHCL behavior to fit a different
-transport.
+The additive approach deliberately left the legacy emulator unchanged.
+That was sufficient for CCA bring-up, but is **not the next implementation
+direction**: the plan below replaces both independent lifecycle engines with
+one shared implementation and retains thin transport/backend facades.
 
 `tdisp::devicereport` is useful for reading interface-report ranges for
 diagnostics/access policy. Before using it for host access decisions, add
@@ -681,6 +703,282 @@ cleanup where release is allowed. A failed teardown retains the assignment.
 The later full-assignment service adds native state, regeneration, MMIO and
 serialized RAM operations behind the frontend access gate. That path has now
 demonstrated LOCK/RUN and I/O; its UNLOCK/release restrictions remain open.
+
+### Shared host refactor: current implementation plan
+
+This section supersedes the earlier proposal to leave the two engines
+separate. The background analysis is in
+[findings-cca-tdisp-pr4416-reuse.md](findings-cca-tdisp-pr4416-reuse.md);
+implementation decisions, sequencing and acceptance gates live here.
+
+The PR's `VpciClientTdispState` and OpenHCL resource-validator hooks are
+**guest-consumer** machinery. Our CCA OpenVMM instance is the **host**.
+Do not move guest/RMM acceptance into the untrusted host or replace native
+RHI with a VPCI client. Share the host engine beneath the two host facades.
+
+```text
+OpenHCL consumer                         Unchanged Linux Realm guest
+  | VPCI/protobuf                         | RHI
+  v                                       v
+VPCI protocol facade                    virt_kvm adapter
+TdispHostStateMachine                   EvidenceService worker
+  |                                     Coordinator<B> facade
+  +----------- shared Lifecycle engine --------+
+               confirmed state + health
+               transition legality/commit
+               mutation failure/quarantine
+               bounded transition history
+                        |
+              facade-owned backend
+              /                  \
+Emulator callbacks + MMIO gate    RealmDevice + AccessGate
+                                 Linux TSM/IOMMUFD
+                                 ^
+                                 KVM TIO and whole RAM work enter
+                                 through the same native service
+```
+
+Each device has one authoritative owner. This shares an implementation, not
+one runtime instance between unrelated VPCI and CCA devices. Simultaneously
+exposing both protocols for a physical assignment is not proposed.
+
+#### State and ownership extraction
+
+Add `tdisp/src/host/lifecycle.rs` with a shared `Lifecycle` engine (proposed
+name). Move the native confirmed-state, health and transition types there,
+with re-exports from `tdisp::host` to avoid widespread caller renames.
+The engine owns authoritative state, mutation outcomes and bounded history.
+It must not depend on protobuf, Linux handles, guest buffers, VTLs or reports.
+
+Move the actual transition tables and mutation commit/error handling from
+**both** implementations into it. Use a scoped synchronous transaction:
+reject invalid requests before invoking work, mark uncertain state before
+backend mutation, and commit confirmed state only after successful completion.
+Error or unwind retains quarantine. No public unchecked state setter or
+backend accessor may bypass this path.
+
+`host::Coordinator<B>` remains the native backend/evidence facade, but loses
+its independent state updates, transition table and `mutate` implementation.
+It retains snapshots, the shared VM budget and native request types.
+`TdispHostStateMachine` becomes the VPCI compatibility facade with the same
+engine, callback handle, negotiation and bounded reason metadata. Move that
+protocol code to `tdisp/src/vpci.rs`, keeping root re-exports and public target
+names. Remove its independent `current_state`, `is_valid_state_transition`
+and `transition_state_to`; `state()` becomes an engine projection.
+`TdispHostDeviceTargetEmulator` only dispatches and formats replies. [S1-S2]
+
+Sharing only an enum or legality helper is insufficient. Both facades must
+use the same commit, quarantine admission, failure and history implementation.
+Protocol reason history remains diagnostic, not a second lifecycle authority.
+
+#### Operation contract
+
+Do not collapse strict native state requests and idempotent VPCI Unbind into
+one permissive state setter:
+
+| Operation | Allowed healthy state | Successful outcome |
+|---|---|---|
+| Native LOCK / VPCI Bind | Unlocked | Locked |
+| Native RUN / VPCI Start | Locked | Running |
+| Native UNLOCK | Locked or Running | Unlocked |
+| VPCI Unbind, including compatibility cleanup | Unlocked, Locked or Running | Unlocked; call backend even when already Unlocked |
+| Native evidence regeneration | Locked or Running | Same state; invalidate snapshots |
+| VPCI MMIO notification | Locked or Running | Same state |
+| Native assignment/RAM work | Confirmed state and existing backend preconditions | Same state |
+| Native reset | Confirmed state; preserve the existing backend invocation | Unlocked on success; backend error quarantines |
+| Owner teardown | Confirmed or quarantined | TornDown only after acknowledged cleanup |
+
+VPCI Unbind must leave a healthy device available for another Bind; it is not
+terminal native assignment destruction. Repeated native state requests remain
+invalid. Do not repurpose the emulator's currently no-op `reset()` as recovery.
+Negotiation is VPCI policy, not a prerequisite for RHI.
+Keep capability/input rejection before mutation wherever support is known.
+Once a backend mutation is invoked, an error remains potentially committed,
+including a backend validation error; do not infer safety from errno. [S1-S3]
+
+**Reset decision:** preserve the existing invoked-reset failure behavior, not
+add a reset-capability API in this refactor. `Backend` has no
+`supports_reset()` query, and the Realm backend returns `MutationsDisabled`
+from its reset callback. Thus reset on a healthy Realm coordinator still
+invokes that callback once, invalidates snapshots, records the attempted
+transition and quarantines on failure. This is not a preflight Unsupported
+rejection. Test callback count, cache/budget release, last-confirmed state and
+transition history explicitly. Do not expose a new RHI reset operation or
+clear uncertainty through reset. [S2, S8-S9]
+
+#### Concrete wire and error policy
+
+The existing protobuf `Uninitialized = 0` already means uninitialized **or
+indeterminate**. Use it for unconfirmed host state, with the existing failure
+code; do not add a CCA protocol tag or invent a new healthy wire state. [S4]
+
+| Situation | VPCI response | Native behavior |
+|---|---|---|
+| Successful transition | Success and confirmed before/after states | Existing RHI success |
+| Decode/capability rejection before mutation | Existing error; healthy state unchanged | Existing input/unsupported status; no work |
+| Invalid healthy Bind/Start or state-gated report | Explicit Unbind, then existing invalid-state/report error; after=Unlocked only if cleanup succeeds | Reject invalid transitions without effects |
+| Invalid/wrong-state MMIO request | Existing error; no implicit Unbind | Keep native checks separate |
+| Backend mutation or implicit cleanup fails | HostFailedToProcessCommand; after=Uninitialized; retain quarantine | Existing device error/fatal-guest handling |
+| Pure report read fails | HostFailedToProcessCommand; retain healthy state unless containment failed | Preserve snapshot/access error semantics |
+| Guest request while quarantined | Error, before/after=Uninitialized; no guest recovery | Existing quarantined/closed behavior |
+
+On the first uncertain failure, `tdi_state_before` can contain its prior
+confirmed value. Never project last-confirmed state as the current state
+after failure. TornDown is not a successfully Unlocked live device.
+Cleanup failure takes precedence over an earlier invalid-command error.
+
+Golden-wire tests must pin validation order and response body shape.
+GuestDeviceId is readable while Unlocked; report enum validation versus
+state checks affects implicit cleanup. A recognized `Unknown` Unbind reason
+still invokes cleanup, unlike an unrecognized numeric enum.
+
+The actual VPCI client caches `tdi_state_after` **before** checking the result.
+Test that Uninitialized plus failure yields that cache value and an error,
+never acceptance. Preserve the existing explicit fatal cleanup policy rather
+than hiding failure to continue. This intentionally changes failed-mutation
+semantics; host/client fault tests and review gate the migration. Successful
+wire behavior stays compatible. [S3-S5]
+
+#### Access revocation is part of the contract
+
+Quarantine bookkeeping does not itself revoke BAR or DMA access. Retain native
+`AccessGate` denial, checked IRQ errors, attempted-map ledgers and physical
+ownership. Do not replace them with report-based isolation classification.
+
+For emulated backends, use an independently shared denial latch alongside
+the `TdispMmioRanges` range set, not a callback that must reacquire the device
+mutex during unwinding. An admitted mutation owns an access permit: entry
+temporarily denies access, success restores eligibility under the ordinary
+range rules, and error/unwind latches quarantine. Implement the permit with
+local atomic state (healthy/in-flight/quarantined); Drop performs no locks,
+Unbind or I/O. A successful completion must not overwrite a separately
+latched quarantine. Only a new device owner can reset a quarantined latch.
+The latch projects access denial, not a second authoritative TDI state.
+
+**Coverage decision:** quarantine denies every emulated controller MMIO read
+and write, including BAR4 MSI-X, not just BAR0. Healthy shared MSI-X access
+still bypasses TDI acceptance as before. Today BAR4 bypasses the range-set
+check, so wire the denial latch into both MMIO dispatch paths before they
+reach registers or MSI-X state. Do not turn healthy Unbind into sticky
+quarantine: clearing the normal range set must still allow a later Bind.
+This latch does not itself prove DMA withdrawal; native DMA and physical
+mapping containment remain backend responsibilities. [S6-S7]
+
+Land the latch, transaction permit and all gate consumers together in step 3.
+Test callbacks that change access and then either return an error or panic,
+followed by actual BAR0 and BAR4 reads/writes. Re-negotiation, reset and later
+Unblock must not reopen quarantine; healthy Unbind/rebind must work.
+Resource-free mocks implement the containment contract explicitly, not through
+a silent success default. Audit aliases so no callback can issue lifecycle
+mutations outside its owner.
+
+If revocation cannot prove physical release, keep quarantine and custody.
+The refactor does not supply the missing CCA protected-map acknowledgement.
+
+#### Evidence and execution remain role-specific
+
+Keep native size/read/regenerate/VCA handling, snapshots and VM-wide budget.
+Legacy report callbacks already return `Vec<u8>`; do not manufacture an
+object-size API by fetching once for size and again for data. That would
+change coherence, allocation and failure behavior. Both facades use common
+healthy-state/transaction checks, but VPCI keeps fresh whole-report retrieval
+and metadata rules. GuestDeviceId/IsRegistered are not native VCA evidence.
+No new legacy cache or wire fragmentation is needed. [S1-S2]
+
+An invalid local request must not invalidate native snapshots. An admitted
+mutation invalidates them before backend work. Preserve post-read
+access-health checks and the original diagnostic source on failure.
+
+Keep `EvidenceService` and its mutex owning the whole native coordinator.
+One admission spans the entire `RamWork::run`: DMA withdrawal, KVM memory
+changes, prefault/mapping and failure handling. Keep device-before-memory
+lock order, weak KVM routes, strong assignment ownership, and no service
+re-entry from admitted work. Cancellation retains worker/owner/sink;
+ambiguous completion prevents guest continuation. Teardown closes admission
+before draining it. The synchronous VPCI facade must not wait on this async
+service while holding its device lock. [S8-S9]
+
+#### Reviewable implementation sequence
+
+Create new changes above the qualified rebased baseline. Do not rewrite the
+repaired stack again or replay its completed bring-up work.
+
+| Step | Change and primary files | Exit gate |
+|---|---|---|
+| 1. Characterize contracts | `tdisp/src/tests/{statemachine,endtoend,serialize}_tests.rs`, `host/tests.rs`, VPCI client mocks | Pin success, validation order, callback counts and strict-native versus idempotent-VPCI behavior. Add before/after-effect fault controls. New failure expectations land with implementation, not as a failing intermediate commit. |
+| 2. Extract engine and migrate native facade | Add `host/lifecycle.rs`; change `host.rs`; retain `host/evidence.rs` ownership | Native transition, snapshot, cancellation and RAM tests remain valid; no platform dependencies added. |
+| 3. Migrate VPCI host facade and gates atomically | `tdisp/src/vpci.rs`, root re-exports, common-engine delegation, error projection, emulator denial latch/permit and all MMIO consumers | Both facades share one engine; remove superseded state logic; callback/error matrix and BAR0/BAR4 error/unwind containment tests pass. Include required mock and constructor edits here. |
+| 4. Prove consumer/client behavior | `tdisp` helpers/mocks, NVMe integration tests, `vpci_relay` mocks/tests, focused `vpci_client` tests | Healthy rebind works, client rejects uncertainty, deferred config ordering remains. No intermediate commit may leave a gate consumer unwired. |
+| 5. Audit native integration and remove dead code | VFIO resolver/backend, KVM RHI/TIO/memory, worker ownership | Keep one native owner and the complete transaction boundary; change callsites only when required. |
+| 6. Runtime qualification | Existing Flowey runners and original inputs | Preserve v15 QEMU/FVP boot and the native TDISP LOCK/RUN/read milestone; report cleanup separately. |
+
+The native backend need not implement the legacy `TdispHostDeviceInterface`
+merely to share the engine. Keep TSM encoding, RHI calling conventions and
+VFIO allocation lifetimes unchanged unless a specific integration need is
+identified. Do not generalize the OpenHCL guest resource-validator trait into
+a host backend. Report-classification sharing needs real CCA fixtures and is
+not a prerequisite for this refactor.
+
+#### Required validation
+
+Run existing package tests, including the actual VPCI client/relay and NVMe
+gate, not just the extracted engine:
+
+```bash
+cargo nextest run --profile agent \
+  -p tdisp -p nvme_test -p vpci -p vpci_client -p vpci_relay -p openhcl_tdisp
+cargo nextest run --profile agent \
+  -p vfio_sys -p vfio_assigned_device -p virt_kvm -p openvmm_core -p petri
+```
+
+Run Arm KVM unit tests through the existing user-mode runner. Check/clippy
+native and Arm consumers, run rustdoc, then full formatting before each
+implementation commit.
+
+Require assertions that both facades use the same engine, matching legal
+requests invoke one backend operation, and no adapter keeps an independent
+authoritative lifecycle. Test idempotent VPCI Unbind, strict native repeats,
+wire validation order, post-effect failure, Uninitialized/error replies,
+access denial, original error propagation and terminal owner teardown.
+Query, reset and re-negotiation must not clear quarantine.
+
+Retain snapshot bounds/byte identity and the native cancellation tests.
+Attempt concurrent teardown during queued and running whole-RAM work;
+neither individual DMA callbacks nor error handling may release admission
+early. Unsupported requests known before mutation must have no effects.
+
+Run the final FVP command after other nextest processes exit, because
+Flowey's installer can otherwise hit `ETXTBSY`:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 INCUBATOR_TIMEOUT=1800 \
+cargo xflowey vmm-tests-run \
+  --target linux-aarch64-musl \
+  --incubator petri/incubator/profiles/aarch64-fvp-cca-realm-vfio.toml \
+  --fvp-platform-root "$PWD/.packages/cca-tdisp-runtime" \
+  --shrinkwrap-package-root "$PWD/.packages/cca-tdisp-runtime/package" \
+  --cca-in-place-payload-root "$PWD/.packages/cca-tdisp-runtime/host-payload" \
+  --cca-tdisp-guest-root "$PWD/.packages/cca-tdisp-runtime/guest-payload" \
+  --dir "$PWD/vmm_test_results/cca-tdisp-shared-core" \
+  --fvp-single-test \
+  aarch64_exclusive::tdisp_ahci::openvmm_linux_aarch64_boot_linux_direct_cca_tdisp_ahci
+```
+
+Require fresh host-confirmed Locked/Run, ordered guest markers and the
+full 64 MiB hash
+`281e519df3077b557c6b03f5da83c4e8d397219259615dd7c3308f89cae8f2a6`.
+Record interrupts, native JUnit, UNLOCK, fixture/launcher exits and preservation
+separately. Do not weaken the test to make known cleanup failures pass.
+Failures before the I/O marker are regressions; a changed post-I/O failure
+needs investigation, not automatic acceptance as the old guard.
+
+Acceptance is shared-core contract coverage and preservation of the measured
+protocol/I/O milestone. A clean full VMM test remains an unmet lifecycle gate.
+No UNLOCK/kernel-reclamation redesign, deferred shutdown hold, same-host reuse,
+private-buffer DMA measurement, physical VPCI backend, OpenHCL CCA guest, new
+transport or in-place QEMU debugging is included.
+Rollback uses the recorded source/inputs on a fresh test instance; it is not
+live rollback of an uncertain physical assignment.
 
 ## 5. Configuration and ownership
 
@@ -738,7 +1036,7 @@ wiring. Do not pass unowned raw KVM fds through unrelated device APIs.
 Similarly, supply a typed native DA request service to the Arm VP path through
 partition/device assembly. `CpuIo` currently has no TDISP operation. Either a
 new explicit service parameter or an architecture-scoped device callback is
-needed; `supports_tdisp()` alone does not connect KVM exits to the device.
+needed; `supports_tdisp_host()` alone does not connect KVM exits to the device.
 [O2-O5]
 
 ### Owned host-object construction
@@ -1427,7 +1725,7 @@ A shell `accept` return code cannot cover the kernel issue described above.
 Fixing that upstream/local guest error propagation is recommended; record any
 kernel patch separately from OpenVMM changes.
 
-### Next qualification step: prove the actual DMA path
+### Follow-on qualification: prove the actual DMA path
 
 **Recommendation:** add a small test-only Linux instrumentation/helper patch,
 then rerun kvmtool on the same FVP configuration. Do not change the pinned
@@ -1647,6 +1945,13 @@ transport/error plumbing, but do not replace a real FVP negative result.
 
 ## 11. Staged implementation
 
+**Active sequence:** implement and review the shared-host refactor in section 4.
+The rebase, native LOCK/RUN and initial I/O integration are complete.
+Do not repeat the original stages below as new refactor prerequisites.
+Buffer-level DMA and clean-lifecycle qualification remain separate follow-ons.
+
+### Original bring-up stages and remaining qualification
+
 | Stage | Main files/crates | Exit criterion |
 |---|---|---|
 | A. Reference and interrupt qualification | Pinned Linux/kvmtool/TF-RMM build manifest; DA model assets; qualification helper | Recorded reference/IRQ baseline plus section 10 buffer-level qualification and clean lifecycle; current read smoke success alone does not close A |
@@ -1658,10 +1963,10 @@ transport/error plumbing, but do not replace a real FVP negative result.
 | G. End-to-end and lifecycle | Petri fixture; new test and helper/instrumentation; fault tests; Guide | Exact FVP test and required evidence pass with clean teardown; record any failures separately, never as overall success |
 
 Stage A has a protocol/read baseline and known MSI-X mode, but remains
-incomplete for confidential DMA and clean lifecycle. The immediate task is
-full host integration followed by the unchanged reference-guest trial.
+incomplete for confidential DMA and clean lifecycle. The original integration
+and unchanged reference-guest trial have now reached LOCK/RUN and verified I/O.
 Section 10's buffer-level instrumentation is a later qualification task, not
-a gate on this attempt. Shutdown investigations remain deferred; do not use
+a gate on the shared-core refactor. Shutdown investigations remain deferred; do not use
 repeated forced shutdown as a clean-reuse result.
 
 Stage C scaffolding and B can proceed using the recorded local candidate;
@@ -1711,6 +2016,21 @@ or replace the existing TDISP infrastructure.
 
 ## 13. Source index
 
+S1-S9 refer to the rebased code inspected on 2026-09-18, at change ID
+`tkorwyzw`, for the current section 4 refactor.
+
+| ID | Current shared-core evidence |
+|---|---|
+| S1 | `vm/devices/tdisp/src/lib.rs:80-120,187-368,420-572,653-944`: callbacks, dispatch, state and protocol policy |
+| S2 | `vm/devices/tdisp/src/host.rs:234-278,431-665`: native backend contract, state, transactions and snapshots |
+| S3 | `vm/devices/tdisp/src/tests/statemachine_tests.rs:51-160,200-252`: idempotent Unbind and validation behavior |
+| S4 | `vm/devices/tdisp_proto/src/tdisp.proto:12-74`: indeterminate state and existing error codes |
+| S5 | `vm/devices/pci/vpci_client/src/tdisp.rs:256-319,609-714`: cache/error ordering and cleanup policy |
+| S6 | `vm/devices/storage/nvme_test/src/tdisp.rs:37-194`: callback and shared gate implementation |
+| S7 | `vm/devices/storage/nvme_test/src/pci.rs:548-610`: BAR0 gate and separate BAR4 MSI-X access paths |
+| S8 | `vm/devices/tdisp/src/host/evidence.rs:59-236`: native admission, worker retention and teardown |
+| S9 | `vmm_core/virt_kvm/src/memory.rs:181-199,428-505`; `vm/devices/pci/vfio_assigned_device/src/realm/tdisp.rs:226-270,528-694`: RAM transaction and backend containment |
+
 Line ranges refer to the inspected sources, before implementation. Kvmtool's
 working tree is now on the pinned v7 branch and was read independently during
 review pass two. The revision links below remain the reproducible references.
@@ -1748,6 +2068,28 @@ review pass two. The revision links below remain the reproducible references.
 | F2 | `../tf-rmm/runtime/rsi/vdev.c:342-348`, protected-IPA validation, independently checked during plan review |
 
 ## Review
+
+### Shared host infrastructure refactor: 2026-09-18
+
+Review verdict: **Minor revisions**, incorporated.
+
+The review checked the current S1-S9 implementations and accepted the shared
+engine, thin facades, operation/wire contracts and staged validation.
+It identified two details that needed explicit decisions:
+
+- Emulator revocation must not rely on clearing the BAR0 range set or taking
+  the callback mutex in Drop. Section 4 now specifies a sticky local atomic
+  denial latch/permit, coverage of BAR0 and BAR4, error and panic tests, and
+  an atomic landing of the facade and all gate consumers.
+- Reset has no existing capability query. Section 4 now preserves the Realm
+  backend's invoked-reset failure behavior and requires tests for callback
+  count, snapshot/budget release, quarantine and transition history. It does
+  not relabel a backend error as a preflight Unsupported rejection.
+
+The main plan is the implementation authority; the findings document is
+background only. No implementation, build or runtime validation was performed
+for this planning update. Earlier reviews below apply to the original
+bring-up and its later milestone updates.
 
 ### Pass one
 
