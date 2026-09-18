@@ -19,6 +19,7 @@ use crate::gsi::GsiRouting;
 use crate::gsi::KvmIrqFdState;
 use crate::gsi::MsiRouteBuilder;
 use crate::memory::KvmMemoryBackingMode;
+use aarch64defs::MpidrEl1;
 use aarch64defs::SystemReg;
 use aarch64defs::Vendor;
 use aarch64defs::gic::GicV2mRegister;
@@ -878,13 +879,14 @@ impl virt::ProtoPartition for KvmProtoPartition<'_> {
         // this has to run after add_vp, and before the GIC starts resolving
         // redistributor affinities.
         for (vp_idx, vp_info) in self.config.processor_topology.vps_arch().enumerate() {
-            self.vm
-                .vp(vp_idx as u32)
-                .set_reg64(KvmRegisterId::SYS_MPIDR_EL1.into(), vp_info.mpidr.into())
-                .map_err(|err| KvmError::SetMpidr {
-                    vp_index: vp_idx as u32,
-                    err,
-                })?;
+            let vp = self.vm.vp(vp_idx as u32);
+            configure_mpidr(
+                isolation,
+                vp_idx as u32,
+                vp_info.mpidr.into(),
+                || vp.get_reg64(KvmRegisterId::SYS_MPIDR_EL1.into()),
+                |value| vp.set_reg64(KvmRegisterId::SYS_MPIDR_EL1.into(), value),
+            )?;
         }
 
         // Set up the GIC device matching the topology's GIC version.
@@ -1352,11 +1354,116 @@ impl virt::Hypervisor for Kvm {
     }
 }
 
+fn configure_mpidr(
+    isolation: virt::IsolationType,
+    vp_index: u32,
+    expected: u64,
+    read: impl FnOnce() -> Result<u64, kvm::Error>,
+    write: impl FnOnce(u64) -> Result<(), kvm::Error>,
+) -> Result<(), KvmError> {
+    if isolation == virt::IsolationType::Cca {
+        // Realm MPIDR writes are rejected by KVM. Check affinity and SMT
+        // instead; U and RES1 do not affect CPU identity or interrupt routing.
+        let actual = read().map_err(|err| KvmError::ReadRealmMpidr { vp_index, err })?;
+        let topology_mask = u64::from(MpidrEl1::AFFINITY_MASK.with_mt(true));
+        if actual & topology_mask != expected & topology_mask {
+            return Err(KvmError::RealmMpidrMismatch {
+                vp_index,
+                expected,
+                actual,
+            });
+        }
+        Ok(())
+    } else {
+        write(expected).map_err(|err| KvmError::SetMpidr { vp_index, err })
+    }
+}
+
 fn map_cca_capability_error(err: crate::memory::MemoryError) -> KvmError {
     match err {
         crate::memory::MemoryError::Kvm(kvm::Error::MissingCapability(capability)) => {
             KvmError::MissingCcaCapability(capability)
         }
         err => err.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::configure_mpidr;
+    use crate::KvmError;
+    use aarch64defs::MpidrEl1;
+    use test_with_tracing::test;
+
+    #[test]
+    fn realm_mpidr_is_checked_without_writing() {
+        for expected in [0, 1, 0xf, 0x100, 0x10000] {
+            for flags in [0, 1 << 30, 1 << 31, (1 << 30) | (1 << 31)] {
+                configure_mpidr(
+                    virt::IsolationType::Cca,
+                    0,
+                    expected | flags,
+                    || Ok(expected | (1 << 31)),
+                    |_| panic!("Realm MPIDR must not be written"),
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn realm_mpidr_rejects_affinity_and_smt_mismatches() {
+        for expected in [1, 1 << 8, 1 << 16, 1 << 32, 1 << 24] {
+            assert!(matches!(
+                configure_mpidr(
+                    virt::IsolationType::Cca,
+                    0,
+                    expected,
+                    || Ok(1 << 31),
+                    |_| panic!("Realm MPIDR must not be written"),
+                ),
+                Err(KvmError::RealmMpidrMismatch { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn ordinary_vm_mpidr_is_still_programmed() {
+        let expected = u64::from(MpidrEl1::new().with_mt(true).with_aff1(2));
+        configure_mpidr(
+            virt::IsolationType::None,
+            0,
+            expected,
+            || panic!("ordinary VM MPIDR need not be read"),
+            |value| {
+                assert_eq!(value, expected);
+                Ok(())
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn mpidr_io_errors_are_preserved() {
+        assert!(matches!(
+            configure_mpidr(
+                virt::IsolationType::Cca,
+                0,
+                0,
+                || Err(kvm::Error::MissingCapability("test read")),
+                |_| panic!("failed Realm read must not fall back to a write"),
+            ),
+            Err(KvmError::ReadRealmMpidr { .. })
+        ));
+        assert!(matches!(
+            configure_mpidr(
+                virt::IsolationType::None,
+                0,
+                0,
+                || panic!("ordinary VM MPIDR need not be read"),
+                |_| Err(kvm::Error::MissingCapability("test write")),
+            ),
+            Err(KvmError::SetMpidr { .. })
+        ));
     }
 }

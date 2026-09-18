@@ -170,6 +170,11 @@ Redact credentials and private environment values before sharing logs.
 
 ## Current limits
 
+The pinned CCA kernel does not permit MPIDR register writes for Realm VPs.
+OpenVMM checks that the requested topology matches KVM's reset MPIDR values
+and rejects mismatches instead of changing the Realm's CPU identities.
+Ordinary KVM guests still use the configurable MPIDR path.
+
 The initial FVP mode targets basic Realm boot, not FVP device assignment.
 The known kernel Realm-teardown warning and RMM SMMUv3 initialization
 diagnostic remain visible follow-ups. They must not be interpreted as
