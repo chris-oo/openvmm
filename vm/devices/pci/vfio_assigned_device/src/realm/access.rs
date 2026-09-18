@@ -37,7 +37,7 @@ pub(crate) struct BarRange {
 pub(crate) struct AccessGate {
     pub state: Mutex<AccessState>,
     pub requester_id: u32,
-    interrupts: std::sync::Arc<dyn pci_core::vfio::VfioVm>,
+    vm: std::sync::Arc<dyn pci_core::vfio::VfioVm>,
     service: std::sync::OnceLock<std::sync::Weak<dyn tdisp::host::EvidenceService>>,
 }
 
@@ -69,7 +69,7 @@ pub(crate) enum AccessError {
     Quarantined,
     #[error("MMIO interval is not a fixed protected BAR interval")]
     InvalidMmio,
-    #[error("protected device mappings remain; the kernel has no forced unmap API")]
+    #[error("protected device mappings remain without checked UNLOCK completion")]
     ProtectedMappingsRemain,
     #[error("checked TDISP UNLOCKED completion is required before kernel object destruction")]
     DeviceNotUnlocked,
@@ -88,7 +88,7 @@ impl AccessGate {
     ) -> Self {
         Self {
             requester_id,
-            interrupts,
+            vm: interrupts,
             service: std::sync::OnceLock::new(),
             state: Mutex::new(AccessState {
                 deny_all: false,
@@ -144,7 +144,20 @@ impl AccessGate {
     }
 
     pub fn interrupt_status(&self) -> Result<(), pci_core::vfio::VfioVmError> {
-        self.interrupts.check_interrupt_routes()
+        self.vm.check_interrupt_routes()
+    }
+
+    pub fn record_protected_mapping(
+        &self,
+        range: Range<u64>,
+        host_base: u64,
+    ) -> Result<(), pci_core::vfio::VfioVmError> {
+        self.vm
+            .record_protected_mapping(self.requester_id, range, host_base)
+    }
+
+    pub fn complete_protected_unlock(&self) -> Result<(), pci_core::vfio::VfioVmError> {
+        self.vm.complete_protected_unlock(self.requester_id)
     }
 
     #[cfg(test)]
@@ -164,6 +177,17 @@ impl AccessGate {
                 unreachable!("test access gate never disassociates files")
             }
             fn check_interrupt_routes(&self) -> Result<(), pci_core::vfio::VfioVmError> {
+                Ok(())
+            }
+            fn record_protected_mapping(
+                &self,
+                _: u32,
+                _: Range<u64>,
+                _: u64,
+            ) -> Result<(), pci_core::vfio::VfioVmError> {
+                Ok(())
+            }
+            fn complete_protected_unlock(&self, _: u32) -> Result<(), pci_core::vfio::VfioVmError> {
                 Ok(())
             }
         }

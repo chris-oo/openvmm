@@ -11,9 +11,12 @@ use tdisp::host::MeasurementRequest;
 use tdisp::host::SnapshotError;
 use test_with_tracing::test;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Call {
     SetState(CcaTdiState),
+    Record(u32, std::ops::Range<u64>, u64),
+    Map(u64, u64, u64),
+    CompleteUnlock(u32),
     Report,
     Measurements(u64, [u8; 32]),
     Size(CcaObject),
@@ -33,6 +36,45 @@ struct Model {
     request_error: Option<(Errno, u64)>,
     close_failures: usize,
     released: bool,
+    kernel_state: CcaTdiState,
+    commit_state_before_error: bool,
+    vm_ledger: Vec<std::ops::Range<u64>>,
+    gate: std::sync::Weak<AccessGate>,
+    record_failure: Option<bool>,
+    completion_failure: bool,
+    pause: Option<(Call, Pause)>,
+    completion_pause: Option<Pause>,
+}
+
+struct Pause {
+    entered: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+impl Pause {
+    fn wait(self) {
+        self.entered.send(()).unwrap();
+        self.resume
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+    }
+}
+
+fn pause() -> (
+    Pause,
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+) {
+    let (entered, observed) = std::sync::mpsc::channel();
+    let (resume, released) = std::sync::mpsc::channel();
+    (
+        Pause {
+            entered,
+            resume: released,
+        },
+        observed,
+        resume,
+    )
 }
 
 struct Fake(Arc<Mutex<Model>>, Option<Arc<AccessGate>>);
@@ -56,6 +98,14 @@ impl Fake {
             request_error: None,
             close_failures: 0,
             released: false,
+            kernel_state: CcaTdiState::Unlocked,
+            commit_state_before_error: true,
+            vm_ledger: Vec::new(),
+            gate: std::sync::Weak::new(),
+            record_failure: None,
+            completion_failure: false,
+            pause: None,
+            completion_pause: None,
         }));
         (Self(model.clone(), None), model)
     }
@@ -69,12 +119,42 @@ impl EvidenceDevice for Fake {
         self.0.lock().phase
     }
 
+    fn assignment(&mut self, operation: AssignmentOperation) -> Result<(), BackendError> {
+        let gate = self.access().ok_or(BackendError::MutationsDisabled)?;
+        let mut state = gate.state.lock();
+        let mut access = AssignmentAccess {
+            state: &mut state,
+            gate: &gate,
+            completed: false,
+        };
+        let result = if access.state.deny_all {
+            Err(AccessError::Quarantined.into())
+        } else {
+            match operation {
+                AssignmentOperation::ValidateMmio { base, top, pa_base } => {
+                    validate_mmio(self, access.state, base, top, pa_base)
+                }
+                _ => Err(BackendError::MutationsDisabled.into()),
+            }
+        };
+        access.completed = result.is_ok();
+        result.map_err(BackendError::Assignment)
+    }
+
     fn request(
         &mut self,
         operation: EvidenceOperation,
         request: CcaTsmRequest<'_>,
         response: &mut [u8],
     ) -> Result<TsmCompletion, BackendError> {
+        if let Some(gate) = &self.1 {
+            if matches!(
+                operation,
+                EvidenceOperation::SetState(_) | EvidenceOperation::ValidateMmio
+            ) {
+                assert!(gate.state.try_lock().is_none());
+            }
+        }
         let mut model = self.0.lock();
         match &request {
             CcaTsmRequest::ObjectSize(object) => model.calls.push(Call::Size(*object)),
@@ -82,7 +162,19 @@ impl EvidenceDevice for Fake {
                 model.calls.push(Call::Read(*object, response.len()))
             }
             CcaTsmRequest::SetState(state) if self.1.is_some() => {
-                model.calls.push(Call::SetState(*state))
+                model.calls.push(Call::SetState(*state));
+                // The kernel can change its software state before returning an error.
+                if model.request_error.is_none() || model.commit_state_before_error {
+                    model.kernel_state = *state;
+                }
+            }
+            CcaTsmRequest::ValidateMmio {
+                gpa_base,
+                gpa_top,
+                pa_base,
+            } if self.1.is_some() => {
+                assert!(model.vm_ledger.contains(&(*gpa_base..*gpa_top)));
+                model.calls.push(Call::Map(*gpa_base, *gpa_top, *pa_base));
             }
             CcaTsmRequest::RegenerateInterfaceReport if self.1.is_some() => {
                 model.calls.push(Call::Report)
@@ -92,6 +184,20 @@ impl EvidenceDevice for Fake {
             }
             _ => panic!("evidence backend issued a mutation"),
         }
+        let pause = if model
+            .pause
+            .as_ref()
+            .is_some_and(|(call, _)| Some(call) == model.calls.last())
+        {
+            model.pause.take().map(|(_, pause)| pause)
+        } else {
+            None
+        };
+        drop(model);
+        if let Some(pause) = pause {
+            pause.wait();
+        }
+        let model = &mut *self.0.lock();
         if let Some((errno, tsm_code)) = model.request_error {
             return Err(BackendError::Request {
                 operation,
@@ -212,7 +318,7 @@ fn every_native_mutation_failure_quarantines_frontend_access() {
 }
 
 #[test]
-fn native_lock_requires_private_import_and_unlock_requires_no_protected_mappings() {
+fn native_lock_requires_private_import_and_unlock_issues_despite_protected_mappings() {
     let (mut fake, model) = Fake::new();
     let gate = Arc::new(AccessGate::new(8));
     fake.1 = Some(gate.clone());
@@ -225,9 +331,376 @@ fn native_lock_requires_private_import_and_unlock_requires_no_protected_mappings
         access.private_ready = true;
         access.protected.push(0x1000..0x2000);
     }
-    assert!(backend.set_state(ConfirmedState::Unlocked).is_err());
-    assert!(model.lock().calls.is_empty());
+    backend.set_state(ConfirmedState::Unlocked).unwrap();
+    assert_eq!(model.lock().calls, [Call::SetState(CcaTdiState::Unlocked)]);
+    assert!(gate.state.lock().protected.is_empty());
+    assert!(!gate.state.lock().deny_all);
+}
+
+struct LedgerVm(Arc<Mutex<Model>>);
+
+impl pci_core::vfio::VfioVm for LedgerVm {
+    fn add_file(&self, _: std::os::fd::BorrowedFd<'_>) -> Result<(), pci_core::vfio::VfioVmError> {
+        unreachable!("ledger fixture")
+    }
+    fn remove_file(
+        &self,
+        _: std::os::fd::BorrowedFd<'_>,
+    ) -> Result<(), pci_core::vfio::VfioVmError> {
+        unreachable!("ledger fixture")
+    }
+    fn check_interrupt_routes(&self) -> Result<(), pci_core::vfio::VfioVmError> {
+        Ok(())
+    }
+    fn record_protected_mapping(
+        &self,
+        rid: u32,
+        range: std::ops::Range<u64>,
+        host: u64,
+    ) -> Result<(), pci_core::vfio::VfioVmError> {
+        let mut model = self.0.lock();
+        assert_eq!(rid, 0x1_0100);
+        assert!(model.gate.upgrade().unwrap().state.try_lock().is_none());
+        model.calls.push(Call::Record(rid, range.clone(), host));
+        if model.record_failure != Some(false) {
+            assert!(!model.vm_ledger.iter().any(|old| overlaps(old, &range)));
+            model.vm_ledger.push(range);
+        }
+        if model.record_failure.is_some() {
+            return Err(pci_core::vfio::VfioVmError::new(std::io::Error::other(
+                "record failure",
+            )));
+        }
+        Ok(())
+    }
+    fn complete_protected_unlock(&self, rid: u32) -> Result<(), pci_core::vfio::VfioVmError> {
+        let mut model = self.0.lock();
+        assert_eq!(rid, 0x1_0100);
+        assert!(model.gate.upgrade().unwrap().state.try_lock().is_none());
+        assert_eq!(model.kernel_state, CcaTdiState::Unlocked);
+        assert_eq!(
+            model.calls.last(),
+            Some(&Call::SetState(CcaTdiState::Unlocked))
+        );
+        model.calls.push(Call::CompleteUnlock(rid));
+        let pause = model.completion_pause.take();
+        drop(model);
+        if let Some(pause) = pause {
+            pause.wait();
+        }
+        let mut model = self.0.lock();
+        if model.completion_failure {
+            return Err(pci_core::vfio::VfioVmError::new(std::io::Error::other(
+                "completion failure",
+            )));
+        }
+        model.vm_ledger.clear();
+        Ok(())
+    }
+}
+
+fn mapping_owner() -> (
+    Coordinator<EvidenceBackend<Fake>>,
+    Arc<Mutex<Model>>,
+    Arc<AccessGate>,
+) {
+    let (mut fake, model) = Fake::new();
+    let gate = Arc::new(AccessGate::with_interrupts(
+        0x1_0100,
+        Arc::new(LedgerVm(model.clone())),
+    ));
+    model.lock().gate = Arc::downgrade(&gate);
+    {
+        let mut state = gate.state.lock();
+        state.private_ready = true;
+        state.bars.push(super::super::access::BarRange {
+            guest: 0x4000..0x8000,
+            host: 0x9000,
+        });
+    }
+    fake.1 = Some(gate.clone());
+    (
+        Coordinator::new(EvidenceBackend { device: fake }, SnapshotBudget::new(8)).unwrap(),
+        model,
+        gate,
+    )
+}
+
+fn map_request() -> AssignmentOperation {
+    AssignmentOperation::ValidateMmio {
+        base: 0x4000,
+        top: 0x6000,
+        pa_base: 0x9000,
+    }
+}
+
+#[test]
+fn checked_unlock_retires_both_ledgers_before_reopening_and_preserves_ram() {
+    let (mut owner, model, gate) = mapping_owner();
+    {
+        let mut state = gate.state.lock();
+        state.shared.insert(
+            1 << 40,
+            super::super::access::SharedIoasMapping {
+                mapping: tdisp::host::SharedMapping {
+                    file: Arc::new(std::fs::File::open("/dev/zero").unwrap()),
+                    file_offset: 0,
+                    iova: 1 << 40,
+                    length: 4096,
+                },
+                memory: Arc::new(sparse_mmap::SparseMapping::new(4096).unwrap()),
+                offset: 0,
+            },
+        );
+    }
+    for _ in 0..2 {
+        owner.set_state(ConfirmedState::Locked).unwrap();
+        owner.assignment(map_request()).unwrap();
+        assert_eq!(gate.state.lock().protected, [0x4000..0x6000]);
+        owner.set_state(ConfirmedState::Running).unwrap();
+        owner.set_state(ConfirmedState::Unlocked).unwrap();
+        assert!(model.lock().vm_ledger.is_empty());
+        let state = gate.state.lock();
+        assert!(state.protected.is_empty());
+        assert!(!state.protected_blocked && !state.deny_all);
+        assert!(state.permits_mmio(0x4000, 4));
+        assert!(state.private_ready);
+        assert_eq!(state.shared.len(), 1);
+    }
+    assert_eq!(
+        model.lock().calls,
+        [
+            Call::SetState(CcaTdiState::Locked),
+            Call::Record(0x1_0100, 0x4000..0x6000, 0x9000),
+            Call::Map(0x4000, 0x6000, 0x9000),
+            Call::SetState(CcaTdiState::Run),
+            Call::SetState(CcaTdiState::Unlocked),
+            Call::CompleteUnlock(0x1_0100),
+            Call::SetState(CcaTdiState::Locked),
+            Call::Record(0x1_0100, 0x4000..0x6000, 0x9000),
+            Call::Map(0x4000, 0x6000, 0x9000),
+            Call::SetState(CcaTdiState::Run),
+            Call::SetState(CcaTdiState::Unlocked),
+            Call::CompleteUnlock(0x1_0100),
+        ]
+    );
+}
+
+#[test]
+fn failed_unlock_never_retires_ledgers_even_after_kernel_state_changed() {
+    for failure in 0..5 {
+        let (mut owner, model, gate) = mapping_owner();
+        owner.set_state(ConfirmedState::Locked).unwrap();
+        owner.assignment(map_request()).unwrap();
+        owner.set_state(ConfirmedState::Running).unwrap();
+        match failure {
+            0 => {
+                model.lock().request_error = Some((Errno::EIO, 0));
+                model.lock().commit_state_before_error = false;
+            }
+            1 => model.lock().request_error = Some((Errno::EFAULT, 17)),
+            2 => model.lock().read_result.residue = 1,
+            3 => model.lock().read_result.tsm_code = 9,
+            _ => model.lock().completion_failure = true,
+        }
+        let error = owner.set_state(ConfirmedState::Unlocked).unwrap_err();
+        match failure {
+            0 => assert!(matches!(
+                error,
+                Error::Backend(BackendError::Request {
+                    source: TsmRequestError::Ioctl {
+                        errno: Errno::EIO,
+                        tsm_code: 0
+                    },
+                    ..
+                })
+            )),
+            1 => assert!(matches!(
+                error,
+                Error::Backend(BackendError::Request {
+                    source: TsmRequestError::Ioctl {
+                        errno: Errno::EFAULT,
+                        tsm_code: 17
+                    },
+                    ..
+                })
+            )),
+            2 | 3 => assert!(matches!(
+                error,
+                Error::Backend(BackendError::Completion { .. })
+            )),
+            _ => assert!(matches!(error, Error::Backend(BackendError::Assignment(_)))),
+        }
+        assert_eq!(
+            owner.state(),
+            DeviceState::Quarantined {
+                last_confirmed: ConfirmedState::Running
+            }
+        );
+        assert_eq!(
+            model.lock().kernel_state,
+            if failure == 0 {
+                CcaTdiState::Run
+            } else {
+                CcaTdiState::Unlocked
+            }
+        );
+        assert_eq!(model.lock().vm_ledger, [0x4000..0x6000]);
+        assert_eq!(
+            model.lock().calls.contains(&Call::CompleteUnlock(0x1_0100)),
+            failure == 4
+        );
+        let state = gate.state.lock();
+        assert_eq!(state.protected, [0x4000..0x6000]);
+        assert!(state.deny_all && state.protected_blocked && state.private_ready);
+        assert!(!state.permits_mmio(0x4000, 4));
+    }
+}
+
+#[test]
+fn empty_unlock_still_requires_platform_acknowledgement() {
+    let (mut owner, model, gate) = mapping_owner();
+    owner.set_state(ConfirmedState::Locked).unwrap();
+    model.lock().completion_failure = true;
+    assert!(owner.set_state(ConfirmedState::Unlocked).is_err());
+    assert_eq!(
+        model.lock().calls.last(),
+        Some(&Call::CompleteUnlock(0x1_0100))
+    );
     assert!(gate.state.lock().deny_all);
+}
+
+#[test]
+fn partial_recording_failure_retains_attempts_without_mapping_ioctl() {
+    for after in [false, true] {
+        let (mut owner, model, gate) = mapping_owner();
+        owner.set_state(ConfirmedState::Locked).unwrap();
+        model.lock().record_failure = Some(after);
+        assert!(owner.assignment(map_request()).is_err());
+        assert_eq!(gate.state.lock().protected, [0x4000..0x6000]);
+        assert_eq!(model.lock().vm_ledger.len(), usize::from(after));
+        assert!(
+            !model
+                .lock()
+                .calls
+                .iter()
+                .any(|call| matches!(call, Call::Map(..)))
+        );
+        assert!(gate.state.lock().deny_all);
+        assert!(matches!(owner.state(), DeviceState::Quarantined { .. }));
+    }
+}
+
+#[test]
+fn fixed_bar_and_hpa_validation_precedes_either_ledger() {
+    for operation in [
+        AssignmentOperation::ValidateMmio {
+            base: 0x3000,
+            top: 0x4000,
+            pa_base: 0x8000,
+        },
+        AssignmentOperation::ValidateMmio {
+            base: 0x4000,
+            top: 0x6000,
+            pa_base: 0xa000,
+        },
+    ] {
+        let (mut owner, model, gate) = mapping_owner();
+        owner.set_state(ConfirmedState::Locked).unwrap();
+        assert!(owner.assignment(operation).is_err());
+        assert!(gate.state.lock().protected.is_empty());
+        assert!(model.lock().vm_ledger.is_empty());
+        assert_eq!(model.lock().calls, [Call::SetState(CcaTdiState::Locked)]);
+        assert!(gate.state.lock().deny_all);
+    }
+}
+
+#[test]
+fn mapping_record_and_unlock_retirement_share_whole_device_admission() {
+    use std::future::Future;
+    use std::task::Context;
+    use std::task::Poll;
+    use std::task::Waker;
+
+    fn pending<T>(future: &mut std::pin::Pin<Box<dyn Future<Output = T> + Send + '_>>) {
+        assert!(matches!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Pending
+        ));
+    }
+    fn entered(receiver: &std::sync::mpsc::Receiver<()>) {
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+    }
+
+    let (owner, model, gate) = mapping_owner();
+    let service = owner.into_evidence_service();
+    let (hold_lock, lock_entered, release_lock) = pause();
+    model.lock().pause = Some((Call::SetState(CcaTdiState::Locked), hold_lock));
+    let mut lock = service.set_state(ConfirmedState::Locked);
+    pending(&mut lock);
+    entered(&lock_entered);
+    let mut mapping = service.assignment(map_request());
+    pending(&mut mapping);
+    assert!(gate.state.try_lock().is_none());
+    assert!(model.lock().vm_ledger.is_empty());
+    assert_eq!(model.lock().calls, [Call::SetState(CcaTdiState::Locked)]);
+
+    let (hold_map, map_entered, release_map) = pause();
+    model.lock().pause = Some((Call::Map(0x4000, 0x6000, 0x9000), hold_map));
+    release_lock.send(()).unwrap();
+    block_on(lock).unwrap();
+    pending(&mut mapping);
+    entered(&map_entered);
+    assert_eq!(model.lock().vm_ledger, [0x4000..0x6000]);
+    assert_eq!(
+        model.lock().calls,
+        [
+            Call::SetState(CcaTdiState::Locked),
+            Call::Record(0x1_0100, 0x4000..0x6000, 0x9000),
+            Call::Map(0x4000, 0x6000, 0x9000),
+        ]
+    );
+    let mut unlock = service.set_state(ConfirmedState::Unlocked);
+    pending(&mut unlock);
+    assert_eq!(model.lock().calls.len(), 3);
+    assert!(gate.state.try_lock().is_none());
+
+    let (hold_completion, completion_entered, release_completion) = pause();
+    model.lock().completion_pause = Some(hold_completion);
+    release_map.send(()).unwrap();
+    block_on(mapping).unwrap();
+    pending(&mut unlock);
+    entered(&completion_entered);
+    assert_eq!(model.lock().vm_ledger, [0x4000..0x6000]);
+    let mut next_lock = service.set_state(ConfirmedState::Locked);
+    pending(&mut next_lock);
+    assert_eq!(model.lock().calls.len(), 5);
+    assert!(gate.state.try_lock().is_none());
+    release_completion.send(()).unwrap();
+    block_on(unlock).unwrap();
+    assert!(model.lock().vm_ledger.is_empty());
+    assert!(gate.state.lock().protected.is_empty());
+    block_on(next_lock).unwrap();
+    block_on(service.assignment(map_request())).unwrap();
+    assert_eq!(model.lock().vm_ledger, [0x4000..0x6000]);
+    assert_eq!(gate.state.lock().protected, [0x4000..0x6000]);
+    assert_eq!(
+        model.lock().calls,
+        [
+            Call::SetState(CcaTdiState::Locked),
+            Call::Record(0x1_0100, 0x4000..0x6000, 0x9000),
+            Call::Map(0x4000, 0x6000, 0x9000),
+            Call::SetState(CcaTdiState::Unlocked),
+            Call::CompleteUnlock(0x1_0100),
+            Call::SetState(CcaTdiState::Locked),
+            Call::Record(0x1_0100, 0x4000..0x6000, 0x9000),
+            Call::Map(0x4000, 0x6000, 0x9000),
+        ]
+    );
 }
 
 #[test]

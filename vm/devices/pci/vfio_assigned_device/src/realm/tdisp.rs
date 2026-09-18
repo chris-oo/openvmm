@@ -6,8 +6,8 @@
 //! Evidence-only preparation exposes no mutations. The production Realm
 //! resolver supplies the shared frontend gate, enabling typed state changes,
 //! regeneration and tracked memory operations on the same coordinator.
-//! Protected mappings require kernel-completed DEV-to-EMPTY invalidation;
-//! forced unmap and function reset are unsupported. Failed teardown retains
+//! Checked native UNLOCK proves all protected ranges released in the pinned
+//! Linux/RMM tuple; forced unmap and function reset are unsupported. Failed teardown retains
 //! the owner and its backing. Destruction requires checked UNLOCKED completion;
 //! the pinned kernel's implicit unlock during destruction discards errors.
 //! Full-assignment evidence transport failures revoke access and admission.
@@ -247,23 +247,7 @@ impl RealmDevice {
                 return Err(AccessError::Quarantined.into());
             }
             AssignmentOperation::ValidateMmio { base, top, pa_base } => {
-                let range = base..top;
-                let host = state.mmio_host(&range)?;
-                if host != pa_base {
-                    return Err(AccessError::InvalidMmio.into());
-                }
-                // Retain even an uncertain or partially installed interval.
-                state.protected.push(range);
-                let completion = self.request(
-                    EvidenceOperation::ValidateMmio,
-                    CcaTsmRequest::ValidateMmio {
-                        gpa_base: base,
-                        gpa_top: top,
-                        pa_base: host,
-                    },
-                    &mut [],
-                )?;
-                mutation_complete(EvidenceOperation::ValidateMmio, completion)?;
+                validate_mmio(self, state, base, top, pa_base)?;
             }
             AssignmentOperation::InvalidateMmio { base, top } => {
                 // The caller only submits this after kernel DEV->EMPTY
@@ -572,11 +556,6 @@ impl<D: EvidenceDevice> Backend for EvidenceBackend<D> {
                 AccessError::PrivateNotReady.into(),
             ));
         }
-        if target == ConfirmedState::Unlocked && !state.protected.is_empty() {
-            return Err(BackendError::Assignment(
-                AccessError::ProtectedMappingsRemain.into(),
-            ));
-        }
         let operation = EvidenceOperation::SetState(target);
         let target = match target {
             ConfirmedState::Unlocked => CcaTdiState::Unlocked,
@@ -587,6 +566,13 @@ impl<D: EvidenceDevice> Backend for EvidenceBackend<D> {
             self.device
                 .request(operation, CcaTsmRequest::SetState(target), &mut [])?;
         mutation_complete(operation, completion)?;
+        if target == CcaTdiState::Unlocked {
+            // Pinned RMM rejects UNLOCK while any device granule is MAPPED;
+            // Linux confirms final UNLOCKED before completing this request.
+            gate.complete_protected_unlock()
+                .map_err(|error| BackendError::Assignment(error.into()))?;
+            state.protected.clear();
+        }
         state.protected_blocked = target != CcaTdiState::Unlocked;
         state.deny_all = false;
         tracelimit::info_ratelimited!(
@@ -654,6 +640,36 @@ impl<D: EvidenceDevice> Backend for EvidenceBackend<D> {
     fn teardown(&mut self) -> Result<(), Self::Error> {
         self.device.close()
     }
+}
+
+fn validate_mmio(
+    device: &mut impl EvidenceDevice,
+    state: &mut AccessState,
+    base: u64,
+    top: u64,
+    pa_base: u64,
+) -> anyhow::Result<()> {
+    let range = base..top;
+    let host = state.mmio_host(&range)?;
+    if host != pa_base {
+        return Err(AccessError::InvalidMmio.into());
+    }
+    let gate = device.access().ok_or(BackendError::MutationsDisabled)?;
+    // Both ledgers precede the ioctl. If platform recording fails, preserve
+    // this conservative record and any record already made by the platform.
+    state.protected.push(range.clone());
+    gate.record_protected_mapping(range, host)?;
+    let completion = device.request(
+        EvidenceOperation::ValidateMmio,
+        CcaTsmRequest::ValidateMmio {
+            gpa_base: base,
+            gpa_top: top,
+            pa_base: host,
+        },
+        &mut [],
+    )?;
+    mutation_complete(EvidenceOperation::ValidateMmio, completion)?;
+    Ok(())
 }
 
 fn checked_evidence_read<D: EvidenceDevice, R>(

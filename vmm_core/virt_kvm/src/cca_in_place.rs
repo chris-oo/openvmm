@@ -29,15 +29,19 @@ pub enum CcaInPlaceError {
     InvalidProtectedMapping,
 }
 
-/// Conservative history of attempted protected mappings. Neither ioctl zero,
-/// a following exit, nor DEV -> EMPTY proves removal in the pinned kernel.
-/// Never remove these entries without a new, checked kernel interface.
+/// Conservative history of attempted protected mappings. Only fully checked
+/// native UNLOCK proves all protected ranges released in the pinned kernel/RMM.
 #[derive(Debug, Default)]
 pub(crate) struct ProtectedAttempts {
     ranges: Vec<MemoryRange>,
 }
 
 impl ProtectedAttempts {
+    /// All fallible platform and requester checks must precede this retirement.
+    pub(crate) fn complete_unlock(&mut self) {
+        self.ranges.clear();
+    }
+
     pub(crate) fn record(
         &mut self,
         range: MemoryRange,
@@ -369,7 +373,7 @@ mod tests {
     use test_with_tracing::test;
 
     #[test]
-    fn protected_attempts_cover_only_known_ranges_and_never_acknowledge_removal() {
+    fn protected_attempts_cover_known_ranges_but_fault_completion_does_not_retire_them() {
         let mut ledger = ProtectedAttempts::default();
         let range = MemoryRange::new(0x4000..0x8000);
         ledger.record(range, 0x9000, 1 << 40).unwrap();
@@ -403,6 +407,18 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn checked_unlock_retires_attempts_for_a_new_mapping_epoch() {
+        let mut ledger = ProtectedAttempts::default();
+        let range = MemoryRange::new(0x4000..0x6000);
+        ledger.record(range, 0x9000, 1 << 40).unwrap();
+        assert!(ledger.record(range, 0x9000, 1 << 40).is_err());
+        ledger.complete_unlock();
+        assert!(!ledger.covers(range));
+        ledger.record(range, 0x9000, 1 << 40).unwrap();
+        assert!(ledger.covers(range));
     }
 
     #[test]

@@ -142,6 +142,10 @@ pub(crate) enum RegistrationError {
     MultipleAssignments,
     #[error("the service does not implement native assignment")]
     EvidenceOnly,
+    #[error("requester ID {0:#x} has no registered full native assignment")]
+    NotAssignment(u32),
+    #[error("native assignment memory preparation is not complete")]
+    NotPrepared,
 }
 
 #[derive(Default)]
@@ -200,6 +204,23 @@ impl Registry {
 
     pub(crate) fn assignment_service(&self) -> Option<Arc<dyn EvidenceService>> {
         self.assignment.and_then(|rid| self.lookup(rid))
+    }
+
+    /// Validate an owning callback without taking device admission again.
+    pub(crate) fn assignment_owner(
+        &self,
+        rid: u32,
+    ) -> Result<Arc<dyn EvidenceService>, RegistrationError> {
+        if self.failed {
+            return Err(RegistrationError::Failed);
+        }
+        if self.assignment != Some(rid) {
+            return Err(RegistrationError::NotAssignment(rid));
+        }
+        if !self.assignment_ready {
+            return Err(RegistrationError::NotPrepared);
+        }
+        self.lookup(rid).ok_or(RegistrationError::Expired)
     }
 
     pub(crate) fn assignment_requested(&self) -> bool {
@@ -474,7 +495,6 @@ impl crate::KvmPartitionInner {
             }
             registry.assignment_service().ok_or(EvidenceError::Closed)?
         };
-        self.record_protected_attempt(request)?;
         service
             .assignment(tdisp::host::AssignmentOperation::ValidateMmio {
                 base: request.range.start(),

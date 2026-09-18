@@ -62,6 +62,36 @@ pub struct KvmVfioAssignment {
     partition: Arc<KvmPartitionInner>,
 }
 
+#[cfg(any(guest_arch = "aarch64", test))]
+pub(super) fn with_registered_assignment(
+    registry: &Mutex<crate::rhi::Registry>,
+    requester_id: u32,
+    work: impl FnOnce() -> Result<(), VfioVmError>,
+) -> Result<(), VfioVmError> {
+    // Keep the service alive, but never retain the registry lock across
+    // bookkeeping or re-enter its already held device admission.
+    let _owner = registry
+        .lock()
+        .assignment_owner(requester_id)
+        .map_err(VfioVmError::new)?;
+    work()
+}
+
+#[cfg(any(guest_arch = "aarch64", test))]
+pub(super) fn complete_unlock(
+    memory: &Mutex<crate::memory::KvmMemoryRangeState>,
+    fatal: &std::sync::atomic::AtomicBool,
+) -> Result<(), VfioVmError> {
+    let mut memory = memory.lock();
+    if fatal.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(VfioVmError::new(
+            crate::cca_in_place::CcaInPlaceError::AmbiguousFault,
+        ));
+    }
+    memory.protected_attempts.complete_unlock();
+    Ok(())
+}
+
 impl KvmVfioAssignment {
     /// Associate a VFIO file before binding its cdev to IOMMUFD.
     pub fn add_file(&self, file: BorrowedFd<'_>) -> Result<(), kvm::Error> {
@@ -87,6 +117,36 @@ impl KvmVfioAssignment {
 }
 
 impl VfioVm for KvmVfioAssignment {
+    #[cfg(guest_arch = "aarch64")]
+    fn record_protected_mapping(
+        &self,
+        requester_id: u32,
+        range: std::ops::Range<u64>,
+        host_base: u64,
+    ) -> Result<(), VfioVmError> {
+        with_registered_assignment(&self.partition.rhi, requester_id, || {
+            let length = range.end.checked_sub(range.start).ok_or_else(|| {
+                VfioVmError::new(crate::cca_in_place::CcaInPlaceError::InvalidProtectedMapping)
+            })?;
+            let range = crate::cca_in_place::checked_range(range.start, length)
+                .map_err(VfioVmError::new)?;
+            self.partition
+                .record_protected_attempt(crate::rhi::MappingRequest {
+                    rid: requester_id,
+                    range,
+                    pa: host_base,
+                })
+                .map_err(VfioVmError::new)
+        })
+    }
+
+    #[cfg(guest_arch = "aarch64")]
+    fn complete_protected_unlock(&self, requester_id: u32) -> Result<(), VfioVmError> {
+        with_registered_assignment(&self.partition.rhi, requester_id, || {
+            complete_unlock(&self.partition.memory, &self.partition.cca_fatal)
+        })
+    }
+
     #[cfg(guest_arch = "aarch64")]
     fn check_interrupt_routes(&self) -> Result<(), VfioVmError> {
         self.partition
