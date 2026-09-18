@@ -27,42 +27,25 @@
 //! operations remain unavailable unless the backend explicitly implements them.
 
 mod evidence;
+pub(crate) mod lifecycle;
 
 pub use evidence::EvidenceError;
 pub use evidence::EvidenceService;
 pub use evidence::EvidenceSink;
+pub use lifecycle::ConfirmedState;
+pub use lifecycle::DeviceState;
+pub use lifecycle::Mutation;
+pub use lifecycle::Transition;
 
+use lifecycle::AdmissionError;
+use lifecycle::Lifecycle;
+use lifecycle::MutationError;
 use parking_lot::Mutex;
 use std::collections::TryReserveError;
 use std::sync::Arc;
 
 /// Maximum bytes in one cached object.
 pub const MAX_OBJECT_SIZE: usize = 16 * 1024 * 1024;
-
-/// A device state confirmed by the backend, not a protocol enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConfirmedState {
-    /// The interface is not locked.
-    Unlocked,
-    /// The interface is locked but not running.
-    Locked,
-    /// The interface is running.
-    Running,
-}
-
-/// Local lifecycle state. Quarantine must never be reported as a device state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeviceState {
-    /// The last operation completed with a confirmed outcome.
-    Confirmed(ConfirmedState),
-    /// A mutation might have committed. Only explicit teardown is allowed.
-    Quarantined {
-        /// Historical state only; not a statement about current hardware.
-        last_confirmed: ConfirmedState,
-    },
-    /// Explicit teardown completed successfully. No further operations are allowed.
-    TornDown,
-}
 
 /// Native object identity, independent of guest or kernel numbering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,34 +174,6 @@ pub enum Regenerate {
     InterfaceReport,
     /// Generate measurements using owned challenge bytes.
     Measurements(MeasurementRequest),
-}
-
-/// Mutation recorded in the latest transition.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mutation {
-    /// Change assignment mappings or acknowledge private-memory preparation.
-    Assignment,
-    /// Change the confirmed interface state.
-    SetState(ConfirmedState),
-    /// Regenerate an interface report.
-    InterfaceReport,
-    /// Regenerate measurements.
-    Measurements,
-    /// Reset and confirm an unlocked interface.
-    Reset,
-    /// Revoke access and tear down the assignment.
-    Teardown,
-}
-
-/// Bounded transition history: the most recent attempted backend mutation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Transition {
-    /// State before the attempt.
-    pub before: DeviceState,
-    /// Requested operation.
-    pub operation: Mutation,
-    /// Confirmed result, or quarantine on error.
-    pub after: DeviceState,
 }
 
 /// Synchronous backend owned exclusively by a [`Coordinator`].
@@ -420,6 +375,24 @@ pub enum Error<E: std::error::Error + 'static> {
     Snapshot(#[from] SnapshotError),
 }
 
+impl<E: std::error::Error + 'static> From<AdmissionError> for Error<E> {
+    fn from(error: AdmissionError) -> Self {
+        match error {
+            AdmissionError::InvalidState { state } => Self::InvalidState { state },
+            AdmissionError::InvalidTransition { from, to } => Self::InvalidTransition { from, to },
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> From<MutationError<E>> for Error<E> {
+    fn from(error: MutationError<E>) -> Self {
+        match error {
+            MutationError::Admission(error) => error.into(),
+            MutationError::Backend(error) => Self::Backend(error),
+        }
+    }
+}
+
 /// Exclusive per-device lifecycle and whole-object snapshot owner.
 ///
 /// All operations require `&mut self`, including snapshot reads. Returned slices
@@ -430,8 +403,7 @@ pub enum Error<E: std::error::Error + 'static> {
 /// Exclusive borrowing prevents callers from observing an intermediate state.
 pub struct Coordinator<B: Backend> {
     backend: B,
-    state: DeviceState,
-    last_transition: Option<Transition>,
+    lifecycle: Lifecycle,
     budget: SnapshotBudget,
     snapshots: [Option<Snapshot>; 4],
 }
@@ -444,19 +416,15 @@ impl<B: Backend> Coordinator<B> {
 
     /// Serialize a mapping change with the same quarantine and snapshot policy.
     pub fn assignment(&mut self, operation: AssignmentOperation) -> Result<(), Error<B::Error>> {
-        let state = self.confirmed()?;
+        self.confirmed()?;
         if !self.backend.supports_assignment() {
             return Err(Error::Unsupported);
         }
-        self.mutate(
-            Mutation::Assignment,
-            DeviceState::Confirmed(state),
-            |backend| {
-                backend
-                    .assignment(operation)
-                    .expect("assignment-capable backend implements assignment operations")
-            },
-        )
+        self.with_backend(Mutation::Assignment, |backend| {
+            backend
+                .assignment(operation)
+                .expect("assignment-capable backend implements assignment operations")
+        })
     }
     /// Take exclusive backend ownership and query its initial confirmed state.
     ///
@@ -466,8 +434,7 @@ impl<B: Backend> Coordinator<B> {
         let state = backend.state().map_err(Error::Backend)?;
         Ok(Self {
             backend,
-            state: DeviceState::Confirmed(state),
-            last_transition: None,
+            lifecycle: Lifecycle::new(state),
             budget,
             snapshots: std::array::from_fn(|_| None),
         })
@@ -475,115 +442,70 @@ impl<B: Backend> Coordinator<B> {
 
     /// Current local lifecycle state, including any uncertain outcome.
     pub fn state(&self) -> DeviceState {
-        self.state
+        self.lifecycle.state()
     }
 
     /// The latest mutation attempt. Invalid local requests do not replace it.
     pub fn last_transition(&self) -> Option<Transition> {
-        self.last_transition
+        self.lifecycle.last_transition()
     }
 
     fn confirmed(&mut self) -> Result<ConfirmedState, Error<B::Error>> {
-        if let DeviceState::Confirmed(last_confirmed) = self.state {
-            if let Err(error) = self.backend.check_access() {
-                self.invalidate();
-                self.state = DeviceState::Quarantined { last_confirmed };
-                return Err(Error::Backend(error));
-            }
+        let state = self.lifecycle.confirmed()?;
+        if let Err(error) = self.backend.check_access() {
+            self.invalidate();
+            self.lifecycle.quarantine();
+            return Err(Error::Backend(error));
         }
-        match self.state {
-            DeviceState::Confirmed(state) => Ok(state),
-            state => Err(Error::InvalidState { state }),
-        }
+        Ok(state)
     }
 
     fn invalidate(&mut self) {
         self.snapshots = std::array::from_fn(|_| None);
     }
 
-    fn mutate(
+    fn with_backend(
         &mut self,
         operation: Mutation,
-        after: DeviceState,
         call: impl FnOnce(&mut B) -> Result<(), B::Error>,
     ) -> Result<(), Error<B::Error>> {
-        let before = self.state;
-        let last_confirmed = match before {
-            DeviceState::Confirmed(state)
-            | DeviceState::Quarantined {
-                last_confirmed: state,
-            } => state,
-            state => return Err(Error::InvalidState { state }),
-        };
-        self.invalidate();
-        // Quarantine first so unwinding cannot leave a success-shaped state.
-        self.state = DeviceState::Quarantined { last_confirmed };
-        self.last_transition = Some(Transition {
-            before,
-            operation,
-            after: self.state,
-        });
-        let result = call(&mut self.backend);
-        if result.is_ok() {
-            self.state = after;
-            self.last_transition = Some(Transition {
-                before,
-                operation,
-                after,
-            });
-        }
-        result.map_err(Error::Backend)
+        self.lifecycle
+            .execute(operation, || {
+                self.snapshots = std::array::from_fn(|_| None);
+                call(&mut self.backend)
+            })
+            .map_err(Into::into)
     }
 
     /// Perform an explicit transition. Repeated states and UNLOCKED → RUN fail
     /// locally. Invalid requests neither call the backend nor invalidate snapshots.
     pub fn set_state(&mut self, to: ConfirmedState) -> Result<(), Error<B::Error>> {
-        let from = self.confirmed()?;
-        if !matches!(
-            (from, to),
-            (ConfirmedState::Unlocked, ConfirmedState::Locked)
-                | (ConfirmedState::Locked, ConfirmedState::Running)
-                | (ConfirmedState::Locked, ConfirmedState::Unlocked)
-                | (ConfirmedState::Running, ConfirmedState::Unlocked)
-        ) {
-            return Err(Error::InvalidTransition { from, to });
-        }
-        self.mutate(Mutation::SetState(to), DeviceState::Confirmed(to), |b| {
-            b.set_state(to)
-        })
+        self.confirmed()?;
+        self.with_backend(Mutation::SetState(to), |b| b.set_state(to))
     }
 
     /// Regenerate evidence in LOCKED or RUN. All cached objects are invalidated
     /// before the call. A backend failure quarantines the device.
     pub fn regenerate(&mut self, request: Regenerate) -> Result<(), Error<B::Error>> {
-        let state = self.confirmed()?;
-        if state == ConfirmedState::Unlocked {
-            return Err(Error::InvalidState { state: self.state });
-        }
+        self.confirmed()?;
         let operation = match &request {
             Regenerate::InterfaceReport => Mutation::InterfaceReport,
             Regenerate::Measurements(_) => Mutation::Measurements,
         };
-        self.mutate(operation, DeviceState::Confirmed(state), |b| {
-            b.regenerate(&request)
-        })
+        self.with_backend(operation, |b| b.regenerate(&request))
     }
 
     /// Explicitly reset a confirmed device. Quarantine is not recoverable by a
     /// state query or reset; it requires assignment teardown.
     pub fn reset(&mut self) -> Result<(), Error<B::Error>> {
         self.confirmed()?;
-        self.mutate(
-            Mutation::Reset,
-            DeviceState::Confirmed(ConfirmedState::Unlocked),
-            B::reset,
-        )
+        self.with_backend(Mutation::Reset, B::reset)
     }
 
     /// Explicit teardown from a confirmed or quarantined state. Errors preserve
     /// quarantine. Dropping this owner does not call this method.
     pub fn teardown(&mut self) -> Result<(), Error<B::Error>> {
-        self.mutate(Mutation::Teardown, DeviceState::TornDown, B::teardown)
+        self.with_backend(Mutation::Teardown, B::teardown)
     }
 
     fn acquire(&mut self, object: Object) -> Result<&[u8], Error<B::Error>> {

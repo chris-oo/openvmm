@@ -25,6 +25,8 @@ struct FakeState {
     actual: Option<usize>,
     calls: Vec<Call>,
     fail: Option<Call>,
+    panic: Option<Call>,
+    access_failed: bool,
     byte: u8,
     nonce: Option<[u8; 32]>,
     budget: SnapshotBudget,
@@ -36,6 +38,7 @@ impl Fake {
     fn call(&mut self, call: Call) -> Result<(), Failure> {
         let mut state = self.0.lock();
         state.calls.push(call);
+        assert_ne!(state.panic, Some(call), "injected backend unwind");
         if state.fail == Some(call) {
             Err(Failure)
         } else {
@@ -55,6 +58,14 @@ impl Fake {
 
 impl Backend for Fake {
     type Error = Failure;
+
+    fn check_access(&self) -> Result<(), Failure> {
+        if self.0.lock().access_failed {
+            Err(Failure)
+        } else {
+            Ok(())
+        }
+    }
 
     fn state(&mut self) -> Result<ConfirmedState, Failure> {
         self.call(Call::State)?;
@@ -109,6 +120,8 @@ fn device(
         actual: None,
         calls: Vec::new(),
         fail: None,
+        panic: None,
+        access_failed: false,
         byte: 0x40,
         nonce: None,
         budget: budget.clone(),
@@ -487,4 +500,141 @@ fn initial_state_failure_is_not_success() {
         Err(Error::Backend(Failure))
     ));
     assert_eq!(backend.lock().calls, [Call::State, Call::State]);
+}
+
+#[test]
+fn reset_backend_failure_is_not_a_capability_rejection() {
+    let budget = SnapshotBudget::new(4);
+    let (mut device, backend) = device(ConfirmedState::Locked, &budget, 4);
+    device.set_state(ConfirmedState::Running).unwrap();
+    device.object_size(Object::Vca).unwrap();
+    backend.lock().fail = Some(Call::Reset);
+    let calls = backend.lock().calls.len();
+
+    assert!(matches!(device.reset(), Err(Error::Backend(Failure))));
+    assert_eq!(&backend.lock().calls[calls..], [Call::Reset]);
+    assert_eq!(budget.used(), 0);
+    let quarantined = DeviceState::Quarantined {
+        last_confirmed: ConfirmedState::Running,
+    };
+    let transition = Some(Transition {
+        before: DeviceState::Confirmed(ConfirmedState::Running),
+        operation: Mutation::Reset,
+        after: quarantined,
+    });
+    assert_eq!(device.state(), quarantined);
+    assert_eq!(device.last_transition(), transition);
+
+    backend.lock().fail = None;
+    assert!(matches!(device.reset(), Err(Error::InvalidState { .. })));
+    assert_eq!(&backend.lock().calls[calls..], [Call::Reset]);
+    assert_eq!(device.last_transition(), transition);
+    device.teardown().unwrap();
+    assert_eq!(device.state(), DeviceState::TornDown);
+}
+
+#[test]
+fn rejected_requests_preserve_snapshot_and_previous_transition() {
+    let budget = SnapshotBudget::new(4);
+    let (mut device, backend) = device(ConfirmedState::Locked, &budget, 4);
+    device.set_state(ConfirmedState::Unlocked).unwrap();
+    assert_eq!(device.read_object(Object::Vca, 0, 4).unwrap(), [0x44; 4]);
+    let transition = device.last_transition();
+    let calls = backend.lock().calls.clone();
+    backend.lock().byte = 0x50;
+
+    for to in [ConfirmedState::Unlocked, ConfirmedState::Running] {
+        assert!(matches!(
+            device.set_state(to),
+            Err(Error::InvalidTransition { from: ConfirmedState::Unlocked, to: actual })
+                if actual == to
+        ));
+    }
+    assert!(matches!(
+        device.regenerate(Regenerate::InterfaceReport),
+        Err(Error::InvalidState { .. })
+    ));
+    assert!(matches!(
+        device.assignment(AssignmentOperation::PreparePrivateMemory),
+        Err(Error::Unsupported)
+    ));
+    assert_eq!(
+        device.state(),
+        DeviceState::Confirmed(ConfirmedState::Unlocked)
+    );
+    assert_eq!(device.last_transition(), transition);
+    assert_eq!(budget.used(), 4);
+    assert_eq!(device.read_object(Object::Vca, 0, 4).unwrap(), [0x44; 4]);
+    assert_eq!(backend.lock().calls, calls);
+}
+
+#[test]
+fn backend_unwind_releases_snapshots_and_preserves_quarantine() {
+    let budget = SnapshotBudget::new(4);
+    let (mut device, backend) = device(ConfirmedState::Locked, &budget, 4);
+    device.object_size(Object::Vca).unwrap();
+    backend.lock().panic = Some(Call::SetState(ConfirmedState::Running));
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            device.set_state(ConfirmedState::Running)
+        }))
+        .is_err()
+    );
+    let quarantined = DeviceState::Quarantined {
+        last_confirmed: ConfirmedState::Locked,
+    };
+    assert_eq!(backend.lock().state, ConfirmedState::Running);
+    assert_eq!(budget.used(), 0);
+    assert_eq!(device.state(), quarantined);
+    assert_eq!(
+        device.last_transition(),
+        Some(Transition {
+            before: DeviceState::Confirmed(ConfirmedState::Locked),
+            operation: Mutation::SetState(ConfirmedState::Running),
+            after: quarantined,
+        })
+    );
+    let calls = backend.lock().calls.clone();
+    assert!(matches!(device.reset(), Err(Error::InvalidState { .. })));
+    assert!(matches!(
+        device.object_size(Object::Vca),
+        Err(Error::InvalidState { .. })
+    ));
+    assert_eq!(backend.lock().calls, calls);
+    device.teardown().unwrap();
+    assert_eq!(device.state(), DeviceState::TornDown);
+}
+
+#[test]
+fn access_failure_latches_core_quarantine_without_mutation_history() {
+    let budget = SnapshotBudget::new(4);
+    let (mut device, backend) = device(ConfirmedState::Unlocked, &budget, 4);
+    device.set_state(ConfirmedState::Locked).unwrap();
+    device.object_size(Object::Vca).unwrap();
+    let transition = device.last_transition();
+    let calls = backend.lock().calls.clone();
+    backend.lock().access_failed = true;
+
+    assert!(matches!(
+        device.object_size(Object::Vca),
+        Err(Error::Backend(Failure))
+    ));
+    assert_eq!(budget.used(), 0);
+    assert_eq!(
+        device.state(),
+        DeviceState::Quarantined {
+            last_confirmed: ConfirmedState::Locked,
+        }
+    );
+    assert_eq!(device.last_transition(), transition);
+    backend.lock().access_failed = false;
+    assert!(matches!(
+        device.set_state(ConfirmedState::Running),
+        Err(Error::InvalidState { .. })
+    ));
+    assert_eq!(backend.lock().calls, calls);
+    // Teardown must remain available even when the frontend cannot confirm access.
+    backend.lock().access_failed = true;
+    device.teardown().unwrap();
+    assert_eq!(device.state(), DeviceState::TornDown);
 }
