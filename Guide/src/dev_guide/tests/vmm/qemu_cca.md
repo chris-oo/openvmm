@@ -337,8 +337,11 @@ overwriting an existing file. Keep source scripts in the repo: `target/` is
 disposable build output. The checked-in script is a byte-identical extraction
 from the validated initrd, not a replacement injected into the guest.
 The committed execution stack with rebuilt FVP firmware has demonstrated
-LOCK/RUN and a matching 64 MiB read. The full test still fails at the
-protected-mapping UNLOCK guard and during cleanup; there is no end-to-end pass.
+LOCK/RUN, a matching 64 MiB read, checked UNLOCK and explicit OpenVMM
+assignment teardown. Validation after the 2026-10-12 rebase passed exactly
+one native reference test and completed fixture teardown. Kernel/RMM Realm
+destruction still returns `RMI_ERROR_REALM`, and the outer FVP launcher fails
+during L1 shutdown. This is not a clean end-to-end lifecycle pass.
 
 Use the DA profile and roots above, add `--cca-tdisp-guest-root` pointing to
 `.packages/cca-tdisp-runtime/guest-payload`, and replace `--filter`
@@ -353,7 +356,8 @@ Single-boot execution runs native nextest enumeration and the selected test
 before L1 shutdown. It records guest execution, cleanup and model shutdown
 separately; model failure still fails the command. The original guest's
 unlock marker is not proof of host protected-map reclamation. I/O followed
-by failed cleanup is not a clean lifecycle or private-DMA qualification.
+by a passing native test does not establish clean model shutdown or
+private-DMA qualification.
 
 The fixture must unbind its VFIO driver and disconnect its owned host TSM
 connection before L1 poweroff. Fixture cleanup errors and model shutdown

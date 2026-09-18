@@ -6,9 +6,10 @@ Updated: 2026-09-18
 
 Status: **native OpenVMM TDISP LOCK/RUN, the verified 64 MiB AHCI read,
 UNLOCK and guest poweroff are demonstrated on FVP with the unchanged
-kvmtool reference guest.** The native test and fixture now return success,
-but the VMM still logs retained shared IOAS mappings and the FVP model aborts
-during outer shutdown. This is not clean-lifecycle qualification.
+kvmtool reference guest.** The native test, checked VMM assignment cleanup and
+fixture now return success. The pinned KVM/RMM stack still reports
+`RMI_REALM_DESTROY` failure, and the FVP model aborts during outer shutdown.
+The overall FVP session therefore still fails.
 The execution implementation and tests have now been split into reviewed,
 validated commits. The provisional shutdown hold is retained separately as
 an unapproved deferred change.
@@ -18,8 +19,9 @@ The native and VPCI facades now use one lifecycle engine. Final runtime
 validation preserved CCA boot and TDISP LOCK/RUN/read/hash behavior; the
 then-known UNLOCK and cleanup failures remained. Section 4 records the design,
 commits and qualification results.
-The subsequent checked-UNLOCK fix is committed as `lrmotzuu`; section 8
-tracks the active explicit owner-teardown work and its separate acceptance gate.
+The subsequent checked-UNLOCK fix is committed as `lrmotzuu` and explicit
+owner teardown as `sswynrkn`. Section 8 records their completed validation;
+section 12 tracks the remaining kernel/RMM and model investigations.
 The original bring-up stages elsewhere in this document remain context and
 qualification history, not instructions to repeat the rebase or implementation.
 
@@ -1642,8 +1644,8 @@ Evidence:
 The model log is
 `~/.local/state/openvmm/fvp-v1/model-a177c22b5da4779d2203792cb23168c8ed1ba9d7989e058acdfcc174f9be0d30.log`.
 
-The next bounded change wires explicit shutdown for VMs with native Realm
-assignments only; ordinary VM shutdown keeps its existing path:
+Change `sswynrkn` implements the following bounded shutdown path for VMs
+with native Realm assignments only; ordinary VM shutdown keeps its existing path:
 
 1. Put the loaded VM into a custody guard before destructive async shutdown.
    Unchecked drop/cancellation must retain the VM, partition, memory owner
@@ -1687,6 +1689,42 @@ Record native test, fixture, kernel/RMM destruction diagnostics and model exit
 separately. This does not qualify constructor-failure recovery, resistance to
 external process kill, arbitrary hardware reuse, or the known FVP allocator
 failure; do not expand this change into those policies.
+
+#### Explicit shutdown result: 2026-09-18
+
+The reviewed shutdown change passed 173 native and 174 Arm unit tests, native
+and Arm clippy/rustdoc, and complete OpenVMM integration checks. The ordinary
+QEMU CCA boot/ping/poweroff test passed in 35.669 s.
+
+The unchanged DA guest then completed the full native test in 575.148 s:
+
+| Milestone | Result |
+|---|---|
+| Locked / Run | Host-confirmed at 105.053580130 s / 107.419836120 s |
+| Read/hash and interrupts | Original 64 MiB hash matched; 132 AHCI MSI-X interrupts |
+| Unlocked / guest exit | Host-confirmed at 251.432813930 s; guest exit 0 and PowerOff |
+| Checked VMM assignment cleanup | `native Realm owner teardown completed` at 253.949187490 s |
+| Previous retained shared-IOAS error | Not present |
+| Native nextest / fixture | Both exit 0; fixture VFIO unbind and TSM disconnect complete |
+| RMM device destruction | `SMC_RMI_VDEV_DESTROY` returns RMI_SUCCESS |
+| RMM Realm destruction | `SMC_RMI_REALM_DESTROY` returns RMI_ERROR_REALM; host KVM warns |
+| FVP / outer command | Heap-corruption abort 134; Shrinkwrap 1; outer command 255 |
+| Output preservation | Succeeded; no report-write errors |
+
+```text
+Code change: sswynrkn
+Invocation: single-boot-363312-1789761664424656603
+FVP: a8b995509576dbf1424732b9967f040b1ddfa8375c11f275b19ba4bb1b778128
+nextest: fec53718-9e32-475a-90a1-7cc8caa54f6e
+Evidence: vmm_test_results/cca-tdisp-explicit-shutdown/fvp-single-boot-runs/
+          single-boot-363312-1789761664424656603/
+```
+
+The native JUnit and fixture success do not override the failed overall
+`outputs/session-result.json`. `outputs/model.log` preserves the RMM statuses,
+host warning and `corrupted size vs. prev_size` abort. Checked VMM assignment
+cleanup is now demonstrated; successful destruction of the Realm itself,
+clean model shutdown and same-host reuse are not.
 
 Provide an explicit async shutdown path, not just best-effort destructors:
 
@@ -2216,6 +2254,27 @@ before changing the VMM or kernel behavior.
 This is separate from the current UNLOCK/owner-teardown work and from the
 `RMI_REALM_DESTROY` warning observed during host shutdown.
 
+### Follow-up: KVM/RMM Realm destruction and FVP model exit
+
+After checked UNLOCK and successful VDEV destruction, the pinned stack still
+returns `RMI_ERROR_REALM` from `RMI_REALM_DESTROY`. Linux warns at
+`arch/arm64/kvm/rmi.c:1878`; this is distinct from the MPIDR configuration
+restriction. Trace the RMM rejection conditions, outstanding Realm references,
+REC/RTT teardown and KVM lifetime ordering before assigning a root cause or
+changing the kernel/firmware.
+In the pinned RMM, `runtime/rmi/realm.c:1006-1095` returns this error for a
+busy RD, a Realm not in ZOMBIE state, nonzero root-RTT references, or remaining
+VDEV references. The status alone does not identify which condition failed;
+the successful VDEV-destroy trace must not be mistaken for proof that all
+other Realm references are gone.
+
+The FVP process then aborts during outer shutdown with
+`corrupted size vs. prev_size` and exit 134. Preserve its complete model log
+and use the existing host-only TSM reproduction when separating model and
+Realm-lifecycle effects. A causal link between the Realm-destroy rejection
+and allocator abort has not been established. Do not suppress either error,
+force a success exit, or treat a fresh FVP instance as same-host reuse proof.
+
 ### Remaining qualification gates
 
 Milestone one excludes hotplug, migration/snapshots, multiple assigned
@@ -2308,12 +2367,13 @@ qualification steps.
 ### Explicit Realm owner shutdown: 2026-09-18
 
 Review verdict: **Minor revisions**, incorporated before implementation.
-The follow-up requires an Inspect/Stop-only retained shutdown phase, custody
-of in-flight device-removal futures as well as the remaining VM, phase-aware
-retry and positive cleanup evidence. A native PASS from the first UNLOCK run
-does not establish checked owner release; its retained-IOAS error remains an
-implementation gap. External process termination, constructor failures and
-the FVP allocator abort remain outside this bounded change.
+The implemented follow-up uses an Inspect/Stop-only retained shutdown phase,
+custody of in-flight device-removal futures as well as the remaining VM,
+phase-aware retry and positive cleanup evidence. The first UNLOCK run's
+native PASS did not establish checked owner release; `sswynrkn` resolves its
+retained-IOAS gap. Its live result is recorded in section 8.
+External process termination, constructor failures and the FVP allocator
+abort remain outside this bounded change.
 
 ### Shared host infrastructure refactor: 2026-09-18
 

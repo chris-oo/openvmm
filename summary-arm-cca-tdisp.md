@@ -4,9 +4,10 @@ Updated: 2026-09-18.
 
 **OpenVMM now runs the unchanged kvmtool reference guest through TDISP
 LOCK/RUN, a verified 64 MiB AHCI read, UNLOCK and guest poweroff on FVP.**
-The native test and fixture return success, but VMM owner cleanup still logs
-retained shared IOAS mappings and the outer model aborts. This is not a claim
-of clean teardown, reusable assignment or measured private-buffer DMA.
+The native test, checked VMM assignment cleanup and fixture return success.
+The kernel/RMM still reports failed Realm destruction and the outer model
+aborts. The overall FVP session still fails; same-host reuse and measured
+private-buffer DMA remain unqualified.
 
 Native CCA and VPCI now share the host lifecycle engine. The refactored
 code reproduced the same FVP protocol/I/O milestone and known cleanup failure.
@@ -118,16 +119,16 @@ preserve the failed overall verdict.
 
 ## What remains
 
-OpenVMM currently refuses UNLOCK while its protected-mapping ledger contains
-attempted mappings. kvmtool does implement UNLOCK: it sends the native state
-request and restores nonsecure BAR access after success. Our guard is not
-evidence that the host kernel cannot unlock.
+Checked native UNLOCK and explicit VMM assignment teardown are now implemented.
+The remaining observed failures are RMM Realm destruction and the FVP
+allocator abort during outer shutdown. Their causal relationship is not yet
+established.
 
-Deferred work includes acknowledged protected-map release, checked UNLOCK,
-forced-stop and parent-disconnect behavior, constructor-failure custody,
-model shutdown and same-host reuse. The provisional worker hold does not
-solve all those paths. The pinned kernel also has error-reporting gaps during
-mapping rollback and destruction.
+Forced-stop recovery, constructor-failure custody, survival of external process
+termination and same-host reuse remain separate qualifications. The new
+shutdown path retains ownership on cleanup errors and cancellation; it does
+not establish those broader guarantees. The pinned kernel also has
+error-reporting gaps during mapping rollback and destruction.
 
 This guest run does not contain the later private-buffer instrumentation used
 with kvmtool. It therefore does not independently prove that every OpenVMM
@@ -244,3 +245,24 @@ exit 134; Shrinkwrap returned 1. Evidence is in
 `vmm_test_results/cca-tdisp-unlock/fvp-single-boot-runs/single-boot-203969-1789758106354120884/`,
 including the preserved `outputs/model.log`. Do not relabel the outer
 session as passed.
+
+## Explicit owner teardown result
+
+Change `sswynrkn` stops native VM activity, retains and awaits frontend
+removal, and calls the checked Realm teardown service before allowing worker
+shutdown. Error and cancellation retain the VM, RAM, assignment and in-flight
+removal ownership. The failure phase accepts only inspection and cleanup retry.
+
+The next FVP run passed native nextest in 575.148 s and completed fixture
+cleanup. OpenVMM confirmed UNLOCK and emitted
+`native Realm owner teardown completed`; the prior shared-IOAS retention
+error disappeared. LOCK/RUN, the 64 MiB hash and 132 MSI-X interrupts remain
+intact.
+
+RMM reported successful VDEV destruction but rejected Realm destruction.
+FVP still aborted with heap corruption and exit 134, so the outer command
+failed. Results are under `vmm_test_results/cca-tdisp-explicit-shutdown/`,
+invocation `single-boot-363312-1789761664424656603`, including
+`outputs/session-result.json` and the complete `outputs/model.log`.
+The main plan now tracks the Realm-destroy and model-abort investigations
+separately from the MPIDR follow-up.
