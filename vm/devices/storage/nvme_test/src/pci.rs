@@ -56,6 +56,9 @@ use vmcore::save_restore::SaveRestore;
 use vmcore::save_restore::SavedStateNotSupported;
 use vmcore::vm_task::VmTaskDriverSource;
 
+#[cfg(test)]
+mod tdisp_tests;
+
 /// An NVMe controller.
 #[derive(InspectMut)]
 pub struct NvmeFaultController {
@@ -74,10 +77,9 @@ pub struct NvmeFaultController {
     /// The NVMe fault controller is repurposed for use in TDISP tests.
     #[inspect(skip)]
     tdisp_interface: Option<Box<dyn TdispHostDeviceTarget>>,
-    /// The MMIO ranges TDISP currently allows the guest to reach. Empty, and so
-    /// blocking every range, on a controller that is not a TDISP device.
+    /// Range acceptance and lifecycle containment for a TDISP controller.
     #[inspect(skip)]
-    tdisp_mmio_ranges: TdispMmioRanges,
+    tdisp_mmio_ranges: Option<TdispMmioRanges>,
 }
 
 #[derive(Inspect)]
@@ -145,10 +147,10 @@ impl NvmeFaultController {
             let (emulator, ranges) = new_tdisp_interface("fault-controller-test", msix.bar_len());
             (
                 Some(Box::new(emulator) as Box<dyn TdispHostDeviceTarget>),
-                ranges,
+                Some(ranges),
             )
         } else {
-            (None, TdispMmioRanges::default())
+            (None, None)
         };
         let bars = DeviceBars::new()
             .bar0(
@@ -552,12 +554,25 @@ impl NvmeFaultController {
     /// until the guest has attested the TDI and accepted the range. A
     /// controller that is not acting as a TDISP device has no such restriction.
     fn bar0_reachable(&self) -> bool {
-        self.tdisp_interface.is_none() || self.tdisp_mmio_ranges.is_unblocked(BAR0_RANGE_ID)
+        self.tdisp_mmio_ranges
+            .as_ref()
+            .is_none_or(|ranges| ranges.is_unblocked(BAR0_RANGE_ID))
+    }
+
+    fn mmio_allowed(&self) -> bool {
+        self.tdisp_mmio_ranges
+            .as_ref()
+            .is_none_or(TdispMmioRanges::is_allowed)
     }
 }
 
 impl MmioIntercept for NvmeFaultController {
     fn mmio_read(&mut self, addr: u64, data: &mut [u8]) -> IoResult {
+        if !self.mmio_allowed() {
+            tracelimit::warn_ratelimited!(addr, "read of a TDISP controller denied by containment");
+            data.fill(!0);
+            return IoResult::Ok;
+        }
         match self.cfg_space.find_bar(addr) {
             Some((0, _)) if !self.bar0_reachable() => {
                 // Read as an undecoded window rather than an error, so the
@@ -580,6 +595,13 @@ impl MmioIntercept for NvmeFaultController {
     }
 
     fn mmio_write(&mut self, addr: u64, data: &[u8]) -> IoResult {
+        if !self.mmio_allowed() {
+            tracelimit::warn_ratelimited!(
+                addr,
+                "write to a TDISP controller denied by containment"
+            );
+            return IoResult::Ok;
+        }
         match self.cfg_space.find_bar(addr) {
             Some((0, _)) if !self.bar0_reachable() => {
                 tracelimit::warn_ratelimited!(

@@ -319,7 +319,7 @@ fn all_mutations_invalidate_all_objects() {
         }
         assert_eq!(budget.used(), 16);
         match operation {
-            Mutation::Assignment => unreachable!(),
+            Mutation::Assignment | Mutation::Unbind | Mutation::ModifyMmio => unreachable!(),
             Mutation::SetState(state) => device.set_state(state),
             Mutation::InterfaceReport => device.regenerate(Regenerate::InterfaceReport),
             Mutation::Measurements => {

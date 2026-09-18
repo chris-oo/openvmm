@@ -1,11 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use crate::TdispAccess;
 use crate::TdispHostDeviceInterface;
 use crate::TdispHostDeviceTargetEmulator;
 use crate::devicereport::TDI_REPORT_HEADER_SIZE;
-use parking_lot::Mutex;
-use std::sync::Arc;
 use tdisp_proto::TdispDeviceInterfaceInfo;
 use tdisp_proto::TdispGuestProtocolType;
 use tdisp_proto::TdispMmioRangeAction;
@@ -71,7 +70,8 @@ impl TdispHostDeviceInterface for NullTdispHostInterface {
 /// Implements the host side of the TDISP interface for a mock device that does nothing.
 pub fn new_null_tdisp_interface(debug_device_id: &str) -> TdispHostDeviceTargetEmulator {
     TdispHostDeviceTargetEmulator::new(
-        Arc::new(Mutex::new(NullTdispHostInterface {})),
+        NullTdispHostInterface {},
+        TdispAccess::new(),
         debug_device_id,
     )
 }

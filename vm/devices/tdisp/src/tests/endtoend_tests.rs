@@ -31,8 +31,226 @@ use tdisp_proto::TdispReportType;
 use tdisp_proto::TdispTdiState;
 use tdisp_proto::guest_to_host_command::Command;
 use tdisp_proto::guest_to_host_response::Response;
+use test_with_tracing::test;
 
 // ── Dispatch helpers ──────────────────────────────────────────────────────────
+
+#[test]
+fn mutation_faults_and_unwind_quarantine_every_guest_entry() {
+    use TdispTdiState::*;
+    for (initial, command, call) in [
+        (Unlocked, bind_cmd(1), LastCall::BindDevice),
+        (Locked, start_tdi_cmd(1), LastCall::StartDevice),
+        (
+            Unlocked,
+            unbind_cmd(1, TdispGuestUnbindReason::Graceful),
+            LastCall::UnbindDevice,
+        ),
+        (
+            Run,
+            unbind_cmd(1, TdispGuestUnbindReason::Graceful),
+            LastCall::UnbindDevice,
+        ),
+        (
+            Run,
+            modify_mmio_range_cmd(1, TdispMmioRangeAction::UnblockMmioRange, 0, 0, 4096),
+            LastCall::ModifyMmioRange {
+                action: TdispMmioRangeAction::UnblockMmioRange,
+                range_id: 0,
+                gpa_base: 0,
+                range_len_bytes: 4096,
+            },
+        ),
+        // Invalid requests invoke compatibility cleanup; its failure wins.
+        (Locked, bind_cmd(1), LastCall::UnbindDevice),
+        (Unlocked, start_tdi_cmd(1), LastCall::UnbindDevice),
+        (
+            Unlocked,
+            get_tdi_report_cmd(1, TdispReportType::InterfaceReport),
+            LastCall::UnbindDevice,
+        ),
+    ] {
+        for after_effect in [false, true] {
+            for panic in [false, true] {
+                let mut mock = new_emulator();
+                dispatch_roundtrip(&mut mock.emulator, negotiate_cmd(1));
+                if initial != Unlocked {
+                    dispatch_roundtrip(&mut mock.emulator, bind_cmd(1));
+                }
+                if initial == Run {
+                    dispatch_roundtrip(&mut mock.emulator, start_tdi_cmd(1));
+                }
+                let calls = mock.control.lock().calls.len();
+                let effects = mock.control.lock().effects;
+                {
+                    let mut control = mock.control.lock();
+                    control.fail = Some(call.clone());
+                    control.after_effect = after_effect;
+                    control.panic = panic;
+                }
+                if panic {
+                    assert!(
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            dispatch(&mut mock.emulator, command.clone())
+                        }))
+                        .is_err()
+                    );
+                } else {
+                    let response = dispatch_roundtrip(&mut mock.emulator, command.clone());
+                    assert_eq!(
+                        response.result,
+                        TdispGuestOperationErrorCode::HostFailedToProcessCommand as i32
+                    );
+                    assert_eq!(response.tdi_state_before, initial as i32);
+                    assert_eq!(response.tdi_state_after, Uninitialized as i32);
+                    assert_eq!(
+                        response.response.is_some(),
+                        matches!(command.command, Some(Command::Unbind(_)))
+                    );
+                }
+                assert_eq!(mock.control.lock().calls.len(), calls + 1);
+                assert_eq!(
+                    mock.control.lock().effects,
+                    effects + usize::from(after_effect)
+                );
+                assert!(!mock.gate.is_allowed());
+                mock.control.lock().fail = None;
+                mock.emulator.reset();
+                for retry in [
+                    negotiate_cmd(1),
+                    bind_cmd(1),
+                    start_tdi_cmd(1),
+                    unbind_cmd(1, TdispGuestUnbindReason::Graceful),
+                    get_tdi_report_cmd(1, TdispReportType::GuestDeviceId),
+                    modify_mmio_range_cmd(1, TdispMmioRangeAction::UnblockMmioRange, 0, 0, 4096),
+                ] {
+                    let response = dispatch_roundtrip(&mut mock.emulator, retry);
+                    assert_eq!(
+                        response.result,
+                        TdispGuestOperationErrorCode::HostFailedToProcessCommand as i32
+                    );
+                    assert_eq!(response.tdi_state_before, Uninitialized as i32);
+                    assert_eq!(response.tdi_state_after, Uninitialized as i32);
+                    assert!(response.response.is_none());
+                    assert!(!mock.gate.is_allowed());
+                }
+                assert_eq!(mock.control.lock().calls.len(), calls + 1);
+            }
+        }
+    }
+}
+
+#[test]
+fn pure_read_failure_keeps_health_and_fetches_fresh_bytes() {
+    let mut mock = new_emulator();
+    dispatch_roundtrip(&mut mock.emulator, negotiate_cmd(1));
+    dispatch_roundtrip(&mut mock.emulator, bind_cmd(1));
+    mock.control.lock().fail = Some(LastCall::GetDeviceReport(TdispReportType::InterfaceReport));
+    let response = dispatch_roundtrip(
+        &mut mock.emulator,
+        get_tdi_report_cmd(1, TdispReportType::InterfaceReport),
+    );
+    assert_eq!(
+        response.result,
+        TdispGuestOperationErrorCode::HostFailedToProcessCommand as i32
+    );
+    assert_eq!(response.tdi_state_after, TdispTdiState::Locked as i32);
+    assert!(mock.gate.is_allowed());
+    mock.control.lock().fail = None;
+    for bytes in [vec![0, 1, 2], vec![0xfe, 0xfd]] {
+        *mock.report_buffer.lock() = bytes.clone();
+        let response = dispatch_roundtrip(
+            &mut mock.emulator,
+            get_tdi_report_cmd(1, TdispReportType::InterfaceReport),
+        );
+        assert!(
+            matches!(response.response, Some(Response::GetTdiReport(report)) if report.report_buffer == bytes)
+        );
+    }
+    assert_eq!(
+        mock.control
+            .lock()
+            .calls
+            .iter()
+            .filter(|call| matches!(call, LastCall::GetDeviceReport(_)))
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn report_and_unbind_enum_validation_preserves_cleanup_order() {
+    for (report_type, expected, cleanup) in [
+        (
+            TdispReportType::GuestDeviceId as i32,
+            TdispGuestOperationErrorCode::Success,
+            false,
+        ),
+        (
+            TdispReportType::Invalid as i32,
+            TdispGuestOperationErrorCode::InvalidGuestAttestationReportState,
+            true,
+        ),
+        (
+            i32::MAX,
+            TdispGuestOperationErrorCode::InvalidGuestAttestationReportType,
+            false,
+        ),
+    ] {
+        let mut mock = new_emulator();
+        dispatch_roundtrip(&mut mock.emulator, negotiate_cmd(1));
+        let calls = mock.control.lock().calls.len();
+        let command = GuestToHostCommand {
+            device_id: 1,
+            command: Some(Command::GetTdiReport(TdispCommandRequestGetTdiReport {
+                report_type,
+            })),
+        };
+        if report_type == i32::MAX {
+            assert!(deserialize_command(&serialize_command(&command)).is_err());
+        }
+        let response = mock.emulator.tdisp_handle_guest_command(command).unwrap();
+        let response = deserialize_response(&serialize_response(&response)).unwrap();
+        assert_eq!(response.result, expected as i32);
+        assert_eq!(response.tdi_state_after, TdispTdiState::Unlocked as i32);
+        assert_eq!(
+            mock.control.lock().calls[calls..].contains(&LastCall::UnbindDevice),
+            cleanup
+        );
+        assert!(mock.gate.is_allowed());
+    }
+    for (reason, expected, calls) in [
+        (
+            TdispGuestUnbindReason::Unknown as i32,
+            TdispGuestOperationErrorCode::Success,
+            1,
+        ),
+        (
+            i32::MAX,
+            TdispGuestOperationErrorCode::InvalidGuestUnbindReason,
+            0,
+        ),
+    ] {
+        let mut mock = new_emulator();
+        dispatch_roundtrip(&mut mock.emulator, negotiate_cmd(1));
+        let count = mock.control.lock().calls.len();
+        let command = GuestToHostCommand {
+            device_id: 1,
+            command: Some(Command::Unbind(TdispCommandRequestUnbind {
+                unbind_reason: reason,
+            })),
+        };
+        if reason == i32::MAX {
+            assert!(deserialize_command(&serialize_command(&command)).is_err());
+        }
+        let response = mock.emulator.tdisp_handle_guest_command(command).unwrap();
+        let response = deserialize_response(&serialize_response(&response)).unwrap();
+        assert_eq!(response.result, expected as i32);
+        assert_eq!(mock.control.lock().calls.len(), count + calls);
+        assert_eq!(response.response.is_some(), calls != 0);
+        assert!(mock.gate.is_allowed());
+    }
+}
 
 /// Serialize `cmd` to bytes, deserialize it, pass it to the emulator, and
 /// return the raw `GuestToHostResponse`.
