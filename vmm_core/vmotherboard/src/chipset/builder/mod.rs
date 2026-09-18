@@ -55,6 +55,21 @@ pub struct ChipsetDevices {
 }
 
 impl ChipsetDevices {
+    /// Take all static device units into an owned asynchronous drain.
+    ///
+    /// Stop state units first. Keep the executor, partition and RAM alive until
+    /// this future completes. Each removed task is awaited and its returned
+    /// device owner dropped. For assignments with uncertain release, retain this
+    /// future itself on cancellation: it owns both remaining and in-flight units.
+    pub fn drain_device_units(&mut self) -> impl Future<Output = ()> + Send + 'static {
+        let units = std::mem::take(&mut self._arc_mutex_device_units);
+        async move {
+            for unit in units {
+                drop(unit.remove().await);
+            }
+        }
+    }
+
     /// The root chipset unit handle.
     ///
     /// All devices that have MMIO, PIO, or PCI callbacks have a "stop after"

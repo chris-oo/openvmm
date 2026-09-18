@@ -80,6 +80,13 @@ pub struct RealmTeardownError {
 }
 
 impl RealmTeardownHandle {
+    /// Whether this handle retains any native assignment services.
+    ///
+    /// This is an owner-shutdown decision, not permission to release resources.
+    pub fn has_assignments(&self) -> bool {
+        !self.state.lock().devices.is_empty()
+    }
+
     /// Permanently stop new device work without waiting for admitted workers.
     ///
     /// This does not revoke DMA or release any resources.
@@ -558,6 +565,7 @@ mod realm_guard_tests {
     #[test]
     fn teardown_handle_retains_all_services_on_failure_and_retries() {
         let handle = RealmTeardownHandle::default();
+        assert!(!handle.has_assignments());
         let first = Arc::new(TeardownService {
             fail: AtomicBool::new(true),
             calls: AtomicUsize::new(0),
@@ -572,10 +580,12 @@ mod realm_guard_tests {
         let weak_second = Arc::downgrade(&second);
         handle.retain(0x100, first.clone()).unwrap();
         handle.retain(0x200, second.clone()).unwrap();
+        assert!(handle.has_assignments());
         assert!(handle.retain(0x100, second.clone()).is_err());
         drop(first);
         drop(second);
         let error = futures::executor::block_on(handle.teardown()).unwrap_err();
+        assert!(handle.has_assignments());
         assert_eq!(error.requester_id, 0x100);
         let first = weak_first.upgrade().unwrap();
         let second = weak_second.upgrade().unwrap();
@@ -586,6 +596,7 @@ mod realm_guard_tests {
         drop(first);
         drop(second);
         futures::executor::block_on(handle.teardown()).unwrap();
+        assert!(!handle.has_assignments());
         assert!(weak_first.upgrade().is_none());
         assert!(weak_second.upgrade().is_none());
     }

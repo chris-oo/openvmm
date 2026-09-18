@@ -11,6 +11,8 @@ mod pcie_wiring;
 mod ram_backing;
 #[cfg(target_os = "linux")]
 mod realm_retention;
+#[cfg(target_os = "linux")]
+mod realm_shutdown;
 mod smmu_wiring;
 
 use crate::emuplat;
@@ -4443,6 +4445,11 @@ impl LoadedVm {
                     self.inner.client_notify_send.send(reason);
                 }
             }
+        }
+
+        #[cfg(target_os = "linux")]
+        if self.inner._realm_teardown.has_assignments() {
+            self = realm_shutdown::shutdown(self, rpc_recv, worker_rpc).await;
         }
 
         while let Some(entry) = self.inner.dynamic_vpci_devices.pop() {

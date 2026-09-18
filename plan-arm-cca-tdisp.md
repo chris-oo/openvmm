@@ -4,10 +4,11 @@ Date: 2026-09-11
 
 Updated: 2026-09-18
 
-Status: **native OpenVMM TDISP LOCK/RUN and a 64 MiB AHCI read are demonstrated
-on FVP with the unchanged kvmtool reference guest.** The read matched the
-reference disk hash. The complete VMM test still fails at UNLOCK and shutdown;
-this is a successful protocol/I/O milestone, not clean-lifecycle qualification.
+Status: **native OpenVMM TDISP LOCK/RUN, the verified 64 MiB AHCI read,
+UNLOCK and guest poweroff are demonstrated on FVP with the unchanged
+kvmtool reference guest.** The native test and fixture now return success,
+but the VMM still logs retained shared IOAS mappings and the FVP model aborts
+during outer shutdown. This is not clean-lifecycle qualification.
 The execution implementation and tests have now been split into reviewed,
 validated commits. The provisional shutdown hold is retained separately as
 an unapproved deferred change.
@@ -15,8 +16,10 @@ an unapproved deferred change.
 **Shared host TDISP infrastructure is implemented and reviewed.**
 The native and VPCI facades now use one lifecycle engine. Final runtime
 validation preserved CCA boot and TDISP LOCK/RUN/read/hash behavior; the
-known UNLOCK and cleanup failures remain. Section 4 records the design,
+then-known UNLOCK and cleanup failures remained. Section 4 records the design,
 commits and qualification results.
+The subsequent checked-UNLOCK fix is committed as `lrmotzuu`; section 8
+tracks the active explicit owner-teardown work and its separate acceptance gate.
 The original bring-up stages elsewhere in this document remain context and
 qualification history, not instructions to repeat the rebase or implementation.
 
@@ -1624,6 +1627,67 @@ moving to owner teardown after guest/frontend activity is stopped.
 
 #### Full owner and fixture shutdown
 
+The checked-UNLOCK change `lrmotzuu` reached host-confirmed Unlocked at
+224.911886360 s, followed by guest poweroff and native nextest PASS
+(547.317 s). Fixture VFIO unbind and TSM disconnect also returned success.
+However, `openvmm.log` still recorded retained shared IOAS mappings during
+`RealmDevice::drop`. The worker did not call the existing
+`RealmTeardownHandle::teardown`, which drains shared mappings before object
+destruction. Therefore this is not evidence of checked VMM owner cleanup.
+The outer FVP launcher separately failed with model exit 134 and
+`corrupted size vs. prev_size`.
+
+Evidence:
+`vmm_test_results/cca-tdisp-unlock/fvp-single-boot-runs/single-boot-203969-1789758106354120884/`.
+The model log is
+`~/.local/state/openvmm/fvp-v1/model-a177c22b5da4779d2203792cb23168c8ed1ba9d7989e058acdfcc174f9be0d30.log`.
+
+The next bounded change wires explicit shutdown for VMs with native Realm
+assignments only; ordinary VM shutdown keeps its existing path:
+
+1. Put the loaded VM into a custody guard before destructive async shutdown.
+   Unchecked drop/cancellation must retain the VM, partition, memory owner
+   and assignment handles. Construct the guard before returning a shutdown
+   future so dropping an unpolled future is also covered.
+2. Stop state units/VPs and close native request admission. Orderly guest
+   UNLOCK has already run on the normal poweroff path; a forced stop must
+   not fabricate it.
+3. Drain and await static chipset device units so PCI frontend and IRQ owners
+   are released. Add a narrow async device-unit drain to `ChipsetDevices`;
+   keep the rest of the VM and RAM owners alive throughout. Also remove any
+   dynamic device handles through their existing shutdown paths. Keep each
+   owned in-flight removal future inside custody, including any device/task
+   moved out of a vector. A popped unit is not drained until its task finishes
+   and the returned unit is dropped.
+4. Call `RealmTeardownHandle::teardown` and wait for checked shared-IOAS
+   withdrawal and IOMMUFD graph cleanup. Only success releases custody and
+   permits the worker to report stopped.
+5. On failure, log the full cleanup error and keep an inspectable retained
+   worker rather than returning success or freeing backing. Permit cleanup
+   retry through a later stop request. Permanently leave normal dispatch:
+   only Inspect and Stop/retry are allowed; close/reject ordinary VM RPCs,
+   including ClearHalt, Reset and device mutations, as well as Restart.
+   Resume retries from the completed phase instead of repeating stop/drain.
+   Record the phase and last full error in inspection. Parent channel
+   closure must not cause a busy loop or release custody. The FVP domain
+   deadline remains an external failure boundary, not a successful cleanup.
+   Some failures, such as a permanently retained frontend after IRQ cleanup
+   failure, may remain unrecoverable within that process.
+
+Test stop/drain/cleanup ordering, success-only release, failure and cancellation
+custody, retry, and the no-assignment path with deterministic fakes. Include
+cancellation inside both static and dynamic device removal and keep the device
+executor alive through completion. Inject frontend/IRQ, short shared-unmap and
+object-destruction failures. Emit a positive completion marker only after the
+checked service succeeds; WorkerEvent::Stopped must be impossible before it.
+The live run must contain that marker and no VMM retention error before
+claiming checked owner cleanup. Successful cleanup must still shut down the
+partition unit and VMBus through their existing paths.
+Record native test, fixture, kernel/RMM destruction diagnostics and model exit
+separately. This does not qualify constructor-failure recovery, resistance to
+external process kill, arbitrary hardware reuse, or the known FVP allocator
+failure; do not expand this change into those policies.
+
 Provide an explicit async shutdown path, not just best-effort destructors:
 
 1. Stop new assignment admission and arrange orderly guest/device quiescence.
@@ -2130,6 +2194,30 @@ trusted-assignment prerequisites.
 
 ## 12. Scope and open gates
 
+### Follow-up: KVM/Realm MPIDR configuration
+
+Track why the pinned CCA kernels reject writes to `MPIDR_EL1` through
+`KVM_SET_ONE_REG`, and whether this is an intended Realm ABI restriction or
+missing KVM/RMM configuration support. Do not assume it is a kernel bug.
+
+The current fix, `vvutrqnt`, reads KVM's reset MPIDR and validates affinity
+and SMT against the requested topology. It ignores U/RES1 differences and
+rejects real topology mismatches; ordinary KVM VMs still program MPIDR.
+Keep that check until a supported replacement is established.
+
+Compare the v15 kernel `4ddbc65b5b408c37605110166a8da19f4dd0e180`, the pinned
+DA kernel `2b68f486fdbc8d2818309f91199dde46b2b7cdd6`, and current upstream
+behavior. Trace `validate_realm_set_reg`, `reset_mpidr`, REC creation and
+GIC redistributor affinity. Determine the supported point for configuring
+Realm CPU identities, including any constraints imposed by RMM.
+Validate multiple VPs, affinity-level boundaries and SMT/non-SMT topologies
+before changing the VMM or kernel behavior.
+
+This is separate from the current UNLOCK/owner-teardown work and from the
+`RMI_REALM_DESTROY` warning observed during host shutdown.
+
+### Remaining qualification gates
+
 Milestone one excludes hotplug, migration/snapshots, multiple assigned
 devices, P2P, ATS/PASID, secure MSI-X, a guest-visible SMMU, production trust
 policy, and hardware qualification.
@@ -2216,6 +2304,16 @@ VFIO ledger retirement and deterministic admission-race coverage.
 No forced-unmap interface, guest-marker assumption or weakening of failure
 custody is involved. Object destruction and outer shutdown remain separate
 qualification steps.
+
+### Explicit Realm owner shutdown: 2026-09-18
+
+Review verdict: **Minor revisions**, incorporated before implementation.
+The follow-up requires an Inspect/Stop-only retained shutdown phase, custody
+of in-flight device-removal futures as well as the remaining VM, phase-aware
+retry and positive cleanup evidence. A native PASS from the first UNLOCK run
+does not establish checked owner release; its retained-IOAS error remains an
+implementation gap. External process termination, constructor failures and
+the FVP allocator abort remain outside this bounded change.
 
 ### Shared host infrastructure refactor: 2026-09-18
 
