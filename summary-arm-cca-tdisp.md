@@ -3,8 +3,9 @@
 Updated: 2026-09-18.
 
 **OpenVMM now runs the unchanged kvmtool reference guest through TDISP
-LOCK/RUN and a verified 64 MiB AHCI read on FVP.** The overall VMM test still
-fails at UNLOCK and shutdown. This is a protocol/I/O milestone, not a claim
+LOCK/RUN, a verified 64 MiB AHCI read, UNLOCK and guest poweroff on FVP.**
+The native test and fixture return success, but VMM owner cleanup still logs
+retained shared IOAS mappings and the outer model aborts. This is not a claim
 of clean teardown, reusable assignment or measured private-buffer DMA.
 
 Native CCA and VPCI now share the host lifecycle engine. The refactored
@@ -219,3 +220,27 @@ Evidence is saved under `vmm_test_results/cca-tdisp-shared-core/` in invocation
 `single-boot-28153-1789748147458299564`. Its `outputs/session-result.json`
 records native command exit 100, fixture/launcher exit 1, and successful
 preservation. No guest, kernel or firmware changes were needed.
+
+## Native UNLOCK and remaining owner cleanup
+
+Change `lrmotzuu` uses checked kernel/RMM UNLOCK completion to retire both
+protected-mapping ledgers under device admission. Mapping attempts now enter
+that same admission before they are recorded. Failures retain records and
+deny access; no unmap ioctl or guest-marker acknowledgement was invented.
+
+The first run confirmed Locked at 104.021506540 s, Run at 106.359098480 s,
+and Unlocked at 224.911886360 s. The guest kept the expected 64 MiB hash and
+132 MSI-X interrupts, then emitted its UNLOCK marker and powered off.
+Native nextest passed in 547.317 s. Fixture VFIO unbind and TSM disconnect
+completed with exit 0.
+
+This still does not prove checked VMM owner release: raw `RealmDevice::drop`
+logged retained shared IOAS mappings because the worker did not invoke the
+explicit teardown service. The next change wires that shutdown path while
+retaining ownership on failed or interrupted cleanup.
+
+The FVP model separately aborted with `corrupted size vs. prev_size` and
+exit 134; Shrinkwrap returned 1. Evidence is in
+`vmm_test_results/cca-tdisp-unlock/fvp-single-boot-runs/single-boot-203969-1789758106354120884/`,
+including the preserved `outputs/model.log`. Do not relabel the outer
+session as passed.
