@@ -108,6 +108,22 @@ pub enum KvmError {
         #[source]
         err: kvm::Error,
     },
+    #[cfg(guest_arch = "aarch64")]
+    #[error("failed to read MPIDR_EL1 for Realm VP {vp_index}")]
+    ReadRealmMpidr {
+        vp_index: u32,
+        #[source]
+        err: kvm::Error,
+    },
+    #[cfg(guest_arch = "aarch64")]
+    #[error(
+        "Realm VP {vp_index} MPIDR_EL1 {actual:#x} does not match requested topology {expected:#x}"
+    )]
+    RealmMpidrMismatch {
+        vp_index: u32,
+        expected: u64,
+        actual: u64,
+    },
     #[cfg(guest_arch = "x86_64")]
     #[error("nested virtualization was requested but the host does not support it")]
     NestedVirtUnsupported,
