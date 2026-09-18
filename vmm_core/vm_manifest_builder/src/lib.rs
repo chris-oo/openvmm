@@ -539,7 +539,12 @@ impl VmManifestBuilder {
                 }
             }
             BaseChipsetType::EnlightenedLinuxDirect => {
-                result.chipset = BaseChipsetManifest::empty();
+                result.chipset = BaseChipsetManifest {
+                    // HACK: The current SNP direct-boot repro kernel requires
+                    // a CMOS RTC. Remove or gate this when it no longer does.
+                    with_generic_cmos_rtc: is_x86,
+                    ..BaseChipsetManifest::empty()
+                };
                 result.capabilities.with_ioapic = is_x86;
                 result.capabilities.with_psp = self.psp;
                 if is_x86 {
@@ -954,6 +959,16 @@ impl VmChipsetResult {
                 name: "missing-gameport".to_owned(),
                 resource: MissingDevHandle::new()
                     .claim_pio("gameport", 0x201..=0x201)
+                    .into_resource(),
+            },
+            // Guests probe for an 8-bit SuperIO chip at the legacy index/data
+            // pair. These ports alias the top of the Hyper-V firmware devices'
+            // register window, which only decodes dword accesses, so the
+            // firmware devices leave them unclaimed.
+            ChipsetDeviceHandle {
+                name: "missing-superio".to_owned(),
+                resource: MissingDevHandle::new()
+                    .claim_pio("superio", 0x2e..=0x2f)
                     .into_resource(),
             },
         ]);

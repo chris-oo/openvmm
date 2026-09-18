@@ -6,6 +6,7 @@
 use crate::Error;
 use crate::ErrorInner;
 use crate::LinuxMshv;
+use crate::MshvIsolationState;
 use crate::MshvPartition;
 use crate::MshvPartitionInner;
 use crate::MshvProcessor;
@@ -68,6 +69,9 @@ impl virt::Hypervisor for LinuxMshv {
         &mut self,
         config: ProtoPartitionConfig<'a>,
     ) -> Result<MshvProtoPartition<'a>, Self::Error> {
+        if self.snp_disable_cpuid_offload {
+            return Err(ErrorInner::IsolationNotSupported.into());
+        }
         if config.isolation.is_isolated() {
             return Err(ErrorInner::IsolationNotSupported.into());
         }
@@ -181,6 +185,7 @@ impl ProtoPartition for MshvProtoPartition<'_> {
             vps: self.vps,
             caps,
             synic_ports: Default::default(),
+            isolation: MshvIsolationState::None,
             time_frozen: false.into(),
             gic_msi: self.config.processor_topology.gic_msi(),
             gsi_states: parking_lot::Mutex::new(Box::new(
@@ -213,6 +218,10 @@ impl ProtoPartition for MshvProtoPartition<'_> {
 // ---------------------------------------------------------------------------
 
 impl virt::Partition for MshvPartition {
+    fn initial_vp_state_source(&self) -> virt::InitialVpStateSource {
+        virt::InitialVpStateSource::Registers
+    }
+
     fn supports_reset(&self) -> Option<&dyn virt::ResetPartition<Error = Error>> {
         Some(self)
     }
@@ -378,6 +387,15 @@ impl virt::BindProcessor for MshvProcessorBinder {
             }
             self.vcpufd.as_ref().unwrap()
         };
+
+        // Set the MPIDR for this VP; otherwise, the hypervisor assigns a value
+        // that would not match the identity firmware advertises.
+        vcpufd
+            .set_hvdef_regs(&[HvRegisterAssoc::from((
+                HvArm64RegisterName::MpidrEl1,
+                u64::from(inner.vp_info.mpidr),
+            ))])
+            .map_err(ErrorInner::Register)?;
 
         // Set the GIC redistributor base for this VP (GICv3 only).
         if let Some(gicr) = inner.vp_info.gicr {
@@ -605,6 +623,9 @@ impl MshvProcessor<'_> {
                     }
                     hvdef::HvArm64ResetType::REBOOT => {
                         return Err(VpHaltReason::Reset);
+                    }
+                    hvdef::HvArm64ResetType::HIBERNATE => {
+                        return Err(VpHaltReason::Hibernate);
                     }
                     _ => {
                         tracelimit::warn_ratelimited!(

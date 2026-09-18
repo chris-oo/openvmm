@@ -101,6 +101,13 @@ pub enum KvmError {
     NoGic,
     #[error("host does not support required cpu capabilities")]
     Capabilities(virt::PartitionCapabilitiesError),
+    #[cfg(guest_arch = "aarch64")]
+    #[error("failed to set MPIDR_EL1 for VP {vp_index}")]
+    SetMpidr {
+        vp_index: u32,
+        #[source]
+        err: kvm::Error,
+    },
     #[cfg(guest_arch = "x86_64")]
     #[error("nested virtualization was requested but the host does not support it")]
     NestedVirtUnsupported,
@@ -130,6 +137,9 @@ struct KvmPartitionInner {
     #[cfg(guest_arch = "x86_64")]
     #[inspect(skip)]
     sev: Option<std::fs::File>,
+    #[cfg(guest_arch = "x86_64")]
+    #[inspect(skip)]
+    snp_config: Option<snp::KvmSnpConfig>,
     #[cfg(guest_arch = "x86_64")]
     #[inspect(skip)]
     snp_launch_state: Mutex<SnpLaunchState>,

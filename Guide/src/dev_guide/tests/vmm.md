@@ -134,6 +134,17 @@ To run a **specific test** (or set of tests), use `--filter` with a
 cargo xflowey vmm-tests-run --filter "test(my_test_name)" --dir /tmp/vmm-tests-run
 ```
 
+### Build without running
+
+Use `--build-only` to prepare the selected tests without running them.
+Native and ordinary TCG runs produce portable target-side scripts.
+CCA incubator runs instead produce a `run.sh` for the build host, retaining
+the resolved payload, firmware and model paths. Keep those inputs at their
+original locations.
+
+`vmm-tests-run-target` does not accept CCA incubator profiles. Use
+`vmm-tests-run` or its generated host-side script for CCA.
+
 ### CCA incubator payloads
 
 The QEMU CCA incubator uses the unified AArch64 CCA kernel and test initrd

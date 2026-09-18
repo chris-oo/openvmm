@@ -233,6 +233,8 @@ pub struct PetriVmConfig {
     pub firmware: Firmware,
     /// Isolation applied to the VM partition.
     pub isolation: Option<IsolationType>,
+    /// Whether to enable guest hibernation support.
+    pub hibernation_enabled: bool,
     /// The amount of memory, in bytes, to assign to the VM
     pub memory: MemoryConfig,
     /// The processor topology for the VM
@@ -462,6 +464,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
                 host_log_levels: None,
                 firmware: artifacts.firmware,
                 isolation,
+                hibernation_enabled: false,
                 memory: Default::default(),
                 proc_topology: Default::default(),
 
@@ -545,6 +548,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
                 host_log_levels: None,
                 firmware: artifacts.firmware,
                 isolation,
+                hibernation_enabled: false,
                 memory: Default::default(),
                 proc_topology: Default::default(),
 
@@ -1099,14 +1103,14 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
         // Auto-prepare the initrd with pipette injected if needed.
         // This centralizes the injection logic so backends only ever
         // receive a prebuilt_initrd path.
-        let _prepared_initrd_guard;
-        if self.uses_pipette_as_init() && self.prebuilt_initrd.is_none() {
-            let tmp = self.prepare_initrd()?;
-            self.prebuilt_initrd = Some(tmp.to_path_buf());
-            _prepared_initrd_guard = Some(tmp);
-        } else {
-            _prepared_initrd_guard = None;
-        }
+        let _prepared_initrd_guard =
+            if self.uses_pipette_as_init() && self.prebuilt_initrd.is_none() {
+                let tmp = self.prepare_initrd()?;
+                self.prebuilt_initrd = Some(tmp.to_path_buf());
+                Some(tmp)
+            } else {
+                None
+            };
 
         tracing::debug!(builder = ?self);
 
@@ -1565,6 +1569,16 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
         self
     }
 
+    /// Enable guest hibernation support.
+    ///
+    /// Applies to any firmware type: for OpenHCL this sets the DPS
+    /// `enable_hibernation` flag; for OpenVMM UEFI/PCAT firmware it enables the
+    /// firmware's hibernation support.
+    pub fn with_hibernation_enabled(mut self, enable: bool) -> Self {
+        self.config.hibernation_enabled = enable;
+        self
+    }
+
     /// Specify the guest state lifetime for the VM
     pub fn with_guest_state_lifetime(
         mut self,
@@ -1679,6 +1693,16 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
             .as_mut()
             .expect("hardware sealing policy requires a TPM")
             .hardware_sealing_policy = policy;
+        self
+    }
+
+    /// Select which TPM reference implementation version the VM's TPM runs.
+    pub fn with_tpm_version(mut self, version: PetriTpmVersion) -> Self {
+        self.config
+            .tpm
+            .as_mut()
+            .expect("TPM version requires a TPM")
+            .version = version;
         self
     }
 
@@ -2616,6 +2640,8 @@ pub struct TpmConfig {
     pub no_persistent_secrets: bool,
     /// Hardware sealing policy for sealed secrets
     pub hardware_sealing_policy: PetriHardwareSealingPolicy,
+    /// TPM reference implementation version
+    pub version: PetriTpmVersion,
 }
 
 impl Default for TpmConfig {
@@ -2623,8 +2649,19 @@ impl Default for TpmConfig {
         Self {
             no_persistent_secrets: true,
             hardware_sealing_policy: PetriHardwareSealingPolicy::Default,
+            version: PetriTpmVersion::default(),
         }
     }
+}
+
+/// TPM reference implementation version used by the test infrastructure.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PetriTpmVersion {
+    /// TPM reference implementation version 1.85
+    #[default]
+    V185,
+    /// TPM reference implementation version 1.38
+    V138,
 }
 
 /// Hardware sealing policy used by the test infrastructure.

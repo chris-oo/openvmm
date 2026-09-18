@@ -15,11 +15,13 @@ use flowey::pipeline::prelude::*;
 use flowey_lib_hvlite::_jobs::local_build_and_run_nextest_vmm_tests::BuildSelections;
 use flowey_lib_hvlite::_jobs::local_build_and_run_nextest_vmm_tests::CcaPlatformSource;
 use flowey_lib_hvlite::_jobs::local_build_and_run_nextest_vmm_tests::VmmTestSelections;
+use flowey_lib_hvlite::build_incubator::IncubatorProfileNameOrPath;
 use flowey_lib_hvlite::common::CommonPlatform;
 use flowey_lib_hvlite::common::CommonTriple;
-use flowey_lib_hvlite::install_vmm_tests_deps::VmmTestsDepSelections;
-use flowey_lib_hvlite::install_vmm_tests_deps::VmmTestsDepSelectionsLinux;
-use flowey_lib_hvlite::install_vmm_tests_deps::VmmTestsDepSelectionsWindows;
+use flowey_lib_hvlite::init_vmm_tests_env::PetriParams;
+use flowey_lib_hvlite::install_vmm_tests_external_deps::VmmTestsExternalDeps;
+use flowey_lib_hvlite::install_vmm_tests_external_deps::VmmTestsExternalDepsLinux;
+use flowey_lib_hvlite::install_vmm_tests_external_deps::VmmTestsExternalDepsWindows;
 use flowey_lib_hvlite::write_incubator_target_runner::FvpPlatformRoots;
 use flowey_lib_hvlite::write_incubator_target_runner::IncubatorPlatform;
 use petri_artifacts_core::ArtifactId;
@@ -29,6 +31,7 @@ use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::io::Write as _;
+use std::num::NonZeroU64;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -118,6 +121,10 @@ pub struct VmmTestsRunCli {
     /// `disabled` in the IGVM manifest.
     #[clap(long)]
     pub disable_secure_avic: bool,
+
+    /// How many times to run the tests
+    #[clap(long)]
+    repetitions: Option<u64>,
 
     /// Run tests inside an emulated incubator.
     ///
@@ -241,6 +248,7 @@ impl IntoPipeline for VmmTestsRunCli {
             ci_profile,
             no_reuse_prepped_vhds,
             disable_secure_avic,
+            repetitions,
             incubator,
             cca_deps_version,
             cca_kernel_archive_sha256,
@@ -260,6 +268,9 @@ impl IntoPipeline for VmmTestsRunCli {
         if incubator.is_some() && target.is_none() {
             anyhow::bail!("--incubator requires --target (e.g., --target linux-aarch64-musl)");
         }
+
+        let repetitions =
+            NonZeroU64::new(repetitions.unwrap_or(1)).context("repetitions must not be zero")?;
 
         let target = resolve_target(target, backend_hint)?;
         let target_os = target.as_triple().operating_system;
@@ -281,23 +292,20 @@ impl IntoPipeline for VmmTestsRunCli {
 
         let repo_root = crate::repo_root();
 
-        // Resolve the incubator profile path. `--incubator` with no value uses
-        // the default profile for the target; `--incubator <PATH>` overrides.
-        let incubator_profile = match incubator {
-            None => None,
-            Some(Some(path)) => Some(path),
-            Some(None) => Some(default_incubator_profile(&repo_root, &target).ok_or_else(
-                || {
-                    anyhow::anyhow!(
-                        "no default incubator profile for target {target_str}; \
-                     pass an explicit path with --incubator <PATH>"
-                    )
-                },
-            )?),
-        };
+        let incubator_profile = incubator
+            .map(|i| resolve_incubator(i, &target))
+            .transpose()?;
         let incubator_platform = incubator_profile
-            .as_deref()
-            .map(classify_incubator_platform)
+            .as_ref()
+            .map(|profile| {
+                let path = match profile {
+                    IncubatorProfileNameOrPath::Name(name) => {
+                        flowey_lib_hvlite::build_incubator::incubator_profile_path(&repo_root, name)
+                    }
+                    IncubatorProfileNameOrPath::Path(path) => path.clone(),
+                };
+                classify_incubator_platform(&path)
+            })
             .transpose()?;
         let fvp_roots = if incubator_platform == Some(IncubatorPlatform::FvpCca) {
             validate_fvp_target(FlowPlatform::host(backend_hint), &target.as_triple())?;
@@ -535,7 +543,7 @@ impl IntoPipeline for VmmTestsRunCli {
         } else {
             let mut hyperv_tests: usize = 0;
             let mut hyperv_artifacts = Vec::new();
-            for (_, suite) in suites.iter() {
+            for suite in suites.values() {
                 let hyperv_testcases: Vec<_> = suite
                     .testcases
                     .iter()
@@ -682,8 +690,14 @@ impl IntoPipeline for VmmTestsRunCli {
                     } else {
                         flowey_lib_hvlite::run_cargo_nextest_run::NextestProfile::Default
                     },
-                    reuse_prepped_vhds: !no_reuse_prepped_vhds,
+                    petri_params: PetriParams {
+                        disable_remote_artifacts: incubator_platform
+                            == Some(IncubatorPlatform::FvpCca),
+                        reuse_prepped_vhds: !no_reuse_prepped_vhds,
+                        require_2mb_hugetlb: false, // TODO
+                    },
                     disable_secure_avic,
+                    repetitions,
                     incubator_profile,
                     incubator_platform,
                     cca_platform_source,
@@ -912,7 +926,7 @@ fn query_test_binary_artifacts(
 }
 
 #[derive(clap::ValueEnum, Copy, Clone)]
-enum VmmTestTargetCli {
+pub(crate) enum VmmTestTargetCli {
     /// Windows Aarch64
     WindowsAarch64,
     /// Windows X64
@@ -924,7 +938,7 @@ enum VmmTestTargetCli {
 }
 
 /// Resolve a CLI target option to a CommonTriple, defaulting to the host.
-fn resolve_target(
+pub(crate) fn resolve_target(
     target: Option<VmmTestTargetCli>,
     backend_hint: PipelineBackendHint,
 ) -> anyhow::Result<CommonTriple> {
@@ -948,21 +962,6 @@ fn resolve_target(
         VmmTestTargetCli::LinuxX64 => CommonTriple::X86_64_LINUX_GNU,
         VmmTestTargetCli::LinuxAarch64Musl => CommonTriple::AARCH64_LINUX_MUSL,
     })
-}
-
-/// Default incubator profile path for a target, used when `--incubator` is
-/// passed without an explicit profile path. Returns `None` for targets that
-/// have no incubator profile.
-fn default_incubator_profile(repo_root: &Path, target: &CommonTriple) -> Option<PathBuf> {
-    let name = match *target {
-        CommonTriple::AARCH64_LINUX_MUSL => "aarch64-tcg-pcie",
-        _ => return None,
-    };
-    Some(
-        repo_root
-            .join("petri/incubator/profiles")
-            .join(format!("{name}.toml")),
-    )
 }
 
 fn classify_incubator_platform(profile: &Path) -> anyhow::Result<IncubatorPlatform> {
@@ -1077,18 +1076,18 @@ fn selections_from_resolved(
 ) -> VmmTestSelections {
     VmmTestSelections {
         filter,
-        artifacts: resolved.downloads.into_iter().collect(),
+        downloaded_artifacts: resolved.downloads.into_iter().collect(),
         build: resolved.build.clone(),
-        deps: match target_os {
+        external_deps: match target_os {
             target_lexicon::OperatingSystem::Windows => {
-                VmmTestsDepSelections::Windows(VmmTestsDepSelectionsWindows {
+                VmmTestsExternalDeps::Windows(VmmTestsExternalDepsWindows {
                     hyperv: resolved.needs_hyperv,
                     whp: resolved.build.openvmm,
                     hardware_isolation: resolved.needs_hardware_isolation,
                 })
             }
             target_lexicon::OperatingSystem::Linux => {
-                VmmTestsDepSelections::Linux(VmmTestsDepSelectionsLinux {
+                VmmTestsExternalDeps::Linux(VmmTestsExternalDepsLinux {
                     hugetlb_2mb_overcommit_pages: None, // TODO
                     prepare_vhost_vsock: false,         // TODO
                 })
@@ -1235,6 +1234,7 @@ impl ResolvedArtifactSelections {
             }
             petri_artifacts_vmm_test::artifacts::test_vhd::GEN2_WINDOWS_DATA_CENTER_CORE2025_X64_PREPPED::GLOBAL_UNIQUE_ID =>
             {
+                self.build.openvmm = true;
                 self.build.prep_steps_standard = true;
                 // prep_steps needs actual VHD files on disk to copy them.
                 // Force download even when lazy fetch is enabled.
@@ -1245,6 +1245,7 @@ impl ResolvedArtifactSelections {
             }
             petri_artifacts_vmm_test::artifacts::test_vhd::GEN2_WINDOWS_DATA_CENTER_CORE2022_X64_NO_VMBUS_PREPPED::GLOBAL_UNIQUE_ID =>
             {
+                self.build.openvmm = true;
                 self.build.prep_steps_no_vmbus = true;
                 self.force_downloads
                     .insert(KnownTestArtifacts::Gen2WindowsDataCenterCore2022X64Vhd);
@@ -1318,10 +1319,67 @@ impl ResolvedArtifactSelections {
     }
 }
 
+/// Resolve the incubator profile path. `--incubator` with no value uses
+/// the default profile for the target; `--incubator <PATH>` overrides.
+pub(crate) fn resolve_incubator(
+    incubator: Option<PathBuf>,
+    target: &CommonTriple,
+) -> anyhow::Result<IncubatorProfileNameOrPath> {
+    Ok(match incubator {
+        // If no separators or extension, assume it is a profile name
+        Some(path) if path.components().count() == 1 && path.extension().is_none() => {
+            IncubatorProfileNameOrPath::Name(path.to_string_lossy().to_string())
+        }
+        Some(path) => IncubatorProfileNameOrPath::Path(std::path::absolute(path)?),
+        None => IncubatorProfileNameOrPath::Name(
+            flowey_lib_hvlite::build_incubator::default_incubator_profile(target)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no default incubator profile for target {}; \
+                         pass an explicit path with --incubator <PATH>",
+                        target.as_triple().to_string()
+                    )
+                })?
+                .into(),
+        ),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use flowey::node::prelude::FlowPlatformLinuxDistro;
+
+    #[test]
+    fn resolves_named_and_explicit_incubator_profiles() {
+        let target = CommonTriple::AARCH64_LINUX_MUSL;
+        let repo_root = crate::repo_root();
+        for (name, expected) in [
+            ("aarch64-tcg-pcie", IncubatorPlatform::QemuTcg),
+            ("aarch64-qemu-cca", IncubatorPlatform::QemuCca),
+            ("aarch64-fvp-cca", IncubatorPlatform::FvpCca),
+        ] {
+            let named = resolve_incubator(Some(name.into()), &target).unwrap();
+            assert!(matches!(named, IncubatorProfileNameOrPath::Name(_)));
+            let path = named.resolve(&repo_root);
+            assert_eq!(classify_incubator_platform(&path).unwrap(), expected);
+
+            let explicit = resolve_incubator(Some(path.clone()), &target).unwrap();
+            assert!(matches!(explicit, IncubatorProfileNameOrPath::Path(_)));
+            assert_eq!(explicit.resolve(&repo_root), path);
+        }
+        let default = resolve_incubator(None, &target).unwrap();
+        assert_eq!(
+            classify_incubator_platform(&default.resolve(&repo_root)).unwrap(),
+            IncubatorPlatform::QemuTcg
+        );
+        let relative = PathBuf::from("petri/incubator/profiles/aarch64-fvp-cca.toml");
+        let profile = resolve_incubator(Some(relative.clone()), &target).unwrap();
+        assert_eq!(
+            profile.resolve(&repo_root),
+            std::path::absolute(relative).unwrap()
+        );
+    }
 
     #[test]
     fn parses_target_runner_with_arguments() {

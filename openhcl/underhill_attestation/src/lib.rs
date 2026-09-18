@@ -1797,7 +1797,11 @@ pub fn get_provenance_claims(prov_file: &[u8]) -> Result<VmgsProvisioner, Error>
             .map_err(ProvenanceError::X509Error)
             .map_err(AttestationErrorInner::Provenance)?),
     );
-    let signer = format!("did:x509:0:sha256:{}:subject:{}", hex::encode(digest), sn);
+    let signer = format!(
+        "did:x509:0:sha256:{}:subject:{}",
+        hex::encode_upper(digest),
+        sn
+    );
     let vmgsid = jwt.jwt.body.vmgsid;
 
     Ok(VmgsProvisioner {
@@ -1976,6 +1980,7 @@ mod tests {
     use guest_emulation_transport::test_utilities::TestGet;
     use key_protector::AES_WRAPPED_AES_KEY_LENGTH;
     use openhcl_attestation_protocol::igvm_attest::get::IgvmAttestRequestType;
+    use openhcl_attestation_protocol::igvm_attest::get::runtime_claims::AttestationTpmVersion;
     use openhcl_attestation_protocol::vmgs::DEK_BUFFER_SIZE;
     use openhcl_attestation_protocol::vmgs::DekKp;
     use openhcl_attestation_protocol::vmgs::GSP_BUFFER_SIZE;
@@ -2131,6 +2136,7 @@ mod tests {
             interactive_console_enabled: false,
             secure_boot: false,
             tpm_enabled: true,
+            tpm_version: AttestationTpmVersion::V138,
             tpm_persisted: true,
             hardware_sealing_policy: HardwareSealingPolicy::None,
             filtered_vpci_devices_allowed: false,
@@ -2705,6 +2711,7 @@ mod tests {
                 interactive_console_enabled: false,
                 secure_boot: false,
                 tpm_enabled: false,
+                tpm_version: AttestationTpmVersion::V138,
                 tpm_persisted: false,
                 hardware_sealing_policy: HardwareSealingPolicy::Hash,
                 filtered_vpci_devices_allowed: true,
@@ -2784,6 +2791,7 @@ mod tests {
                 interactive_console_enabled: false,
                 secure_boot: false,
                 tpm_enabled: false,
+                tpm_version: AttestationTpmVersion::V138,
                 tpm_persisted: false,
                 hardware_sealing_policy: HardwareSealingPolicy::Hash,
                 filtered_vpci_devices_allowed: true,
@@ -2828,6 +2836,7 @@ mod tests {
                 interactive_console_enabled: false,
                 secure_boot: false,
                 tpm_enabled: false,
+                tpm_version: AttestationTpmVersion::V138,
                 tpm_persisted: false,
                 hardware_sealing_policy: HardwareSealingPolicy::Hash,
                 filtered_vpci_devices_allowed: true,
@@ -2898,6 +2907,7 @@ mod tests {
                 interactive_console_enabled: false,
                 secure_boot: false,
                 tpm_enabled: false,
+                tpm_version: AttestationTpmVersion::V138,
                 tpm_persisted: false,
                 hardware_sealing_policy: HardwareSealingPolicy::Hash,
                 filtered_vpci_devices_allowed: true,
@@ -3609,7 +3619,7 @@ mod tests {
         );
         assert_eq!(
             claims.signer,
-            "did:x509:0:sha256:ea76599d86897382aa519ff2bc0fa6b9c15d60da2ebe53e72139cd317b0797ed:subject:fican.cvmprovisioningservice.core.azure-test.net"
+            "did:x509:0:sha256:EA76599D86897382AA519FF2BC0FA6B9C15D60DA2EBE53E72139CD317B0797ED:subject:fican.cvmprovisioningservice.core.azure-test.net"
         );
     }
 

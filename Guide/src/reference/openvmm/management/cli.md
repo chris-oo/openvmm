@@ -1,10 +1,11 @@
 # CLI
 
-```admonish danger title="Disclaimer"
-The following list is not exhaustive, and may be out of date.
-
-The most up to date reference is always the [code itself](https://openvmm.dev/rustdoc/linux/openvmm_entry/struct.Options.html),
-as well as the generated CLI help (via `cargo run -- --help`).
+```admonish note title="CLI compatibility and reference"
+The CLI is not a stable compatibility interface and may change between
+releases. This page summarizes OpenVMM's command-line options. The generated
+`openvmm --help` output is authoritative for the binary being run, and the
+[`Options` rustdoc](https://openvmm.dev/rustdoc/linux/openvmm_entry/struct.Options.html)
+describes the source definitions.
 ```
 
 * `--version`, `-V`: Print the OpenVMM build identity and exit. `-V` prints
@@ -88,18 +89,40 @@ as well as the generated CLI help (via `cargo run -- --help`).
   --hypervisor kvm
   ```
 * `--isolation <MODE>`: Enable a confidential or isolated VM mode.
-  Supported modes include `vbs`, `snp` for `x86_64` KVM guests, and `cca` for
-  `aarch64` KVM guests.
+  Supported modes include `vbs`, `snp` for `x86_64` KVM or MSHV guests, and
+  `cca` for `aarch64` KVM guests.
 
   SNP support is currently limited to Linux direct boot and is intended for
-  bring-up. It does not support UEFI, Hyper-V enlightenments, VTL2, VMBus,
-  or hugetlb-backed memory. In addition to the minimal emulated chipset and
-  serial console, optional devices are limited to virtio devices attached
-  through PCIe.
+  bring-up. It supports either loader-based kernel/initrd boot or an SNP IGVM
+  selected with `--igvm-personality linux-direct`. MSHV SNP can expose Hyper-V
+  enlightenments with `--hv --no-vmbus`; VMBus devices remain unsupported.
+  The IGVM must use VTL0, no shared GPA boundary, and no relocation metadata.
+
+  SNP does not support UEFI, VTL2, or hugetlb-backed memory. In addition to
+  the minimal emulated chipset and serial console, optional devices are
+  limited to virtio devices attached through PCIe.
+
+  A minimal MSHV IGVM invocation is:
+
+  ```bash
+  openvmm --hypervisor mshv --isolation snp \
+    --igvm path/to/snp-linux-direct.bin \
+    --igvm-personality linux-direct --com1 console \
+    --no-vmbus -m 160MB -p 1
+  ```
 
   CCA support requires device-tree Linux direct boot with shared userspace RAM
   backing. It does not support Hyper-V enlightenments, VTL2, VMBus, hugetlb
   memory, assigned devices, vhost-user devices, PCIe hotplug, or CXL.
+
+* `--snp-restricted-injection`: Enable restricted interrupt injection in the
+  loader-generated SNP VMSA. This bring-up option has no default and requires
+  `--hypervisor mshv --isolation snp` with Linux direct boot. KVM SNP does not
+  support this option.
+* `--hypervisor mshv:snp_disable_cpuid_offload=true`: Disable MSHV handling of
+  SNP GHCB CPUID requests so they are forwarded to OpenVMM. The default is
+  offloading enabled. This diagnostic parameter is meaningful only with
+  `--isolation snp`.
 * `--nested-virt`: Expose hardware virtualization (VMX/SVM) to the guest so it
   can run its own hypervisor (Hyper-V, KVM, etc.). Only supported on `x86_64`,
   and only by backends that support nested virtualization (currently WHP and
@@ -112,6 +135,25 @@ as well as the generated CLI help (via `cargo run -- --help`).
 * `--uefi`: Boot using `mu_msvm` UEFI
 * `--uefi-firmware <FILE>`: Path to the UEFI firmware file (`MSVM.fd`). When `--uefi` is specified, this option is required only if you do not set the environment variable `OPENVMM_UEFI_FIRMWARE` (or the architecture-specific variants `X86_64_OPENVMM_UEFI_FIRMWARE`, or `AARCH64_OPENVMM_UEFI_FIRMWARE`). If omitted, the default is read from `OPENVMM_UEFI_FIRMWARE` first, then falls back to the architecture-specific variables.
 * `--pcat`: Boot using the Microsoft Hyper-V PCAT BIOS
+* `--igvm <FILE>`: Boot from an IGVM file.
+* `--igvm-personality <uefi|linux-direct>`: Select the chipset and
+  device shape for an IGVM boot without VTL2. This option is required with
+  `--igvm` unless `--vtl2` is present; there is no default for non-VTL2
+  boots. The personality does not select the isolation platform. Use
+  `--isolation` separately when required by the IGVM.
+
+  The `uefi` personality uses the Gen2 device shape, but firmware is loaded
+  from the IGVM. It does not select the normal external-UEFI load path. The
+  `linux-direct` personality enables Hyper-V enlightenments only when `--hv`
+  is also specified. The UEFI personality requires Hyper-V enlightenments and
+  fails explicitly on backend and isolation combinations that cannot provide
+  them.
+
+  With `--igvm --vtl2`, omit `--igvm-personality`. OpenVMM retains the
+  existing HCL-host device shape and VBS-compatible IGVM behavior.
+* `--tpm [VERSION]`: Add a vTPM device. Supported versions are `138` and
+  `185`; a bare `--tpm` uses version `185`. The dotted forms `1.38` and `1.85`
+  are also accepted.
 * `--vmbus-scsi id=<name>[,sub_channels=<N>][,vtl2]`: Creates a
   named VMBus SCSI controller. Use with `--disk ...,on=<name>` to
   attach disks.
@@ -161,6 +203,19 @@ as well as the generated CLI help (via `cargo run -- --help`).
   `--memory-backing-file <PATH>`: Deprecated aliases for `--memory`
   parameters. Prefer `shared=off`, `prefetch=on`, `thp=on`, and
   `file=<PATH>`.
+* `--smbios <PARAMS>`: Override the SMBIOS (DMI) identity reported to the
+  guest (repeatable), using `type=N,key=value[,key=value...]`.
+  Type 0 supports `vendor`, `version`, `date`, and `release`; Type 1 supports
+  `manufacturer`, `product`, `version`, `serial`, `uuid`, `sku`, and `family`.
+  Use `uuid=random` to generate a per-VM system UUID.
+
+  OpenVMM Linux direct boot supports both types. OpenHCL Linux direct and UEFI
+  support Type 1 only. PCAT supports only Type 1 `serial` and `uuid`.
+  Unsupported fields are rejected.
+
+  ```bash
+  --smbios type=1,manufacturer=Contoso,product="Virtual Machine"
+  ```
 * `--pidfile <PATH>`: Write the process ID to the specified file on startup,
   and remove it on clean exit. If the process is killed with `SIGKILL` or
   crashes, the pidfile is not removed — consumers should verify the PID is

@@ -8,7 +8,6 @@ use loader::importer::X86Register;
 use loader::linux::InitrdAddressType;
 use loader::linux::InitrdConfig;
 use memory_range::MemoryRange;
-use openvmm_defs::config::IsolationType;
 use std::ffi::CString;
 use std::io::Seek;
 use thiserror::Error;
@@ -34,8 +33,6 @@ pub enum Error {
     Dt(#[source] DtError),
     #[error("failed to write EFI/ACPI tables to guest memory")]
     Efi(#[source] guestmem::GuestMemoryError),
-    #[error("missing SNP C-bit CPUID information")]
-    MissingSnpCBit,
     #[error("failed to finalize SNP VMSA")]
     SnpVmsa(#[source] anyhow::Error),
 }
@@ -54,9 +51,22 @@ pub struct KernelConfig<'a> {
     pub initrd: &'a Option<std::fs::File>,
     pub cmdline: &'a str,
     pub mem_layout: &'a MemoryLayout,
-    pub isolation: Option<IsolationType>,
+    pub isolation: KernelIsolationConfig,
     pub shared_gpa_bit: Option<u64>,
-    pub snp_c_bit: Option<u8>,
+    pub smbios: &'a openvmm_defs::config::SmbiosConfig,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum KernelIsolationConfig {
+    None,
+    #[cfg_attr(not(guest_arch = "x86_64"), expect(dead_code))]
+    Snp(SnpKernelConfig),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SnpKernelConfig {
+    pub c_bit: u8,
+    pub restricted_injection: bool,
 }
 
 // Bring-up hack for SNP Linux direct boot. Without a bootshim or firmware to
@@ -98,29 +108,61 @@ fn complete_snp_direct_ram_imports(
     }
 }
 
-/// The default SMBIOS identity for firmware-less Linux direct boot.
-///
-/// There is no configuration surface yet, so every direct-boot VM gets this
-/// fixed OpenVMM identity. The UUID is left nil.
-fn default_smbios_tables() -> loader::smbios::SmbiosTables<'static> {
+/// Merges the owned SMBIOS override config into the borrowed table view the
+/// builder consumes, substituting the `loader` crate's default strings for any
+/// unset (`None`) override.
+fn smbios_tables_from_config(
+    config: &openvmm_defs::config::SmbiosConfig,
+) -> loader::smbios::SmbiosTables<'_> {
     use loader::smbios;
+
+    // Destructure fully so new fields must be wired into the table view.
+    let openvmm_defs::config::SmbiosConfig { bios, system } = config;
+    let openvmm_defs::config::SmbiosBiosOverrides {
+        vendor,
+        version: bios_version,
+        release_date,
+        release,
+    } = bios;
+    let openvmm_defs::config::SmbiosSystemOverrides {
+        manufacturer,
+        product_name,
+        version: system_version,
+        serial_number,
+        sku_number,
+        family,
+        uuid,
+    } = system;
+
+    const DEFAULT_BIOS_VENDOR: &str = "OpenVMM";
+    const DEFAULT_BIOS_VERSION: &str = "OpenVMM Direct";
+    const DEFAULT_BIOS_RELEASE_DATE: &str = "06/19/2026";
+    const DEFAULT_BIOS_MAJOR: u8 = 0;
+    const DEFAULT_BIOS_MINOR: u8 = 0;
+    const DEFAULT_MANUFACTURER: &str = "OpenVMM";
+    const DEFAULT_PRODUCT_NAME: &str = "OpenVMM Virtual Machine";
 
     smbios::SmbiosTables {
         bios: smbios::SmbiosBiosInfo {
-            vendor: "OpenVMM",
-            version: "OpenVMM Direct",
-            release_date: "06/19/2026",
-            major: 0,
-            minor: 0,
+            vendor: vendor.as_deref().unwrap_or(DEFAULT_BIOS_VENDOR),
+            version: bios_version.as_deref().unwrap_or(DEFAULT_BIOS_VERSION),
+            release_date: release_date.as_deref().unwrap_or(DEFAULT_BIOS_RELEASE_DATE),
+            major: release.map_or(DEFAULT_BIOS_MAJOR, |(major, _)| major),
+            minor: release.map_or(DEFAULT_BIOS_MINOR, |(_, minor)| minor),
         },
         system: smbios::SmbiosSystemInfo {
-            manufacturer: "OpenVMM",
-            product_name: "OpenVMM Virtual Machine",
-            version: "",
-            serial_number: "",
-            sku_number: "",
-            family: "",
-            uuid: [0; 16],
+            manufacturer: manufacturer.as_deref().unwrap_or(DEFAULT_MANUFACTURER),
+            product_name: product_name.as_deref().unwrap_or(DEFAULT_PRODUCT_NAME),
+            version: system_version.as_deref().unwrap_or(""),
+            serial_number: serial_number.as_deref().unwrap_or(""),
+            sku_number: sku_number.as_deref().unwrap_or(""),
+            family: family.as_deref().unwrap_or(""),
+            // SMBIOS (>= 2.6) stores the Type 1 UUID's first three fields
+            // little-endian, which is exactly the in-memory byte layout of our
+            // `Guid` type, so its raw bytes go in directly with no swap. The
+            // UEFI boot path uses the same VM BIOS GUID, so a guest reports the
+            // same `product_uuid` whether booted via UEFI or direct boot.
+            uuid: (*uuid).into(),
         },
     }
 }
@@ -151,18 +193,16 @@ pub fn load_linux_x86(
     });
 
     let cmdline = CString::new(cfg.cmdline).unwrap();
-    let snp_boot = if cfg.isolation == Some(IsolationType::Snp) {
-        Some(loader::linux::SnpBootConfig {
-            c_bit: cfg.snp_c_bit.ok_or(Error::MissingSnpCBit)?,
-        })
-    } else {
-        None
+    let snp = match cfg.isolation {
+        KernelIsolationConfig::None => None,
+        KernelIsolationConfig::Snp(snp) => Some(snp),
     };
+    let snp_boot = snp.map(|snp| loader::linux::SnpBootConfig { c_bit: snp.c_bit });
 
     let mut loader = Loader::new(gm.clone(), cfg.mem_layout, hvdef::Vtl::Vtl0);
 
     // The loader owns the sub-1 MB layout; we supply only the kernel, command
-    // line, an ACPI builder, and the default SMBIOS identity.
+    // line, an ACPI builder, and the configured SMBIOS identity.
     loader::linux::load_x86(
         &mut loader,
         &mut kernel_file,
@@ -170,14 +210,20 @@ pub fn load_linux_x86(
         &cmdline,
         cfg.mem_layout,
         acpi_at_gpa,
-        Some(default_smbios_tables()),
+        Some(smbios_tables_from_config(cfg.smbios)),
         snp_boot,
     )
     .map_err(Error::Loader)?;
 
-    if cfg.isolation == Some(IsolationType::Snp) {
+    if let Some(snp) = snp {
         loader
-            .finalize_snp_vmsa(caps, bsp)
+            .finalize_snp_vmsa(
+                caps,
+                bsp,
+                virt::x86::snp::SnpVmsaConfig {
+                    restricted_injection: snp.restricted_injection,
+                },
+            )
             .map_err(Error::SnpVmsa)?;
     }
 
@@ -185,7 +231,7 @@ pub fn load_linux_x86(
         regs,
         mut page_imports,
     } = loader.initial_regs_and_page_imports();
-    if cfg.isolation == Some(IsolationType::Snp) {
+    if snp.is_some() {
         complete_snp_direct_ram_imports(
             &mut page_imports,
             cfg.mem_layout.ram().iter().map(|range| range.range),
@@ -365,7 +411,7 @@ fn build_dt(
         .add_str(p_compatible, "arm,psci-0.2")?
         .add_str(
             p_method,
-            if cfg.isolation == Some(IsolationType::Cca) {
+            if shared_gpa_bit.is_some() {
                 "smc"
             } else {
                 "hvc"
@@ -698,6 +744,7 @@ fn write_efi_and_acpi_tables(
     rsdp_addr: u64,
     mem_layout: &MemoryLayout,
     acpi_tables: &vmm_core::acpi_builder::BuiltAcpiTables,
+    smbios: &openvmm_defs::config::SmbiosConfig,
 ) -> Result<Aarch64EfiInfo, Error> {
     use memory_range::MemoryRange;
     use uefi_specs::uefi::boot::ACPI_20_TABLE_GUID;
@@ -762,7 +809,7 @@ fn write_efi_and_acpi_tables(
     cursor += loader::smbios::ENTRY_POINT_SIZE as u64;
     cursor = align_up(cursor, 16);
     let smbios_table_addr = cursor;
-    let smbios = loader::smbios::build(&default_smbios_tables(), smbios_table_addr);
+    let smbios = loader::smbios::build(&smbios_tables_from_config(smbios), smbios_table_addr);
     cursor += smbios.structure_table.len() as u64;
 
     // Compute how many pages the metadata region spans.
@@ -1000,6 +1047,7 @@ pub fn load_linux_arm64(
             rsdp_addr,
             cfg.mem_layout,
             &acpi_tables,
+            cfg.smbios,
         )?;
         build_stub_dt(cfg.cmdline, initrd_start, initrd_end, &efi_info)
             .map_err(|e| Error::Dt(DtError(e)))?
@@ -1046,6 +1094,70 @@ pub fn load_linux_arm64(
 mod tests {
     use super::*;
     use test_with_tracing::test;
+
+    #[test]
+    fn device_tree_psci_conduit_matches_cca_shared_addressing() {
+        use vm_topology::processor::TopologyBuilder;
+        use vm_topology::processor::aarch64::Aarch64PlatformConfig;
+        use vm_topology::processor::aarch64::GicMsiController;
+        use vm_topology::processor::aarch64::GicVersion;
+
+        let kernel = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+        let layout = MemoryLayout::new(0x4000_0000, &[], &[], &[], None).unwrap();
+        let topology = TopologyBuilder::new_aarch64(Aarch64PlatformConfig {
+            gic_distributor_base: 0xffff0000,
+            gic_version: GicVersion::V3 {
+                redistributors_base: 0xefff0000,
+            },
+            gic_msi: GicMsiController::None,
+            pmu_gsiv: None,
+            virt_timer_ppi: 20,
+            gic_nr_irqs: 992,
+        })
+        .build(1)
+        .unwrap();
+
+        for (shared_gpa_bit, method) in [(None, "hvc"), (Some(1 << 39), "smc")] {
+            let config = KernelConfig {
+                kernel: &kernel,
+                initrd: &None,
+                cmdline: "",
+                mem_layout: &layout,
+                isolation: KernelIsolationConfig::None,
+                shared_gpa_bit,
+                smbios: &Default::default(),
+            };
+            let blob = build_dt(
+                &config,
+                &GuestMemory::empty(),
+                false,
+                &topology,
+                &[],
+                &[],
+                MemoryRange::new(0xc000_0000..0x1_0000_0000),
+                MemoryRange::new(0x1_0000_0000..0x2_0000_0000),
+                0,
+                0,
+            )
+            .unwrap();
+            let parser = fdt::parser::Parser::new(&blob).unwrap();
+            let psci = parser
+                .root()
+                .unwrap()
+                .children()
+                .map(Result::unwrap)
+                .find(|node| node.name == "psci")
+                .unwrap();
+            assert_eq!(
+                psci.find_property("method")
+                    .unwrap()
+                    .unwrap()
+                    .read_str()
+                    .unwrap(),
+                method
+            );
+        }
+    }
 
     #[test]
     fn completes_snp_direct_ram_imports() {

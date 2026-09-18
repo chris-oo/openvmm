@@ -8,6 +8,8 @@
 //! in via `INCUBATOR_*` environment variables (see the `incubator` crate's CLI,
 //! whose options each have a matching `env =` fallback).
 
+use crate::build_incubator::IncubatorOutput;
+use crate::build_incubator::IncubatorProfileNameOrPath;
 use flowey::node::prelude::*;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -47,6 +49,20 @@ pub enum IncubatorPlatform {
     QemuCca,
     /// Licensed Arm FVP CCA L1 host platform.
     FvpCca,
+}
+
+pub(crate) fn incubator_profile_backend(profile: &Path) -> anyhow::Result<String> {
+    let contents = fs_err::read_to_string(profile)
+        .with_context(|| format!("failed to read incubator profile {}", profile.display()))?;
+    let document = contents
+        .parse::<toml_edit::DocumentMut>()
+        .with_context(|| format!("failed to parse incubator profile {}", profile.display()))?;
+    document
+        .get("incubator")
+        .and_then(|incubator| incubator.get("type"))
+        .and_then(toml_edit::Item::as_str)
+        .map(str::to_owned)
+        .context("incubator profile is missing incubator.type")
 }
 
 /// Read-only local roots. Incubator validates their complete pinned inventory.
@@ -149,9 +165,9 @@ fn add_incubator_target_runner_env(
 flowey_request! {
     pub struct Request {
         /// Path to the incubator binary.
-        pub incubator_bin: ReadVar<PathBuf>,
+        pub incubator: ReadVar<IncubatorOutput>,
         /// Path to the incubator profile TOML file.
-        pub profile_path: ReadVar<PathBuf>,
+        pub incubator_profile: IncubatorProfileNameOrPath,
         /// Path to the guest kernel image. If omitted, incubator auto-detects it.
         pub kernel: Option<ReadVar<PathBuf>>,
         /// Path to the base initrd. If omitted, incubator auto-detects it.
@@ -193,8 +209,8 @@ impl SimpleFlowNode for Node {
 
     fn process_request(request: Self::Request, ctx: &mut NodeCtx<'_>) -> anyhow::Result<()> {
         let Request {
-            incubator_bin,
-            profile_path,
+            incubator,
+            incubator_profile,
             kernel,
             initrd,
             firmware,
@@ -209,25 +225,24 @@ impl SimpleFlowNode for Node {
         } = request;
 
         ctx.emit_rust_step("compute incubator target runner env", |ctx| {
-            let incubator_bin = incubator_bin.claim(ctx);
-            let profile_path = profile_path.claim(ctx);
+            let incubator = incubator.claim(ctx);
             let kernel = kernel.claim(ctx);
             let initrd = initrd.claim(ctx);
             let firmware = firmware.claim(ctx);
             let repo_root = repo_root.claim(ctx);
-            let test_content_dir = test_content_dir.claim(ctx);
+            let test_content_dir: ReadVar<PathBuf, VarClaimed> = test_content_dir.claim(ctx);
             let extra_share_paths = extra_share_paths.claim(ctx);
             let extra_env = extra_env.claim(ctx);
             let qemu_binary = qemu_binary.claim(ctx);
             let nextest_env = nextest_env.claim(ctx);
 
             move |rt| {
-                let incubator_bin = rt.read(incubator_bin).absolute()?;
-                let profile_path = rt.read(profile_path).absolute()?;
+                let repo_root = rt.read(repo_root).absolute()?;
+                let incubator_bin = rt.read(incubator).bin.absolute()?;
+                let profile_path = incubator_profile.resolve(&repo_root).absolute()?;
                 let kernel = kernel.map(|v| rt.read(v).absolute()).transpose()?;
                 let initrd = initrd.map(|v| rt.read(v).absolute()).transpose()?;
                 let firmware = firmware.map(|v| rt.read(v).absolute()).transpose()?;
-                let repo_root = rt.read(repo_root).absolute()?;
                 let test_content_dir = rt.read(test_content_dir).absolute()?;
                 let extra_share_paths = rt
                     .read(extra_share_paths)
@@ -249,16 +264,7 @@ impl SimpleFlowNode for Node {
                 let guest_test_content_dir = guest_path(&share_root, &test_content_dir)?;
                 let output_dir = test_content_dir.join("test_results");
                 let tmp_dir = test_content_dir.join(NEXTEST_ARCHIVE_TMP_DIR);
-                fs_err::create_dir_all(&output_dir)?;
-                fs_err::create_dir_all(&tmp_dir)?;
-
-                incubator_bin.make_executable()?;
-                if let Some(qemu_binary) = &qemu_binary {
-                    qemu_binary.make_executable()?;
-                }
-
-                let mut nextest = extra_env;
-                nextest.extend(incubator_runner_env(IncubatorRunnerConfig {
+                let config = IncubatorRunnerConfig {
                     profile_path: &profile_path,
                     kernel: kernel.as_deref(),
                     initrd: initrd.as_deref(),
@@ -269,7 +275,22 @@ impl SimpleFlowNode for Node {
                     guest_current_dir: &guest_test_content_dir,
                     qemu_binary: qemu_binary.as_deref(),
                     tmp_dir: &tmp_dir,
-                }));
+                };
+                validate_incubator_platform_inputs(
+                    &incubator_profile_backend(&profile_path)?,
+                    &config,
+                    fvp_roots.is_some(),
+                )?;
+                fs_err::create_dir_all(&output_dir)?;
+                fs_err::create_dir_all(&tmp_dir)?;
+
+                incubator_bin.make_executable()?;
+                if let Some(qemu_binary) = &qemu_binary {
+                    qemu_binary.make_executable()?;
+                }
+
+                let mut nextest = extra_env;
+                nextest.extend(incubator_runner_env(config));
                 add_incubator_target_runner_env(&mut nextest, &target, &incubator_bin);
                 if let Some(roots) = &fvp_roots {
                     add_fvp_runner_env(&mut nextest, roots)?;
@@ -336,6 +357,39 @@ struct IncubatorRunnerConfig<'a> {
     pub guest_current_dir: &'a str,
     pub qemu_binary: Option<&'a Path>,
     pub tmp_dir: &'a Path,
+}
+
+fn validate_incubator_platform_inputs(
+    backend: &str,
+    config: &IncubatorRunnerConfig<'_>,
+    has_fvp_roots: bool,
+) -> anyhow::Result<()> {
+    match backend {
+        "qemu-tcg" => anyhow::ensure!(
+            config.firmware.is_none() && !has_fvp_roots,
+            "QEMU TCG does not accept CCA platform overrides"
+        ),
+        "qemu-cca" => anyhow::ensure!(
+            config.kernel.is_some()
+                && config.initrd.is_some()
+                && config.firmware.is_some()
+                && config.qemu_binary.is_some()
+                && !has_fvp_roots,
+            "QEMU CCA requires resolved CCA kernel, initrd, firmware, and QEMU artifacts; \
+             use vmm-tests-run with the CCA profile"
+        ),
+        "fvp-cca" => anyhow::ensure!(
+            config.kernel.is_some()
+                && config.initrd.is_some()
+                && config.firmware.is_none()
+                && config.qemu_binary.is_none()
+                && has_fvp_roots,
+            "FVP CCA requires resolved CCA payload and local FVP roots, without QEMU overrides; \
+             use vmm-tests-run with the CCA profile"
+        ),
+        other => anyhow::bail!("unsupported incubator backend type: {other}"),
+    }
+    Ok(())
 }
 
 /// Build the per-run `INCUBATOR_*` (and `TMPDIR`) environment that configures
@@ -431,6 +485,42 @@ fn common_ancestor(paths: &[&Path]) -> anyhow::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_cca_profiles_with_generic_runner_inputs() {
+        let mut config = IncubatorRunnerConfig {
+            profile_path: Path::new("profile.toml"),
+            kernel: Some(Path::new("kernel")),
+            initrd: Some(Path::new("initrd")),
+            firmware: None,
+            share_root: Path::new("share"),
+            output_dir: Path::new("output"),
+            guest_pipette: "/pipette",
+            guest_current_dir: "/",
+            qemu_binary: Some(Path::new("qemu")),
+            tmp_dir: Path::new("nextest-archive-tmp"),
+        };
+        validate_incubator_platform_inputs("qemu-tcg", &config, false).unwrap();
+        assert!(validate_incubator_platform_inputs("qemu-cca", &config, false).is_err());
+        assert!(validate_incubator_platform_inputs("fvp-cca", &config, false).is_err());
+
+        config.firmware = Some(Path::new("firmware"));
+        validate_incubator_platform_inputs("qemu-cca", &config, false).unwrap();
+        assert!(validate_incubator_platform_inputs("qemu-cca", &config, true).is_err());
+        assert!(validate_incubator_platform_inputs("qemu-tcg", &config, false).is_err());
+
+        config.firmware = None;
+        config.qemu_binary = None;
+        validate_incubator_platform_inputs("fvp-cca", &config, true).unwrap();
+        assert!(validate_incubator_platform_inputs("fvp-cca", &config, false).is_err());
+        assert!(validate_incubator_platform_inputs("qemu-tcg", &config, true).is_err());
+
+        config.kernel = None;
+        assert!(validate_incubator_platform_inputs("fvp-cca", &config, true).is_err());
+        config.kernel = Some(Path::new("kernel"));
+        config.initrd = None;
+        assert!(validate_incubator_platform_inputs("fvp-cca", &config, true).is_err());
+    }
 
     #[test]
     fn validates_fvp_roots() {
