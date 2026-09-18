@@ -1551,12 +1551,86 @@ the planned AHCI test passed.
 
 ### Lifecycle
 
+#### Native UNLOCK follow-up: pinned completion barrier
+
+The shared-core refactor is complete. The next lifecycle change uses the
+existing pinned UNLOCK operation, not a fabricated forced-unmap ioctl.
+Source inspection on 2026-09-18 established:
+
+- Guest `arm-cca.c::cca_tsm_unlock` first calls
+  `cca_unmap_evidence_report_range`, which uses RSI RIPAS_EMPTY for encrypted
+  report ranges, then issues RHI UNLOCK. Guest sysfs completion alone still
+  is not reliable error evidence.
+- RMM `smc_vdev_unlock` rejects the request while any granule in the VDEV's
+  ranges remains MAPPED. It then disables the device STE before beginning
+  the unlock protocol.
+- Host `cca_vdev_device_unlock` propagates failures, including communication
+  failures after the initial RMI call. Its final state-transition work checks
+  `rmi_vdev_get_state` for UNLOCKED. The IOMMUFD request handler propagates
+  this result and does not hide a failed response copy.
+
+These facts apply to Linux `2b68f486fdbc8d2818309f91199dde46b2b7cdd6` and
+RMM `33bbaf7814fee335027bf4d2417d97b551838b70`, the existing test tuple.
+See Linux `drivers/virt/coco/arm-cca-guest/arm-cca.c:478-501`,
+`rsi-da.c:109-160`, host `rmi-da.c:642-665,1074-1123`,
+`arm-cca.c:507-525`, `drivers/iommu/iommufd/tsm.c:55-93`, and
+RMM `runtime/rmi/vdev.c:1279-1420`.
+kvmtool's `vfio/iommufd.c:495-524` already submits UNLOCK before restoring
+nonsecure BAR access.
+
+Implementation direction:
+
+1. Keep frontend access denied while issuing native UNLOCK. Only zero syscall
+   error, zero residue and zero TSM status establish completion. On any failure,
+   retain mapping records and quarantine; do not trust the host driver's
+   prematurely updated software state.
+2. After checked completion, retire both the VFIO protected-mapping ledger
+   and KVM's attempted-range ledger before reopening shared BAR access or
+   returning guest success. Invoke the platform completion hook on every
+   checked UNLOCK, even with an empty VFIO vector. Run it before clearing
+   VFIO's ledger; validate all fallible prerequisites before changing KVM's
+   ledger so a hook error leaves it intact. Only infallible bookkeeping
+   follows hook success. Shared DMA, RAM visibility and retention requirements
+   are not cleared by this acknowledgement.
+3. Use the existing owning `VfioVm` platform boundary for recording mapping
+   attempts and retiring them on acknowledged UNLOCK. Check the registered
+   requester identity. Default unsupported platforms must fail explicitly.
+   Forward both operations through the RAM-retaining wrapper.
+   Hooks are synchronous and must not re-enter `EvidenceService`; do not
+   retain the RHI registry lock across backend work.
+4. Move KVM attempt recording from before async service admission into the
+   admitted VFIO mapping transaction, before the mapping ioctl. This makes
+   recording and unlock retirement share device admission and preserves the
+   device-gate-before-memory lock order.
+   Both records precede the mapping ioctl. Partial recording failure retains
+   any conservative record already created, issues no ioctl and denies access.
+5. Review and commit this bounded change, then run the unchanged guest.
+   Diagnose any subsequent object-destruction, fixture or model failure
+   separately. Do not waive those outcomes or claim same-host reuse.
+
+Tests must prove no records/access are released for failed/short/status-error
+UNLOCK, and that a failed platform acknowledgement keeps access closed.
+Successful acknowledgement must permit a later mapping epoch without stale
+overlap records. A controlled admission-race test must show that a waiting
+mapping request changes neither ledger, recording precedes its ioctl,
+UNLOCK cannot interleave with admitted mapping work, and old retirement
+cannot erase a subsequent epoch. Test unsupported, unregistered, evidence-only
+and wrong requester hooks, plus wrapper forwarding of success and errors. The actual
+guest run must show host-confirmed Unlocked in addition to its script marker.
+
+Do not permanently close native service admission before the orderly guest
+UNLOCK; that would prevent the required request. Close and drain it when
+moving to owner teardown after guest/frontend activity is stopped.
+
+#### Full owner and fixture shutdown
+
 Provide an explicit async shutdown path, not just best-effort destructors:
 
-1. Stop new requests; quiesce DMA and interrupts and drain in-flight work.
+1. Stop new assignment admission and arrange orderly guest/device quiescence.
 2. Prefer guest driver unbind and guest TSM unlock while the Realm is live.
    Confirm protected mappings were invalidated before restoring shared access.
-3. Withdraw any remaining mappings. Detach the VFIO device from its HWPT,
+3. Close native service admission and drain work before owner destruction.
+   Withdraw any remaining mappings. Detach the VFIO device from its HWPT,
    destroy the vdevice (which triggers TSM unbind), then release dependent
    child HWPT/vIOMMU/parent/IOAS resources in valid reference order.
 4. Remove the KVM VFIO association and close files only after their users
@@ -2131,6 +2205,17 @@ review pass two. The revision links below remain the reproducible references.
 | F2 | `../tf-rmm/runtime/rsi/vdev.c:342-348`, protected-IPA validation, independently checked during plan review |
 
 ## Review
+
+### Native UNLOCK completion barrier: 2026-09-18
+
+Review verdict: **Minor revisions**, incorporated before implementation.
+Independent source review confirmed the pinned guest invalidation order,
+RMM mapped-granule rejection and DMA stop, host state confirmation, and error
+propagation. The plan now requires an error-atomic KVM completion hook before
+VFIO ledger retirement and deterministic admission-race coverage.
+No forced-unmap interface, guest-marker assumption or weakening of failure
+custody is involved. Object destruction and outer shutdown remain separate
+qualification steps.
 
 ### Shared host infrastructure refactor: 2026-09-18
 

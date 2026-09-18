@@ -163,6 +163,103 @@ fn service() -> Arc<dyn EvidenceService> {
 }
 
 #[test]
+fn protected_hooks_validate_full_requester_before_unlocked_registry_bookkeeping() {
+    use crate::vfio::complete_unlock;
+    use crate::vfio::with_registered_assignment;
+    use memory_range::MemoryRange;
+
+    let registry = Mutex::new(Registry::default());
+    let memory = Mutex::new(crate::memory::KvmMemoryRangeState::default());
+    let fatal = AtomicBool::new(false);
+    let range = MemoryRange::new(0x4000..0x6000);
+    let shared_ram = MemoryRange::new(0x10000..0x11000);
+    let private_ram = MemoryRange::new(0x11000..0x12000);
+    memory.lock().cca_visibility =
+        crate::cca_in_place::Visibility::all_private(vec![shared_ram, private_ram]).unwrap();
+    memory.lock().cca_visibility.record(shared_ram, false);
+    memory
+        .lock()
+        .protected_attempts
+        .record(range, 0x9000, 1 << 40)
+        .unwrap();
+    let reject_without_work = |rid| {
+        assert!(
+            with_registered_assignment(&registry, rid, || {
+                panic!("invalid assignment must not reach memory bookkeeping")
+            })
+            .is_err()
+        );
+        assert!(memory.lock().protected_attempts.covers(range));
+    };
+    reject_without_work(0x100);
+    let evidence = service();
+    registry
+        .lock()
+        .register(0x100, Arc::downgrade(&evidence), || Ok(()))
+        .unwrap();
+    reject_without_work(0x100);
+    let mut full = Service::new();
+    full.assignment = true;
+    let full: Arc<dyn EvidenceService> = Arc::new(full);
+    registry
+        .lock()
+        .register_assignment(0x200, Arc::downgrade(&full), || Ok(()))
+        .unwrap();
+    reject_without_work(0x200); // Private RAM is not prepared.
+    registry.lock().assignment_prepared();
+    reject_without_work(0x100);
+    reject_without_work(0x1_0200); // Do not truncate the segment from the RID.
+    registry.lock().freeze().unwrap(); // Valid callbacks run after registration freezes.
+
+    fatal.store(true, Ordering::Release);
+    assert!(
+        with_registered_assignment(&registry, 0x200, || {
+            assert!(registry.try_lock().is_some());
+            complete_unlock(&memory, &fatal)
+        })
+        .is_err()
+    );
+    assert!(memory.lock().protected_attempts.covers(range));
+    fatal.store(false, Ordering::Release);
+    with_registered_assignment(&registry, 0x200, || {
+        assert!(registry.try_lock().is_some());
+        complete_unlock(&memory, &fatal)
+    })
+    .unwrap();
+    assert!(!memory.lock().protected_attempts.covers(range));
+    assert!(
+        memory
+            .lock()
+            .cca_visibility
+            .require_shared(shared_ram)
+            .is_ok()
+    );
+    assert!(
+        memory
+            .lock()
+            .cca_visibility
+            .require_shared(private_ram)
+            .is_err()
+    );
+    assert!(registry.lock().assignment_requested());
+    with_registered_assignment(&registry, 0x200, || {
+        assert!(registry.try_lock().is_some());
+        memory
+            .lock()
+            .protected_attempts
+            .record(range, 0x9000, 1 << 40)
+            .map_err(pci_core::vfio::VfioVmError::new)
+    })
+    .unwrap();
+    assert!(memory.lock().protected_attempts.covers(range));
+    registry.lock().failed = true;
+    reject_without_work(0x200);
+    registry.lock().failed = false;
+    drop(full);
+    reject_without_work(0x200);
+}
+
+#[test]
 fn fatal_request_closes_admission_before_pending_mutations_can_start() {
     let service = Arc::new(Service::new());
     let pending_state = service.set_state(ConfirmedState::Running);
