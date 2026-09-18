@@ -12,16 +12,30 @@ use chipset_device::pci::ByteEnabledDwordRead;
 use chipset_device::pci::ByteEnabledDwordWrite;
 use chipset_device::pci::PciConfigSpace;
 use closeable_mutex::CloseableMutex;
+use futures::FutureExt;
 use guestmem::GuestMemory;
 use guid::Guid;
 use hvdef::Vtl;
+use openhcl_tdisp::GuestToHostResponseExt;
+use openhcl_tdisp::TdispCommandTransport;
+use openhcl_tdisp::TdispGuestOperationErrorCode;
 use openhcl_tdisp::noop::TdispNoopResourceValidator;
 use pal_async::DefaultDriver;
 use pal_async::async_test;
 use pal_async::task::Spawn;
+use parking_lot::Mutex;
 use std::sync::Arc;
 use task_control::StopTask;
+use tdisp::TdispAccess;
+use tdisp::TdispDeviceInterfaceInfo;
+use tdisp::TdispGuestProtocolType;
+use tdisp::TdispGuestUnbindReason;
+use tdisp::TdispHostDeviceInterface;
 use tdisp::TdispHostDeviceTargetEmulator;
+use tdisp::TdispMmioRangeAction;
+use tdisp::TdispReportType;
+use tdisp::TdispTdiState;
+use tdisp::test_helpers::NullTdispHostInterface;
 use tdisp::test_helpers::TDISP_MOCK_DEVICE_ID;
 use tdisp::test_helpers::TDISP_MOCK_GUEST_PROTOCOL;
 use tdisp::test_helpers::TDISP_MOCK_SUPPORTED_FEATURES;
@@ -92,9 +106,11 @@ fn make_noop_device() -> Arc<CloseableMutex<NoopDevice>> {
     }))
 }
 
-#[async_test]
-async fn test_negotiate_version(driver: DefaultDriver) {
-    let device = make_noop_device();
+async fn with_device(
+    driver: &DefaultDriver,
+    host_device: Arc<CloseableMutex<NoopDevice>>,
+    run: impl AsyncFnOnce(super::VpciDevice),
+) {
     let msi_controller = TestVpciInterruptController::new();
     let (bus, mut channel) = VpciBusDevice::new(
         VpciBusConfig {
@@ -102,7 +118,7 @@ async fn test_negotiate_version(driver: DefaultDriver) {
             vtom: None,
             vnode: None,
         },
-        device,
+        host_device,
         &mut ExternallyManagedMmioIntercepts,
         VpciInterruptMapper::new(msi_controller),
     )
@@ -119,10 +135,9 @@ async fn test_negotiate_version(driver: DefaultDriver) {
     });
 
     let (_client, devices) =
-        super::VpciClient::connect(&driver, guest, Box::new(BusWrapper(bus)), mesh::channel().0)
+        super::VpciClient::connect(driver, guest, Box::new(BusWrapper(bus)), mesh::channel().0)
             .await
             .unwrap();
-
     let (device, _removed) = devices
         .into_iter()
         .next()
@@ -134,26 +149,34 @@ async fn test_negotiate_version(driver: DefaultDriver) {
         )
         .await
         .unwrap();
-    let MsiAddressData { address, data } = device
-        .register_interrupt(
-            1,
-            &VpciInterruptParameters {
-                vector: 5,
-                multicast: false,
-                target_processors: &[1, 2, 3],
-            },
-        )
-        .await
-        .unwrap();
+    run(device).await;
+}
 
-    let mut value = 0;
-    device.read_cfg(
-        256,
-        ByteEnabledDwordRead::with_all_bytes_enabled(&mut value),
-    );
-    assert_eq!(value, 0);
+#[async_test]
+async fn test_negotiate_version(driver: DefaultDriver) {
+    with_device(&driver, make_noop_device(), async |device| {
+        let MsiAddressData { address, data } = device
+            .register_interrupt(
+                1,
+                &VpciInterruptParameters {
+                    vector: 5,
+                    multicast: false,
+                    target_processors: &[1, 2, 3],
+                },
+            )
+            .await
+            .unwrap();
 
-    device.unregister_interrupt(address, data).await;
+        let mut value = 0;
+        device.read_cfg(
+            256,
+            ByteEnabledDwordRead::with_all_bytes_enabled(&mut value),
+        );
+        assert_eq!(value, 0);
+
+        device.unregister_interrupt(address, data).await;
+    })
+    .await;
 }
 
 /// Tests that VPCI can negotiate basic TDISP commands with a device.
@@ -165,62 +188,246 @@ async fn test_negotiate_version(driver: DefaultDriver) {
 /// - Basic TDISP state machine processing
 #[async_test]
 async fn test_tdisp_interface_get_device_interface_info(driver: DefaultDriver) {
-    let device = make_noop_device();
-    let msi_controller = TestVpciInterruptController::new();
-    let (bus, mut channel) = VpciBusDevice::new(
-        VpciBusConfig {
-            instance_id: Guid::new_random(),
-            vtom: None,
-            vnode: None,
-        },
-        device,
-        &mut ExternallyManagedMmioIntercepts,
-        VpciInterruptMapper::new(msi_controller),
-    )
-    .unwrap();
+    with_device(&driver, make_noop_device(), async |device| {
+        let interface = device
+            .tdisp()
+            .get_device_interface_info(TDISP_MOCK_GUEST_PROTOCOL)
+            .await;
 
-    let (host, guest) = vmbus_channel::connected_async_channels(32768);
-
-    let mut runner = channel.open(host, GuestMemory::empty()).unwrap();
-    let _task = driver.spawn("server", async move {
-        StopTask::run_with(std::future::pending(), async |stop| {
-            let _ = channel.run(stop, &mut runner).await;
-        })
-        .await
-    });
-
-    let (_client, devices) =
-        super::VpciClient::connect(&driver, guest, Box::new(BusWrapper(bus)), mesh::channel().0)
-            .await
-            .unwrap();
-
-    let (device, _removed) = devices
-        .into_iter()
-        .next()
-        .unwrap()
-        .init(
-            Arc::new(TdispNoopResourceValidator::new()),
-            IsolationType::None,
-            Vtl::Vtl0,
-        )
-        .await
-        .unwrap();
-    let interface = device
-        .tdisp()
-        .get_device_interface_info(TDISP_MOCK_GUEST_PROTOCOL)
-        .await;
-
-    match interface {
-        Ok(interface) => {
-            assert_eq!(
-                interface.guest_protocol_type,
-                TDISP_MOCK_GUEST_PROTOCOL as i32
-            );
-            assert_eq!(interface.supported_features, TDISP_MOCK_SUPPORTED_FEATURES);
-            assert_eq!(interface.tdisp_device_id, TDISP_MOCK_DEVICE_ID);
+        match interface {
+            Ok(interface) => {
+                assert_eq!(
+                    interface.guest_protocol_type,
+                    TDISP_MOCK_GUEST_PROTOCOL as i32
+                );
+                assert_eq!(interface.supported_features, TDISP_MOCK_SUPPORTED_FEATURES);
+                assert_eq!(interface.tdisp_device_id, TDISP_MOCK_DEVICE_ID);
+            }
+            Err(err) => panic!("unexpected error: {err}"),
         }
-        Err(err) => panic!("unexpected error: {err}"),
+    })
+    .await;
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum HostCall {
+    Negotiate,
+    Bind,
+    Start,
+    Unbind,
+    Report,
+    ModifyMmio,
+}
+
+#[derive(Default)]
+struct HostState {
+    calls: Vec<HostCall>,
+    bound: bool,
+    fail_bind_after_effect: bool,
+}
+
+struct TrackingHost(Arc<Mutex<HostState>>);
+
+impl TdispHostDeviceInterface for TrackingHost {
+    fn tdisp_negotiate_protocol(
+        &mut self,
+        requested: TdispGuestProtocolType,
+    ) -> anyhow::Result<TdispDeviceInterfaceInfo> {
+        self.0.lock().calls.push(HostCall::Negotiate);
+        assert_eq!(requested, TDISP_MOCK_GUEST_PROTOCOL);
+        Ok(TdispDeviceInterfaceInfo {
+            guest_protocol_type: TDISP_MOCK_GUEST_PROTOCOL as i32,
+            supported_features: TDISP_MOCK_SUPPORTED_FEATURES,
+            tdisp_device_id: TDISP_MOCK_DEVICE_ID,
+        })
     }
+
+    fn tdisp_bind_device(&mut self) -> anyhow::Result<()> {
+        let mut state = self.0.lock();
+        state.calls.push(HostCall::Bind);
+        state.bound = true;
+        if state.fail_bind_after_effect {
+            anyhow::bail!("injected Bind failure after device effect");
+        }
+        Ok(())
+    }
+
+    fn tdisp_start_device(&mut self) -> anyhow::Result<()> {
+        self.0.lock().calls.push(HostCall::Start);
+        Ok(())
+    }
+
+    fn tdisp_unbind_device(&mut self) -> anyhow::Result<()> {
+        let mut state = self.0.lock();
+        state.calls.push(HostCall::Unbind);
+        state.bound = false;
+        Ok(())
+    }
+
+    fn tdisp_get_device_report(&mut self, report_type: TdispReportType) -> anyhow::Result<Vec<u8>> {
+        self.0.lock().calls.push(HostCall::Report);
+        NullTdispHostInterface {}.tdisp_get_device_report(report_type)
+    }
+
+    fn tdisp_modify_mmio_range(
+        &mut self,
+        _: TdispMmioRangeAction,
+        _: u16,
+        _: u64,
+        _: u64,
+    ) -> anyhow::Result<()> {
+        self.0.lock().calls.push(HostCall::ModifyMmio);
+        anyhow::bail!("these channel tests do not modify MMIO ranges")
+    }
+}
+
+fn make_tracking_device(state: Arc<Mutex<HostState>>) -> Arc<CloseableMutex<NoopDevice>> {
+    Arc::new(CloseableMutex::new(NoopDevice {
+        tdisp_interface: TdispHostDeviceTargetEmulator::new(
+            TrackingHost(state),
+            // This mock owns no MMIO or DMA resources.
+            TdispAccess::new(),
+            "vpci-channel-tdisp-test",
+        ),
+    }))
+}
+
+#[async_test]
+async fn real_tdisp_host_supports_client_unbind_and_rebind(driver: DefaultDriver) {
+    let state = Arc::new(Mutex::new(HostState::default()));
+    with_device(
+        &driver,
+        make_tracking_device(state.clone()),
+        async |device| {
+            let tdisp = device.tdisp();
+            let interface_info = tdisp
+                .get_device_interface_info(TDISP_MOCK_GUEST_PROTOCOL)
+                .await
+                .unwrap();
+            tdisp.attest(interface_info).await.unwrap();
+            assert!(state.lock().bound);
+            assert_eq!(tdisp.tdi_state().await, TdispTdiState::Run);
+            tdisp.unbind(TdispGuestUnbindReason::Graceful).await;
+            assert!(!state.lock().bound);
+            assert_eq!(tdisp.tdi_state().await, TdispTdiState::Unlocked);
+            let interface_info = tdisp
+                .get_device_interface_info(TDISP_MOCK_GUEST_PROTOCOL)
+                .await
+                .unwrap();
+            tdisp.attest(interface_info).await.unwrap();
+            assert_eq!(tdisp.tdi_state().await, TdispTdiState::Run);
+            let state = state.lock();
+            assert!(state.bound);
+            assert_eq!(
+                state.calls,
+                [
+                    HostCall::Negotiate,
+                    HostCall::Bind,
+                    HostCall::Start,
+                    HostCall::Report,
+                    HostCall::Unbind,
+                    HostCall::Negotiate,
+                    HostCall::Bind,
+                    HostCall::Start,
+                    HostCall::Report,
+                ]
+            );
+        },
+    )
+    .await;
+}
+
+fn host_failure(command: &str) -> String {
+    format!(
+        "send_command {:?} failed because host responded with an error: HostFailedToProcessCommand",
+        Some(command),
+    )
+}
+
+#[async_test]
+async fn real_tdisp_host_failure_reaches_client_and_prevents_guest_recovery(driver: DefaultDriver) {
+    let state = Arc::new(Mutex::new(HostState {
+        fail_bind_after_effect: true,
+        ..Default::default()
+    }));
+    with_device(
+        &driver,
+        make_tracking_device(state.clone()),
+        async |device| {
+            let tdisp = device.tdisp();
+            let interface_info = tdisp
+                .get_device_interface_info(TDISP_MOCK_GUEST_PROTOCOL)
+                .await
+                .unwrap();
+            // Attestation now owns Bind and attempts Unbind when Bind fails.
+            // A quarantined host rejects that cleanup, which remains fatal.
+            let panic = std::panic::AssertUnwindSafe(tdisp.attest(interface_info))
+                .catch_unwind()
+                .await
+                .expect_err("the client must not hide failed attestation cleanup");
+            let message = panic
+                .downcast_ref::<String>()
+                .expect("formatted fatal Unbind message");
+            assert_eq!(
+                message,
+                &format!(
+                    "tdisp_unbind: error response from host, cannot continue: {}",
+                    host_failure("Unbind"),
+                )
+            );
+            assert!(state.lock().bound);
+            assert_eq!(tdisp.tdi_state().await, TdispTdiState::Uninitialized);
+
+            // Removing the fault does not let later guest commands recover the host.
+            state.lock().fail_bind_after_effect = false;
+            // Start is internal to TdispClient. Send it over the same VPCI
+            // transport to check that quarantine still blocks the backend.
+            let transport = super::tdisp::VpciTdispTransport::new(
+                device.dev.req.clone(),
+                device.dev.id.slot.into_bits() as u64,
+            );
+            let response = transport
+                .send_command(openhcl_tdisp::new_start_tdi_command(
+                    transport.bus_device_id(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.error_code(),
+                Some(TdispGuestOperationErrorCode::HostFailedToProcessCommand)
+            );
+            assert_eq!(
+                response.tdi_state_after_enum(),
+                Some(TdispTdiState::Uninitialized)
+            );
+            let error = tdisp
+                .get_device_interface_info(TDISP_MOCK_GUEST_PROTOCOL)
+                .await
+                .unwrap_err();
+            assert_eq!(error.to_string(), host_failure("GetDeviceInterfaceInfo"));
+
+            let panic =
+                std::panic::AssertUnwindSafe(tdisp.unbind(TdispGuestUnbindReason::Graceful))
+                    .catch_unwind()
+                    .await
+                    .expect_err("the client must not hide failed cleanup");
+            let message = panic
+                .downcast_ref::<String>()
+                .expect("formatted fatal Unbind message");
+            assert_eq!(
+                message,
+                &format!(
+                    "tdisp_unbind: error response from host, cannot continue: {}",
+                    host_failure("Unbind"),
+                )
+            );
+            assert_eq!(tdisp.tdi_state().await, TdispTdiState::Uninitialized);
+            let state = state.lock();
+            assert!(state.bound);
+            assert_eq!(state.calls, [HostCall::Negotiate, HostCall::Bind]);
+        },
+    )
+    .await;
 }
 
 mod active_mmio_bars {
