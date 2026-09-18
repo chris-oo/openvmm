@@ -12,6 +12,8 @@ use crate::BAR0_LEN;
 use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::sync::Arc;
+use tdisp::TdispAccess;
+use tdisp::TdispAccessGate;
 use tdisp::TdispDeviceInterfaceInfo;
 use tdisp::TdispGuestProtocolType;
 use tdisp::TdispHostDeviceInterface;
@@ -45,8 +47,31 @@ const REPORT_PAGE_SIZE: u64 = 0x1000;
 /// access. A range starts blocked and stays that way until the guest has
 /// attested the TDI and accepted the range into its context, and goes back to
 /// blocked when the TDI is unbound.
-#[derive(Clone, Default)]
-pub struct TdispMmioRanges(Arc<Mutex<HashSet<u16>>>);
+#[derive(Clone)]
+pub struct TdispMmioRanges {
+    ranges: Arc<Mutex<HashSet<u16>>>,
+    gate: TdispAccessGate,
+    #[cfg(test)]
+    fault: Arc<Mutex<Option<MutationFault>>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) struct MutationFault {
+    pub after_effect: bool,
+    pub panic: bool,
+}
+
+#[cfg(test)]
+impl MutationFault {
+    fn check(self, after_effect: bool) -> anyhow::Result<()> {
+        if self.after_effect == after_effect {
+            assert!(!self.panic, "injected MMIO callback unwind");
+            anyhow::bail!("injected MMIO callback failure");
+        }
+        Ok(())
+    }
+}
 
 impl TdispMmioRanges {
     /// Whether the guest may currently reach `range_id`.
@@ -54,7 +79,22 @@ impl TdispMmioRanges {
     /// * `range_id` - The range to check, which for this device is the BAR
     ///   index.
     pub fn is_unblocked(&self, range_id: u16) -> bool {
-        self.0.lock().contains(&range_id)
+        self.gate.is_allowed() && self.ranges.lock().contains(&range_id)
+    }
+
+    /// Whether lifecycle containment permits any MMIO, including shared MSI-X.
+    pub(crate) fn is_allowed(&self) -> bool {
+        self.gate.is_allowed()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_fault(&self, fault: MutationFault) {
+        *self.fault.lock() = Some(fault);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recorded_unblocked(&self, range_id: u16) -> bool {
+        self.ranges.lock().contains(&range_id)
     }
 }
 
@@ -69,12 +109,19 @@ pub(crate) fn new_tdisp_interface(
     debug_device_id: &str,
     msix_bar_len: u64,
 ) -> (TdispHostDeviceTargetEmulator, TdispMmioRanges) {
-    let ranges = TdispMmioRanges::default();
+    let access = TdispAccess::new();
+    let ranges = TdispMmioRanges {
+        ranges: Arc::new(Mutex::new(HashSet::new())),
+        gate: access.gate(),
+        #[cfg(test)]
+        fault: Arc::new(Mutex::new(None)),
+    };
     let emulator = TdispHostDeviceTargetEmulator::new(
-        Arc::new(Mutex::new(FaultControllerTdispInterface {
+        FaultControllerTdispInterface {
             ranges: ranges.clone(),
             msix_bar_len,
-        })),
+        },
+        access,
         debug_device_id,
     );
     (emulator, ranges)
@@ -145,7 +192,7 @@ impl TdispHostDeviceInterface for FaultControllerTdispInterface {
     fn tdisp_unbind_device(&mut self) -> anyhow::Result<()> {
         // Every range the guest had accepted goes away with the binding, so
         // the device stops answering on all of them.
-        let mut ranges = self.ranges.0.lock();
+        let mut ranges = self.ranges.ranges.lock();
         tracing::info!(
             unblocked_ranges = ranges.len(),
             "fault controller TDISP unbind, blocking every MMIO range"
@@ -170,6 +217,12 @@ impl TdispHostDeviceInterface for FaultControllerTdispInterface {
         gpa_base: u64,
         range_len_bytes: u64,
     ) -> anyhow::Result<()> {
+        #[cfg(test)]
+        let fault = self.ranges.fault.lock().take();
+        #[cfg(test)]
+        if let Some(fault) = fault {
+            fault.check(false)?;
+        }
         tracing::info!(
             ?action,
             range_id,
@@ -180,16 +233,20 @@ impl TdispHostDeviceInterface for FaultControllerTdispInterface {
 
         match action {
             TdispMmioRangeAction::UnblockMmioRange => {
-                self.ranges.0.lock().insert(range_id);
+                self.ranges.ranges.lock().insert(range_id);
             }
             TdispMmioRangeAction::BlockMmioRange => {
-                self.ranges.0.lock().remove(&range_id);
+                self.ranges.ranges.lock().remove(&range_id);
             }
             TdispMmioRangeAction::Invalid => {
                 anyhow::bail!("invalid MMIO range action for range {range_id}")
             }
         }
 
+        #[cfg(test)]
+        if let Some(fault) = fault {
+            fault.check(true)?;
+        }
         Ok(())
     }
 }

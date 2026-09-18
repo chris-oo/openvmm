@@ -39,6 +39,10 @@ pub enum Mutation {
     Assignment,
     /// Change the confirmed interface state. Repeated states are invalid.
     SetState(ConfirmedState),
+    /// Unbind a healthy interface, including one already unlocked.
+    Unbind,
+    /// Modify an MMIO range on a locked or running interface.
+    ModifyMmio,
     /// Regenerate an interface report.
     InterfaceReport,
     /// Regenerate measurements.
@@ -117,6 +121,13 @@ impl Lifecycle {
         }
     }
 
+    pub(crate) fn locked_or_running(&self) -> Result<(), AdmissionError> {
+        match self.confirmed()? {
+            ConfirmedState::Locked | ConfirmedState::Running => Ok(()),
+            ConfirmedState::Unlocked => Err(AdmissionError::InvalidState { state: self.state }),
+        }
+    }
+
     fn outcome(&self, operation: Mutation) -> Result<DeviceState, AdmissionError> {
         if operation == Mutation::Teardown {
             return match self.state {
@@ -129,8 +140,6 @@ impl Lifecycle {
         let from = self.confirmed()?;
         let after = match operation {
             Mutation::SetState(to) => {
-                // Strict state requests are not idempotent Unbind operations.
-                // A protocol Unbind must have its own typed operation and rules.
                 if !matches!(
                     (from, to),
                     (ConfirmedState::Unlocked, ConfirmedState::Locked)
@@ -142,14 +151,12 @@ impl Lifecycle {
                 }
                 to
             }
-            Mutation::InterfaceReport | Mutation::Measurements => match from {
-                ConfirmedState::Locked | ConfirmedState::Running => from,
-                ConfirmedState::Unlocked => {
-                    return Err(AdmissionError::InvalidState { state: self.state });
-                }
-            },
+            Mutation::InterfaceReport | Mutation::Measurements | Mutation::ModifyMmio => {
+                self.locked_or_running()?;
+                from
+            }
             Mutation::Assignment => from,
-            Mutation::Reset => ConfirmedState::Unlocked,
+            Mutation::Reset | Mutation::Unbind => ConfirmedState::Unlocked,
             Mutation::Teardown => unreachable!("teardown handled before confirmed admission"),
         };
         Ok(DeviceState::Confirmed(after))
@@ -197,12 +204,14 @@ mod tests {
         Ok(())
     }
 
-    fn operations() -> [Mutation; 8] {
+    fn operations() -> [Mutation; 10] {
         [
             Mutation::SetState(ConfirmedState::Unlocked),
             Mutation::SetState(ConfirmedState::Locked),
             Mutation::SetState(ConfirmedState::Running),
             Mutation::Assignment,
+            Mutation::Unbind,
+            Mutation::ModifyMmio,
             Mutation::InterfaceReport,
             Mutation::Measurements,
             Mutation::Reset,
@@ -219,13 +228,15 @@ mod tests {
                 let expected = match (from, operation) {
                     (Unlocked, Mutation::SetState(Locked)) => Some(DeviceState::Confirmed(Locked)),
                     (Locked, Mutation::SetState(Running)) => Some(DeviceState::Confirmed(Running)),
-                    (Locked | Running, Mutation::SetState(Unlocked)) | (_, Mutation::Reset) => {
+                    (Locked | Running, Mutation::SetState(Unlocked))
+                    | (_, Mutation::Reset | Mutation::Unbind) => {
                         Some(DeviceState::Confirmed(Unlocked))
                     }
                     (_, Mutation::Assignment)
-                    | (Locked | Running, Mutation::InterfaceReport | Mutation::Measurements) => {
-                        Some(DeviceState::Confirmed(from))
-                    }
+                    | (
+                        Locked | Running,
+                        Mutation::InterfaceReport | Mutation::Measurements | Mutation::ModifyMmio,
+                    ) => Some(DeviceState::Confirmed(from)),
                     (_, Mutation::Teardown) => Some(DeviceState::TornDown),
                     _ => None,
                 };
