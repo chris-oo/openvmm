@@ -12,6 +12,7 @@ use crate::serialize_proto::serialize_response;
 use crate::test_helpers::TDISP_MOCK_GUEST_PROTOCOL;
 use tdisp_proto::GuestToHostCommand;
 use tdisp_proto::GuestToHostResponse;
+use tdisp_proto::GuestToHostResponseExt;
 use tdisp_proto::TdispCommandRequestBind;
 use tdisp_proto::TdispCommandRequestGetDeviceInterfaceInfo;
 use tdisp_proto::TdispCommandRequestGetTdiReport;
@@ -32,6 +33,7 @@ use tdisp_proto::TdispReportType;
 use tdisp_proto::TdispTdiState;
 use tdisp_proto::guest_to_host_command::Command;
 use tdisp_proto::guest_to_host_response::Response;
+use test_with_tracing::test;
 
 /// Build a well-formed response wrapper around the given `Response` variant.
 fn make_response(response: Response) -> GuestToHostResponse {
@@ -307,4 +309,52 @@ fn test_deserialize_response_rejects_missing_interface_info() {
 #[test]
 fn test_deserialize_response_rejects_malformed_bytes() {
     assert!(deserialize_response(&[0x80]).is_err());
+}
+
+#[test]
+fn indeterminate_state_roundtrips_only_for_error_responses() {
+    for before in [TdispTdiState::Run, TdispTdiState::Uninitialized] {
+        let mut response = GuestToHostResponse {
+            result: TdispGuestOperationErrorCode::HostFailedToProcessCommand as i32,
+            tdi_state_before: before as i32,
+            tdi_state_after: TdispTdiState::Uninitialized as i32,
+            response: None,
+        };
+        let decoded = deserialize_response(&serialize_response(&response)).unwrap();
+        assert_eq!(decoded.tdi_state_before_enum(), Some(before));
+        assert_eq!(
+            decoded.tdi_state_after_enum(),
+            Some(TdispTdiState::Uninitialized)
+        );
+
+        response.result = TdispGuestOperationErrorCode::Success as i32;
+        response.response = Some(Response::Bind(TdispCommandResponseBind {}));
+        assert!(response.tdi_state_after_enum().is_none());
+        assert!(deserialize_response(&serialize_response(&response)).is_err());
+
+        response.tdi_state_before = TdispTdiState::Uninitialized as i32;
+        response.tdi_state_after = TdispTdiState::Unlocked as i32;
+        assert!(response.tdi_state_before_enum().is_none());
+        assert!(deserialize_response(&serialize_response(&response)).is_err());
+    }
+}
+
+#[test]
+fn invalid_error_or_state_cannot_authorize_an_indeterminate_reply() {
+    let mut response = GuestToHostResponse {
+        result: i32::MAX,
+        tdi_state_before: TdispTdiState::Uninitialized as i32,
+        tdi_state_after: TdispTdiState::Uninitialized as i32,
+        response: None,
+    };
+    assert!(response.tdi_state_before_enum().is_none());
+    assert!(response.tdi_state_after_enum().is_none());
+    assert!(deserialize_response(&serialize_response(&response)).is_err());
+
+    response.result = TdispGuestOperationErrorCode::HostFailedToProcessCommand as i32;
+    response.tdi_state_before = -1;
+    response.tdi_state_after = i32::MAX;
+    assert!(response.tdi_state_before_enum().is_none());
+    assert!(response.tdi_state_after_enum().is_none());
+    assert!(deserialize_response(&serialize_response(&response)).is_err());
 }

@@ -833,6 +833,12 @@ state checks affects implicit cleanup. A recognized `Unknown` Unbind reason
 still invokes cleanup, unlike an unrecognized numeric enum.
 
 The actual VPCI client caches `tdi_state_after` **before** checking the result.
+Implementation inspection found that the existing response enum accessors
+reject Uninitialized even on errors. Enable the selected contract first:
+permit that value only with a recognized non-success result, and reject
+indeterminate states in successful replies during response validation.
+Keep unknown numeric states/results invalid. Add wire round-trip and actual
+client Bind/Unbind failure tests before migrating the host facade.
 Test that Uninitialized plus failure yields that cache value and an error,
 never acceptance. Preserve the existing explicit fatal cleanup policy rather
 than hiding failure to continue. This intentionally changes failed-mutation

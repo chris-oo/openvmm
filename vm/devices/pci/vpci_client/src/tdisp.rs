@@ -1428,9 +1428,11 @@ impl VpciDevice {
 mod tests {
     use super::*;
 
+    use futures::FutureExt;
     use tdisp::devicereport::TdispTdiReportInterfaceInfo;
     use tdisp::devicereport::TdispTdiReportMmioFlags;
     use tdisp::devicereport::TdispTdiReportMmioInterfaceInfo;
+    use test_with_tracing::test;
 
     /// Build a `VpciClientTdispState` with default fields and a dangling
     /// worker sender. `send_tdisp_command` must not be called on the
@@ -1455,6 +1457,62 @@ mod tests {
             Vtl::Vtl0,
             present_bars,
         )
+    }
+
+    async fn reject_command(
+        mut requests: mesh::Receiver<WorkerRequest>,
+        command_name: &str,
+        before: TdispTdiState,
+    ) {
+        let WorkerRequest::TdispCommand(rpc) = requests.recv().await.unwrap() else {
+            panic!("expected a TDISP request");
+        };
+        let (packet, reply) = rpc.split();
+        let command = openhcl_tdisp::deserialize_command(&packet.data).unwrap();
+        assert_eq!(command.type_name(), Some(command_name));
+        let response = GuestToHostResponse {
+            result: TdispGuestOperationErrorCode::HostFailedToProcessCommand as i32,
+            tdi_state_before: before as i32,
+            tdi_state_after: TdispTdiState::Uninitialized as i32,
+            response: None,
+        };
+        let wire = openhcl_tdisp::serialize_response(&response);
+        reply.complete(Ok(openhcl_tdisp::deserialize_response(&wire).unwrap()));
+    }
+
+    #[test]
+    fn failed_bind_replaces_cached_state_with_indeterminate() {
+        futures::executor::block_on(async {
+            let mut state = new_state();
+            let (requests, responses) = mesh::channel();
+            state.worker_req = requests;
+            state.mutable_state.tdi_state = TdispTdiState::Unlocked;
+
+            let (_, result) = futures::join!(
+                reject_command(responses, "Bind", TdispTdiState::Unlocked),
+                state.tdisp_bind_interface(),
+            );
+            assert!(result.is_err());
+            assert_eq!(state.tdi_state(), TdispTdiState::Uninitialized);
+        });
+    }
+
+    #[test]
+    fn failed_unbind_keeps_indeterminate_state_and_remains_fatal() {
+        futures::executor::block_on(async {
+            let mut state = new_state();
+            let (requests, responses) = mesh::channel();
+            state.worker_req = requests;
+            state.mutable_state.tdi_state = TdispTdiState::Run;
+
+            let (_, result) = futures::join!(
+                reject_command(responses, "Unbind", TdispTdiState::Run),
+                std::panic::AssertUnwindSafe(state.tdisp_unbind(TdispGuestUnbindReason::Graceful))
+                    .catch_unwind(),
+            );
+            assert!(result.is_err());
+            assert_eq!(state.tdi_state(), TdispTdiState::Uninitialized);
+        });
     }
 
     /// Build a minimal `TdiReportStruct` containing only the given
