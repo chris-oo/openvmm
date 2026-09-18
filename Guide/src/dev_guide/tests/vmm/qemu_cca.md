@@ -93,6 +93,18 @@ There is no FVP rootfs option. The runtime overlay fixes the virtio-blk
 backing-image path to empty. An unbacked, zero-capacity device may still
 appear in the host; it is not used as the root filesystem.
 
+## Build now, run later
+
+Add `--build-only` to either command above to prepare the artifacts without
+running the tests. Run the generated `run.sh` on the same build host.
+It retains the resolved payload, firmware and FVP input paths, so keep those
+inputs at their original locations. This script is not a portable target-side
+test package.
+
+`vmm-tests-run-target --incubator` rejects CCA profiles before constructing
+the execution pipeline. Use `vmm-tests-run` or its generated host-side script;
+the portable target-side path does not carry the required CCA overrides.
+
 ## Avoid unnecessary enumeration boots
 
 The `tests` executable contains `boot_linux_direct_cca`. The explicit

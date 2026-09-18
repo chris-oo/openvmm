@@ -23,7 +23,6 @@ pub mod vmm_tests_run;
 pub mod vmm_tests_run_target;
 
 #[derive(clap::Subcommand)]
-#[expect(clippy::large_enum_variant)]
 pub enum OpenvmmPipelines {
     /// Alias for root-level `regen` command.
     // DEVNOTE: this enables the useful `cargo xflowey regen` alias

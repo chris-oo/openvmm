@@ -866,6 +866,7 @@ impl virt::ProtoPartition for KvmProtoPartition<'_> {
         mut self,
         config: virt::PartitionConfig<'_>,
     ) -> Result<(Self::Partition, Vec<Self::ProcessorBinder>), Self::Error> {
+        let isolation = self.config.isolation.isolation_type();
         // Create all VCPUs now so that they are assigned dense, sequential
         // vcpu_idx values in KVM.  See the x86_64 build() for details on why
         // this matters for the Hyper-V enlightenment fast paths.
@@ -891,7 +892,7 @@ impl virt::ProtoPartition for KvmProtoPartition<'_> {
             GicVersion::V3 {
                 redistributors_base,
             } => self.add_gicv3(redistributors_base)?,
-            GicVersion::V2 { .. } if self.config.isolation == virt::IsolationType::Cca => {
+            GicVersion::V2 { .. } if isolation == virt::IsolationType::Cca => {
                 return Err(KvmError::CcaRequiresGicV3);
             }
             GicVersion::V2 { cpu_interface_base } => self.add_gicv2(cpu_interface_base)?,
@@ -924,7 +925,7 @@ impl virt::ProtoPartition for KvmProtoPartition<'_> {
                 pfr0 & 0xf == 2
             };
             PartitionCapabilities {
-                isolation: self.config.isolation,
+                isolation,
                 vendor: Vendor::ARM,
                 supports_aarch32_el0,
             }
@@ -937,7 +938,7 @@ impl virt::ProtoPartition for KvmProtoPartition<'_> {
             .map(|range| range.range)
             .chain(config.mem_layout.vtl2_range())
             .collect();
-        let memory_backing_mode = match self.config.isolation {
+        let memory_backing_mode = match isolation {
             virt::IsolationType::None => KvmMemoryBackingMode::Userspace,
             virt::IsolationType::Cca => KvmMemoryBackingMode::guest_memfd(
                 &self.vm,
@@ -954,7 +955,7 @@ impl virt::ProtoPartition for KvmProtoPartition<'_> {
             memory: Default::default(),
             cca_launch_state: Mutex::new(crate::CcaLaunchState::NotStarted),
             cca_fatal: false.into(),
-            shared_gpa_bit: (self.config.isolation == virt::IsolationType::Cca)
+            shared_gpa_bit: (isolation == virt::IsolationType::Cca)
                 .then_some(1_u64 << (self.ipa_size - 1)),
             memory_backing_mode,
             ram_ranges,
@@ -1288,7 +1289,8 @@ impl virt::Hypervisor for Kvm {
         &'a mut self,
         config: ProtoPartitionConfig<'a>,
     ) -> Result<Self::ProtoPartition<'a>, Self::Error> {
-        match config.isolation {
+        let isolation = config.isolation.isolation_type();
+        match isolation {
             virt::IsolationType::None => {}
             virt::IsolationType::Cca => {
                 if config.hv_config.is_some() {
@@ -1319,14 +1321,14 @@ impl virt::Hypervisor for Kvm {
             }
         }
 
-        let ipa_size = match config.isolation {
+        let ipa_size = match isolation {
             virt::IsolationType::Cca => self
                 .cca_ipa_size
                 .ok_or(KvmError::MissingCcaCapability("KVM_CAP_ARM_RMI"))?,
             _ => self.ipa_size,
         };
 
-        let vm = match config.isolation {
+        let vm = match isolation {
             virt::IsolationType::None => self.kvm.new_vm(kvm::VmType::Default)?,
             virt::IsolationType::Cca => {
                 let vm = self.kvm.new_vm(kvm::VmType::Realm { ipa_bits: ipa_size })?;
