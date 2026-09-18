@@ -1,11 +1,14 @@
 # Arm CCA TDISP: implementation summary
 
-Updated: 2026-09-17.
+Updated: 2026-09-18.
 
 **OpenVMM now runs the unchanged kvmtool reference guest through TDISP
 LOCK/RUN and a verified 64 MiB AHCI read on FVP.** The overall VMM test still
 fails at UNLOCK and shutdown. This is a protocol/I/O milestone, not a claim
 of clean teardown, reusable assignment or measured private-buffer DMA.
+
+Native CCA and VPCI now share the host lifecycle engine. The refactored
+code reproduced the same FVP protocol/I/O milestone and known cleanup failure.
 
 The detailed design, artifact pins and run history are in
 [plan-arm-cca-tdisp.md](plan-arm-cca-tdisp.md).
@@ -47,7 +50,8 @@ validated guest initrd.
 | `kvm` | guest_memfd flags/attributes, RIPAS and bounded prefault helpers; KVM/VFIO association; Arm SMCCC filters, registers and TIO exits | Exposes the pinned host-kernel interfaces without treating Arm hypercalls as x86 hypercalls. |
 | `virt_kvm` | In-place memory ledger; full RHI request routing; pre-entry private prefault; serialized shared/private DMA conversion; TIO dispatch | Connects guest requests and memory transitions to one assignment service. Checks original x0, shared buffers, addresses and completion results. |
 | `membacking` and `guestmem` | Partition-provided backing, explicit file offsets, revocable access policy and retained RAM-region ownership | Keeps CPU and device access on the intended guest_memfd backing rather than a second shared RAM copy. |
-| `tdisp` | Additive native coordinator, bounded evidence snapshots, mutation handling and asynchronous service admission | Shares device state across evidence, LOCK/RUN, mapping and RAM work. Existing OpenHCL/VPCI protobuf behavior remains separate. |
+| `tdisp` | Shared lifecycle engine with native and VPCI facades; bounded native snapshots and asynchronous service admission | One transition/completion/quarantine implementation. Transport policy and backend ownership stay separate; uncertain VPCI failures report indeterminate state. |
+| VPCI client and NVMe test device | Error-state decoding, real-channel compatibility tests and fail-closed emulator access permits | Healthy Unbind/rebind remains valid. Error/unwind denies both register and MSI-X access; this does not claim physical DMA withdrawal. |
 | `vfio_sys` | Typed CCA TSM requests and strict Realm IOMMUFD primitives; shared ownership of the VFIO open file | Preserves syscall errors, residue and TSM status independently and keeps assignment handles alive. |
 | `vfio_assigned_device` | Realm object owner, distinct resolver, access gate, fixed BAR/RID checks, shared-DMA ledger and native TDISP backend | Uses trapped shared BAR access before LOCK and blocks protected fallback access afterward. Maps shared RAM through retained VMAs with `IOMMU_IOAS_MAP`, matching kvmtool. |
 | PCI core and KVM IRQ routing | Native assignment hooks, MSI-X route release, checked error latches and retained failed-route ownership | Supports the fixture's nonsecure MSI-X pages without relying on unchecked IRQ-route failures. |
@@ -195,3 +199,23 @@ The new invocation is `single-boot-2987526-1789612384327479418` under
 `vmm_test_results/cca-tdisp-committed-stack/fvp-single-boot-runs/`.
 Its `outputs/session-result.json` records the separate outcomes. The plan
 records the exact FVP/nextest identities and evidence locations.
+
+## Shared-host refactor qualification
+
+The reviewed implementation is split into `pvkpunvk` (engine extraction),
+`kpvlkusy` (wire-error contract), `lwssxxtz` (VPCI migration and emulator gates),
+and `punxvyql` (real VPCI/VMBus client integration coverage). These are jj
+change IDs. The main plan records each review and the preserved contracts.
+
+Final validation passed 696 host tests and 71 Arm KVM tests. Separate-backing
+CCA boot, agent ping and poweroff passed on both QEMU and v15 FVP.
+The full DA FVP test confirmed Locked at 103.778174350 s, Run at
+106.115586080 s, the original 64 MiB hash and 132 AHCI MSI-X interrupts.
+It then failed at the same protected-map UNLOCK guard and cleanup.
+The full test remains failed; only the existing protocol/I/O milestone is
+requalified.
+
+Evidence is saved under `vmm_test_results/cca-tdisp-shared-core/` in invocation
+`single-boot-28153-1789748147458299564`. Its `outputs/session-result.json`
+records native command exit 100, fixture/launcher exit 1, and successful
+preservation. No guest, kernel or firmware changes were needed.
