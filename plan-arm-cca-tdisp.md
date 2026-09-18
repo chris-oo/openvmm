@@ -12,9 +12,11 @@ The execution implementation and tests have now been split into reviewed,
 validated commits. The provisional shutdown hold is retained separately as
 an unapproved deferred change.
 
-**Current implementation priority: share the host-side TDISP infrastructure
-with microsoft/openvmm#4416.** The rebase is complete; the refactor is not.
-Section 4 is the authoritative design and commit sequence for that work.
+**Shared host TDISP infrastructure is implemented and reviewed.**
+The native and VPCI facades now use one lifecycle engine. Final runtime
+validation preserved CCA boot and TDISP LOCK/RUN/read/hash behavior; the
+known UNLOCK and cleanup failures remain. Section 4 records the design,
+commits and qualification results.
 The original bring-up stages elsewhere in this document remain context and
 qualification history, not instructions to repeat the rebase or implementation.
 
@@ -611,7 +613,7 @@ it is not implemented as ordinary OpenVMM MMIO emulation. [K3-K5]
 
 ## 4. Integrating with `vm/devices/tdisp`
 
-### Current rebased infrastructure
+### Pre-refactor rebased infrastructure
 
 `TdispHostDeviceInterface` supplies negotiate, bind, start, unbind, and report
 callbacks, plus the PR's MMIO Block/Unblock hook.
@@ -628,7 +630,7 @@ representation. The state numbers also differ: RHI uses 0/1/2 for
 UNLOCKED/LOCKED/RUN, while the protobuf enum uses 1/2/3. Never cast between
 them. [O1, K2]
 
-The current state machine also:
+Before the shared-core refactor, the VPCI state machine also:
 
 - Requires protocol negotiation before transitions.
 - Tries to unbind after some invalid requests.
@@ -659,9 +661,9 @@ handler. Keep Linux ioctl code in `vfio_sys`/the VFIO backend, not in `tdisp`.
 Keep Arm calling-convention code out of the generic device crate.
 
 The additive approach deliberately left the legacy emulator unchanged.
-That was sufficient for CCA bring-up, but is **not the next implementation
-direction**: the plan below replaces both independent lifecycle engines with
-one shared implementation and retains thin transport/backend facades.
+That was sufficient for CCA bring-up. The implemented refactor below replaces
+both independent lifecycle engines with one shared implementation and retains
+thin transport/backend facades.
 
 `tdisp::devicereport` is useful for reading interface-report ranges for
 diagnostics/access policy. Before using it for host access decisions, add
@@ -678,8 +680,9 @@ types, explicit lifecycle transitions, quarantine on mutation errors, and
 bounded transition history. Whole-object acquisition rejects empty or
 oversized objects and inconsistent returned lengths. Snapshots use a shared
 RAII budget across devices, fallible allocation, and checked slices. Mutations
-and failed acquisition invalidate cached evidence. Legacy protobuf behavior
-remains unchanged.
+and failed acquisition invalidate cached evidence. The additive implementation
+left legacy protobuf behavior unchanged; the later shared-core work explicitly
+changes uncertain-failure reporting, not healthy protocol behavior.
 
 Typed `vfio_sys::iommufd::tsm` bindings now encode the pinned CCA request
 layouts, retain host buffers for synchronous calls, and preserve syscall
@@ -704,7 +707,7 @@ The later full-assignment service adds native state, regeneration, MMIO and
 serialized RAM operations behind the frontend access gate. That path has now
 demonstrated LOCK/RUN and I/O; its UNLOCK/release restrictions remain open.
 
-### Shared host refactor: current implementation plan
+### Shared host refactor: implemented design and validation
 
 This section supersedes the earlier proposal to leave the two engines
 separate. The background analysis is in
@@ -927,6 +930,9 @@ not a prerequisite for this refactor.
 
 #### Required validation
 
+The commands and criteria below remain regression requirements. The completed
+implementation and its latest results follow this section.
+
 Run existing package tests, including the actual VPCI client/relay and NVMe
 gate, not just the extracted engine:
 
@@ -985,6 +991,56 @@ private-buffer DMA measurement, physical VPCI backend, OpenHCL CCA guest, new
 transport or in-place QEMU debugging is included.
 Rollback uses the recorded source/inputs on a fresh test instance; it is not
 live rollback of an uncertain physical assignment.
+
+#### Completed implementation and reviews: 2026-09-18
+
+The code was committed in four logical chunks above the reviewed planning
+change `nxuyxowl`, without rewriting the qualified baseline:
+
+| Change ID | Scope | Review |
+|---|---|---|
+| `pvkpunvk` | Extract `host/lifecycle.rs`; native coordinator delegates state, admission, completion, quarantine and bounded history | Independent code review: no significant issues |
+| `kpvlkusy` | Enable indeterminate error states in response accessors/validation; wire round-trip and actual client cache/fatal-Unbind tests | Independent code review: no significant issues |
+| `lwssxxtz` | Move VPCI policy into its facade over the shared engine; explicit owned callbacks and access permits; atomic error/unwind denial wired into BAR0 and BAR4 consumers | Independent code review: no significant issues |
+| `punxvyql` | Real emulator -> VPCI/VMBus -> client integration tests, including healthy rebind and failure after a backend effect | Direct review of the complete test-only diff: no issues |
+
+All chunks passed scoped tests, clippy and rustdoc, with full formatting
+before commit. Native and Arm OpenVMM integration checks passed.
+Native RHI/TSM requests, VFIO object ownership, evidence snapshots and whole
+RAM-work admission remain in their existing adapters and service.
+The legacy host callback constructors now take exclusive callback ownership
+and explicit `TdispAccess`; MMIO consumers receive read-only gate handles.
+
+The final qualification used code change `punxvyql` and unchanged guest,
+host payload and firmware inputs:
+
+| Check | Result |
+|---|---|
+| Combined host/package tests | 696 passed, 4 skipped |
+| Arm KVM tests through user-mode QEMU | 71 passed |
+| Separate-backing QEMU CCA boot/ping/poweroff | Passed, 35.290 s |
+| Separate-backing v15 FVP CCA boot/ping/poweroff | Passed, 226.133 s |
+| Full DA FVP test: native Locked / Run | Confirmed at 103.778174350 s / 106.115586080 s |
+| Full DA FVP test: read and interrupts | Original 64 MiB hash matched; 132 AHCI MSI-X interrupts |
+| UNLOCK / guest poweroff | Existing protected-map guard rejected UNLOCK; SingleStep instead of poweroff |
+| Native TDISP test / outer command | Failed after 531.499 s; command exit 100 / outer exit 255 |
+| Fixture / launcher shutdown | Both exit 1 |
+| Evidence preservation | Succeeded; no report-write errors |
+
+```text
+Invocation: single-boot-28153-1789748147458299564
+FVP: 34db8c67b835ff7f1cc613da0a03cf4f0ac929a883edc8e1b109f7f9ca3ff2ae
+nextest: c90c71a6-1bee-4d9f-9b1a-6b8857a172ce
+Evidence: vmm_test_results/cca-tdisp-shared-core/fvp-single-boot-runs/
+          single-boot-28153-1789748147458299564/
+```
+
+`outputs/session-result.json` records the separate failure channels.
+The FVP output's native JUnit and selected test's `linux.log`, `openvmm.log`
+and `petri.log` preserve the guest and host evidence. Basic-boot results are
+under `vmm_test_results/shared-core-cca-qemu/` and `shared-core-cca-fvp/`.
+The shared-core behavior-preservation gate passed. The full TDISP VMM test
+and clean-lifecycle qualification did not; do not describe them as passed.
 
 ## 5. Configuration and ownership
 
@@ -1951,7 +2007,8 @@ transport/error plumbing, but do not replace a real FVP negative result.
 
 ## 11. Staged implementation
 
-**Active sequence:** implement and review the shared-host refactor in section 4.
+**Completed sequence:** the shared-host refactor in section 4 is implemented,
+reviewed and qualified against the existing protocol/I/O baseline.
 The rebase, native LOCK/RUN and initial I/O integration are complete.
 Do not repeat the original stages below as new refactor prerequisites.
 Buffer-level DMA and clean-lifecycle qualification remain separate follow-ons.
@@ -2093,9 +2150,9 @@ It identified two details that needed explicit decisions:
   not relabel a backend error as a preflight Unsupported rejection.
 
 The main plan is the implementation authority; the findings document is
-background only. No implementation, build or runtime validation was performed
-for this planning update. Earlier reviews below apply to the original
-bring-up and its later milestone updates.
+background only. This review preceded implementation. The completed chunk
+reviews and runtime results are recorded in section 4. Earlier reviews below
+apply to the original bring-up and its later milestone updates.
 
 ### Pass one
 
