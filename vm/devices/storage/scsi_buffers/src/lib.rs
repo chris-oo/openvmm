@@ -169,6 +169,52 @@ impl Deref for IoBuffer<'_> {
 
 const PAGE_SIZE: usize = 4096;
 
+/// Maximum size of one request staged in owned memory.
+///
+/// This is a per-request limit, not a shared budget across devices.
+pub const MAX_BOUNCE_IO_SIZE: usize = 1024 * 1024;
+
+/// Page-aligned owned memory for a storage request.
+///
+/// The memory and page numbers stay alive while a borrowed request is in use.
+/// Unlike guest memory with a copy-only policy, this memory permits direct IO.
+pub struct OwnedIoBuffers {
+    memory: GuestMemory,
+    gpns: Vec<u64>,
+    len: usize,
+}
+
+impl OwnedIoBuffers {
+    /// Fallibly allocates at most [`MAX_BOUNCE_IO_SIZE`] bytes of request data.
+    pub fn try_new(size: usize) -> std::io::Result<Self> {
+        if size > MAX_BOUNCE_IO_SIZE {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
+        let pages = size.div_ceil(PAGE_SIZE);
+        let mut gpns = Vec::new();
+        gpns.try_reserve_exact(pages)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::OutOfMemory, err))?;
+        gpns.extend(0..pages as u64);
+        let memory = GuestMemory::try_allocate(pages * PAGE_SIZE)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::OutOfMemory, err))?;
+        Ok(Self {
+            memory,
+            gpns,
+            len: size,
+        })
+    }
+
+    /// Borrows the owned memory with the specified write permission.
+    pub fn buffers(&self, is_write: bool) -> RequestBuffers<'_> {
+        RequestBuffers::new(
+            &self.memory,
+            PagedRange::new(0, self.len, &self.gpns)
+                .expect("owned IO allocation covers the request"),
+            is_write,
+        )
+    }
+}
+
 #[repr(C, align(4096))]
 #[derive(Clone, IntoBytes, Immutable, KnownLayout, FromBytes)]
 struct Page([u8; PAGE_SIZE]);
@@ -562,7 +608,37 @@ impl BounceBufferTracker {
 mod tests {
     use super::*;
     use sparse_mmap::SparseMapping;
+    use test_with_tracing::test;
     const SIZE_1MB: usize = 1048576;
+
+    #[test]
+    fn owned_io_is_aligned_and_bounded() {
+        for size in [0, 512, 4096, 4608, MAX_BOUNCE_IO_SIZE] {
+            let owned = OwnedIoBuffers::try_new(size).unwrap();
+            let buffers = owned.buffers(true);
+            assert_eq!(buffers.len(), size);
+            assert_eq!(
+                buffers.guest_memory().io_policy(),
+                guestmem::GuestMemoryIoPolicy::Direct
+            );
+            assert!(buffers.is_aligned(512));
+            let locked = buffers.lock(true).unwrap();
+            assert_eq!(
+                locked.io_vecs().iter().map(|iov| iov.len()).sum::<usize>(),
+                size
+            );
+            for iov in locked.io_vecs() {
+                assert_eq!(iov.as_ptr() as usize % PAGE_SIZE, 0);
+            }
+        }
+        assert_eq!(
+            OwnedIoBuffers::try_new(MAX_BOUNCE_IO_SIZE + 1)
+                .err()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
 
     #[test]
     fn correct_read_only_behavior() {

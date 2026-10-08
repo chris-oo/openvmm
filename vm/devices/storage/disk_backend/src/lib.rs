@@ -20,8 +20,11 @@
 //! # I/O model
 //!
 //! All I/O is **async** and uses **scatter-gather** buffers via
-//! [`RequestBuffers`]. Callers must pass
-//! buffers that are an integral number of sectors.
+//! [`RequestBuffers`]. Buffer lengths must be an integral number of sectors.
+//! Invalid lengths return [`DiskError::InvalidInput`]. Copy-only guest memory
+//! is staged in separate, page-aligned owned memory before backend IO, with a
+//! per-request limit of [`MAX_BOUNCE_IO_SIZE`]. Reads copy back only after
+//! successful backend completion; writes copy in before backend submission.
 //!
 //! The key operations are:
 //!
@@ -76,8 +79,16 @@ pub mod pr;
 pub mod resolve;
 pub mod sync_wrapper;
 
+#[cfg(test)]
+mod tests;
+
 use guestmem::AccessError;
+use guestmem::GuestMemoryIoPolicy;
+use guestmem::MemoryRead;
+use guestmem::MemoryWrite;
 use inspect::Inspect;
+use scsi_buffers::MAX_BOUNCE_IO_SIZE;
+use scsi_buffers::OwnedIoBuffers;
 use scsi_buffers::RequestBuffers;
 use stackfuture::StackFuture;
 use std::fmt::Debug;
@@ -430,14 +441,21 @@ impl Disk {
 
     /// Returns the number of sectors spanned by `buffers`.
     ///
-    /// Callers must pass a whole number of sectors, so this is normally exact.
-    /// Rounding down is nonetheless the right choice for a caller that does
-    /// not: `max_sector` is `i64::MAX` rounded *down* to a sector, which for a
-    /// power-of-two sector size leaves exactly `sector_size - 1` bytes of slack
-    /// below `i64::MAX` — enough to cover a partial trailing sector. So the end
-    /// byte offset stays representable either way.
+    /// Buffer validation ensures that this is an exact sector count.
     fn buffer_sectors(&self, buffers: &RequestBuffers<'_>) -> u64 {
         (buffers.len() as u64) >> self.0.sector_shift
+    }
+
+    fn check_buffers(&self, buffers: &RequestBuffers<'_>, sector: u64) -> Result<(), DiskError> {
+        if !buffers.len().is_multiple_of(self.sector_size() as usize) {
+            return Err(DiskError::InvalidInput);
+        }
+        if buffers.guest_memory().io_policy() == GuestMemoryIoPolicy::CopyOnly
+            && buffers.len() > MAX_BOUNCE_IO_SIZE
+        {
+            return Err(DiskError::InvalidInput);
+        }
+        self.check_representable(sector, self.buffer_sectors(buffers))
     }
 
     /// Unmap sectors from the disk.
@@ -502,8 +520,32 @@ impl Disk {
         buffers: &RequestBuffers<'_>,
         sector: u64,
     ) -> Result<(), DiskError> {
-        self.check_representable(sector, self.buffer_sectors(buffers))?;
-        self.0.disk.read_vectored(buffers, sector).await
+        self.check_buffers(buffers, sector)?;
+        if buffers.guest_memory().io_policy() != GuestMemoryIoPolicy::CopyOnly {
+            return self.0.disk.read_vectored(buffers, sector).await;
+        }
+        if buffers.is_empty() {
+            return Ok(());
+        }
+        // Keep owned staging state out of the future used by direct IO and
+        // storage frontends with fixed-size future buffers.
+        Box::pin(self.read_bounced(buffers, sector)).await
+    }
+
+    async fn read_bounced(
+        &self,
+        buffers: &RequestBuffers<'_>,
+        sector: u64,
+    ) -> Result<(), DiskError> {
+        let writer = buffers.writer();
+        if writer.len() != buffers.len() {
+            return Err(AccessError::ReadOnly.into());
+        }
+        let owned = OwnedIoBuffers::try_new(buffers.len()).map_err(DiskError::Io)?;
+        let staging = owned.buffers(true);
+        self.0.disk.read_vectored(&staging, sector).await?;
+        Self::copy_buffers(staging.reader(), writer, buffers.len())?;
+        Ok(())
     }
 
     /// Issues an asynchronous write-gather operation to the disk.
@@ -514,17 +556,52 @@ impl Disk {
     /// * `sector` - The logical sector at which the write operation starts.
     /// * `fua` - A flag indicates if FUA (force unit access) is requested.
     ///
-    /// # Panics
-    ///
-    /// The caller must pass a buffer with an integer number of sectors.
+    /// Returns [`DiskError::InvalidInput`] for a partial sector.
     pub async fn write_vectored(
         &self,
         buffers: &RequestBuffers<'_>,
         sector: u64,
         fua: bool,
     ) -> Result<(), DiskError> {
-        self.check_representable(sector, self.buffer_sectors(buffers))?;
-        self.0.disk.write_vectored(buffers, sector, fua).await
+        self.check_buffers(buffers, sector)?;
+        if buffers.guest_memory().io_policy() != GuestMemoryIoPolicy::CopyOnly {
+            return self.0.disk.write_vectored(buffers, sector, fua).await;
+        }
+        if buffers.is_empty() {
+            return Ok(());
+        }
+        Box::pin(self.write_bounced(buffers, sector, fua)).await
+    }
+
+    async fn write_bounced(
+        &self,
+        buffers: &RequestBuffers<'_>,
+        sector: u64,
+        fua: bool,
+    ) -> Result<(), DiskError> {
+        let owned = OwnedIoBuffers::try_new(buffers.len()).map_err(DiskError::Io)?;
+        let staging = owned.buffers(false);
+        Self::copy_buffers(
+            buffers.reader(),
+            owned.buffers(true).writer(),
+            buffers.len(),
+        )?;
+        self.0.disk.write_vectored(&staging, sector, fua).await
+    }
+
+    fn copy_buffers(
+        mut reader: impl MemoryRead,
+        mut writer: impl MemoryWrite,
+        mut len: usize,
+    ) -> Result<(), AccessError> {
+        let mut chunk = [0; 4096];
+        while len != 0 {
+            let count = len.min(chunk.len());
+            reader.read(&mut chunk[..count])?;
+            writer.write(&chunk[..count])?;
+            len -= count;
+        }
+        Ok(())
     }
 
     /// Issues an asynchronous flush operation to the disk.
