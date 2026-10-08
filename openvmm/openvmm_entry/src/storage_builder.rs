@@ -149,6 +149,7 @@ impl VirtioBlkDisk {
             disk: self.disk,
             read_only: self.read_only,
             serial: self.serial,
+            bounce_io: false,
         }
         .into_resource()
     }

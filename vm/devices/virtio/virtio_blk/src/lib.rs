@@ -19,6 +19,7 @@ use inspect::Inspect;
 use inspect::InspectMut;
 use inspect_counters::Counter;
 use pal_async::wait::PolledWait;
+use scsi_buffers::MAX_BOUNCE_IO_SIZE;
 use scsi_buffers::RequestBuffers;
 use std::future::Future;
 use std::future::poll_fn;
@@ -67,6 +68,7 @@ pub struct VirtioBlkDevice {
     driver: VmTaskDriver,
     read_only: bool,
     supports_discard: bool,
+    bounce_io: bool,
     config: VirtioBlkConfig,
 }
 
@@ -80,6 +82,7 @@ pub struct VirtioBlkDevice {
 #[derive(InspectMut)]
 struct BlkWorker {
     disk: Disk,
+    completion_failed: bool,
     read_only: bool,
     serial: Option<[u8; VIRTIO_BLK_ID_BYTES]>,
     stats: WorkerStats,
@@ -92,6 +95,7 @@ struct BlkWorker {
 struct BlkQueueState {
     queue: VirtioQueue,
     memory: GuestMemory,
+    completion_failed: bool,
 }
 
 #[derive(Inspect, Default)]
@@ -101,6 +105,8 @@ struct WorkerStats {
     flush_ops: Counter,
     discard_ops: Counter,
     bounce_ops: Counter,
+    direct_ops: Counter,
+    completion_errors: Counter,
     errors: Counter,
 }
 
@@ -117,6 +123,7 @@ struct IoCompletion {
     bytes_written: u32,
     stat: IoStat,
     bounced: bool,
+    status_written: bool,
 }
 
 /// Which stat counter to increment for a completed IO.
@@ -131,8 +138,24 @@ enum IoStat {
 
 impl BlkWorker {
     /// Complete a descriptor and accumulate stats.
-    fn finish_io(&mut self, queue: &mut VirtioQueue, completion: IoCompletion) {
-        queue.complete(completion.work, completion.bytes_written);
+    fn finish_io(&mut self, state: &mut BlkQueueState, completion: IoCompletion) {
+        if !completion.status_written && !state.completion_failed {
+            state.completion_failed = true;
+            self.stats.completion_errors.increment();
+        }
+        if !state.completion_failed
+            && let Err(err) = state
+                .queue
+                .try_complete(completion.work, completion.bytes_written)
+        {
+            state.completion_failed = true;
+            self.stats.completion_errors.increment();
+            tracelimit::error_ratelimited!(
+                error = &err as &dyn std::error::Error,
+                "virtio-blk completion failed; retiring queue and draining I/O"
+            );
+        }
+        self.completion_failed |= state.completion_failed;
         match completion.stat {
             IoStat::Read => self.stats.read_ops.increment(),
             IoStat::Write => self.stats.write_ops.increment(),
@@ -143,6 +166,8 @@ impl BlkWorker {
         }
         if completion.bounced {
             self.stats.bounce_ops.increment();
+        } else if matches!(completion.stat, IoStat::Read | IoStat::Write) {
+            self.stats.direct_ops.increment();
         }
     }
 
@@ -152,10 +177,10 @@ impl BlkWorker {
     /// The `FuturesUnordered` still holds any IOs that were in flight when
     /// `until_stopped` returned. This drains them, ensuring all descriptor
     /// completions are written to the used ring before the queue is dropped.
-    fn poll_drain(&mut self, queue: &mut VirtioQueue, cx: &mut Context<'_>) -> Poll<()> {
+    fn poll_drain(&mut self, state: &mut BlkQueueState, cx: &mut Context<'_>) -> Poll<()> {
         loop {
             match self.ios.poll_next_unpin(cx) {
-                Poll::Ready(Some(completion)) => self.finish_io(queue, completion),
+                Poll::Ready(Some(completion)) => self.finish_io(state, completion),
                 Poll::Ready(None) => return Poll::Ready(()),
                 Poll::Pending => return Poll::Pending,
             }
@@ -218,7 +243,8 @@ impl AsyncRun<BlkQueueState> for BlkWorker {
                         queue_done = true;
                     }
                     Event::Completed(completion) => {
-                        self.finish_io(&mut state.queue, completion);
+                        self.finish_io(state, completion);
+                        queue_done |= state.completion_failed;
                     }
                 }
             }
@@ -304,6 +330,7 @@ impl VirtioBlkDevice {
         Ok(Self {
             worker: TaskControl::new(BlkWorker {
                 disk,
+                completion_failed: false,
                 read_only,
                 serial,
                 stats: WorkerStats::default(),
@@ -312,8 +339,21 @@ impl VirtioBlkDevice {
             driver: driver_source.simple(),
             read_only,
             supports_discard,
+            bounce_io: false,
             config,
         })
+    }
+
+    /// Uses bounded owned buffers for all payload I/O on this device.
+    ///
+    /// This restricts device-facing memory access, not kernel registration or
+    /// hypervisor host-access permissions.
+    pub fn with_bounce_io(mut self) -> Self {
+        self.bounce_io = true;
+        self.config.size_max = self.config.blk_size.max(guestmem::PAGE_SIZE as u32);
+        self.config.seg_max =
+            DEFAULT_SEG_MAX.min((MAX_BOUNCE_IO_SIZE / self.config.size_max as usize).max(1) as u32);
+        self
     }
 }
 
@@ -341,6 +381,9 @@ impl VirtioDevice for VirtioBlkDevice {
 
         if self.read_only {
             features |= VIRTIO_BLK_F_RO;
+        }
+        if self.bounce_io {
+            features |= VIRTIO_BLK_F_SIZE_MAX;
         }
         if self.supports_discard {
             features |= VIRTIO_BLK_F_DISCARD;
@@ -397,14 +440,25 @@ impl VirtioDevice for VirtioBlkDevice {
         initial_state: Option<QueueState>,
     ) -> anyhow::Result<()> {
         assert_eq!(idx, 0);
+        anyhow::ensure!(
+            !self.worker.get_mut().0.completion_failed,
+            "virtio-blk queue was retired after completion failure; recreate the device"
+        );
 
         let queue_event = PolledWait::new(&self.driver, resources.event)
             .context("failed to create queue event")?;
 
+        let memory = if self.bounce_io {
+            resources
+                .guest_memory
+                .with_io_policy(guestmem::GuestMemoryIoPolicy::CopyOnly)
+        } else {
+            resources.guest_memory
+        };
         let queue = VirtioQueue::new(
             *features,
             resources.params,
-            resources.guest_memory.clone(),
+            memory.clone(),
             resources.notify,
             queue_event,
             initial_state,
@@ -416,7 +470,8 @@ impl VirtioDevice for VirtioBlkDevice {
             "virtio-blk-worker",
             BlkQueueState {
                 queue,
-                memory: resources.guest_memory,
+                memory,
+                completion_failed: false,
             },
         );
         self.worker.start();
@@ -434,15 +489,15 @@ impl VirtioDevice for VirtioBlkDevice {
         // BlkWorker and survives the stop — its pending disk IO futures are
         // polled here until all descriptors are completed in the used ring.
         let (worker, queue_state) = self.worker.get_mut();
-        let queue = &mut queue_state.expect("state exists after stop").queue;
-        poll_fn(|cx| worker.poll_drain(queue, cx)).await;
+        let state = queue_state.expect("state exists after stop");
+        poll_fn(|cx| worker.poll_drain(state, cx)).await;
         // Remove the queue state (drops VirtioQueue).
         let state = self.worker.remove().queue.queue_state();
         Some(state)
     }
 
     fn supports_save_restore(&self) -> bool {
-        true
+        !self.bounce_io
     }
 }
 
@@ -458,35 +513,29 @@ async fn process_request(
     serial: Option<[u8; VIRTIO_BLK_ID_BYTES]>,
     work: VirtioQueueCallbackWork,
 ) -> IoCompletion {
-    match process_request_inner(disk, mem, read_only, serial, &work).await {
-        Ok((bytes_written, stat, bounced)) => {
-            if let Err(err) = write_status_byte(mem, &work, VIRTIO_BLK_S_OK) {
-                tracelimit::error_ratelimited!(
-                    error = &err as &dyn std::error::Error,
-                    "failed to write status byte"
-                );
+    let (bytes_written, stat, bounced, status) =
+        match process_request_inner(disk, mem, read_only, serial, &work).await {
+            Ok((bytes_written, stat, bounced)) => {
+                (bytes_written + 1, stat, bounced, VIRTIO_BLK_S_OK)
             }
-            IoCompletion {
-                work,
-                bytes_written: bytes_written + 1, // +1 for status byte
-                stat,
-                bounced,
-            }
+            Err(status) => (1, IoStat::Error, false, status),
+        };
+    let status_written = match write_status_byte(mem, &work, status) {
+        Ok(()) => true,
+        Err(err) => {
+            tracelimit::error_ratelimited!(
+                error = &err as &dyn std::error::Error,
+                "failed to write virtio-blk status; retiring queue"
+            );
+            false
         }
-        Err(status) => {
-            if let Err(err) = write_status_byte(mem, &work, status) {
-                tracelimit::error_ratelimited!(
-                    error = &err as &dyn std::error::Error,
-                    "failed to write error status byte"
-                );
-            }
-            IoCompletion {
-                work,
-                bytes_written: 1, // just the status byte
-                stat: IoStat::Error,
-                bounced: false,
-            }
-        }
+    };
+    IoCompletion {
+        work,
+        bytes_written,
+        stat,
+        bounced,
+        status_written,
     }
 }
 
@@ -637,7 +686,14 @@ fn copy_regions(
     let mut linear_offset: usize = 0;
     for region in regions {
         let len = region.len as usize;
-        let buf = &mut bounce_buf[linear_offset..linear_offset + len];
+        region
+            .addr
+            .checked_add(region.len)
+            .ok_or(VIRTIO_BLK_S_IOERR)?;
+        let end = linear_offset.checked_add(len).ok_or(VIRTIO_BLK_S_IOERR)?;
+        let buf = bounce_buf
+            .get_mut(linear_offset..end)
+            .ok_or(VIRTIO_BLK_S_IOERR)?;
         if to_bounce {
             guest_mem
                 .read_at(region.addr, buf)
@@ -647,7 +703,7 @@ fn copy_regions(
                 .write_at(region.addr, buf)
                 .map_err(|_| VIRTIO_BLK_S_IOERR)?;
         }
-        linear_offset += len;
+        linear_offset = end;
     }
     Ok(())
 }
@@ -692,6 +748,10 @@ async fn do_io(
     if data_len > u32::MAX as u64 - 1 {
         return Err(VIRTIO_BLK_S_IOERR);
     }
+    let force_bounce = mem.io_policy() == guestmem::GuestMemoryIoPolicy::CopyOnly;
+    if force_bounce && data_len > MAX_BOUNCE_IO_SIZE as u64 {
+        return Err(VIRTIO_BLK_S_IOERR);
+    }
 
     // Validate that the data length is a whole number of backend sectors.
     // The disk backend may panic if given a non-sector-aligned buffer.
@@ -700,23 +760,54 @@ async fn do_io(
         return Err(VIRTIO_BLK_S_IOERR);
     }
 
-    let regions: Vec<_> = data_regions(&work.payload, writable, skip_bytes, data_len).collect();
+    let mut regions = Vec::new();
+    regions
+        .try_reserve_exact(work.payload.len())
+        .map_err(|err| {
+            tracelimit::error_ratelimited!(
+                error = &err as &dyn std::error::Error,
+                "failed to allocate virtio-blk region metadata"
+            );
+            VIRTIO_BLK_S_IOERR
+        })?;
+    regions.extend(data_regions(&work.payload, writable, skip_bytes, data_len));
+    let described_len = regions.iter().try_fold(0u64, |total, region| {
+        region.addr.checked_add(region.len)?;
+        total.checked_add(region.len)
+    });
+    if described_len != Some(data_len) {
+        return Err(VIRTIO_BLK_S_IOERR);
+    }
 
+    let compatible = try_build_gpn_list(&regions);
+    let direct_eligible = compatible.is_some();
     let (mut io_mem, io_range, bounced) =
-        if let Some((gpns, offset, len)) = try_build_gpn_list(&regions) {
+        if let Some((gpns, offset, len)) = compatible.filter(|_| !force_bounce) {
             // Fast path: descriptor chain is PagedRange-compatible.
             (None, OwnedPagedRange { gpns, offset, len }, false)
         } else {
             // Slow path: allocate a bounce buffer.
-            // TODO: cap data_len to a reasonable maximum (e.g. seg_max * PAGE_SIZE)
-            // to prevent a malicious guest from causing unbounded allocation.
             let data_len_usize = data_len as usize;
-            let mut bounce_mem = GuestMemory::allocate(data_len_usize);
+            let mut bounce_mem = GuestMemory::try_allocate(data_len_usize).map_err(|err| {
+                tracelimit::error_ratelimited!(
+                    error = &err as &dyn std::error::Error,
+                    "failed to allocate virtio-blk bounce buffer"
+                );
+                VIRTIO_BLK_S_IOERR
+            })?;
             let num_pages = data_len_usize.div_ceil(guestmem::PAGE_SIZE);
-            let gpns: Vec<u64> = (0..num_pages as u64).collect();
+            let mut gpns = Vec::new();
+            gpns.try_reserve_exact(num_pages).map_err(|err| {
+                tracelimit::error_ratelimited!(
+                    error = &err as &dyn std::error::Error,
+                    "failed to allocate virtio-blk bounce page metadata"
+                );
+                VIRTIO_BLK_S_IOERR
+            })?;
+            gpns.extend(0..num_pages as u64);
 
             if !is_read {
-                let buf = bounce_mem.inner_buf_mut().unwrap();
+                let buf = bounce_mem.inner_buf_mut().ok_or(VIRTIO_BLK_S_IOERR)?;
                 copy_regions(buf, mem, &regions, true)?;
             }
 
@@ -730,6 +821,21 @@ async fn do_io(
                 true,
             )
         };
+    if force_bounce {
+        if is_read {
+            tracelimit::info_ratelimited!(
+                direct_eligible,
+                data_len,
+                "virtio-blk read uses owned bounce memory"
+            );
+        } else {
+            tracelimit::info_ratelimited!(
+                direct_eligible,
+                data_len,
+                "virtio-blk write uses owned bounce memory"
+            );
+        }
+    }
 
     let effective_mem = io_mem.as_ref().unwrap_or(mem);
     let range =
@@ -747,7 +853,10 @@ async fn do_io(
     }
 
     if bounced && is_read {
-        let buf = io_mem.as_mut().unwrap().inner_buf_mut().unwrap();
+        let buf = io_mem
+            .as_mut()
+            .and_then(GuestMemory::inner_buf_mut)
+            .ok_or(VIRTIO_BLK_S_IOERR)?;
         copy_regions(buf, mem, &regions, false)?;
     }
 

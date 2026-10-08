@@ -124,10 +124,67 @@ pub mod blk {
         pub disk: Resource<DiskHandleKind>,
         pub read_only: bool,
         pub serial: Option<String>,
+        /// Stage block data in owned memory for this device only.
+        pub bounce_io: bool,
     }
 
     impl ResourceId<VirtioDeviceHandle> for VirtioBlkHandle {
         const ID: &'static str = "virtio-blk";
+    }
+
+    /// Backends reviewed for virtio-blk bounce I/O.
+    ///
+    /// File handles must refer to regular buffered files. On Linux, neither
+    /// `O_DIRECT` nor `O_APPEND` is supported. Other disk resources, including
+    /// arbitrary layered disks and host block devices, are not supported.
+    #[derive(MeshPayload)]
+    pub enum VirtioBlkBounceDiskHandle {
+        File(std::fs::File),
+        Ram { len: u64 },
+    }
+
+    impl ResourceId<DiskHandleKind> for VirtioBlkBounceDiskHandle {
+        const ID: &'static str = "virtio-blk-bounce-disk";
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use test_with_tracing::test;
+
+        #[derive(MeshPayload)]
+        struct LegacyVirtioBlkHandle {
+            disk: Resource<DiskHandleKind>,
+            read_only: bool,
+            serial: Option<String>,
+        }
+
+        #[test]
+        fn missing_bounce_field_defaults_off() {
+            let legacy = LegacyVirtioBlkHandle {
+                disk: Resource::new(VirtioBlkBounceDiskHandle::Ram { len: 512 }),
+                read_only: true,
+                serial: Some("legacy".into()),
+            };
+            let handle: VirtioBlkHandle = mesh::OwnedMessage::new(legacy).parse().unwrap();
+            assert!(!handle.bounce_io);
+            assert!(handle.read_only);
+            assert_eq!(handle.serial.as_deref(), Some("legacy"));
+        }
+
+        #[test]
+        fn bounce_field_round_trips() {
+            for bounce_io in [false, true] {
+                let handle = VirtioBlkHandle {
+                    disk: Resource::new(VirtioBlkBounceDiskHandle::Ram { len: 512 }),
+                    read_only: false,
+                    serial: None,
+                    bounce_io,
+                };
+                let handle: VirtioBlkHandle = mesh::OwnedMessage::new(handle).parse().unwrap();
+                assert_eq!(handle.bounce_io, bounce_io);
+            }
+        }
     }
 }
 

@@ -187,6 +187,7 @@ impl crate::harness::WarmPerfTest for DiskIoTest {
                                         disk: FileDiskHandle(erofs_file.into()).into_resource(),
                                         read_only: true,
                                         serial: None,
+                                        bounce_io: false,
                                     }
                                     .into_resource(),
                                 )
@@ -200,6 +201,7 @@ impl crate::harness::WarmPerfTest for DiskIoTest {
                                         disk,
                                         read_only: false,
                                         serial: None,
+                                        bounce_io: false,
                                     }
                                     .into_resource(),
                                 )
@@ -229,6 +231,7 @@ impl crate::harness::WarmPerfTest for DiskIoTest {
                                             disk: FileDiskHandle(erofs_file.into()).into_resource(),
                                             read_only: true,
                                             serial: None,
+                                            bounce_io: false,
                                         }
                                         .into_resource(),
                                     )
