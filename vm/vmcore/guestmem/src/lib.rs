@@ -14,6 +14,7 @@ use inspect::Inspect;
 use pal_event::Event;
 use sparse_mmap::AsMappableRef;
 use std::any::Any;
+use std::collections::TryReserveError;
 use std::fmt::Debug;
 use std::future::Future;
 use std::io;
@@ -45,6 +46,16 @@ pub use guestmem_core::PageFaultError;
 use guestmem_core::gpn_to_gpa;
 
 const PAGE_SIZE64: u64 = 4096;
+
+/// Controls whether a guest memory view can export its backing for IO.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GuestMemoryIoPolicy {
+    /// Allow direct IO through exported mappings or shared backing.
+    #[default]
+    Direct,
+    /// Allow bounded memory operations, but do not export the backing.
+    CopyOnly,
+}
 
 #[derive(Debug, Error)]
 #[error("no memory at address")]
@@ -91,7 +102,7 @@ impl LinearGuestMemory for sparse_mmap::alloc::SharedMem {}
 
 /// A page-aligned heap allocation for use with [`GuestMemory`].
 pub struct AlignedHeapMemory {
-    pages: Box<[AlignedPage]>,
+    pages: Vec<AlignedPage>,
 }
 
 impl Debug for AlignedHeapMemory {
@@ -114,9 +125,20 @@ impl AlignedHeapMemory {
         const ZERO_PAGE: AlignedPage = AlignedPage([ZERO; PAGE_SIZE]);
         let mut pages = Vec::new();
         pages.resize_with(size.div_ceil(PAGE_SIZE), || ZERO_PAGE);
-        Self {
-            pages: pages.into(),
-        }
+        Self { pages }
+    }
+
+    /// Allocates page-aligned memory, returning allocation errors to the caller.
+    pub fn try_new(size: usize) -> Result<Self, TryReserveError> {
+        #[expect(clippy::declare_interior_mutable_const)] // <https://github.com/rust-lang/rust-clippy/issues/7665>
+        const ZERO: AtomicU8 = AtomicU8::new(0);
+        #[expect(clippy::declare_interior_mutable_const)]
+        const ZERO_PAGE: AlignedPage = AlignedPage([ZERO; PAGE_SIZE]);
+        let mut pages = Vec::new();
+        let page_count = size / PAGE_SIZE + usize::from(!size.is_multiple_of(PAGE_SIZE));
+        pages.try_reserve_exact(page_count)?;
+        pages.resize_with(page_count, || ZERO_PAGE);
+        Ok(Self { pages })
     }
 
     /// Returns the length of the memory in bytes.
@@ -297,6 +319,11 @@ impl<T: ProvideShareableRegions> DynProvideShareableRegions for T {
 ///
 /// The implementor must follow the contract for each method.
 pub unsafe trait GuestMemoryAccess: 'static + Send + Sync {
+    /// Returns the minimum IO restriction for views of this backing.
+    fn io_policy(&self) -> GuestMemoryIoPolicy {
+        GuestMemoryIoPolicy::Direct
+    }
+
     /// Returns a stable VA mapping for guest memory.
     ///
     /// The size of the mapping is the same as `max_address`.
@@ -647,6 +674,10 @@ pub struct BitmapInfo {
 
 // SAFETY: passing through guarantees from `T`.
 unsafe impl<T: GuestMemoryAccess> GuestMemoryAccess for Arc<T> {
+    fn io_policy(&self) -> GuestMemoryIoPolicy {
+        self.as_ref().io_policy()
+    }
+
     fn mapping(&self) -> Option<NonNull<u8>> {
         self.as_ref().mapping()
     }
@@ -724,6 +755,18 @@ unsafe impl<T: GuestMemoryAccess> GuestMemoryAccess for Arc<T> {
     fn sharing(&self) -> Option<GuestMemorySharing> {
         self.as_ref().sharing()
     }
+
+    fn supports_locking(&self) -> bool {
+        self.as_ref().supports_locking()
+    }
+
+    fn lock_gpns(&self, gpns: &[u64]) -> Result<bool, GuestMemoryBackingError> {
+        self.as_ref().lock_gpns(gpns)
+    }
+
+    fn unlock_gpns(&self, gpns: &[u64]) {
+        self.as_ref().unlock_gpns(gpns)
+    }
 }
 
 // SAFETY: the allocation will stay valid for the lifetime of the object.
@@ -740,6 +783,7 @@ unsafe impl GuestMemoryAccess for sparse_mmap::SparseMapping {
 /// Default guest memory range type, enforcing access boundaries.
 struct GuestMemoryAccessRange {
     base: Arc<GuestMemoryInner>,
+    io_policy: GuestMemoryIoPolicy,
     offset: u64,
     len: u64,
     region: usize,
@@ -761,6 +805,14 @@ impl GuestMemoryAccessRange {
 
 // SAFETY: `mapping()` is guaranteed to be valid for the lifetime of the object.
 unsafe impl GuestMemoryAccess for GuestMemoryAccessRange {
+    fn io_policy(&self) -> GuestMemoryIoPolicy {
+        self.io_policy
+    }
+
+    fn supports_locking(&self) -> bool {
+        self.io_policy == GuestMemoryIoPolicy::Direct && self.base.supports_locking
+    }
+
     fn mapping(&self) -> Option<NonNull<u8>> {
         let region = &self.base.regions[self.region];
         region.mapping.and_then(|mapping| {
@@ -808,6 +860,7 @@ unsafe impl GuestMemoryAccess for GuestMemoryAccessRange {
             self.base.debug_name.clone(),
             GuestMemoryAccessRange {
                 base: self.base.clone(),
+                io_policy: self.io_policy,
                 offset: address,
                 len,
                 region: self.region,
@@ -890,6 +943,7 @@ unsafe impl GuestMemoryAccess for GuestMemoryAccessRange {
 /// back into the base implementation.
 fn create_memory_subrange(
     base: Arc<GuestMemoryInner>,
+    io_policy: GuestMemoryIoPolicy,
     offset: u64,
     len: u64,
     _allow_preemptive_locking: bool,
@@ -899,6 +953,7 @@ fn create_memory_subrange(
         base.debug_name.clone(),
         GuestMemoryAccessRange {
             base,
+            io_policy,
             offset,
             len,
             region,
@@ -1030,6 +1085,7 @@ impl<T: GuestMemoryAccess> DynGuestMemoryAccess for MultiRegionGuestMemoryAccess
 #[inspect(skip)]
 pub struct GuestMemory {
     inner: Arc<GuestMemoryInner>,
+    io_policy: GuestMemoryIoPolicy,
 }
 
 struct GuestMemoryInner<T: ?Sized = dyn DynGuestMemoryAccess> {
@@ -1240,6 +1296,7 @@ impl GuestMemory {
         let regions = vec![MemoryRegion::new(&imp)];
         let supports_locking = imp.supports_locking();
         Self {
+            io_policy: imp.io_policy(),
             inner: Arc::new(GuestMemoryInner {
                 imp,
                 debug_name,
@@ -1326,6 +1383,15 @@ impl GuestMemory {
             .iter()
             .flatten()
             .all(GuestMemoryAccess::supports_locking);
+        let io_policy = if imps
+            .iter()
+            .flatten()
+            .any(|imp| imp.io_policy() == GuestMemoryIoPolicy::CopyOnly)
+        {
+            GuestMemoryIoPolicy::CopyOnly
+        } else {
+            GuestMemoryIoPolicy::Direct
+        };
         let imp = MultiRegionGuestMemoryAccess { imps, region_def };
 
         let inner = GuestMemoryInner {
@@ -1339,6 +1405,7 @@ impl GuestMemory {
 
         Ok(Self {
             inner: Arc::new(inner),
+            io_policy,
         })
     }
 
@@ -1355,13 +1422,43 @@ impl GuestMemory {
         Self::new_inner("heap".into(), AlignedHeapMemory::new(size), true)
     }
 
+    /// Allocates page-aligned guest memory, returning payload allocation errors.
+    pub fn try_allocate(size: usize) -> Result<Self, TryReserveError> {
+        Ok(Self::new_inner(
+            "heap".into(),
+            AlignedHeapMemory::try_new(size)?,
+            true,
+        ))
+    }
+
+    /// Returns the IO policy for this view.
+    pub fn io_policy(&self) -> GuestMemoryIoPolicy {
+        self.io_policy
+    }
+
+    /// Returns a view of the same backing with at least the requested restriction.
+    ///
+    /// A copy-only view cannot become direct. Other views remain unchanged.
+    /// This does not revoke mappings or locks exported by other direct views.
+    pub fn with_io_policy(&self, policy: GuestMemoryIoPolicy) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            io_policy: if self.io_policy == GuestMemoryIoPolicy::CopyOnly {
+                self.io_policy
+            } else {
+                policy
+            },
+        }
+    }
+
     /// If this memory is unaliased and was created via
-    /// [`GuestMemory::allocate`], returns the backing buffer.
+    /// [`GuestMemory::allocate`] or [`GuestMemory::try_allocate`], returns the
+    /// backing buffer unless this is a copy-only view.
     ///
     /// Returns `Err(self)` if there are other references to this memory (via
     /// `clone()`).
     pub fn into_inner_buf(self) -> Result<AlignedHeapMemory, Self> {
-        if !self.inner.allocated {
+        if self.io_policy == GuestMemoryIoPolicy::CopyOnly || !self.inner.allocated {
             return Err(self);
         }
         // FUTURE: consider using `Any` and `Arc::downcast` once trait upcasting is stable.
@@ -1369,14 +1466,15 @@ impl GuestMemory {
         let inner = unsafe {
             Arc::<GuestMemoryInner<AlignedHeapMemory>>::from_raw(Arc::into_raw(self.inner).cast())
         };
-        let inner = Arc::try_unwrap(inner).map_err(|inner| Self { inner })?;
+        let io_policy = self.io_policy;
+        let inner = Arc::try_unwrap(inner).map_err(|inner| Self { inner, io_policy })?;
         Ok(inner.imp)
     }
 
     /// If this memory was created via [`GuestMemory::allocate`], returns a slice to
-    /// the allocated buffer.
+    /// the allocated buffer unless this is a copy-only view.
     pub fn inner_buf(&self) -> Option<&[AtomicU8]> {
-        if !self.inner.allocated {
+        if self.io_policy == GuestMemoryIoPolicy::CopyOnly || !self.inner.allocated {
             return None;
         }
         // FUTURE: consider using `<dyn Any>::downcast` once trait upcasting is stable.
@@ -1387,9 +1485,9 @@ impl GuestMemory {
 
     /// If this memory was created via [`GuestMemory::allocate`] and there are
     /// no other references to it, returns a mutable slice to the backing
-    /// buffer.
+    /// buffer unless this is a copy-only view.
     pub fn inner_buf_mut(&mut self) -> Option<&mut [u8]> {
-        if !self.inner.allocated {
+        if self.io_policy == GuestMemoryIoPolicy::CopyOnly || !self.inner.allocated {
             return None;
         }
         let inner = Arc::get_mut(&mut self.inner)?;
@@ -1434,14 +1532,22 @@ impl GuestMemory {
         allow_preemptive_locking: bool,
     ) -> Result<GuestMemory, GuestMemoryError> {
         self.with_op(Some((offset, len)), GuestMemoryOperation::Subrange, || {
+            let allow_preemptive_locking =
+                allow_preemptive_locking && self.io_policy == GuestMemoryIoPolicy::Direct;
             if let Some(guest_memory) =
                 self.inner
                     .imp
                     .subrange(offset, len, allow_preemptive_locking)?
             {
-                Ok(guest_memory)
+                Ok(guest_memory.with_io_policy(self.io_policy))
             } else {
-                create_memory_subrange(self.inner.clone(), offset, len, allow_preemptive_locking)
+                create_memory_subrange(
+                    self.inner.clone(),
+                    self.io_policy,
+                    offset,
+                    len,
+                    allow_preemptive_locking,
+                )
             }
         })
     }
@@ -1452,6 +1558,13 @@ impl GuestMemory {
         offset: u64,
         len: u64,
     ) -> Result<GuestMemory, GuestMemoryError> {
+        if self.io_policy == GuestMemoryIoPolicy::CopyOnly {
+            return Err(self.wrap_err(
+                Some((offset, len)),
+                GuestMemoryOperation::Subrange,
+                GuestMemoryBackingError::other(offset, NotLockable),
+            ));
+        }
         // TODO: Enforce subrange is actually lockable.
         self.subrange(offset, len, true)
     }
@@ -1459,8 +1572,11 @@ impl GuestMemory {
     /// Returns the mapping for all of guest memory.
     ///
     /// Returns `None` if there is more than one region or if the memory is not
-    /// mapped.
+    /// mapped or this is a copy-only view.
     pub fn full_mapping(&self) -> Option<(*mut u8, usize)> {
+        if self.io_policy == GuestMemoryIoPolicy::CopyOnly {
+            return None;
+        }
         if let [region] = self.inner.regions.as_slice() {
             #[cfg(feature = "bitmap")]
             if region.bitmaps.is_some() {
@@ -1477,6 +1593,9 @@ impl GuestMemory {
     /// Gets the IO address for DMAing to `gpa` from a user-mode driver not
     /// going through an IOMMU.
     pub fn iova(&self, gpa: u64) -> Option<u64> {
+        if self.io_policy == GuestMemoryIoPolicy::CopyOnly {
+            return None;
+        }
         let (region, offset, _) = self.inner.region(gpa, 1).ok()?;
         Some(region.base_iova? + offset)
     }
@@ -1484,6 +1603,9 @@ impl GuestMemory {
     /// Returns a sharing object if this memory supports
     /// file-based sharing. See [`GuestMemorySharing`].
     pub fn sharing(&self) -> Option<GuestMemorySharing> {
+        if self.io_policy == GuestMemoryIoPolicy::CopyOnly {
+            return None;
+        }
         self.inner.imp.sharing()
     }
 
@@ -1496,7 +1618,7 @@ impl GuestMemory {
     /// returns `false`, [`lock_gpns`](Self::lock_gpns) and
     /// [`lock_range`](Self::lock_range) fail with a `NotLockable` error.
     pub fn supports_locking(&self) -> bool {
-        self.inner.supports_locking
+        self.io_policy == GuestMemoryIoPolicy::Direct && self.inner.supports_locking
     }
 
     /// Gets a pointer to the VA range for `gpa..gpa+len`.
@@ -1960,7 +2082,7 @@ impl GuestMemory {
         gpns: &[u64],
     ) -> Result<LockedPages, GuestMemoryError> {
         self.with_op(None, GuestMemoryOperation::Lock, || {
-            if !self.inner.supports_locking {
+            if !self.supports_locking() {
                 let gpa = gpns.first().map_or(0, |&gpn| gpn.wrapping_mul(PAGE_SIZE64));
                 return Err(GuestMemoryBackingError::other(gpa, NotLockable));
             }
@@ -2147,7 +2269,7 @@ impl GuestMemory {
     ) -> Result<LockedRangeImpl<'a, T>, GuestMemoryError> {
         self.with_op(None, GuestMemoryOperation::Lock, || {
             let gpns = paged_range.gpns();
-            if !self.inner.supports_locking {
+            if !self.supports_locking() {
                 let gpa = gpns.first().map_or(0, |&gpn| gpn.wrapping_mul(PAGE_SIZE64));
                 return Err(GuestMemoryBackingError::other(gpa, NotLockable));
             }
@@ -2386,6 +2508,9 @@ mod tests {
     use sparse_mmap::SparseMapping;
     use std::ptr::NonNull;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use test_with_tracing::test;
     use thiserror::Error;
 
     /// An implementation of a GuestMemoryAccess trait that expects all of
@@ -2645,20 +2770,47 @@ mod tests {
     struct ToggleLockMapping {
         mapping: SparseMapping,
         lockable: bool,
+        io_policy: crate::GuestMemoryIoPolicy,
+        custom_range: Option<GuestMemory>,
+        locks: AtomicUsize,
+        unlocks: AtomicUsize,
+        exposures: AtomicUsize,
+        subranges: AtomicUsize,
+        preemptive_locks: AtomicUsize,
+        fallback: Option<GuestMemory>,
     }
 
     impl ToggleLockMapping {
         fn new(size: usize, lockable: bool) -> Self {
             let mapping = SparseMapping::new(size).unwrap();
             mapping.alloc(0, size).unwrap();
-            Self { mapping, lockable }
+            Self {
+                mapping,
+                lockable,
+                io_policy: crate::GuestMemoryIoPolicy::Direct,
+                custom_range: None,
+                locks: AtomicUsize::new(0),
+                unlocks: AtomicUsize::new(0),
+                exposures: AtomicUsize::new(0),
+                subranges: AtomicUsize::new(0),
+                preemptive_locks: AtomicUsize::new(0),
+                fallback: None,
+            }
         }
     }
 
     // SAFETY: the mapping is valid for the full range reported by `max_address`.
     unsafe impl crate::GuestMemoryAccess for ToggleLockMapping {
+        fn io_policy(&self) -> crate::GuestMemoryIoPolicy {
+            self.io_policy
+        }
+
         fn mapping(&self) -> Option<NonNull<u8>> {
-            NonNull::new(self.mapping.as_ptr().cast())
+            if self.fallback.is_some() {
+                None
+            } else {
+                NonNull::new(self.mapping.as_ptr().cast())
+            }
         }
 
         fn max_address(&self) -> u64 {
@@ -2668,6 +2820,312 @@ mod tests {
         fn supports_locking(&self) -> bool {
             self.lockable
         }
+
+        fn lock_gpns(&self, _gpns: &[u64]) -> Result<bool, crate::GuestMemoryBackingError> {
+            self.locks.fetch_add(1, Ordering::Relaxed);
+            Ok(true)
+        }
+
+        fn unlock_gpns(&self, _gpns: &[u64]) {
+            self.unlocks.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn expose_va(
+            &self,
+            _address: u64,
+            _len: u64,
+        ) -> Result<(), crate::GuestMemoryBackingError> {
+            self.exposures.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn base_iova(&self) -> Option<u64> {
+            Some(0x10000)
+        }
+
+        fn subrange(
+            &self,
+            offset: u64,
+            len: u64,
+            allow_preemptive_locking: bool,
+        ) -> Result<Option<GuestMemory>, crate::GuestMemoryBackingError> {
+            self.subranges.fetch_add(1, Ordering::Relaxed);
+            if allow_preemptive_locking {
+                self.preemptive_locks.fetch_add(1, Ordering::Relaxed);
+            }
+            self.custom_range
+                .as_ref()
+                .map(|gm| {
+                    gm.subrange(offset, len, false).map_err(|_| {
+                        crate::GuestMemoryBackingError::other(offset, super::OutOfRange)
+                    })
+                })
+                .transpose()
+        }
+
+        fn sharing(&self) -> Option<crate::GuestMemorySharing> {
+            Some(crate::GuestMemorySharing::new(EmptyShareableRegions))
+        }
+
+        unsafe fn read_fallback(
+            &self,
+            addr: u64,
+            dest: *mut u8,
+            len: usize,
+        ) -> Result<(), crate::GuestMemoryBackingError> {
+            // SAFETY: the caller guarantees that dest is valid for writes.
+            unsafe { self.fallback.as_ref().unwrap().read_ptr(addr, dest, len) }
+                .map_err(|_| crate::GuestMemoryBackingError::other(addr, super::OutOfRange))
+        }
+
+        unsafe fn write_fallback(
+            &self,
+            addr: u64,
+            src: *const u8,
+            len: usize,
+        ) -> Result<(), crate::GuestMemoryBackingError> {
+            // SAFETY: the caller guarantees that src is valid for reads.
+            unsafe { self.fallback.as_ref().unwrap().write_ptr(addr, src, len) }
+                .map_err(|_| crate::GuestMemoryBackingError::other(addr, super::OutOfRange))
+        }
+
+        fn fill_fallback(
+            &self,
+            addr: u64,
+            val: u8,
+            len: usize,
+        ) -> Result<(), crate::GuestMemoryBackingError> {
+            self.fallback
+                .as_ref()
+                .unwrap()
+                .fill_at(addr, val, len)
+                .map_err(|_| crate::GuestMemoryBackingError::other(addr, super::OutOfRange))
+        }
+
+        fn compare_exchange_fallback(
+            &self,
+            addr: u64,
+            current: &mut [u8],
+            new: &[u8],
+        ) -> Result<bool, crate::GuestMemoryBackingError> {
+            let gm = self.fallback.as_ref().unwrap();
+            let mut previous = [0; 8];
+            let previous = &mut previous[..current.len()];
+            gm.read_at(addr, previous).unwrap();
+            if current == previous {
+                gm.write_at(addr, new).unwrap();
+                Ok(true)
+            } else {
+                current.copy_from_slice(previous);
+                Ok(false)
+            }
+        }
+    }
+
+    struct EmptyShareableRegions;
+
+    impl crate::ProvideShareableRegions for EmptyShareableRegions {
+        async fn get_regions(
+            &self,
+        ) -> Result<Vec<crate::ShareableRegion>, crate::ShareableRegionError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[derive(Default)]
+    struct TestLockedRange;
+
+    impl<'a> crate::LockedRange<'a> for TestLockedRange {
+        fn push_sub_range(&mut self, _sub_range: &'a [std::sync::atomic::AtomicU8]) {
+            panic!("copy-only memory must not export a slice");
+        }
+    }
+
+    fn assert_copy_only(gm: &GuestMemory) {
+        assert_eq!(gm.io_policy(), crate::GuestMemoryIoPolicy::CopyOnly);
+        assert!(!gm.supports_locking());
+        assert!(gm.full_mapping().is_none());
+        assert!(gm.iova(0).is_none());
+        assert!(gm.sharing().is_none());
+        assert!(gm.inner_buf().is_none());
+        assert!(gm.lockable_subrange(0, PAGE_SIZE64).is_err());
+        for access in [crate::AccessType::Read, crate::AccessType::Write] {
+            for kernel_access in [false, true] {
+                assert!(gm.lock_gpns(access, kernel_access, &[0]).is_err());
+                assert!(gm.lock_gpns(access, kernel_access, &[]).is_err());
+            }
+            assert!(
+                gm.lock_range(
+                    access,
+                    crate::ranges::PagedRange::new(0, PAGE_SIZE, &[0]).unwrap(),
+                    TestLockedRange,
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(
+            gm.with_io_policy(crate::GuestMemoryIoPolicy::Direct)
+                .io_policy(),
+            crate::GuestMemoryIoPolicy::CopyOnly,
+        );
+    }
+
+    fn assert_copies(gm: &GuestMemory) {
+        gm.write_at(0, &[1, 2, 3, 4]).unwrap();
+        let mut bytes = [0; 4];
+        gm.read_at(0, &mut bytes).unwrap();
+        assert_eq!(bytes, [1, 2, 3, 4]);
+        gm.fill_at(0, 9, 4).unwrap();
+        assert_eq!(gm.read_plain::<u32>(0).unwrap(), u32::from_ne_bytes([9; 4]));
+        gm.write_plain(0, &7u32).unwrap();
+        assert_eq!(gm.compare_exchange(0, 7u32, 8u32).unwrap(), Ok(8));
+        assert_eq!(gm.compare_exchange(0, 7u32, 9u32).unwrap(), Err(8));
+        let bytes = [std::sync::atomic::AtomicU8::new(42)];
+        gm.write_from_atomic(0, &bytes).unwrap();
+        bytes[0].store(0, Ordering::Relaxed);
+        gm.read_to_atomic(0, &bytes).unwrap();
+        assert_eq!(bytes[0].load(Ordering::Relaxed), 42);
+        assert!(gm.read_plain::<u8>(PAGE_SIZE64).is_err());
+        assert!(gm.write_at(PAGE_SIZE64, &[0]).is_err());
+        assert!(gm.fill_at(PAGE_SIZE64, 0, 1).is_err());
+    }
+
+    #[test]
+    fn test_copy_only_views() {
+        let backing = Arc::new(ToggleLockMapping::new(PAGE_SIZE, true));
+        let direct = GuestMemory::new("direct", backing.clone());
+        assert_eq!(direct.io_policy(), crate::GuestMemoryIoPolicy::Direct);
+        assert!(direct.full_mapping().is_some());
+        assert!(direct.iova(0).is_some());
+        assert!(direct.sharing().is_some());
+        let copy = direct.with_io_policy(crate::GuestMemoryIoPolicy::CopyOnly);
+        assert_copy_only(&copy);
+        assert_copies(&copy);
+        assert_eq!(direct.read_plain::<u8>(0).unwrap(), 42);
+        assert!(direct.supports_locking());
+        let range = copy.subrange(0, PAGE_SIZE64, true).unwrap();
+        assert_copy_only(&range);
+        assert_copies(&range);
+        let nested = range.subrange(0, PAGE_SIZE64, true).unwrap();
+        assert_copy_only(&nested);
+        assert_copies(&nested);
+        assert_eq!(backing.preemptive_locks.load(Ordering::Relaxed), 0);
+        assert_eq!(backing.locks.load(Ordering::Relaxed), 0);
+        assert_eq!(backing.exposures.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_copy_only_backings_and_custom_ranges() {
+        for arc in [false, true] {
+            let mut backing = ToggleLockMapping::new(PAGE_SIZE, true);
+            backing.io_policy = crate::GuestMemoryIoPolicy::CopyOnly;
+            backing.custom_range = Some(GuestMemory::allocate(PAGE_SIZE));
+            let gm = if arc {
+                GuestMemory::new("arc", Arc::new(backing))
+            } else {
+                GuestMemory::new("plain", backing)
+            };
+            assert_copy_only(&gm);
+            assert_copies(&gm);
+            let range = gm.subrange(0, PAGE_SIZE64, true).unwrap();
+            assert_copy_only(&range);
+            assert_copies(&range);
+            assert_copy_only(&range.subrange(0, PAGE_SIZE64, true).unwrap());
+        }
+        let mut backing = ToggleLockMapping::new(PAGE_SIZE, true);
+        backing.custom_range = Some(GuestMemory::allocate(PAGE_SIZE));
+        let backing = Arc::new(backing);
+        let gm = GuestMemory::new("custom-view-policy", backing.clone())
+            .with_io_policy(crate::GuestMemoryIoPolicy::CopyOnly);
+        assert_copy_only(&gm);
+        let range = gm.subrange(0, PAGE_SIZE64, true).unwrap();
+        assert_copy_only(&range);
+        assert_copies(&range);
+        assert_eq!(backing.subranges.load(Ordering::Relaxed), 1);
+        assert_eq!(backing.preemptive_locks.load(Ordering::Relaxed), 0);
+        assert_eq!(backing.locks.load(Ordering::Relaxed), 0);
+        assert_eq!(backing.exposures.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_copy_only_multi_region() {
+        let mut restricted = ToggleLockMapping::new(PAGE_SIZE, true);
+        restricted.io_policy = crate::GuestMemoryIoPolicy::CopyOnly;
+        let mut direct = ToggleLockMapping::new(PAGE_SIZE, true);
+        direct.custom_range = Some(GuestMemory::allocate(PAGE_SIZE));
+        let direct = Arc::new(direct);
+        let gm = GuestMemory::new_multi_region(
+            "mixed-policy",
+            PAGE_SIZE64 * 2,
+            vec![Some(direct.clone()), None, Some(Arc::new(restricted))],
+        )
+        .unwrap();
+        assert_copy_only(&gm);
+        for offset in [0, PAGE_SIZE64 * 4] {
+            let range = gm.subrange(offset, PAGE_SIZE64, true).unwrap();
+            assert_copy_only(&range);
+            assert_copies(&range);
+            assert_copy_only(&range.subrange(0, PAGE_SIZE64, true).unwrap());
+        }
+        assert_eq!(direct.preemptive_locks.load(Ordering::Relaxed), 0);
+        assert_eq!(direct.locks.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_arc_lock_forwarding() {
+        let backing = Arc::new(ToggleLockMapping::new(PAGE_SIZE, true));
+        let gm = GuestMemory::new("arc-lock", backing.clone());
+        let pages = gm.lock_gpns(crate::AccessType::Read, true, &[0]).unwrap();
+        assert_eq!(backing.locks.load(Ordering::Relaxed), 1);
+        assert_eq!(backing.exposures.load(Ordering::Relaxed), 1);
+        drop(pages);
+        assert_eq!(backing.unlocks.load(Ordering::Relaxed), 1);
+        let backing = Arc::new(ToggleLockMapping::new(PAGE_SIZE, false));
+        let gm = GuestMemory::new("arc-no-lock", backing.clone());
+        assert!(!gm.supports_locking());
+        assert!(gm.lock_gpns(crate::AccessType::Read, true, &[0]).is_err());
+        assert_eq!(backing.locks.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_copy_only_fallback() {
+        let mut backing = ToggleLockMapping::new(PAGE_SIZE, false);
+        let payload = GuestMemory::allocate(PAGE_SIZE);
+        backing.fallback = Some(payload.clone());
+        let gm = GuestMemory::new("fallback", backing)
+            .with_io_policy(crate::GuestMemoryIoPolicy::CopyOnly);
+        let range = gm.subrange(0, PAGE_SIZE64, true).unwrap();
+        let nested = range.subrange(0, PAGE_SIZE64, true).unwrap();
+        for gm in [gm, range, nested] {
+            assert_copy_only(&gm);
+            assert_copies(&gm);
+            gm.fill_at(0, 3, 4).unwrap();
+            assert_eq!(payload.read_plain::<[u8; 4]>(0).unwrap(), [3; 4]);
+            assert_eq!(gm.compare_exchange(0, 3u8, 4u8).unwrap(), Ok(4));
+            assert_eq!(payload.read_plain::<u8>(0).unwrap(), 4);
+            assert!(gm.fill_at(PAGE_SIZE64, 0, 1).is_err());
+        }
+    }
+
+    #[test]
+    fn test_try_allocate() {
+        for size in [0, 1, PAGE_SIZE, PAGE_SIZE + 1] {
+            let mut heap = crate::AlignedHeapMemory::try_new(size).unwrap();
+            assert_eq!(heap.len(), size.div_ceil(PAGE_SIZE) * PAGE_SIZE);
+            assert!(heap.as_mut_bytes().iter().all(|&b| b == 0));
+            let mut gm = GuestMemory::try_allocate(size).unwrap();
+            assert_eq!(gm.io_policy(), crate::GuestMemoryIoPolicy::Direct);
+            assert!(gm.supports_locking());
+            assert_eq!(gm.inner_buf().unwrap().len(), heap.len());
+            assert_eq!(gm.inner_buf_mut().unwrap().len(), heap.len());
+            assert_eq!(gm.into_inner_buf().unwrap().len(), heap.len());
+        }
+        assert!(crate::AlignedHeapMemory::try_new(usize::MAX).is_err());
+        assert!(GuestMemory::try_allocate(usize::MAX).is_err());
+        let mut gm =
+            GuestMemory::allocate(PAGE_SIZE).with_io_policy(crate::GuestMemoryIoPolicy::CopyOnly);
+        assert!(gm.inner_buf_mut().is_none());
+        assert!(gm.into_inner_buf().is_err());
     }
 
     #[test]
