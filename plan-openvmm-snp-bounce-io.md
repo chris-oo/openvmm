@@ -2,13 +2,23 @@
 
 Status: implementation plan, not an implemented or validated isolation boundary.
 Research date: 2026-10-07. Sources below refer to the current working tree, including the user's SNP changes. Line numbers will move as those changes develop.
-Revision: initial review findings and ABI clarifications addressed; final review **Ready at plan-review level**. Kernel ABI, MM enforcement, Hyper-V semantics, and hardware behavior remain proof and enablement gates.
+Revision: 2026-10-08 user correction incorporated and reviewed. Review reached **Minor revisions**; those corrections are incorporated. Scoped acquire/copy/release uses existing host-access calls, not a new hypervisor interface. Lite MM enforcement follows separately. The first implementation uses only 4 KiB pages; large pages are deferred.
 
 Companion: [MSHV kernel backing and isolation plan](plan-mshv-guest-memfd-lite.md).
 
 ## 1. Goal and direct answer
 
-Use **one guest backing**, eventually `guest_memfd_lite`, for `virt_mshv` SNP. OpenVMM may touch that backing only through short, synchronous host-access windows, and only when the verified guest-ownership/root-grant contract permits access. All backend I/O must use OpenVMM-owned memory. No guest backing address, guest backing file descriptor, or guest page IOVA may reach a backend, kernel payload I/O request, or physical device. AP VMSA and doorbell registration are separately gated control-page exceptions, not payload-buffer exemptions.
+The end state uses **one guest backing**, `guest_memfd_lite`, for `virt_mshv` SNP. OpenVMM touches it only through short, synchronous host-access windows when the verified guest-ownership/root-grant contract permits access. All supported device payload I/O uses OpenVMM-owned memory. No guest backing address, backing file descriptor, or guest page IOVA reaches a payload backend, kernel payload I/O request, or physical device. AP VMSA and doorbell registration are separately gated control-page exceptions.
+
+**Implement this in two phases, with separate phase-1a and phase-1b gates:**
+
+| Phase | Deliverable | Kernel dependency |
+|---|---|---|
+| **1a. Bounce I/O first** | Userspace copy-only I/O policy, bounded owned payloads, backend lifetime/error handling, and a tested device/backend allowlist. | **No kernel changes or new capability required.** Keep current RAM registration, acquisition-only host access, launch/control paths, and fail-closed attribute intercepts. |
+| **1b. Scoped guest copies** | Acquire host access, copy synchronously, release; deny conflicting guest attribute exits through the existing completion protocol when established. | Uses the **existing** modify-host-access ioctl and Hyper-V acquire/release calls. Independent of lite-MM capability. |
+| **2. Enforced private-memory isolation** | New lite backing, Linux mapping revocation, MM no-pin/no-PFN-export enforcement, ownership/control lifecycles, and verified reclaim. Reuse phases 1a/1b. | Requires companion kernel backing/MM work; no new Hyper-V operation or copy-window token ioctl. |
+
+Phase 1a removes actual guest buffers from supported **device payload submissions**, not MSHV's RAM registration pins or all hypervisor control operations. It does not shorten current host-access grants, revoke Linux mappings, enable guest transitions, or establish a security boundary. Phase 1b adds balanced host access without lite MM enforcement. Neither is `guest_memfd_lite`; phase-two gates must not block phase 1a.
 
 **OpenVMM already has useful bounce paths, but no universal bounce-only device mode and no scoped MSHV host-access release.**
 
@@ -23,7 +33,8 @@ Use **one guest backing**, eventually `guest_memfd_lite`, for `virt_mshv` SNP. O
 ### Non-goals
 
 * No dual-memfd private/shared guest RAM design. Bounce allocations are I/O scratch memory, not a second guest RAM image.
-* No new kernel ABI is assumed to exist. Kernel backing registration, page-state serialization, scoped root acquire/release semantics, and no-pin enforcement are dependencies, not facts proved by this plan. Guest ownership and root grants are distinct: never use a SHARED/PRIVATE ownership transition as the acquire/release operation for each copy.
+* No new Hyper-V operation or BEGIN/END copy-window UAPI. Existing host-access flags support acquisition and release. New lite backing registration/query and MM enforcement may be needed in phase two. Guest ownership and temporary root grants are distinct: never force a SHARED/PRIVATE transition for each copy, or assume a caller must first make the page shared. Copy only after Hyper-V authorizes the existing access request; this is not a claim of arbitrary private plaintext access.
+* Base 4 KiB pages only in the first implementation. Owned huge folios, large guest mappings/grants, mixed 2 MiB state, and demotion are follow-up work. Do not change unrelated legacy guests' superpage flags.
 * Do not rewrite OpenHCL memory protection or non-SNP zero-copy paths.
 * Do not promise transparent support for VFIO passthrough, kernel vhost, vhost-user, or shared-memory/DAX devices. Reject incompatible configurations until a separate implementation proves them safe.
 * This task changes only this plan. Do not edit or revert the existing user changes in the Guide or SNP source files. No commit, push, or remote operation is needed.
@@ -59,7 +70,7 @@ Thus, a copy through today's `read_at`/`write_at` may acquire access, but does *
 * Completion publishes split used elements and then the used index with fences, or packed used descriptors with a release fence. The current public completion API consumes the token and releases in-flight capacity before publishing; publishing failures are logged, not returned to the device. Sources: `vm/devices/virtio/virtio/src/queue/split.rs:230-295`; `vm/devices/virtio/virtio/src/queue/packed.rs:219-258`; `vm/devices/virtio/virtio/src/common.rs:390-415`.
 * Virtio-net buffers completion tokens in `InOrderCompletion`, and RX/TX call that helper. Preserve its publication order when adding scratch ownership. Do not assume all devices have the same completion discipline. Sources: `vm/devices/virtio/virtio/src/in_order.rs:29-52,101-148`; `vm/devices/virtio/virtio_net/src/lib.rs:1338-1347,1415-1425`.
 
-**Decision:** fixed rings and indirect tables receive bounded synchronous metadata copies, never lifetime host-access grants. Payload receives owned backend buffers. Do not hold ring-page access across queue waits, backend work, or notification. If metadata and payload share a page, the same page-state coordinator must cover both.
+**Decision:** Fixed rings and indirect tables use bounded synchronous metadata copies; payload submissions use owned backend buffers. No guest slice or copy guard crosses backend work or queue waits. Phase 1a retains acquisition-only access. Phase 1b adds acquire/copy/release and one coordinator for metadata and payload, including shared pages. Phase two adds kernel backing/MM enforcement.
 
 ### 2.4 Existing backend lifetimes and limits
 
@@ -72,7 +83,7 @@ Thus, a copy through today's `read_at`/`write_at` may acquire access, but does *
 
 ## 3. Device and backend coverage matrix
 
-“Adapt” means planned support, not current isolation support. All supported entries also require the common scoped-copy and policy work in section 4.
+“Adapt” means planned support, not current isolation support. This matrix describes the full phase-two disposition. Phase 1a can admit converted payload paths without scoped access; phase 1b adds scoped payload and metadata copies on existing interfaces. Configurations that export actual guest backing remain rejected in bounce mode. PSP/AP/doorbell no-pin requirements apply to phase two; preserve existing supported control behavior in phase one and state that exception.
 
 | Surface | Current behavior and evidence | Copy-only SNP disposition |
 |---|---|---|
@@ -142,82 +153,61 @@ The table uses crate-relative citations to keep cells readable. The exact source
 
 ### 4.1 Explicit capability policy, not heuristic selection
 
-Add an immutable guest-memory access policy selected during VM construction, before `GuestMemory::new` caches backing capabilities:
+Add an immutable guest-memory **I/O** policy selected during VM construction, before `GuestMemory::new` caches backing capabilities. It is a userspace routing/export restriction, independently usable on current backing in phase one; it is not kernel enforcement:
 
 * Existing normal memory: retains current supported access/export capabilities.
-* Copy-only SNP backing: permits bounded byte/plain/atomic copies; denies persistent slices, page locks, raw guest VA exports, IOVA exports, backing FD sharing, and registration of guest ranges with DMA targets.
+* Copy-only I/O guest view: permits bounded byte/plain/atomic copies; denies device-facing persistent slices, page locks, raw guest VA exports, IOVA exports, backing FD sharing, and guest DMA registration. Phase one retains the separate existing MSHV RAM-registration and control interfaces. Phase two additionally requires lite backing and MM enforcement.
 * Host-owned I/O memory: can use normal locks, raw pointers, backend registration, and device DMA as needed.
 
 A conceptual name is `GuestMemoryIoPolicy::CopyOnly`; choose final names during implementation. This is stronger than `supports_locking=false`. Forward policy through `Arc`, default nested subranges, multi-region wrappers, translated memory, and remote proxies. Preserve correct region offsets and return typed errors for denied operations. Do not accidentally make a copy-only subrange lockable because it still has an internal mapping.
 
 Distinguish **internal mapping for fault-contained copies** from **exportable mapping**. `GuestMemory::full_mapping()` must return `None` for copy-only guest memory even if the internal mapped-copy fast path exists. `sharing()` and `iova()` must be denied. The region manager must reject guest-memory DMA registration independently, because it supplies VAs/FDs without going through these GuestMemory methods.
 
-These userspace restrictions are not a substitute for the companion kernel plan's mandatory, immutable MM no-PFN-export restriction. Capability discovery must confirm terminal rejection of all enabled non-GUP PFN consumers as well as GUP, including attempts to register a shared alias with KVM, VFIO, legacy MSHV MMIO, or another partition. If an enabled consumer cannot enforce denial, withhold lite capability or use an enforced supported build/deployment exclusion; a warning or device allowlist alone is insufficient. See `plan-mshv-guest-memfd-lite.md`, sections 3 and 4.
+These userspace restrictions can ship in phase one without a new kernel capability, but cannot claim kernel no-pin/no-PFN-export enforcement. In **phase two**, capability discovery must confirm the companion's immutable MM restriction and terminal rejection of enabled GUP and non-GUP consumers, including KVM, VFIO, legacy MSHV MMIO, and another partition. Without that proof, withhold lite capability or enforce a supported deployment exclusion. See `plan-mshv-guest-memfd-lite.md`, sections 3 and 4.
 
 Do not use `supports_locking` as the sole signal that a buffer is guest memory: emulated-IOMMU memory is already non-lockable. Carry policy/origin explicitly so device-owned staging is not needlessly staged again.
 
 ### 4.2 Scoped synchronous access boundary
 
-Redesign `PartitionHostAccess` from acquisition-only to a scoped copy contract. Track **committed guest ownership/visibility**, **transient root read/write grant**, and **copy admission/drain phase** separately. Ownership state alone neither authorizes nor describes a root copy grant. The initial public kernel mapping contract may allow only committed-shared pages, but do not infer that Hyper-V root access always requires a guest SHARED ownership transition. Any grant while guest ownership remains otherwise private requires an explicitly verified capability/authorization contract. Without it, deny access; never silently transfer guest ownership just to copy.
+**Phase 1b, independent of lite backing.** “Per-copy” means the short interval needed to transfer bytes between guest RAM and an owned buffer. It does not mean an I/O request lifetime, a guest ownership transition, or a hypervisor token. For completed read/RX, acquire only when the backend has returned valid bytes, copy them into the guest, then release. Write/TX acquires and copies out before submission. Descriptor, queue, status, and ring copies follow the same rule.
 
-The companion kernel plan now proposes the same independent scoped-window extension (`plan-mshv-guest-memfd-lite.md`, section 4, “Scoped root-access grants are not ownership transitions”). Both plans require that **shared proposed contract before enablement**. Names and layouts are provisional, not existing ioctl definitions:
+Extend the internal Rust host-access abstraction with fallible release and a coordinator/guard. Keep the existing `modify_gpa_host_access` interface: acquisition sets `ACQUIRE` and the supported permissions; release clears `ACQUIRE`. The current kernel initializes hypercall flags to zero (adding only `LARGE_PAGE` if requested), selects acquire from `ACQUIRE`, and invokes `hv_call_modify_spa_host_access` (`K/drivers/hv/mshv_root_main.c:2415-2468`, K root is the companion's kernel tree). The PSP path independently uses flags-zero release (`K/drivers/hv/mshv_root_main.c:2557-2577`). These calls do not add `MAKE_SHARED` or `MAKE_EXCLUSIVE`. No new Hyper-V operation, window capability, or BEGIN/END ioctl is required.
 
-* Proposed `MSHV_CAP_LITE_COPY_WINDOWS` identifies permitted guest ownership/page types, read/write modes, byte/page granules, alias/barrier behavior, synchronous versus pending outcomes, and maximum range/batch limits. The conservative baseline accepts only committed-shared backing. This is an explicit baseline policy, not proof that every possible Hyper-V root grant requires SHARED ownership. No fallback to raw host-access changes or SHARED/PRIVATE transitions is allowed.
-* Proposed `MSHV_BEGIN_COPY_WINDOW { object/range, expected_generation, permissions, reserved } -> { token, granted_scope, generation }` validates controller/owner-mm identity, bound range/generation, and admission/eligibility and returns a durable token only after definitive root grant/barriers. No guest pointer is passed as an I/O payload.
-* Proposed `MSHV_END_COPY_WINDOW { token, expected_generation, reserved }` ends the sole admitted leaf copy, closes its fault admission, zaps covered aliases and completes CPU TLB barriers, then releases the verified root grant without changing guest ownership or generation. Success means both alias and root release barriers completed. Define duplicate release, partial acquisition rollback, and late results.
-* Start with **one active or pending window per partition**, matching the companion's conservative baseline. Copies serialize; no nested/overlapping grants or in-place permission upgrades are permitted. Per-page concurrent grants and permission unions are later separately reviewed capabilities, not assumptions needed for bring-up.
-* Outside initialization/runtime active-window coverage, lite VMAs remain VA reservations with no accessible guest PTEs. Every alias obeys the window's scope/mode. A hypervisor grant may round wider only if the entire extent is independently validated eligible; do not expose extra user pages. Reject unverified granule combinations.
-* Query/drain operations report active/pending window tokens, copy phase, generation, and uncertain release. Kernel token accounting and the userspace local lease count must agree before the existing transaction/epoch drain acknowledgement can advance.
-* Owner-authorized query recovers tokens, scopes, generations, grant state, and terminal begin/end results even when a result was not delivered. Owner-scoped request correlation IDs make retries idempotent; never issue a fresh begin or free backing because a returned token is missing. Recover the operation or confirm automatic release. Test failed begin-result delivery and interrupted end during drain.
-* Unbound initialization windows serialize per object under its creation-time owner mm and expose only local PTEs; they claim no Hyper-V root revocation. Bind closes initialization admission, drains windows, invalidates aliases, establishes the verified runtime root baseline, and transfers admission to the partition. Reopen initialization after failed binding only on confirmed wholly unbound host-owned rollback; otherwise quarantine.
-* Interrupted, timed-out, or pending acquire/release does not mean cancelled or completed. A durable partition operation owner keeps input/output, backing, binding, routing, and token state until a verified terminal completion and barriers. The synchronous leaf-copy API returns without accessing data if acquisition is not definitively complete; uncertain grants are recovered/released by that owner, not blindly retried.
+The bounded synchronous leaf operation is:
 
-The two plans now share the proposal, but its actual ABI and ownership-preserving Hyper-V semantics remain unresolved and capability-gated. A supported copy leaves guest ownership unchanged:
+1. Translate addresses, select RAM backing, validate identity and checked byte ranges, then normalize to 4 KiB GPA ranges with checked rounding. Validate every covered page, holes, permissions, and page type; zero-length copies acquire nothing.
+2. Under one partition coordinator lock, reserve all ranges **before acquisition**. Track RAM identity and acquiring, copying, releasing, and uncertain state. Pending guest changes and copies use the same admission decision, so neither can slip between the other's conflict check and reservation.
+3. Issue the existing host-access acquisition. Copy only after definite success and only through fault-contained leaf helpers. Failed acquisition never permits a copy; retain any partially or uncertainly granted extent for release/recovery.
+4. Copy only the bounded requested bytes, with no backend call, application await, RPC wait, or task yield while access is live.
+5. Release through the existing call before retiring the reservation or returning success. Guest ownership remains unchanged. A grant must be authorized by Hyper-V; do not force guest SHARED state, infer eligibility from a present PTE, or claim arbitrary private plaintext access.
 
-```text
-eligible committed guest ownership + no transient root grant
-  -> acquire root grant/window -> synchronous copy
-  -> release root grant/window -> same committed guest ownership
-```
+Initially serialize all leaf copies per partition, including overlap. Reserve pending ranges before the grant call; never let one copy release another copy's grant. No nested acquisition or permission upgrades. Internal reference counts are an optional later optimization, not a kernel token API.
 
-The leaf-copy operation is:
+The coordinator mutex protects admission and state changes only; release it before acquire/release ioctls and byte copies. Reservations remain visible throughout acquisition, copy, release, and uncertainty, so another VP can reject a conflicting exit without waiting for the active operation.
 
-1. Validate actual mapped RAM and checked byte range.
-2. Normalize to the kernel/hypervisor access granule, using checked rounding.
-3. Enter per-page copy admission and check the verified ownership/grant eligibility. Reject unmapped, ineligible, or draining/transitioning ranges unless a defined bounded retry applies.
-4. Acquire host read/write access for exactly that normalized range.
-5. Perform only the synchronous copy/plain operation using existing fault-contained helpers.
-6. Release host access synchronously before returning success or error.
+Phase 1b also admits existing runtime operations that change host access or establish control-page use through this coordinator, including PSP request/response pages and AP VMSA/doorbell registration or replacement. Preserve their ABI and supported behavior, but reserve affected pages before submission and exclude ordinary copies for the required operation/control lifetime. Reject conflicts before side effects through an established failure protocol, or retain fail-closed stopping where unresolved. Uncertain outcomes retain the exclusion and cleanup owner. This is userspace conflict coordination, not phase-two no-pin/control-lifecycle enforcement. The current PSP path itself releases host access before submission (`K/drivers/hv/mshv_root_main.c:2536-2577`), so excluding only attribute exits is insufficient.
 
-Acquire **exactly once at the ultimate guest-backing copy**, after address translation, backing selection, offset/range validation, and access-mode selection. A leaf hook around the mapped operation covers `run_on_mapping` before any first successful access, not only `page_fault`. An already accessible VA must not bypass it. Adapter fallback dispatch must not acquire an outer lease and then call an inner leased copy:
+Select scoped mode before runtime guest copies. Retire or account for any preexisting launch/initialization grants before opening scoped admission; a successful mapped access must not inherit an untracked persistent grant. Do not switch a running phase-1a VM to scoped mode without a complete coordinated drain.
 
-* `Arc` forwards policy and leaf operations; it creates no second grant.
-* Subranges translate offsets; multi-region views select the concrete backing.
-* IOMMU fallback translates IOVA to GPA, then the inner guest copy acquires the validated leaf range. Current code holds a translation lock across the inner operation; define a nonblocking/bounded acquisition and lock order so a transition cannot wait on that lock while the copy waits on the transition. Sources: `vm/devices/iommu/iommu_common/src/lib.rs:198-224,238-281`.
-* RPC callers stage/serialize bytes without a lease. Only the process that executes the ultimate backing copy acquires it; no lease spans send/receive, RPC waits, or response decoding. Current remote fallback blocks on a response and the local proxy performs guest copies. Sources: `workers/chipset_device_worker/src/guestmem.rs:85-101,125-134,158-195`.
+Acquire exactly once at the ultimate backing operation, including mapped accesses that never fault. `Arc` forwards, subranges translate, multi-region views select backing, and IOMMU translation precedes leaf admission. RPC forwarding holds no grant while waiting. Keep current IOMMU/manager lock ordering explicit and use bounded admission; never wait while holding a lock required by a conflicting operation. Evidence: `vm/devices/iommu/iommu_common/src/lib.rs:198-224,238-281`; `workers/chipset_device_worker/src/guestmem.rs:85-101,125-134,158-195`.
 
-Use an explicit backing-leaf versus forwarding-adapter distinction in the hook, not a blanket wrapper around every fallback. Keep raw-pointer work inside existing guestmem/membacking modules. Never expose a guest guard to device/backend async futures.
+In scoped mode, fault handling services only an already confirmed leaf grant. It must not independently acquire again, revive a released grant, or retry an ineligible fault forever. Phase 1a alone retains the current acquisition-on-fault callback.
 
-Prefer an explicit `finish/release -> Result` on the normal path, plus a non-panicking RAII cleanup backstop for early errors. `Drop` cannot report release failure. **Failed or uncertain release poisons partition-wide coordination**, closes all new copy/control admissions, gates/stops VPs, and notifies the persistent management owner independently of device error handling. A device that logs a copy error, returns zero bytes, or drops a queue cannot suppress this action. Quarantine the affected range and retain cleanup/token ownership until verified completion or recovery; do not free it or return ordinary success. Do not make a best-effort Drop callback the entire security boundary.
+### Conflicting guest exits: reject the request, not the copy
 
-A synchronous userspace coordinator mutex/reference count is not kernel pinning. It must nevertheless integrate with the kernel's page-state transition mechanism so a page cannot become private, change backing, or be freed during a live copy. The kernel agent must specify this exclusion contract. If the kernel cannot provide it, the userspace plan alone cannot establish safety.
+All VPs consult the same coordinator for intercepted ownership, visibility, or access changes. Validate range count against the 29-entry payload, encodings, checked GPA arithmetic, RAM identity, and 4 KiB extents before admission. Large-range requests are unsupported in this first implementation. If **any** requested range overlaps an acquiring, copying, releasing, or unresolved grant, reject the **whole** request atomically; no partial ownership update. Do not wait for backend I/O: no grant is held across backend work. An already admitted guest change reserves its range until resolved, preventing a racing copy acquisition. Unsupported nonconflicting transitions remain rejected; this work does not invent transition support.
 
-State requirements:
+“Deny” must mean a verified failure completion without applying the change or replaying it as success. **The exact existing GPA-attribute rejection/resume protocol remains a narrow implementation question.** `HvX64GpaAttributeInterceptMessage` contains VP index, attribute flags, and 29 ranges, but no result/completion field (`vm/hv1/hvdef/src/lib.rs:4335-4358`). Its SNP dispatch calls the current halt handler (`vmm_core/virt_mshv/src/x86_64/snp.rs:1133-1134`); the supplied baseline handler returns `TripleFault`, not a guest-visible failure. The inspected legacy register-intercept-result definition supports CPUID/MSR results, not a proven GPA-attribute reply (`K/include/hyperv/hvhdk.h:1093-1125`; forwarding call `K/drivers/hv/mshv_root_main.c:1217-1229`). `CompletePartitionIntercept` is only an enumerated property in the inspected Rust definition (`vm/hv1/hvdef/src/lib.rs:515`), not a demonstrated completion call site.
 
-* Baseline copies serialize at partition scope, including copies of the same page. No forwarding adapter can nest a grant. Future per-page concurrent accounting must ensure that one release cannot revoke another copy.
-* Read and write modes remain distinct. Baseline requests choose one mode before admission; overlapping read/write unions or upgrades require a later capability.
-* New acquisitions cannot starve a pending transition. Reserve the durable kernel transaction/epoch and gate/drain VPs; close new copy and copyback admission, but keep already admitted copies' committed-eligible faults and live root grants serviceable. Drain existing copies without holding fault/invalidation or copy-coordinator locks they need. Acknowledge the exact transaction/epoch/generation only at zero admitted copies and known window state; then the kernel closes faults, drains fault handlers, revokes aliases/TLBs, and performs the verified ownership change. Never block an old copy's page fault before draining that copy.
-* Apply finite drain deadlines, stale/duplicate acknowledgement rejection, interrupted-query recovery, and owner-mm death rules from the companion plan. Timeout/interruption/fd close with a live owner mm is not acknowledgement or cancellation. Stop/poison and preserve state; only verified owner-mm death plus kernel alias/drain barriers permits the documented death path. A late acknowledgement must not complete a different transaction.
-* Deduplicate page-state operations for repeated/overlapping scatter pages without changing payload byte order.
-* Use ordered range/page locking or one initial coordinator lock with bounded batches. Define ordering relative to mapping-manager, partition memory, and emulated-IOMMU locks. Do not wait for mapping-manager RPC while holding a lock needed by that manager.
-* Reuse access only within the same bounded synchronous copy batch; never cache access between requests, kicks, or backend polls.
-* Zero-byte copies have no acquisition. Copy batches do not cross an unmapped hole or incompatible backing.
-* Unbound initialization uses explicit scoped windows with no prebind hypervisor grant; bind requires zero initialization windows. Postlaunch/ownership transitions normalize to no root grant and closed aliases before opening copy admission.
-* A drain reservation does not occupy the partition's hypercall/completion slot. Existing window END/recovery operations must retain admission until terminal; only at zero windows/pending grants may the ownership operation atomically take the slot. Otherwise copy drain deadlocks waiting for a release it has blocked.
+GHCB error returns are a different protocol: `set_ghcb_error` writes exit-info error fields (`snp.rs:368-372`), while GHCB page handling receives a VMGEXIT snapshot (`:1404-1418`); this does not establish a reply for the separate GPA-attribute message. No legacy non-SNP attribute handler or concrete denial call was found in the scoped trace. Do not invent an error status, write unrelated VP/GHCB registers, or treat `TripleFault` as clean denial. Until the existing completion/rejection path is established, retain fail-closed halt/stop on these exits and do not resume the unresolved request. Guest retry is the guest's responsibility **only if** the verified failure-return protocol permits it. This question does not require a new hypervisor interface.
 
-Metadata accesses need the same protection. Batching several descriptor reads in one synchronous window may reduce ioctl cost, but must not retain a grant after returning work or awaiting a kick.
+Prefer explicit fallible `finish/release` plus a non-panicking RAII cleanup backstop. Failed or uncertain release keeps the conflicting range blocked in quarantine, stops/poisons the partition, closes new copy/control admission, notifies management, and retains backing and cleanup ownership. A device cannot suppress this by logging its local error. Do not blindly reacquire, replay, free, or resume. Confirm platform ordering and failure behavior through existing-call regression tests.
+
+Phase two integrates this same lifecycle with lite kernel object/map state. Faults install accessible PTEs only under confirmed authorized access. Release/revocation closes faults, zaps aliases, and finishes CPU TLB barriers before access is considered revoked; private commit cannot leave a usable Linux mapping. Kernel ownership/teardown may need a drain handshake, but ordinary copy admission and conflict denial do not stop all VPs or reserve ownership transactions per copy. Large pages are deferred; ordinary direct-map removal/splitting needed for MM safety is not.
 
 ### 4.3 Owned I/O dataflow
+
+This dataflow applies throughout. Phase 1a uses ordinary synchronous guest-copy calls; current hypervisor grants may persist afterward. Phase 1b implements the shown acquire/copy/release with existing calls, and phase two adds MM enforcement. Waiting for scratch or backend work must never retain a guest slice or copy guard.
 
 Guest-to-backend write/TX:
 
@@ -270,10 +260,12 @@ Physical-network support remains disabled until the selected endpoint demonstrat
 
 ### 4.6 Metadata, errors, retries, and ordering
 
+Validation, snapshots, partial-result handling, and exactly-once publication apply throughout. Scoped host access, conflict denial, release failure, and partition poison enter in phase 1b. Kernel ownership transitions and enforced Linux revocation enter in phase two. Unsupported private/shared transitions remain rejected.
+
 * Use short accesses for fixed rings, event suppression, status/header bytes, indirect descriptors, controller command/response metadata, and emulated-IOMMU page tables.
 * Keep the existing acquire/release fences and ordering helpers. The host-access release must finish before used publication makes payload visible. Confirm kernel release visibility semantics; a userspace fence alone cannot establish a missing kernel contract.
 * Snapshot descriptors once for each accepted request. Do not re-read guest descriptor chains after a backend await to decide where to write. Treat guest modifications during a valid copy as untrusted concurrent data, not stable protocol state.
-* Store queue/reset and backing-mapping generations with accepted work. Before copyback, verify that the queue still owns the token, the mapped RAM identity has not changed, and each destination is currently eligible for the negotiated copy grant. A pre-I/O probe is not a lease. If page-state transitions are allowed to change the generation while preserving the mapping, define whether fresh eligibility validation permits completion or requires request failure; never write into a newly repurposed backing merely because its GPA matches. Ownership eligibility comes from the scoped-window capability, not an assumed SHARED requirement.
+* Store queue/reset and backing-mapping generations with accepted work. Before copyback, verify token ownership and RAM identity, then acquire fresh authorized access to the destination. A pre-I/O probe is not a lease. If future supported transitions change generation, define fresh validation or request failure; never write into repurposed backing because its GPA matches. Eligibility is not an assumed SHARED requirement or a new window capability.
 * Revocation cannot erase bytes already copied while access was permitted. Backend work may continue on that authorized snapshot after the guest makes the source private. Define and document this semantics, scrub recycled scratch, and never acquire new private bytes to finish a partially captured write.
 * Validate indirect lengths, entry counts, indices, alignment requirements, cycle/chain bounds, and all address additions before creating a subrange or allocation. Preserve split/packed format semantics.
 * No whole-request atomic copy promise: a fault can leave an earlier scatter range or part of a guest write changed. For guest-to-host failure, do not submit the backend at all. For host-to-guest failure, do not report complete success; scrub/recycle scratch and use device-specific error/drop semantics.
@@ -286,6 +278,8 @@ Physical-network support remains disabled until the selected endpoint demonstrat
 
 ### 4.7 Allocation, alignment, cancellation, and dirty state
 
+Bounded buffers and retained submitted-operation ownership are phase-one requirements. During a live VMM, stop/reset must drain operations rather than drop unsafe futures or recycle DMA buffers early. After process death, phase one relies on current kernel/driver close and I/O ownership contracts; it does not claim new guest-reclaim guarantees. Phase 1b retains uncertain host-access cleanup; phase two adds kernel ownership/control/teardown recovery.
+
 * Start with a configurable host-side maximum request size and total per-VM/queue scratch budget. A possible initial block maximum is 1 MiB, but choose the final limit with workload data and advertise compatible `size_max`/`seg_max` limits. Do not silently use `seg_max * PAGE_SIZE`: one descriptor can legitimately span many pages.
 * Bound descriptor expansion and metadata before payload allocation. Use checked sums/conversions and fallible reservation. Return typed errors for oversize/OOM pressure rather than panicking or waiting forever.
 * Improve/reuse `BounceBufferTracker` accounting where practical. Reject a request larger than the budget. Make reservation cancellation-safe; restore permits exactly once. Avoid a per-thread budget deadlock when an owned frontend buffer requires an additional backend DMA/alignment buffer.
@@ -294,51 +288,49 @@ Physical-network support remains disabled until the selected endpoint demonstrat
 * Stop acceptance first, drain backend work, then retire/reset queue state and release scratch. Preserve virtio-blk's existing drain path. For non-cancel-safe io_uring, transfer outstanding owned buffers into a persistent worker owner and finish them rather than dropping the future.
 * Install persistent submitted-operation ownership **before** submission, not after timeout. Keep backend scratch, request/completion tokens, required partition/backing-generation references, and terminal-result state alive through timeout, interrupted callers, worker stop, and process death. For pending kernel ownership/control calls, the kernel's partition-wide operation owner must retain completion routing and all input/output/backing references after userspace disappears; userspace cannot provide that death guarantee. Do not reuse a completion slot, partition ID, or buffer until authoritative terminal completion/drain. Late results reach the same owner and do not automatically resume poisoned VPs.
 * Device DMA cancellation requires confirmed hardware completion/reset/quiescence before recycling scratch. A Rust future being dropped is not proof that the device stopped DMA.
-* Initial lite backing uses base pages. Gate every claimed hugepage benefit on verified physical allocation order, uniform ownership/page type across the hypervisor granule, grant/release granularity, and supported subpage split/demotion barriers. Existing GPA-superpage flags, page-aligned scratch, THP, or hugetlb options are not proof. Reject 4 KiB changes within a huge ownership extent without verified demotion, and exclude VMSA/control pages from undifferentiated huge extents. See `plan-mshv-guest-memfd-lite.md`, section 7.
+* Initial lite backing and scoped grants use 4 KiB pages. Large guest mappings/grants, huge folios, THP/hugetlb support, mixed 2 MiB states, and demotion are deferred to the companion's section 7; they are not launch requirements.
 * Dirty/access bitmaps are not interchangeable. The guestmem bitmaps cited above control accessibility, not proven migration dirty tracking. Guest payload/status/ring writes must participate in any selected dirty-tracking/snapshot scheme. If MSHV SNP has no supported scheme, explicitly reject that migration mode rather than claiming copyback is tracked. Test payload, partial copy, status, used ring, and packed descriptors once a concrete dirty tracker is selected.
 
 ## 5. Concrete implementation stages
 
-Each stage is a separate reviewable change. Do not enable the feature until the required kernel contract and the initial allowlist pass.
+Each stage is a separate reviewable change. **Implement phase 1a first, then phase 1b on existing calls; neither depends on phase-two APIs or gates.** Select opt-in bounce/scoped policy before device/memory construction, independent of lite capability. Choose final setting names during implementation. Keep ordinary guests' fast paths unchanged.
 
-### Stage A — policy and deny exports
+| Stage | Prerequisites | Independently deliverable result |
+|---|---|---|
+| 1A | None | Userspace I/O policy, propagation, and denied device exports. |
+| 1B | None | Fallible queue completion and error propagation. |
+| 1C | 1A and 1B | Bounded owned storage; first block-only bounce-I/O configuration can ship after its gate passes. |
+| 1D | 1A and 1B | Converted simple devices and in-process vsock. Can proceed alongside 1C. |
+| 1E | 1A and 1B | Owned network staging. Can proceed alongside 1C/1D. |
+| 1F | Relevant device conversion | Per-device enablement, documentation, broader coverage. No requirement to finish all devices before shipping a tested subset. |
+| 1G (phase 1b) | Phase-1a policy and admitted device conversions | Scoped host access and conflict rejection on existing interfaces; independent of lite kernel capability. |
+| 2A | Companion backing/MM capabilities and phases 1a/1b | Enforced lite backing, ownership/control lifecycles, and reclaim. |
+
+### Stage 1A — userspace I/O policy and deny device exports
 
 Files/functions:
 
 * `vm/vmcore/guestmem/src/lib.rs`: `GuestMemoryAccess`, `DynGuestMemoryAccess`, `GuestMemoryInner`, `GuestMemory::new/new_multi_region`, `Arc<T>`, `GuestMemoryAccessRange`, `MultiRegionGuestMemoryAccess`, `full_mapping`, `sharing`, `iova`, `lock_gpns`, `lock_range`.
 * `openvmm/membacking/src/mapping_manager/va_mapper.rs`: immutable policy construction; deny guest exports and locking for copy-only backing.
 * `openvmm/membacking/src/mapping_manager/manager.rs` and `memory_manager/mod.rs`: create the primary with policy before clients can construct/copy `GuestMemory`; preserve single-backing mapping and process-local cache semantics.
-* `openvmm/membacking/src/region_manager.rs`: reject guest RAM DMA registration under policy, including map-by-file and late mappings. Require kernel no-GUP/no-PFN-export capability before exposing even shared lite aliases.
+* `openvmm/membacking/src/region_manager.rs`: reject device-facing guest RAM DMA registration under policy, including map-by-file and late mappings. Leave existing MSHV RAM registration intact. Kernel no-GUP/no-PFN-export capability is required only when phase two creates lite backing.
 * `vm/devices/iommu/iommu_common/src/lib.rs` and remote guest proxy: propagate restriction/origin through translations/RPC adapters.
 * `openvmm/openvmm_core/src/worker/dispatch.rs` and relevant device resolvers: initial allowlist and early errors for passthrough, vhost, DAX/pmem, and persistent-lock VMBus paths.
+* `virtio/src/queue.rs`, `queue/split.rs`, `queue/packed.rs`: existing synchronous metadata copies, no preemptive locking under the I/O policy, and checked indirect metadata. Phase 1b scopes metadata access.
 
-Tests: direct, `Arc`, nested subrange, multi-region, translated/proxy views cannot acquire guest locks or export VA/FD/IOVA. Host-owned staging remains lockable. DMA registration fails before the first guest mapping ioctl.
+Tests: device-facing direct, `Arc`, nested subrange, multi-region, translated/proxy views cannot acquire guest locks or export VA/FD/IOVA. Host-owned staging remains lockable. Reject device DMA registration before its first mapping ioctl; this does not prohibit the legacy MSHV RAM-registration ioctl.
 
-### Stage B — scoped access and kernel integration
+Test split/packed queue construction and indirect-table access under the copy-only policy, including malformed metadata and denied preemptive locking. These shared queue checks are prerequisites for the first block-only release, not deferred simple-device work.
 
-Files/functions:
+### Stage 1B — fallible queue publication prerequisite
 
-* `vmm_core/virt/src/generic/partition_memory_map.rs`: replace/extend `PartitionHostAccess` with the proposed root-copy-window contract, distinct from ownership transitions, plus fallible release/cleanup semantics.
-* `vmm_core/virt_mshv/src/lib.rs`: partition-level coordinator, unconditional poison/VP gating, persistent pending-operation owner, and adapter; memory range validation; capability checks; transaction/epoch drain acknowledgement and timeout/death handling.
-* `openvmm/membacking/src/memory_manager/mod.rs`, `mapping_manager/manager.rs`, and `region_manager.rs`: once the real ABI is specified, add an explicit restricted guest backing kind and allocate/map the one `guest_memfd_lite` object. Preserve GPA-to-file-offset layout, holes, permissions, and lifetime ownership. Do not route it through unrestricted shared-memory export merely because it has an fd. Decide unsupported hugepage/hotplug/restart combinations explicitly.
-* `vmm_core/virt_mshv/src/x86_64/snp.rs`: replace `acquire_snp_host_access` with balanced bounded operations once the actual ABI is specified; integrate `handle_snp_gpa_attribute_intercept` with coordinator state instead of removing fail-closed behavior prematurely.
-* `vmm_core/virt_mshv/src/lib.rs` (`MshvIsolationState::map_user_memory`, `PartitionMemoryMap::map_range/unmap_range`) and `x86_64/snp.rs` (`snp_launch_initial_pages_inner`, `add_snp_vmsa_mapping`): use the negotiated backing-registration/import contract, not the current user-VA registration by assumption. Separate prelaunch initialization windows from postlaunch capability-eligible copies and audit each control/VMSA registration. No payload bounce operation grants access to a VMSA.
-* `vmm_core/virt_mshv/src/x86_64/snp.rs`: reject `handle_snp_guest_request` before `psp_issue_guest_request` unless a verified owned-buffer PSP protocol is negotiated. Once supported, stage request/response through leaf copy windows and give pending PSP input/output/control operations a durable completion owner. Preserve request authentication/protocol semantics; do not invent a bounce GPA.
-* The same file's `handle_snp_ap_create` and `SVM_EXITCODE_HV_DOORBELL_PAGE` branch: implement or reject the explicit control-page exception ledger. Track VP/backing/generation/page type, replacement/unregistration, quiescence and terminal reclaim; do not use generic payload-window admission as control-page lifetime ownership. `SnpVpState::new`/`MshvGhcbPage::drop` continue to own kernel GHCB state, not guest pages.
-* `vm/vmcore/guestmem/src/lib.rs`: add scoped access only at the validated ultimate backing operation, including mapped/fallback leaf implementations; forwarding adapters translate/select/forward without acquiring twice. Cover read/write/fill/plain/compare-exchange and probes. IOMMU translation precedes leaf acquisition; RPC waits have no lease.
-* `openvmm/membacking/src/mapping_manager/va_mapper.rs`: stop granting unbounded access only from faults. Use page faults solely to resolve a valid operation inside an active scope, or return an error.
+Land this **before Stage 1C storage error integration and Stage 1E network staging**, independently of scoped host access:
 
-Keep acquisition/release logic synchronous and private to the memory layer. No new unsafe device interfaces. Use existing typed guestmem errors, a `thiserror` protocol error enum, `anyhow::Context` for configuration plumbing, and rate-limited traces for guest-triggered failures. Rust 2024 and `guest_arch` cfg rules apply.
-
-### Stage B.1 — fallible queue publication prerequisite
-
-Land this **before Stage C storage error integration and Stage E network staging**:
-
-* `vm/devices/virtio/virtio/src/common.rs`, `queue.rs`, `queue/split.rs`, `queue/packed.rs`, and `in_order.rs`: return publication phase plus release/notification outcome; retain exactly-once tokens/cursors. Distinguish not-published, published-with-error, and uncertain publication. Never hide partition poison behind device logging.
+* `vm/devices/virtio/virtio/src/common.rs`, `queue.rs`, `queue/split.rs`, `queue/packed.rs`, and `in_order.rs`: return publication phase plus copy/notification outcome; retain exactly-once tokens/cursors. Distinguish not-published, published-with-error, and uncertain publication. Phase 1b adds release outcomes and partition poison.
 * Wire device worker stop/failure propagation and management notification before storage begins to depend on fallible copyback/status completion.
-* Test used-element/index partial publication, packed marker visibility, and release failure after visible used marker. A visible completion never replays backend work or completion.
+* Test used-element/index partial publication, packed marker visibility, and failure after a visible marker. A visible completion never replays backend work or completion. Root-release failure injection belongs to phase 1b.
 
-### Stage C — bounded owned storage
+### Stage 1C — bounded owned storage
 
 Files/functions:
 
@@ -350,17 +342,16 @@ Files/functions:
 
 Do not solve every storage backend by adding its own `always_bounce` flag. The common boundary provides coverage; backend-specific buffers remain for alignment/DMA requirements only.
 
-### Stage D — virtio queues and simple devices
+### Stage 1D — simple devices and in-process vsock
 
 Files/functions:
 
-* `virtio/src/queue.rs`, `queue/split.rs`, `queue/packed.rs`: copy-only metadata access, no preemptive locking under policy, checked indirect metadata, bounded windows.
-* `virtio/src/common.rs` and `in_order.rs`: use the already-landed Stage B.1 fallible completion API; retain ordering and notify semantics.
-* `virtio_console`, `virtio_rng`, `virtio_p9`: use common copy scopes, bound allocations, correct failure lengths; do not hold guest access through backend waits.
+* `virtio/src/common.rs` and `in_order.rs`: use the already-landed Stage 1B fallible completion API; retain ordering and notify semantics.
+* `virtio_console`, `virtio_rng`, `virtio_p9`: use existing synchronous copy APIs, bound allocations, and correct failure lengths; do not pass guest slices to backend waits. Existing hypervisor grants may persist in phase one.
 * `virtio_vsock/src/lib.rs`: `lock_payload_data`, `handle_guest_tx_inner`, `write_packet`.
 * `virtio_vsock/src/connections.rs`: owned RX/TX paths, bounded credit-aware fallback buffer, partial/socket progress and lifetime handling.
 
-### Stage E — network staging
+### Stage 1E — network staging
 
 Files/functions:
 
@@ -370,24 +361,49 @@ Files/functions:
 * `net_mana` construction/resolution: force driver bounce and gate unsupported offloads.
 * TAP/DIO/Consomme: test with scratch memory and asynchronous/partial completion. Optimization to remove extra copies follows correctness.
 
-### Stage F — broader devices and documentation
+### Stage 1F — per-device enablement, broader coverage, and documentation
 
 * Implement virtio-fs request/reply staging without DAX before allowing it.
-* Audit non-virtio controller metadata and memory-transfer helpers against the new hook. Add each device to the allowlist only after it passes guard/export tests.
+* Audit non-virtio controller metadata and memory-transfer helpers for synchronous copies and owned payloads. Add each device/backend combination to the bounce-I/O allowlist only after its phase-one tests pass; no phase-two kernel proof is required to ship a converted subset.
 * Keep incompatible backends rejected. Shadow vhost queues, assigned-device emulation, and copied VMBus rings require separate plans.
-* Update the Guide memory-backing architecture page, SNP support notes, device/backend compatibility pages, and CLI reference if configuration changes. State the unsupported configurations, staging limits, ordering/error behavior, and performance costs. Do not describe anonymous `shared=off` RAM as SNP-private state.
+* Update the Guide memory-backing architecture page, SNP support notes, device/backend compatibility pages, and CLI reference if configuration changes. Explain the independent opt-in bounce-I/O mode, tested combinations, buffer limits, costs, and retained kernel pins/host-access behavior. Do not describe it as MM isolation or anonymous `shared=off` RAM as SNP-private state.
 * Follow `.github/instructions/doc-code-sync.instructions.md` for implementation changes. This planning task itself does not change the Guide.
+
+### Stage 1G — phase 1b scoped copies on existing interfaces
+
+* Extend internal `PartitionHostAccess` with fallible release/cleanup; route the leaf hook through existing `modify_gpa_host_access`, without a new Hyper-V ABI or BEGIN/END ioctl.
+* Add the partition coordinator in `virt_mshv`: checked 4 KiB RAM ranges, pending acquisition through completed release, serialization, and whole-request conflict denial across VPs. Resolve the existing attribute failure-completion path before permitting guest-visible denial/resume; otherwise keep the halt/stop fallback.
+* Route existing PSP and AP VMSA/doorbell page use through the same admission domain without changing their ABI. Reserve before submission or replacement; exclude payload/metadata copies through the required control lifetime. Resolve failure-return behavior before resuming conflicts, retain uncertain exclusion, and never hold the coordinator mutex across an ioctl or copy.
+* Integrate `guestmem`/`VaMapper` leaf copies, including metadata and mapped-success operations. Adapters acquire no outer guard; backend/RPC waits carry no grant.
+* Add failed acquisition/release and visible-publication tests, plus platform regression/ordering tests of existing calls. Release failure blocks the range, stops the partition, and retains cleanup ownership. No lite-MM capability is required.
+
+### Stage 2A — kernel backing and MM integration
+
+Start after companion backing/MM gates pass. Reuse stage 1G; do not replace it with a token API.
+
+* `vmm_core/virt_mshv/src/lib.rs`: kernel backing capability checks and ownership/teardown drain, timeout/death, and pending-operation coordination where needed.
+* `openvmm/membacking/src/memory_manager/mod.rs`, `mapping_manager/manager.rs`, and `region_manager.rs`: allocate/map one lite object with 4 KiB backing, preserving GPA/file-offset layout, holes, permissions, and lifetime. Require MM no-GUP/no-PFN-export enforcement; reject unsupported hotplug/restart combinations.
+* `vmm_core/virt_mshv/src/x86_64/snp.rs`: integrate existing scoped host-access calls with kernel object state. Supported ownership transitions must exclude active/pending grants; unimplemented transitions remain rejected.
+* `MshvIsolationState::map_user_memory`, `PartitionMemoryMap::map_range/unmap_range`, `snp_launch_initial_pages_inner`, and `add_snp_vmsa_mapping`: adopt backing-registration/import and kernel-owned initialization lifetimes. Bind closes initialization access and invalidates aliases. Do not reuse legacy user-VA registration as proof of no pins.
+* Runtime `handle_snp_guest_request`: reject before PSP submission unless a verified owned-buffer protocol is negotiated; supported operations need persistent completion owners. Preserve authentication/protocol semantics.
+* `handle_snp_ap_create` and doorbell handling: implement or reject typed control-page lifecycles, with page identity/type, replacement/unregistration, VP quiescence, terminal reclaim, and no ordinary payload exemption. Kernel GHCB state remains separate.
+* `vm/vmcore/guestmem/src/lib.rs` and `va_mapper.rs`: preserve stage 1G leaf-only access while kernel faults/revocation enforce authorized map state. Reuse owned payload paths and release-error publication behavior unchanged.
+* Add phase-two backing/MM, ownership/control, and reclaim tests and its enablement gate below.
+
+Use existing typed guestmem errors, `thiserror` protocol errors, `anyhow::Context` for configuration, and rate-limited guest-triggered diagnostics. No new unsafe device interface. Rust 2024 and `guest_arch` rules apply to both phases.
 
 ## 6. Kernel dependencies and teardown boundary
 
-This plan does not inspect or design the kernel implementation. It aligns with the companion `plan-mshv-guest-memfd-lite.md`, especially its API, two-phase drain, persistent async-owner, MM-export, and hugepage gates; those are proposed contracts, not current kernel capabilities. Ownership transitions alone are insufficient for per-copy acquire/release. Section 4.2 and the companion's section 4 now use the same proposed `MSHV_CAP_LITE_COPY_WINDOWS` and `MSHV_BEGIN_COPY_WINDOW`/`MSHV_END_COPY_WINDOW` contract. Actual ABI, eligibility, and Hyper-V grant/release/barrier behavior remain unresolved until verified; no implementation is assumed. The previous shutdown report supplied by the parent is historical context, not current proof. Neither `research-mshv-snp-teardown.md` nor `mshv-snp-unmap-first.patch` was present at the OpenVMM root during the initial research.
+**This section applies to phase two.** Phase 1a retains current backing, registration, acquisition-only access, launch/control behavior, and teardown; phase 1b adds balanced existing host-access calls. Both drain owned backend work before freeing scratch. Neither claims to repair kernel teardown or guarantee allocator return. No new window/drain/PSP capability gates phase 1a or scoped copies.
+
+The companion specifies backing registration, ownership/teardown drain, retained async ownership, and MM export denial. Temporary copies use the existing host-access interface in both plans; guest ownership changes are separate. Verify existing-call ordering/failure behavior on the platform, not a proposed Hyper-V feature. Historical shutdown reports are not allocator-return proof.
 
 The OpenVMM side currently stores `mshv_user_mem_region` with a userspace VA, defers SNP registration until launch, and calls `map_user_memory` after isolation configuration. It also keeps a separate VMSA mapping. This is a real kernel handoff independent of payload I/O. Sources: `vmm_core/virt_mshv/src/lib.rs:273-294,980-999`; `vmm_core/virt_mshv/src/x86_64/snp.rs:604-634,682-711`.
 
 Required kernel answers before enabling `guest_memfd_lite`:
 
 1. What actual feature negotiation/backing registration binds this one fd and offsets to guest GPAs without pinning/locking guest folios? Current userspace registration is not proof of that property.
-2. What scoped-root-window capability permits copies without changing guest ownership, including any explicitly supported non-shared ownership case? What makes ownership transitions mutually exclusive with admitted windows? What is the release point, and does it revoke all relevant aliases?
+2. How does the existing modify-host-access path enforce lite object acquisition/release state, fault admission, alias zap, and TLB completion? How are ownership changes excluded from all active/pending grants?
 3. What does read-only acquisition mean? Current MSHV code requests both read and write.
 4. How are mixed-state/partial range acquisition failures reported and rolled back?
 5. What is the behavior when release, unmap, or partition destruction fails? Which component retains the cleanup/retry owner?
@@ -396,23 +412,25 @@ Required kernel answers before enabling `guest_memfd_lite`:
 8. What verified owned-buffer PSP interface preserves the guest request protocol? Until supplied, reject runtime guest requests before the current GPA-based ioctl. What AP VMSA/doorbell exception protocol provides registration/replacement/unregistration, VP quiescence, no pins, terminal reclaim, and death handling?
 9. Does capability discovery include immutable MM denial of every enabled non-GUP PFN consumer? GUP rejection, `supports_locking=false`, and userspace device restrictions alone do not satisfy the gate.
 
-### Required drain and asynchronous ownership protocol
+### Kernel ownership/teardown drain and asynchronous lifetime
+
+This protocol applies to explicit kernel ownership changes and teardown, **not each copy**. Normal conflicting guest exits are rejected under section 4.2; backend latency never holds a guest grant. Nonconflicting changes remain rejected until separately supported.
 
 Use the companion kernel plan's transaction ID, drain epoch, and generation fields, not an unscoped “drained” boolean:
 
 1. Kernel reserves the durable transition, gates new VP runs, and kicks/drains running VPs. Before ownership or alias changes, it publishes the drain phase and notifies the controller.
 2. OpenVMM atomically closes new range windows and device copyback admission. Already admitted eligible copies can still fault their aliases and use their existing root grants; no blanket fault closure or access withdrawal may precede their drain.
 3. Drain admitted leaf copies without fault/invalidation locks, mapping/RPC waits, or locks needed by those copies. Queue completed scratch for later or fail/discard it by protocol; it cannot acquire a new window for the draining generation.
-4. At zero admitted copies and known terminal window state, send acknowledgement with transaction ID, epoch, expected generation, and controller identity. Stale/wrong-controller/wrong-generation acknowledgements fail. Uncertain release poisons the partition and prevents a success acknowledgement.
+4. At zero admitted copies and resolved acquisition/release state, acknowledge transaction ID, epoch, generation, and controller identity. Stale or mismatched acknowledgements fail. Uncertain release stops the partition and prevents success acknowledgement. No kernel copy token is required.
 5. Only then may the kernel close faults, drain existing fault handlers, revoke every alias and complete translation/cache barriers, and execute/commit the verified ownership operation. The kernel must still enforce revocation against raw user accesses; the local lease count is coordination, not hardware authority.
 
 Adopt finite controller drain and pending-operation deadlines consistent with the companion's proposed defaults (5 seconds for drain acknowledgement, 30 seconds for pending-operation watchdog; finite administrative limits). These are watchdog/error bounds, not permission to force free or cancel:
 
 * Timeout or interrupted waiter before revocation retains the documented committed state and serviceable old faults until safe abort/recovery; no private commit proceeds without acknowledgement. Keep VPs gated and publish durable status.
 * Closing a controller fd while its owner mm/VMA remains alive does not prove copies drained. Only kernel-established owner-mm death/exec and its alias/VP/fault barriers permit the companion's death path; never manufacture a userspace acknowledgement.
-* If a hypercall/window/control operation is pending, a kernel partition-wide owner persists after timeout, interruption, or process death. It retains partition/backing/binding, bounce input/output, intercept token, completion slot and routing references. It records authoritative terminal payload/progress, not progress sampled before `CALL_PENDING`.
+* For kernel ownership/control/teardown operations that can remain pending, a kernel partition-wide owner persists after timeout, interruption, or process death. It retains backing, binding, input/output, and completion routing until authoritative terminal results. Existing host-access calls must retain uncertain cleanup too; this is not a new per-copy async ABI.
 * Serialize long pending operations per partition. Do not reuse the wire completion slot, partition identity, or buffers on timeout. Unexpected/uncertain completion poisons the partition; late completion reaches the original owner and triggers verified recovery, never automatic VM resume.
-* Missing verified completion routing, final-progress semantics, drain liveness, or owner-death behavior disables the applicable private/scoped-window capability. No fallback to a legacy ioctl may bypass that decision.
+* Missing ownership/control completion routing, final-progress semantics, drain liveness, or owner-death behavior disables that lite operation/capability. No legacy ioctl bypass is allowed. Phase 1b uses existing calls and stops on uncertain completion, without requiring a new scoped-window capability.
 
 OpenVMM shutdown order must be:
 
@@ -433,11 +451,30 @@ Current `MshvPartitionInner::unmap_range` retains its tracked entry when `unmap_
 
 ## 7. Tests and measurable acceptance criteria
 
-### Unit and component tests
+### Phase-1a acceptance on existing backing and kernel
+
+These tests require no new kernel ABI, no lite object, and no root-window mock to enable the bounce-I/O mode:
+
+1. Exercise direct, `Arc`, nested subrange, multi-region, translated, and remote device views. Denied lock/VA/FD/IOVA exports must remain denied; host-owned scratch stays usable. Prove the legacy MSHV RAM-registration/control path still works.
+2. Use storage and network fakes that reject actual guest backing identity, pointers, descriptors, and DMA addresses at payload handoff and on delayed consumption. Observe guest-copy begin/end events for synchronous byte copies, not hypervisor grants: no device request retains a guest slice/copy operation during backend work. Existing root grants and registration pins may remain.
+3. Test aligned/page-compatible and scattered block requests in both directions; preserve FUA/flush/discard, exact counts, backend errors, and direct-I/O alignment. Exercise file and block backends on the current kernel.
+4. Test delayed/partial network submission, RX copyback, stale/duplicate slot IDs, and TX offload metadata from the same owned snapshot. Include console/RNG/9p/in-process vsock only as their conversions pass.
+5. Inject payload/status/ring-copy errors with an ordinary failing guest-memory test backing. Never replay a committed backend write or visible completion; fail the queue and surface publication errors.
+6. Test request limits, allocation failure, scratch budget saturation, oversize requests, cancelled budget waits, backend stalls, stop/reset drains, and initialized-length copyback. Verify hard active/retained memory bounds.
+7. Reject guest-backing export configurations in the opt-in bounce mode before device mapping/submission. Ordinary non-opt-in configurations keep their existing behavior. Do not require or fake kernel no-GUP/no-PFN-export tests.
+8. Run admitted combinations on existing backing, including current `virt_mshv` SNP bring-up where supported. Confirm unchanged registration/control calls and continued rejection of guest attribute transitions. No new guest_memfd or scoped-window ioctl is sent, and missing new capabilities do not prevent bounce-I/O startup.
+9. Measure buffer bytes, copy count, latency, throughput, and CPU. Compare ordinary-guest baseline and document that host grants and kernel registration pins are unchanged.
+
+A block-only configuration can pass this gate and ship before network/simple devices. Expand the allowlist per tested combination; do not claim “all I/O” for unconverted devices or existing hypervisor control operations.
+
+### Phase-1b scoped-copy tests and phase-two extensions
+
+Tests 1–12 cover scoped-copy userspace behavior in phase 1b, using existing calls/fakes and phase-1a buffers/queues. Add platform regression tests for the existing calls and startup/initialization grant accounting. Tests 13–17 add kernel ownership/control/MM enforcement and base-page scope in phase two. No new copy-window UAPI is required.
 
 1. Add a fake revocable backing/coordinator with active read/write counters, acquisition/release events, state generations, explicit private/unmapped states, and injectable acquire/copy/release failures.
-2. Assert every byte/plain/fill/atomic operation balances access on success and error, including mapped-success accesses that never fault, page-crossing copies, overlapping scopes, zero lengths, and nested subranges. Record exact backing identity, translated/rounded leaf range, mode, generation, token, and acquire/release counts. Translation/RPC adapters acquire zero outer windows, and a leaf acquires once per defined copy batch. No lease spans RPC waiting or response processing.
-3. Test ineligible private, unmapped, overflowed, mixed-state, and transitioning ranges; changing state during a copy must serialize or return an error without a panic or infinite retry. Test any explicitly negotiated grant while ownership is unchanged separately; ordinary acquire/release must never issue SHARED/PRIVATE transitions.
+2. Assert byte/plain/fill/atomic operations balance access, including mapped-success, page-crossing, overlapping, zero-length, and nested-subrange copies. Record exact RAM identity, translated/rounded 4 KiB GPA ranges, mode, generation, and acquire/release counts. Adapters acquire no outer grant; leaf admission happens once. Failed acquisition never copies; failed/uncertain release keeps ranges blocked and stops the partition. No guard spans RPC waits.
+3. Test malformed, unmapped, overflowed, ineligible, and transitioning ranges. Race guest attribute admission on other VPs with pending acquisition, copy, and release. Reject a request atomically if any range conflicts; no partial update. Test reverse admission, denied unsupported nonconflicting changes, serialized overlap, and metadata sharing payload pages. Existing calls must not issue per-copy SHARED/PRIVATE transitions or require forced sharing. Successful grants need Hyper-V authorization. Verify actual failure-return/resume if established; otherwise unresolved completion retains halt/stop with no success/replay or fabricated retry status.
+   Also race PSP request/response use against acquisition, copy, and release in both admission orders on different VPs; inject failed PSP restoration and control-page registration overlapping payload or metadata. Confirm visible reservations permit conflict handling without waiting for the active ioctl or copy.
 4. Test `Arc` and subrange policy propagation. Existing `test_supports_locking` covers direct and multi-region cases but not this whole export contract (`vm/vmcore/guestmem/src/lib.rs:2674-2709`).
 5. Test adversarial descriptors: split/packed, indirect cycles/nesting, length truncation, huge descriptors, address overflow during header skips, short header/status capacity, repeated pages, unaligned scatter boundaries, and metadata sharing a page with payload.
 6. Extend virtio-blk's existing scatter bounce round trip with **aligned/page-compatible** copy-only requests. Use a backend that asserts its memory is host-owned and observes zero active guest grants before entering and at every backend poll/await.
@@ -451,19 +488,19 @@ Current `MshvPartitionInner::unmap_range` retains its tracked entry when `unmap_
 14. Test PSP rejection before submission without the owned-buffer capability; supported PSP paths must show owned input/output and persistent pending ownership. Test AP VMSA/doorbell exception registration, overlap/page type, replacement, VP stop/drain, failed unregister/reclaim, owner death, and no ordinary backend access. Kernel GHCB-state accesses must create no guest backing window.
 15. Test capability rejection without no-PFN-export enforcement and independently attempt KVM remapped resolution, VFIO, legacy MSHV MMIO, and each enabled raw-PFN consumer through prefaulted shared aliases. Verify terminal denial after split/remap/alias/protection changes, not only GUP failure.
 16. Test pending acquire/release/control operation completion-before-return, delayed/late terminal result, timeout/death, duplicate/unexpected routing, and teardown. Confirm persistent owner references and no slot/partition-ID/buffer reuse. Hardware NVMe/network remain disabled until equivalent terminal completion/reset/drain ownership tests pass.
-17. Test huge capability absence and positive verified cases independently: allocation order, host PTE and guest SLAT granules, ownership/grant granules, mixed-state/subpage transitions, confirmed demotion, and VMSA/control exclusions.
+17. Verify base-4-KiB lite allocation/maps/grants and rejection of unsupported large-page operation without changing unrelated legacy guests. Positive huge-folio, large-grant, and demotion tests are deferred.
 
 Use `test_with_tracing::test` in new unit modules and rate-limited diagnostics for guest-triggered errors. Assertions are for internal invariants, never malformed guest inputs.
 
-### Kernel-backed/VMM acceptance
+### Phase-two kernel-backed/VMM acceptance
 
 These are required future tests, not tests run for this document:
 
 * Boot an SNP guest using one `guest_memfd_lite` backing with allowed block/network/simple virtio devices, and perform sustained bidirectional I/O with split/packed and indirect descriptors.
 * Instrument the userspace copy coordinator: active guest-access scopes must be **zero at each backend handoff, await/poll boundary, queued DMA submission, and idle queue wait**. This is per request/thread; another independent copy may be active elsewhere.
 * Instrument actual kernel guest backing references/pins: **zero guest backing kernel pins/locks**, including map-by-file, GUP, io_uring, VFIO/iommufd, vhost, backing registration, runtime PSP/AP/doorbell controls, and teardown paths. Physical-device scratch pins and kernel GHCB state are excluded and separately attributed. Ordinary backing lifetime references remain accountable until verified reclaim; do not mislabel them as GUP pins or allocator return.
-* Prove enforced non-GUP PFN denial in the actual supported kernel configuration. A kernel missing that restriction must advertise no public lite/scoped-copy capability; user avoidance or skipped consumer tests is not acceptance.
-* Attempt private/shared transitions during I/O, including queued RX with no packet, backend read in flight, copyback, and ring publication. Backend latency must not hold up a transition through a guest buffer grant. Only bounded live copy windows may delay it.
+* Prove enforced non-GUP PFN denial in the supported kernel configuration. Missing enforcement means no public lite-MM capability, not loss of the independent phase-1b existing-call path. User avoidance or skipped tests are not acceptance.
+* Attempt attribute changes during queued RX, backend reads, copyback, and ring publication. No grant exists during backend waits. Conflicting guest requests are rejected across pending acquisition through completed release, not queued behind I/O. Nonconflicting unsupported changes stay rejected. Separately supported kernel ownership/teardown drain waits only for bounded live copies.
 * Trace ordinary copies: each has a balanced root-grant acquire/release and unchanged committed guest ownership. Transition traces must show serviceable admitted-copy faults before exact epoch acknowledgement, then fault closure/alias revocation and ownership commit.
 * Inject acquisition/release/unmap/teardown failures. The system must retain cleanup ownership, fail closed, and provide observable outstanding state. An ioctl returning zero is not sufficient.
 * On normal shutdown and faulted shutdown, confirm no active scopes, no guest pins, no remaining mapping/reference owners, and eventual backing allocator return with kernel evidence. Check RAM and VMSA/control pages separately.
@@ -482,35 +519,47 @@ Implementation validation: scoped `cargo check`, `cargo clippy --all-targets`, `
 * New fallible completion behavior changes queue recovery semantics. Existing logging is not a reliable completion protocol for revocable metadata.
 * Existing controllers/backend variants are broader than virtio. An allowlist is safer than a claim that disabling page locking converts all devices.
 * Blocking synchronous copy acquisition can harm executor latency. Keep batches bounded and reject inaccessible pages rather than waiting for a guest that requires this same executor to run.
-* Snapshot/restart, hugepages, hotplug, NUMA, existing-backing files, and remote mapping need explicit compatibility decisions for the new backing. Current shared-file restart APIs do not prove new-fd restart support.
+* Snapshot/restart, hotplug, NUMA, existing-backing files, and remote mapping need compatibility decisions for lite backing. Large pages are deferred. Current shared-file restart APIs do not prove new-fd restart support.
 
 ### Unresolved claims — do not present as facts
 
-* `guest_memfd_lite` registration/acquire/release ABI, granularity, capability discovery, no-pin semantics, and release visibility ordering are not established by this userspace research.
+* Lite backing registration, MM capability discovery, no-pin enforcement, and reclaim are not implemented. Temporary acquisition/release uses the existing ioctl; platform tests must validate ordering and failures.
 * Whether current kernel MSHV registration still pins particular SNP backing/control pages is not proved here.
 * No full guest RAM dirty-tracking/migration scheme for this SNP backing was proved.
 * No automatic bounce proxy exists for kernel vhost, vhost-user, or arbitrary assigned devices in the paths read.
 * No universal safe cancellation contract was proved for host NVMe DMA or every `DiskIo` backend; the io_uring abort contract is confirmed.
-* The proposed BEGIN/END window ABI is aligned with the companion plan, but ownership-preserving root grant/release, barrier semantics, permitted ownership states, and pending-operation outcomes still need verification. Ownership transitions cannot substitute for it.
-* A compatible owned-buffer PSP API and no-pin AP VMSA/doorbell exception lifecycles were not proved. Those operations remain rejected or separately capability-gated; the kernel GHCB-state mapping is not a guest-RAM exception.
+* The exact existing GPA-attribute rejection/completion path is not established by the scoped trace. Until resolved, stop on unsupported/unresolved exits rather than resume or claim clean denial. Existing-call platform ordering/failure tests remain; no new Hyper-V feature or BEGIN/END contract is proposed.
+* For phase two, a compatible owned-buffer PSP API and no-pin AP VMSA/doorbell exception lifecycles were not proved. In that phase, those operations must be rejected or separately capability-gated until verified. Phase one preserves existing supported PSP/AP/doorbell behavior and explicitly excludes it from the bounced device-payload guarantee. The kernel GHCB-state mapping is not guest RAM.
 * Enforced no-PFN-export coverage, dead-owner/pending-completion recovery, and physical-device terminal drain/reset are capability prerequisites, not properties inferred from userspace bounce branches.
-* Huge backing allocation, ownership/grant granules, and safe subpage demotion were not proved. Base-page support cannot imply hugepage support.
+* Large-page support is deferred, not a blocker for the 4 KiB implementation.
 * The suggested request cap and pool sizes need measurements and a feature-advertisement decision.
 * In-process virtio-fs may be made copy-only without DAX, but its current streaming dispatch is not already an owned-request boundary.
 
-### Enablement gate
+### Phase-1a enablement gate
 
-Enable only after:
+Enable the explicit bounce-I/O mode for a tested device/backend subset after Stage 1A policy, Stage 1B completion handling, that subset's conversions, bounded scratch/lifetime tests, current-kernel I/O tests, and documentation pass. Keep current registration, acquisition-only host access, launch/control support, and fail-closed SNP transition behavior. Reject configurations that would export actual guest backing for payload I/O.
 
-1. Both plans' proposed copy-window contract has a concrete tested ABI and verified ownership-preserving grant/release/barriers. The kernel supplies one-backing/no-pin/no-PFN-export enforcement, exact drain acknowledgement, timeout/death behavior, persistent pending-completion ownership, teardown, and failure recovery.
+No lite backing, BEGIN/END token, MM no-pin/no-PFN-export proof, transition handshake, no-registration-pin claim, or allocator-return proof is required for this gate. Those guarantees are absent, not simulated. Hardware payload backends still require demonstrated completion/reset/drain safety for their owned buffers; defer them without blocking software/file/block/network subsets.
+
+### Phase-1b scoped-copy gate
+
+After stage 1G, enable scoped copies on existing backing only after leaf balance, range admission, metadata/publication, release-failure cleanup, and existing-call platform tests pass. Establish the existing failure completion before permitting guest-visible denial/resume; otherwise preserve fail-closed stop. No lite-MM capability, new Hyper-V operation, or kernel token API is required. This gate does not claim Linux mapping revocation or pin-free backing.
+
+### Phase-two isolation enablement gate
+
+Enable lite backing and scoped private-memory isolation only after:
+
+1. Existing host-access calls integrate with lite object/fault/map state and alias/TLB revocation. The kernel supplies one-backing/no-pin/no-PFN-export enforcement, ownership/teardown drain, timeout/death behavior, retained pending-completion ownership, and reclaim/recovery. No copy-window token ABI.
 2. Capability propagation/export denial, scoped copies, fallible completion, owned storage/network staging, and allocation limits pass component tests.
 3. Every enabled device/backend/control combination has a reviewed coverage row and kernel-backed test evidence. PSP has an owned-buffer protocol or is rejected; AP VMSA/doorbell exceptions have verified no-pin control lifecycles. Host NVMe/physical network remain disabled without confirmed drain/reset ownership.
 4. No guest access spans backend work, no guest backing is exported or pinned, and transitions/shutdown pass adversarial tests.
-5. Hugepage support is separately gated on allocation, ownership/grant granules, and demotion tests. The Guide states compatibility restrictions and measured costs.
+5. The implementation is 4 KiB-only. The Guide states this scope, compatibility restrictions, and measured costs; large pages are a separate follow-up.
 
-Until then, retain current fail-closed SNP transition behavior and reject unsupported configurations. Do not market the existing bounce helpers as sufficient isolation.
+Unsupported guest transitions remain rejected in every phase; unresolved denial completion stays stopped. Phases 1a and 1b can ship independently of lite-MM gates, but are not MM enforcement or complete private-memory isolation.
 
 ## Review
+
+**History notice — superseded on 2026-10-08:** Earlier BEGIN/END copy-window capability/UAPI, token recovery, phase-two-only scoped copies, and large-page launch requirements no longer apply. The staging review's phase-two-only metadata grant rule is also superseded by phase 1b. Keep the historical findings on owned payloads, leaf-only copies, publication ordering, MM enforcement, and safe cleanup. Earlier verdicts do not approve this revision.
 
 ### Initial review
 
@@ -526,7 +575,7 @@ Until then, retain current fail-closed SNP transition behavior and reject unsupp
 
 This source-based review was performed by the `review-plan` agent. Future ABI and hardware results remain enablement prerequisites, not approved assumptions.
 
-### Author response — main-plan revision
+### Author response — main-plan revision (historical; token and large-page requirements superseded)
 
 Addressed all three required items and the localized refinements above:
 
@@ -538,10 +587,36 @@ Addressed all three required items and the localized refinements above:
 
 The main plan now contains these changes; the initial review text is preserved. No implementation, kernel capability, or hardware result is claimed. Only this OpenVMM plan was edited; focused re-review remains for the parent to request.
 
-### Final confirmation
+### Final confirmation (superseded approval)
 
 **Verdict: Ready at plan-review level.** The reviewer confirmed that all original must-fix items and localized refinements are resolved. No residual must-fix plan changes remain.
 
 The added section 4.2 rules provide owner-authorized recovery of copy-window tokens and terminal results after failed delivery, with idempotent request correlation and explicit interrupted-end tests. Unbound initialization windows serialize per object; bind closes admission, drains windows, invalidates aliases, establishes the runtime root baseline, and transfers admission to the partition. Failed binding reopens initialization only after confirmed wholly unbound host-owned rollback; otherwise it quarantines the object.
 
 This approves the plan's structure and safeguards, not the future kernel ABI, MM enforcement, Hyper-V semantics, or hardware behavior. Those remain explicit proof and enablement gates. Initial review and author responses above are retained as history.
+
+### Staging revision — 2026-10-08
+
+At the user's request, separated kernel-independent bounce I/O from enforced lite isolation. Stages 1A/1B precede independently deliverable storage, simple-device, and network conversions; Stage 2A now contains backing/scoped-access/transition/control integration. Each phase has a separate acceptance and enablement gate. Phase one preserves legacy registration, host grants, control behavior, and SNP transition rejection, and explicitly makes no kernel no-pin or private-memory claim. This revision awaits plan review; the earlier approval is retained as history.
+
+### Staging review (historical; scoped-access staging superseded)
+
+**Verdict: Minor revisions.** Kernel-independent bounce I/O is correctly separated from lite isolation, and the companion delivery-order note is consistent. The reviewer requested three localized corrections: qualify the metadata grant/coordinator rule as phase-two-only, move shared virtio queue policy/validation into Stage 1A rather than optional Stage 1D, and qualify the PSP/AP/doorbell rejection rule as phase-two-only. All three are incorporated in the main plan.
+
+The reviewed order preserves current registration, acquisition-only host access, supported control behavior, and fail-closed SNP transitions while allowing a tested block-only subset to ship first. Phase-two MM/window/control/reclaim gates and applicable owned-buffer completion/drain requirements remain intact. This review assessed the staging text, not source execution or hardware results.
+
+### Author response — existing access, conflict denial, and 4 KiB scope, 2026-10-08
+
+Replaced the proposed BEGIN/END/token dependency with existing host-access acquire/copy/release. Phase 1a still ships bounce-first; phase 1b scopes leaf payload and metadata copies independently of lite backing. Completed backend read/RX copies back only after acquisition; write/TX copies out and releases before submission. One coordinator covers pending acquisition through completed release with 4 KiB GPA ranges and RAM identity. Any conflicting guest attribute request is rejected as a whole across VPs; uncertain release blocks ranges and stops the partition with retained cleanup.
+
+The narrow trace does not establish the existing GPA-attribute failure-completion/resume mechanism. TripleFault is stopping, not clean denial; preserve halt/stop until the actual protocol is established. No new hypervisor interface is requested. Kernel MM/private revocation and safe reclaim stay in phase two. Large pages are deferred, without deferring direct-map safety or changing legacy superpage support.
+
+**Review pending.** No implementation, build, or hardware result is claimed.
+
+### Existing-interface revision review
+
+**Verdict: Minor revisions; corrections incorporated.** The existing acquire/release interface is sufficient for the planned scoped-copy implementation; no new Hyper-V operation or copy-token ioctl is required. Both I/O directions, metadata, failed-release quarantine, bounce-first staging, and deferred large pages are consistent.
+
+The reviewer required admission coordination for existing PSP/AP/doorbell page use in phase 1b, not only copies and attribute exits. The main plan now reserves those pages before side effects and keeps exclusions through the required control lifetime. The coordinator mutex is held only for admission/state updates, not ioctls or copying. Added multi-VP PSP/copy races, restoration failures, and control-page overlap tests.
+
+The companion kernel plan now drains confirmed eligible grants independently of guest ownership labels. This preserves fault liveness and MM revocation without assuming SHARED is required for every authorized grant. Exact clean GPA-attribute denial/resume remains an existing-protocol integration question; unresolved exits remain stopped. This review assessed the plans and targeted source paths, not hardware execution.
