@@ -2,7 +2,7 @@
 
 Status: implementation plan, not an implemented or validated isolation boundary.
 Research date: 2026-10-07. Sources below refer to the current working tree, including the user's SNP changes. Line numbers will move as those changes develop.
-Revision: 2026-10-08 user correction incorporated and reviewed. Review reached **Minor revisions**; those corrections are incorporated. Scoped acquire/copy/release uses existing host-access calls, not a new hypervisor interface. Lite MM enforcement follows separately. The first implementation uses only 4 KiB pages; large pages are deferred.
+Revision: 2026-10-08 user corrections and mandatory `chris-mshv` hardware acceptance incorporated and reviewed. Both reviews reached **Minor revisions**; corrections are incorporated. Scoped acquire/copy/release uses existing host-access calls, not a new hypervisor interface. Lite MM enforcement follows separately. The first implementation uses only 4 KiB pages; large pages are deferred.
 
 Companion: [MSHV kernel backing and isolation plan](plan-mshv-guest-memfd-lite.md).
 
@@ -462,10 +462,53 @@ These tests require no new kernel ABI, no lite object, and no root-window mock t
 5. Inject payload/status/ring-copy errors with an ordinary failing guest-memory test backing. Never replay a committed backend write or visible completion; fail the queue and surface publication errors.
 6. Test request limits, allocation failure, scratch budget saturation, oversize requests, cancelled budget waits, backend stalls, stop/reset drains, and initialized-length copyback. Verify hard active/retained memory bounds.
 7. Reject guest-backing export configurations in the opt-in bounce mode before device mapping/submission. Ordinary non-opt-in configurations keep their existing behavior. Do not require or fake kernel no-GUP/no-PFN-export tests.
-8. Run admitted combinations on existing backing, including current `virt_mshv` SNP bring-up where supported. Confirm unchanged registration/control calls and continued rejection of guest attribute transitions. No new guest_memfd or scoped-window ioctl is sent, and missing new capabilities do not prevent bounce-I/O startup.
+8. Require real `virt_mshv` SNP guest boot and virtio-blk read/write acceptance on the available `chris-mshv` host, following the procedure below. Confirm unchanged registration/control calls and continued rejection of guest attribute transitions. No new guest_memfd or scoped-window ioctl is sent, and missing new capabilities do not prevent bounce-I/O startup.
 9. Measure buffer bytes, copy count, latency, throughput, and CPU. Compare ordinary-guest baseline and document that host grants and kernel registration pins are unchanged.
 
 A block-only configuration can pass this gate and ship before network/simple devices. Expand the allowlist per tested combination; do not claim “all I/O” for unconverted devices or existing hypervisor control operations.
+
+### Required phase-1a hardware acceptance: `chris-mshv`
+
+**Real SNP boot plus exercised virtio-blk is a release gate, not an optional smoke test.** Component tests remain necessary but cannot replace this run. If the machine or artifacts are unavailable, report hardware acceptance as blocked; do not mark it passed or substitute a non-SNP/KVM boot. This planning change does not run or deploy anything on the host.
+
+#### Prepare without changing the platform
+
+1. Confirm the intended host, current kernel release, `/dev/mshv` access, and the known-good SNP boot artifacts/command on `chris-mshv`. Record the OpenVMM source revision, binary digest, exact command, guest kernel/initrd or IGVM digests, and host kernel release. Prior SNP boots are historical context, not proof of the current host state. Do not reboot, replace the kernel, change its default boot entry, or overwrite known-good guest artifacts for this test.
+2. Use two known builds/configurations: the baseline with bounce mode disabled, and the candidate with the new phase-1a bounce mode explicitly enabled. Preserve other settings, including current acquisition-only host access and rejected attribute changes. The final bounce flag does not exist in this plan; record its implemented spelling and fail test startup if it is unsupported or ignored.
+3. Start from the known-good Linux direct-boot SNP invocation, using loader kernel/initrd or its supported SNP IGVM personality. Keep the minimal chipset, serial console, and existing VMBus restriction. The supported forms are documented in `Guide/src/reference/openvmm/management/cli.md:90-110`; do not introduce UEFI or phase-two lite backing.
+4. Attach a dedicated disposable **file-backed data disk** through the in-process PCIe virtio-blk device, not vhost-user or emulated SCSI/NVMe. Existing CLI syntax is `--pcie-root-complex rc0 --pcie-root-port rc0:rp0 --virtio-blk file:<scratch-disk>,pcie_port=rp0,serial=BOUNCE-TEST` (`Guide/src/reference/openvmm/management/cli.md:374-382,491-502`). Merge with any existing PCIe topology rather than duplicate it. Use a unique, explicitly resolved scratch path and a bounded disk size; never use a host block device, the guest boot image, or another user's data. A 256 MiB scratch disk is sufficient for the minimum workload below.
+5. Ensure the test guest has PCIe/virtio-blk support and a deterministic workload helper. Use existing suitable artifacts, or build a separate test initrd/helper without overwriting them. The test must work through serial with VMBus disabled; do not assume SSH, networking, pipette, or fio is available inside this guest. The helper may use fio if present, but must implement the same checks otherwise.
+
+Confirm artifact compatibility with the selected SNP boot mode, PCIe/virtio-blk, helper, and guest shutdown mechanism before starting acceptance. An embedded/signed IGVM may not accept an external initrd replacement. If a helper needs a rebuilt initrd or IGVM, preserve the original and record the replacement's build recipe and digest. Missing compatible artifacts block acceptance.
+
+Create the scratch disk exclusively in a harness-owned private directory. Refuse preexisting paths, symlinks, non-regular files, and host block devices; verify size and available space. Before guest writes, require exactly one matching serial, virtio-blk binding, expected capacity, and no mounted use. Delete only artifacts created and still owned by this run.
+
+#### Execute and prove the intended path
+
+1. Run the baseline and candidate as separate invocations, with bounded boot, I/O, and shutdown deadlines. Confirm successful SNP launch and guest userspace readiness from explicit log markers, not merely that the OpenVMM process remains alive. Verify in the guest that the data disk has serial `BOUNCE-TEST` and binds to the virtio-blk driver before writing; do not assume `/dev/vda` is the scratch device.
+2. Execute deterministic sequential write/read verification, then seeded random write/read verification, using 512-byte, 4 KiB, and 64 KiB transfers within the configured request limit. Perform at least 10,000 I/O operations per invocation, including writes, and exercise queue depth 1 and a concurrent depth such as 8. Use guest direct I/O where supported to avoid cache-only readback, flush before verification, and check every completed transfer's full byte count and expected contents. Unsupported direct I/O must be recorded and replaced with a documented cache-bypass method, not silently skipped.
+3. Include 4 KiB-aligned, page-compatible requests: these would previously permit the frontend's direct path and must now bounce. Add fragmented/page-crossing requests where the guest workload can produce them. Exact descriptor-shape coverage remains mandatory in component tests; do not claim a particular shape from an ordinary guest syscall without tracing it.
+4. Collect candidate instrumentation at `virtio_blk::do_io`/the common `Disk` staging boundary: copy-only mode selected, requests/bytes staged in both directions, actual guest-backed payload submissions equal to zero, and owned-buffer lifetime through delayed backend completion. Count actual buffer origin at handoff, not just backend bounce counts: a file backend's existing internal copy is not proof that the new frontend/common boundary worked. Metadata remains synchronous guest copying.
+5. Check guest-copy/backend ordering: write capture finishes before backend submission; read/RX-style copyback starts after backend completion and finishes before a successful used-ring completion. No retained guest slice/copy operation spans backend work. Do not require phase-1b balanced hypervisor grants or absence of legacy registration pins in this phase.
+6. Shut down normally and repeat at least three complete boot/I/O/shutdown cycles for the candidate. Capture guest serial, OpenVMM logs/exit status, and the host kernel-log interval for each run. Check for new host warnings/oops, unexpected access errors, and failed partition cleanup. Known teardown issues do not become acceptable because they predate bouncing: an unresolved cleanup failure blocks hardware acceptance, while any fix remains a separately scoped kernel task.
+
+Specify a fixed matrix covering sequential/random access, all three transfer sizes, and depths 1/8, with exact planned and completed read/write counts totaling at least 10,000 operations per invocation. Compute expected contents independently from run ID, offset, and generation. Avoid overlapping outstanding writes and read/write races with disjoint worker ranges or explicit ordering. Drain writes, check flush success, then verify; reset expectations between transfer-size phases and cycles.
+
+Run against the identified, unmounted raw guest scratch device. Validate guest direct-I/O alignment and success, or demonstrate effective cache bypass; flushing alone does not invalidate the guest cache. Record workload-correlated virtio-blk read/write request and byte deltas, with documented splitting/merging. Trace at least one read and write whose actual descriptor regions satisfy `try_build_gpn_list`, the former direct-path predicate (`vm/devices/virtio/virtio_blk/src/lib.rs:705-734`), and show candidate policy still chooses owned staging. Guest alignment alone is not proof of descriptor eligibility. Host file caching may remain enabled.
+
+Record effective MSHV/SNP configuration and evidence that isolated launch completed successfully, followed by readiness/results bound to this run's nonce. The current “completing MSHV SNP launch” message precedes `complete_isolated_import` (`vmm_core/virt_mshv/src/x86_64/snp.rs:827-846`) and is insufficient by itself. Add a post-success test event if needed; do not accept stale serial markers or a non-SNP fallback.
+
+Document how the chosen guest shutdown causes an observable successful VMM exit. The harness owns its process tree, scratch, and logs through failure as well as success. On timeout, preserve diagnostics, attempt bounded guest shutdown, then bounded termination/reaping of only its processes. Check partition cleanup before deleting scratch or beginning another cycle. Uncertain cleanup blocks acceptance and stops further runs; retain artifacts and report operator action without a host reboot or kernel change. Forced termination is not a successful shutdown cycle.
+
+#### Harness and evidence
+
+Prefer a repository-owned repeatable test driver that records exact inputs, verifies serial result markers, enforces deadlines, and preserves logs on failure. **Do not assume an existing Petri SNP test can run unchanged:** the current OpenVMM constructor accepts VBS or no isolation and rejects other firmware isolation (`petri/src/vm/openvmm/construct.rs:671-678`), and its Linux direct-boot load mode sets isolation to `None` (`:922-930`). Initially drive the known-good OpenVMM CLI/guest helper for this hardware gate, rather than broaden phase one into a Petri isolation redesign.
+
+If an existing/new Petri test is used after the required support is implemented, run it through `cargo xflowey vmm-tests-run --filter "test(<implemented-test-name>)"` on the target host; the selector is a placeholder, not a claim that such a test already exists. Do not run raw `cargo nextest -p vmm_tests`. Normal component tests still use the repository's nextest `agent` profile.
+
+Save per-build manifests, helper digest/build recipe, run nonce, seed/workload matrix, and per-cycle workload results, serial/OpenVMM logs, host-log intervals, exit statuses, bounce-origin counters, and peak scratch usage. Baseline must pass the same verification workload; candidate must pass all three cycles as MSHV SNP. Both directions must show owned staging, including formerly direct-eligible requests; actual guest-backed payload handoffs must be zero; ordering, budgets, and shutdown/cleanup must pass. Missing identity, successful-isolation, cache-bypass, staging, ordering/lifetime, budget, or cleanup evidence prevents a pass.
+
+For delayed backend lifetime, use a bounded test hook or cite the required delayed-backend component-test results for the exact build; ordinary file I/O alone does not prove that case occurred. Hardware acceptance remains mandatory regardless of harness choice. Successful boot alone, cached readback, or baseline-only results are insufficient.
 
 ### Phase-1b scoped-copy tests and phase-two extensions
 
@@ -537,7 +580,7 @@ Implementation validation: scoped `cargo check`, `cargo clippy --all-targets`, `
 
 ### Phase-1a enablement gate
 
-Enable the explicit bounce-I/O mode for a tested device/backend subset after Stage 1A policy, Stage 1B completion handling, that subset's conversions, bounded scratch/lifetime tests, current-kernel I/O tests, and documentation pass. Keep current registration, acquisition-only host access, launch/control support, and fail-closed SNP transition behavior. Reject configurations that would export actual guest backing for payload I/O.
+Enable the explicit bounce-I/O mode for a tested device/backend subset after Stage 1A policy, Stage 1B completion handling, that subset's conversions, bounded scratch/lifetime tests, and documentation pass. For the first virtio-blk release, **require the real SNP boot/I/O/shutdown acceptance on `chris-mshv` above**; component tests and non-SNP runs do not substitute for it. Keep current registration, acquisition-only host access, launch/control support, and fail-closed SNP transition behavior. Reject configurations that would export actual guest backing for payload I/O.
 
 No lite backing, BEGIN/END token, MM no-pin/no-PFN-export proof, transition handshake, no-registration-pin claim, or allocator-return proof is required for this gate. Those guarantees are absent, not simulated. Hardware payload backends still require demonstrated completion/reset/drain safety for their owned buffers; defer them without blocking software/file/block/network subsets.
 
@@ -620,3 +663,13 @@ The narrow trace does not establish the existing GPA-attribute failure-completio
 The reviewer required admission coordination for existing PSP/AP/doorbell page use in phase 1b, not only copies and attribute exits. The main plan now reserves those pages before side effects and keeps exclusions through the required control lifetime. The coordinator mutex is held only for admission/state updates, not ioctls or copying. Added multi-VP PSP/copy races, restoration failures, and control-page overlap tests.
 
 The companion kernel plan now drains confirmed eligible grants independently of guest ownership labels. This preserves fault liveness and MM revocation without assuming SHARED is required for every authorized grant. Exact clean GPA-attribute denial/resume remains an existing-protocol integration question; unresolved exits remain stopped. This review assessed the plans and targeted source paths, not hardware execution.
+
+### Hardware-acceptance revision — 2026-10-08
+
+Made real MSHV SNP boot and virtio-blk usage on `chris-mshv` mandatory for the first phase's block release. Added baseline/candidate runs, safe disposable disk selection, serial-controlled workload, actual staging-origin evidence, repeated shutdown checks, artifact capture, and a blocked-not-skipped rule. The current Petri isolation gap is explicit; initial hardware acceptance uses the known-good CLI path rather than assuming an existing SNP test. Review pending; no remote access, deployment, boot, or hardware validation was performed by this planning change.
+
+### Hardware-acceptance review
+
+**Verdict: Minor revisions; corrections incorporated.** The mandatory real SNP/virtio-blk gate and CLI-first approach are sound. The reviewer requested a deterministic concurrency-safe data oracle, observed device reads and formerly direct-eligible descriptor traces, artifact/launch-success evidence, enforced scratch ownership checks, bounded timeout/cleanup ownership, and complete baseline/candidate pass criteria. All are incorporated above.
+
+The gate requires baseline verification and three candidate boot/I/O/normal-shutdown cycles on `chris-mshv`, with owned staging in both directions and no guest-backed payload submissions. Missing machine/artifacts or uncertain cleanup blocks acceptance; no silent skip or non-SNP substitute. Review was local and source-based, not a host run.
