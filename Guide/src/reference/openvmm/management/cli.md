@@ -501,6 +501,55 @@ PCIe root port. The syntax varies slightly between device types:
 The optional `serial` value accepts 1-20 printable ASCII bytes except commas
 and brackets. If omitted, OpenVMM uses the disk ID or `openvmm-virtio-blk`.
 
+#### Per-device block bounce I/O
+
+Add `bounce` to one `--virtio-blk` option to stage its block data in owned
+buffers. The default is off. Other disks and all network devices keep their
+existing I/O path. For example:
+
+```bash
+--virtio-blk file:path/to/disk.raw,pcie_port=rp0,bounce
+--virtio-blk mem:1G,bounce
+```
+
+This phase 1a mode supports only buffered plain images backed by regular
+files and RAM disks in VTL0. The opened file must be a regular file; a path
+spelling alone does not establish this. It rejects host block devices,
+physical NVMe, assigned devices, disk wrappers, structured formats such as
+VHD/VHDX (regardless of extension letter case), and
+`;direct`. It does not apply to vhost-user disks or external guest-memory
+exports. `bounce` is not valid with `--disk`, `--nvme`, `dvd`, `vtl2`,
+OpenHCL relay options, or named controllers (`on`). `ro`, `serial`, and
+`pcie_port` remain available.
+
+Programmatic bounce disk resources must also use regular buffered file
+descriptors. On Linux, the resolver rejects `O_DIRECT` and `O_APPEND`.
+The CLI bounce path opens files without either flag.
+
+Each selected device limits a request to 1 MiB and admits at most 64 requests
+at once. Its primary scratch memory is therefore bounded by 64 MiB. Backends
+can allocate additional owned buffers. The maximum segment size is the larger
+of 4 KiB and the disk sector size. The segment count is at most 254 and is
+reduced for larger sectors so the aggregate request limit still applies.
+Sparse and unaligned guest buffers must pass the same request checks.
+
+This mode is validated for guests with 4 KiB base pages. A guest with 64 KiB
+base pages, such as an ARM64 Linux configuration, can fail to probe a disk
+that advertises a 4 KiB maximum segment size. Use a guest with 4 KiB base
+pages, or omit `bounce` for that device. This phase does not claim support
+for every guest page size or platform.
+
+Save and restore are not supported for a device using `bounce` in this
+milestone. A status or completion-publication failure retires the device's
+queue; restarting that queue is refused. Recreate the device to recover
+instead of replaying an I/O operation whose result may already be visible.
+
+```admonish warning
+Bounce I/O is block-data staging, not memory isolation. This phase does not
+release host access to guest memory, change the kernel ABI, or prevent other
+devices from accessing guest memory.
+```
+
 **CXL test endpoint** (comma-separated option): `--cxl-test`
 
 ```sh
