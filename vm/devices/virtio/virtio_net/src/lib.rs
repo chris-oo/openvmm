@@ -7,6 +7,20 @@
 //! NIC to a pluggable [`net_backend::Endpoint`]. It currently operates with a
 //! single queue pair (one RX, one TX) and supports synchronous and asynchronous
 //! TX completion modes depending on the backend.
+//!
+//! [`NicBuilder::bounce_io`] enables owned staging for Consomme, TAP, and null
+//! software endpoints. The frontend uses a copy-only guest view for all queue
+//! and packet access. Backend addresses refer only to a separate aligned arena:
+//! 32 receive slots and 32 transmit slots, each 68 KiB (4.25 MiB per queue pair).
+//! Packets are limited to 64 KiB; packets larger than the MTU require negotiated
+//! segmentation offload. Each packet can contain at most 256 descriptors.
+//! Slots stay occupied until backend completion, with
+//! backpressure when full. Save/restore is not supported in this mode.
+//! On endpoint restart, accepted and unsent transmits are dropped once after
+//! old queues are dropped and endpoint stop finishes. Receives get fresh IDs.
+//! An unfinished stop retains the old arena and prevents automatic restart.
+//! This separates backend memory access; it does not revoke existing guest
+//! mappings or enforce memory-manager grant lifetimes.
 
 #![expect(missing_docs)]
 #![forbid(unsafe_code)]
@@ -17,6 +31,7 @@ pub mod resolver;
 #[cfg(test)]
 mod tests;
 
+use crate::buffers::RxCompletionError;
 use crate::buffers::RxQueueError;
 use crate::buffers::VirtioWorkPool;
 use anyhow::Context as _;
@@ -226,6 +241,7 @@ struct Adapter {
     tx_fast_completions: bool,
     mac_address: MacAddress,
     tx_offload_support: TxOffloadSupport,
+    bounce_io: bool,
 }
 
 pub struct Device {
@@ -319,10 +335,19 @@ impl VirtioDevice for Device {
     async fn start_queue(
         &mut self,
         idx: u16,
-        resources: QueueResources,
+        mut resources: QueueResources,
         features: &VirtioDeviceFeatures,
         initial_state: Option<QueueState>,
     ) -> anyhow::Result<()> {
+        if self.adapter.bounce_io {
+            anyhow::ensure!(
+                initial_state.is_none(),
+                "owned network staging does not support restore"
+            );
+            resources.guest_memory = resources
+                .guest_memory
+                .with_io_policy(guestmem::GuestMemoryIoPolicy::CopyOnly);
+        }
         let guest_memory = resources.guest_memory.clone();
         let queue_size = resources.params.size;
         let queue_event = PolledWait::new(&self.adapter.driver, resources.event)
@@ -353,6 +378,7 @@ impl VirtioDevice for Device {
             }
             QueuePairState::HalfOpen {
                 is_rx: pending_is_rx,
+                queue_size: pending_size,
                 ..
             } => {
                 if *pending_is_rx == is_rx {
@@ -360,6 +386,19 @@ impl VirtioDevice for Device {
                         "duplicate {} queue for pair {pair_idx}",
                         if is_rx { "RX" } else { "TX" }
                     );
+                }
+
+                let (rx_size, tx_size) = if *pending_is_rx {
+                    (*pending_size, queue_size)
+                } else {
+                    (queue_size, *pending_size)
+                };
+                let mut active_state = ActiveState::new(guest_memory.clone(), rx_size, tx_size);
+                if self.adapter.bounce_io {
+                    active_state
+                        .pending_rx_packets
+                        .enable_owned()
+                        .context("allocating owned network staging arena")?;
                 }
 
                 // Second queue — extract the first, form the pair.
@@ -399,7 +438,7 @@ impl VirtioDevice for Device {
                 self.insert_worker(
                     virtio_state,
                     pair_idx,
-                    &guest_memory,
+                    active_state,
                     negotiated_features,
                     negotiated_features_bank1,
                 );
@@ -450,7 +489,7 @@ impl VirtioDevice for Device {
     }
 
     fn supports_save_restore(&self) -> bool {
-        true
+        !self.adapter.bounce_io
     }
 }
 
@@ -528,13 +567,25 @@ impl ActiveState {
 /// The state for a tx packet that's currently pending in the backend endpoint.
 struct PendingTxPacket {
     completion: QueueCompletion,
+    id: TxId,
+    slot: Option<usize>,
+    submitted: bool,
+    backend_done: bool,
 }
 
 pub struct NicBuilder {
     max_queue_pairs: u16,
+    bounce_io: bool,
 }
 
 impl NicBuilder {
+    /// Keeps backend packet access in bounded, frontend-owned scratch memory.
+    /// The default is disabled. Only software endpoints support this mode.
+    pub fn bounce_io(mut self, bounce_io: bool) -> Self {
+        self.bounce_io = bounce_io;
+        self
+    }
+
     pub fn max_queues(mut self, max_queue_pairs: u16) -> Self {
         self.max_queue_pairs = max_queue_pairs;
         self
@@ -555,6 +606,14 @@ impl NicBuilder {
         endpoint: Box<dyn Endpoint>,
         mac_address: MacAddress,
     ) -> anyhow::Result<Device> {
+        if self.bounce_io {
+            let supported = matches!(endpoint.endpoint_type(), "consomme" | "tap" | "null")
+                || cfg!(test) && endpoint.endpoint_type() == "mock";
+            anyhow::ensure!(
+                supported,
+                "owned network staging requires a software endpoint"
+            );
+        }
         if !endpoint.is_ordered() {
             anyhow::bail!(
                 "network backend '{}' does not complete packets in order; \
@@ -576,6 +635,7 @@ impl NicBuilder {
             tx_fast_completions: endpoint.tx_fast_completions(),
             mac_address,
             tx_offload_support,
+            bounce_io: self.bounce_io,
         });
 
         let coordinator = TaskControl::new(CoordinatorState {
@@ -611,6 +671,7 @@ impl Device {
     pub fn builder() -> NicBuilder {
         NicBuilder {
             max_queue_pairs: !0,
+            bounce_io: false,
         }
     }
 }
@@ -632,6 +693,7 @@ impl Device {
                     .collect(),
                 num_queues,
                 restart: true,
+                owned_restart_pending: false,
             },
         );
     }
@@ -643,7 +705,7 @@ impl Device {
         &mut self,
         virtio_state: VirtioState,
         idx: usize,
-        guest_memory: &GuestMemory,
+        active_state: ActiveState,
         negotiated_features: NetworkFeaturesBank0,
         negotiated_features_bank1: NetworkFeaturesBank1,
     ) {
@@ -657,16 +719,12 @@ impl Device {
         builder.run_on_target(!self.adapter.tx_fast_completions);
         let driver = builder.build("virtio-net");
 
-        let active_state = ActiveState::new(
-            guest_memory.clone(),
-            virtio_state.rx_queue_size,
-            virtio_state.tx_queue_size,
-        );
         let worker = Worker {
             virtio_state,
             active_state,
             negotiated_features,
             negotiated_features_bank1,
+            retired: false,
         };
         let coordinator = self.coordinator.state_mut().unwrap();
         let worker_task = &mut coordinator.workers[idx];
@@ -679,6 +737,7 @@ struct Coordinator {
     workers: Vec<TaskControl<NetQueue, Worker>>,
     num_queues: u16,
     restart: bool,
+    owned_restart_pending: bool,
 }
 
 struct CoordinatorState {
@@ -761,9 +820,27 @@ impl Coordinator {
     }
 
     async fn restart_queues(&mut self, c_state: &mut CoordinatorState) -> Result<(), WorkerError> {
-        // Drop all of the current queues.
+        if self.owned_restart_pending {
+            for worker in &mut self.workers {
+                worker.state_mut().unwrap().retired = true;
+            }
+            return Err(WorkerError::EndpointNotQuiescent);
+        }
+        let mut had_queues = false;
         for worker in &mut self.workers {
+            had_queues |= worker.task_mut().state.is_some();
             worker.task_mut().state = None;
+        }
+
+        if c_state.adapter.bounce_io && had_queues {
+            // Endpoint::stop requires all queues to be dropped first. Do not
+            // release any scratch or create a new consumer until it returns.
+            self.owned_restart_pending = true;
+            c_state.endpoint.stop().await;
+            for worker in &mut self.workers {
+                worker.state_mut().unwrap().finish_owned_restart()?;
+            }
+            self.owned_restart_pending = false;
         }
 
         let queue_config = (0..self.workers.len())
@@ -782,7 +859,11 @@ impl Coordinator {
         assert_eq!(queues.len(), self.workers.len());
 
         for (worker, mut queue) in self.workers.iter_mut().zip(queues) {
-            let state = &mut worker.state_mut().unwrap().active_state;
+            let worker_state = worker.state_mut().unwrap();
+            if worker_state.retired {
+                continue;
+            }
+            let state = &mut worker_state.active_state;
             let n = state
                 .pending_rx_packets
                 .fill_ready(&mut state.data.rx_ready);
@@ -810,7 +891,33 @@ impl AsyncRun<Worker> for NetQueue {
             Ok(()) => {}
             Err(WorkerError::Cancelled(cancelled)) => return Err(cancelled),
             Err(err) => {
-                tracing::error!(err = &err as &dyn std::error::Error, "virtio net error");
+                tracelimit::error_ratelimited!(
+                    err = &err as &dyn std::error::Error,
+                    "virtio net error"
+                );
+                if worker.active_state.pending_rx_packets.is_owned() {
+                    worker.retired = true;
+                    if let Some(state) = self.state.as_mut() {
+                        let drained = stop
+                            .until_stopped(worker.drain_owned(state.queue.as_mut()))
+                            .await;
+                        // Admitted software endpoints have no DMA into scratch.
+                        // Drop ends callback access even if drain was cancelled
+                        // or a malformed backend response prevented completion.
+                        self.state = None;
+                        match drained {
+                            Err(cancelled) => return Err(cancelled),
+                            Ok(Err(err)) => {
+                                tracelimit::error_ratelimited!(
+                                    error = err.as_ref() as &dyn std::error::Error,
+                                    "failed to drain retired owned network queue"
+                                );
+                            }
+                            Ok(Ok(())) => {}
+                        }
+                    }
+                    self.state = None;
+                }
             }
         }
         Ok(())
@@ -837,6 +944,10 @@ enum WorkerError {
     VirtioQueue(#[source] std::io::Error),
     #[error("endpoint")]
     Endpoint(#[source] anyhow::Error),
+    #[error("RX buffer completion failed")]
+    RxBuffer(#[source] RxCompletionError),
+    #[error("old owned endpoint did not establish quiescence")]
+    EndpointNotQuiescent,
     #[error("guest submitted duplicate descriptor index {0}")]
     DuplicateDescriptor(u16),
     #[error("cancelled")]
@@ -853,6 +964,8 @@ enum TxPacketError {
     TooManySegments,
     #[error("descriptor index {0} already in use")]
     DuplicateIndex(u16),
+    #[error("owned TX staging failed")]
+    Staging(#[source] anyhow::Error),
 }
 
 impl From<task_control::Cancelled> for WorkerError {
@@ -869,6 +982,7 @@ struct Worker {
     negotiated_features: NetworkFeaturesBank0,
     #[inspect(skip)]
     negotiated_features_bank1: NetworkFeaturesBank1,
+    retired: bool,
 }
 
 impl Worker {
@@ -880,7 +994,7 @@ impl Worker {
         // Be careful not to wait on actions with unbounded blocking time (e.g.
         // guest actions, or waiting for network packets to arrive) without
         // wrapping the wait on `stop.until_stopped`.
-        if queue.state.is_none() {
+        if self.retired || queue.state.is_none() {
             // wait for an active queue
             stop.until_stopped(pending()).await?
         }
@@ -917,14 +1031,20 @@ impl Worker {
                 if let Poll::Ready(()) = epqueue_state.queue.poll_ready(cx, pending_rx_packets) {
                     return Poll::Ready(());
                 }
+                if pending_rx_packets.check_error().is_err() {
+                    return Poll::Ready(());
+                }
 
                 if tx_segments.is_empty()
+                    && pending_rx_packets.has_room(true)
                     && let Poll::Ready(()) = tx_queue.poll_kick(cx)
                 {
                     return Poll::Ready(());
                 }
 
-                if let Poll::Ready(()) = rx_queue.poll_kick(cx) {
+                if pending_rx_packets.has_room(false)
+                    && let Poll::Ready(()) = rx_queue.poll_kick(cx)
+                {
                     return Poll::Ready(());
                 }
 
@@ -946,6 +1066,9 @@ impl Worker {
             }
             // Only batch up to 8 packets at a time.
             for _ in 0..8 {
+                if !self.active_state.pending_rx_packets.has_room(true) {
+                    break;
+                }
                 let Some(work) = self
                     .virtio_state
                     .tx_in_order
@@ -967,9 +1090,13 @@ impl Worker {
     fn queue_tx_packet(&mut self, work: VirtioQueueCallbackWork) -> Result<(), WorkerError> {
         let seg_start = self.active_state.data.tx_segments.len();
         match self.try_queue_tx_packet(&work) {
-            Ok(idx) => {
+            Ok((idx, id, slot)) => {
                 self.active_state.pending_tx_packets[idx as usize] = Some(PendingTxPacket {
                     completion: work.into_completion(),
+                    id,
+                    slot,
+                    submitted: false,
+                    backend_done: false,
                 });
             }
             Err(err) => {
@@ -981,17 +1108,19 @@ impl Worker {
                     // violation rather than an out-of-order drop.
                     return Err(WorkerError::DuplicateDescriptor(idx));
                 }
+                if matches!(err, TxPacketError::Staging(_)) {
+                    return Err(WorkerError::Endpoint(err.into()));
+                }
                 tracelimit::warn_ratelimited!(
                     error = &err as &dyn std::error::Error,
                     "dropping TX packet"
                 );
                 // Complete (drop) the packet in avail order via the in-order
                 // completion discipline.
-                self.virtio_state.tx_in_order.complete(
-                    &mut self.virtio_state.tx_queue,
-                    work.into_completion(),
-                    0,
-                );
+                self.virtio_state
+                    .tx_in_order
+                    .try_complete(&mut self.virtio_state.tx_queue, work.into_completion(), 0)
+                    .map_err(|e| WorkerError::Endpoint(e.into()))?;
             }
         }
         Ok(())
@@ -1006,17 +1135,83 @@ impl Worker {
     fn try_queue_tx_packet(
         &mut self,
         work: &VirtioQueueCallbackWork,
-    ) -> Result<u16, TxPacketError> {
+    ) -> Result<(u16, TxId, Option<usize>), TxPacketError> {
         let idx = work.descriptor_index();
         if self.active_state.pending_tx_packets[idx as usize].is_some() {
             return Err(TxPacketError::DuplicateIndex(idx));
         }
 
-        let total_readable = work.get_payload_length(false) as usize;
+        let total_readable = work
+            .payload
+            .iter()
+            .filter(|p| !p.writeable)
+            .try_fold(0usize, |len, p| len.checked_add(p.length as usize))
+            .ok_or(TxPacketError::Empty)?;
         let packet_len: u32 = total_readable
             .checked_sub(header_size())
             .and_then(|len| u32::try_from(len).ok())
             .ok_or(TxPacketError::Empty)?;
+        if self.active_state.pending_rx_packets.is_owned() {
+            if work.payload.len() > buffers::MAX_PACKET_DESCRIPTORS {
+                return Err(TxPacketError::TooManySegments);
+            }
+            if packet_len == 0 || packet_len as usize > buffers::MAX_PACKET_SIZE {
+                return Err(TxPacketError::Empty);
+            }
+            let mut snapshot = buffers::try_packet_buffer(
+                total_readable,
+                buffers::MAX_PACKET_SIZE + header_size(),
+            )
+            .map_err(|err| TxPacketError::Staging(err.into()))?;
+            let read = work
+                .read(self.active_state.pending_rx_packets.mem(), &mut snapshot)
+                .map_err(TxPacketError::ReadHeader)?;
+            if read != total_readable {
+                return Err(TxPacketError::Empty);
+            }
+            let mut header_buf = [0; size_of::<VirtioNetHeader>()];
+            header_buf[..header_size()].copy_from_slice(&snapshot[..header_size()]);
+            let header = VirtioNetHeader::read_from_bytes(&header_buf).ok();
+            let metadata = Self::parse_tx_offloads(
+                header.as_ref(),
+                &snapshot[header_size()..],
+                packet_len,
+                self.negotiated_features,
+                self.negotiated_features_bank1,
+            );
+            if packet_len > u32::from(DEFAULT_MTU) + 4
+                && !metadata.flags.offload_tcp_segmentation()
+                && !metadata.flags.offload_udp_segmentation()
+            {
+                return Err(TxPacketError::Empty);
+            }
+            let id = TxId(
+                self.active_state
+                    .pending_rx_packets
+                    .new_backend_id()
+                    .map_err(TxPacketError::Staging)?,
+            );
+            let (slot, gpa) = self
+                .active_state
+                .pending_rx_packets
+                .stage_tx(&snapshot)
+                .map_err(TxPacketError::Staging)?;
+            tracelimit::info_ratelimited!(
+                len = packet_len,
+                "virtio-net TX uses owned packet memory"
+            );
+            self.active_state.data.tx_segments.push(TxSegment {
+                gpa,
+                len: packet_len,
+                ty: TxSegmentType::Head(TxMetadata {
+                    id,
+                    segment_count: 1,
+                    len: packet_len,
+                    ..metadata
+                }),
+            });
+            return Ok((idx, id, Some(slot)));
+        }
 
         // Read the virtio-net header + enough of the Ethernet frame to parse
         // the EtherType (and a potential VLAN tag).
@@ -1083,7 +1278,7 @@ impl Worker {
             len: packet_len,
             ..tx_metadata
         });
-        Ok(idx)
+        Ok((idx, TxId(idx.into()), None))
     }
 
     /// Parse virtio-net header offload fields into a `TxMetadata` template.
@@ -1286,12 +1481,15 @@ impl Worker {
     ) -> Result<bool, WorkerError> {
         // Fill the receive queue with any available buffers.
         let mut rx_ids = Vec::new();
-        while let Some(work) = self
-            .virtio_state
-            .rx_in_order
-            .try_next(&mut self.virtio_state.rx_queue)
-            .map_err(WorkerError::VirtioQueue)?
-        {
+        while self.active_state.pending_rx_packets.has_room(false) {
+            let Some(work) = self
+                .virtio_state
+                .rx_in_order
+                .try_next(&mut self.virtio_state.rx_queue)
+                .map_err(WorkerError::VirtioQueue)?
+            else {
+                break;
+            };
             tracing::trace!("rx packet");
             match self.active_state.pending_rx_packets.queue_work(work) {
                 Ok(rx_id) => rx_ids.push(rx_id),
@@ -1299,11 +1497,10 @@ impl Worker {
                     // Complete (drop) the buffer in avail order via the in-order
                     // completion discipline. Reason traced by callee.
                     self.active_state.stats.rx_dropped.increment();
-                    self.virtio_state.rx_in_order.complete(
-                        &mut self.virtio_state.rx_queue,
-                        work.into_completion(),
-                        0,
-                    );
+                    self.virtio_state
+                        .rx_in_order
+                        .try_complete(&mut self.virtio_state.rx_queue, work.into_completion(), 0)
+                        .map_err(|e| WorkerError::Endpoint(e.into()))?;
                 }
                 Err(RxQueueError::DuplicateIndex(work)) => {
                     // A duplicate descriptor index cannot be tracked (the pool
@@ -1314,9 +1511,17 @@ impl Worker {
                     return Err(WorkerError::DuplicateDescriptor(idx));
                 }
             }
+            self.active_state
+                .pending_rx_packets
+                .check_error()
+                .map_err(WorkerError::RxBuffer)?;
         }
         if !rx_ids.is_empty() {
             epqueue.rx_avail(&mut self.active_state.pending_rx_packets, rx_ids.as_slice());
+            self.active_state
+                .pending_rx_packets
+                .check_error()
+                .map_err(WorkerError::RxBuffer)?;
             Ok(true)
         } else {
             Ok(false)
@@ -1331,18 +1536,37 @@ impl Worker {
         let n = epqueue
             .rx_poll(&mut state.pending_rx_packets, &mut state.data.rx_ready)
             .map_err(WorkerError::Endpoint)?;
+        state
+            .pending_rx_packets
+            .check_error()
+            .map_err(WorkerError::RxBuffer)?;
+        if n > state.data.rx_ready.len() {
+            return Err(WorkerError::Endpoint(anyhow::anyhow!(
+                "invalid backend RX count"
+            )));
+        }
         if n == 0 {
             return Ok(false);
         }
 
         for ready_id in state.data.rx_ready[..n].iter() {
-            state.stats.rx_packets.increment();
-            let (work, bytes) = state.pending_rx_packets.take_rx_work(*ready_id);
-            self.virtio_state.rx_in_order.complete(
-                &mut self.virtio_state.rx_queue,
-                work.into_completion(),
-                bytes,
-            );
+            let (work, bytes) = state
+                .pending_rx_packets
+                .take_rx_work(*ready_id)
+                .map_err(WorkerError::RxBuffer)?;
+            if bytes == 0 {
+                state.stats.rx_dropped.increment();
+            } else {
+                state.stats.rx_packets.increment();
+            }
+            self.virtio_state
+                .rx_in_order
+                .try_complete(
+                    &mut self.virtio_state.rx_queue,
+                    work.into_completion(),
+                    bytes,
+                )
+                .map_err(|e| WorkerError::Endpoint(e.into()))?;
         }
 
         state.stats.rx_packets_per_wake.add_sample(n as u64);
@@ -1360,10 +1584,22 @@ impl Worker {
                 &mut self.active_state.data.tx_done,
             )
             .map_err(|tx_error| WorkerError::Endpoint(tx_error.into()))?;
+        self.active_state
+            .pending_rx_packets
+            .check_error()
+            .map_err(WorkerError::RxBuffer)?;
+        if n > self.active_state.data.tx_done.len() {
+            return Err(WorkerError::Endpoint(anyhow::anyhow!(
+                "invalid backend TX count"
+            )));
+        }
         if n == 0 {
             return Ok(false);
         }
 
+        for i in 0..n {
+            self.mark_tx_backend_done(self.active_state.data.tx_done[i])?;
+        }
         for i in 0..n {
             let id = self.active_state.data.tx_done[i];
             self.complete_tx_packet(id)?;
@@ -1383,6 +1619,25 @@ impl Worker {
         if self.active_state.data.tx_segments.is_empty() {
             return Ok(false);
         }
+        let owned = self.active_state.pending_rx_packets.is_owned();
+        if owned {
+            // An error may not report how much the backend accepted. Keep all
+            // offered slots in flight until completion or backend quiescence.
+            for segment in &self.active_state.data.tx_segments {
+                if let TxSegmentType::Head(meta) = &segment.ty {
+                    let packet = self
+                        .active_state
+                        .pending_tx_packets
+                        .iter_mut()
+                        .flatten()
+                        .find(|p| p.id.0 == meta.id.0)
+                        .ok_or_else(|| {
+                            WorkerError::Endpoint(anyhow::anyhow!("invalid offered TX ID"))
+                        })?;
+                    packet.submitted = true;
+                }
+            }
+        }
         let (sync, segments_sent) = queue_state
             .queue
             .tx_avail(
@@ -1390,6 +1645,35 @@ impl Worker {
                 &self.active_state.data.tx_segments,
             )
             .map_err(WorkerError::Endpoint)?;
+        let segments = &self.active_state.data.tx_segments;
+        if segments_sent > segments.len()
+            || (segments_sent < segments.len()
+                && !matches!(segments[segments_sent].ty, TxSegmentType::Head(_)))
+        {
+            return Err(WorkerError::Endpoint(anyhow::anyhow!(
+                "invalid backend TX acceptance"
+            )));
+        }
+        for (i, segment) in segments.iter().enumerate() {
+            if !owned && i >= segments_sent {
+                break;
+            }
+            if let TxSegmentType::Head(meta) = &segment.ty {
+                let packets = &mut self.active_state.pending_tx_packets;
+                let packet = if self.active_state.pending_rx_packets.is_owned() {
+                    packets.iter_mut().flatten().find(|p| p.id.0 == meta.id.0)
+                } else {
+                    packets.get_mut(meta.id.0 as usize).and_then(Option::as_mut)
+                }
+                .ok_or_else(|| WorkerError::Endpoint(anyhow::anyhow!("invalid submitted TX ID")))?;
+                packet.submitted = i < segments_sent;
+                packet.backend_done = packet.submitted && sync;
+            }
+        }
+        self.active_state
+            .pending_rx_packets
+            .check_error()
+            .map_err(WorkerError::RxBuffer)?;
 
         if sync {
             // Complete the packets now.
@@ -1414,13 +1698,144 @@ impl Worker {
 
     fn complete_tx_packet(&mut self, id: TxId) -> Result<(), WorkerError> {
         let state = &mut self.active_state;
-        let tx_packet = state.pending_tx_packets[id.0 as usize].take().unwrap();
-        self.virtio_state.tx_in_order.complete(
-            &mut self.virtio_state.tx_queue,
-            tx_packet.completion,
-            0,
-        );
+        let idx = if state.pending_rx_packets.is_owned() {
+            state.pending_tx_packets.iter().position(|p| {
+                p.as_ref()
+                    .is_some_and(|p| p.id.0 == id.0 && p.submitted && p.backend_done)
+            })
+        } else {
+            state
+                .pending_tx_packets
+                .get(id.0 as usize)
+                .and_then(Option::as_ref)
+                .filter(|p| p.submitted && p.backend_done)
+                .map(|_| id.0 as usize)
+        }
+        .ok_or_else(|| {
+            WorkerError::Endpoint(anyhow::anyhow!("invalid or stale TX completion ID"))
+        })?;
+        let tx_packet = state.pending_tx_packets[idx].take().unwrap();
+        if let Some(slot) = tx_packet.slot {
+            state
+                .pending_rx_packets
+                .release_tx(slot)
+                .map_err(WorkerError::Endpoint)?;
+        }
+        self.virtio_state
+            .tx_in_order
+            .try_complete(&mut self.virtio_state.tx_queue, tx_packet.completion, 0)
+            .map_err(|e| WorkerError::Endpoint(e.into()))?;
         self.active_state.stats.tx_packets.increment();
         Ok(())
+    }
+
+    fn mark_tx_backend_done(&mut self, id: TxId) -> Result<(), WorkerError> {
+        let packets = &mut self.active_state.pending_tx_packets;
+        let packet = if self.active_state.pending_rx_packets.is_owned() {
+            packets.iter_mut().flatten().find(|p| p.id.0 == id.0)
+        } else {
+            packets.get_mut(id.0 as usize).and_then(Option::as_mut)
+        }
+        .ok_or_else(|| {
+            WorkerError::Endpoint(anyhow::anyhow!("invalid backend TX completion ID"))
+        })?;
+        if !packet.submitted || packet.backend_done {
+            return Err(WorkerError::Endpoint(anyhow::anyhow!(
+                "duplicate or unsent backend TX completion"
+            )));
+        }
+        packet.backend_done = true;
+        Ok(())
+    }
+
+    /// The coordinator has dropped old queues and awaited Endpoint::stop.
+    /// Drop both accepted and unsent TX once, without resubmission. The
+    /// completion tracker preserves available order even for shuffled IDs.
+    fn finish_owned_restart(&mut self) -> Result<(), WorkerError> {
+        if self.retired {
+            return Ok(());
+        }
+        self.retired = true;
+        self.active_state.data.tx_segments.clear();
+        for packet in &mut self.active_state.pending_tx_packets {
+            let Some(packet) = packet.take() else {
+                continue;
+            };
+            if let Some(slot) = packet.slot {
+                self.active_state
+                    .pending_rx_packets
+                    .release_tx(slot)
+                    .map_err(WorkerError::Endpoint)?;
+            }
+            self.virtio_state
+                .tx_in_order
+                .try_complete(&mut self.virtio_state.tx_queue, packet.completion, 0)
+                .map_err(|e| WorkerError::Endpoint(e.into()))?;
+            self.active_state.stats.tx_dropped.increment();
+        }
+        self.active_state
+            .pending_rx_packets
+            .rearm_owned_rx()
+            .map_err(WorkerError::Endpoint)?;
+        self.retired = false;
+        Ok(())
+    }
+
+    /// Keep accepted scratch packets alive until backend completion, without
+    /// copying any more RX data or publishing any more guest completions.
+    async fn drain_owned(&mut self, queue: &mut dyn net_backend::Queue) -> anyhow::Result<()> {
+        std::future::poll_fn(|cx| {
+            for packet in &mut self.active_state.pending_tx_packets {
+                if packet
+                    .as_ref()
+                    .is_some_and(|p| !p.submitted || p.backend_done)
+                {
+                    let packet = packet.take().unwrap();
+                    if let Some(slot) = packet.slot {
+                        self.active_state.pending_rx_packets.release_tx(slot)?;
+                    }
+                }
+            }
+            self.active_state.data.tx_segments.clear();
+            if self
+                .active_state
+                .pending_tx_packets
+                .iter()
+                .all(Option::is_none)
+            {
+                return Poll::Ready(Ok(()));
+            }
+            let _ = queue.poll_ready(cx, &mut self.active_state.pending_rx_packets);
+            let n = queue.rx_poll(
+                &mut self.active_state.pending_rx_packets,
+                &mut self.active_state.data.rx_ready,
+            )?;
+            if n > self.active_state.data.rx_ready.len() {
+                return Poll::Ready(Err(anyhow::anyhow!("invalid RX drain count")));
+            }
+            let received = n != 0;
+            for i in 0..n {
+                self.active_state
+                    .pending_rx_packets
+                    .discard_rx(self.active_state.data.rx_ready[i])?;
+            }
+            let n = queue
+                .tx_poll(
+                    &mut self.active_state.pending_rx_packets,
+                    &mut self.active_state.data.tx_done,
+                )
+                .map_err(anyhow::Error::from)?;
+            if n > self.active_state.data.tx_done.len() {
+                return Poll::Ready(Err(anyhow::anyhow!("invalid TX drain count")));
+            }
+            for i in 0..n {
+                self.mark_tx_backend_done(self.active_state.data.tx_done[i])?;
+            }
+            if n != 0 || received {
+                cx.waker().wake_by_ref();
+            }
+            Poll::Pending
+        })
+        .await
     }
 }
