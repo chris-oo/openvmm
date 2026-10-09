@@ -128,6 +128,7 @@ pub(crate) enum MapperRole {
 /// static snapshot of the RAM layout.
 #[derive(Debug)]
 struct MappingProps {
+    writable: bool,
     /// Backed by private anonymous memory (committed up front) rather than a
     /// shared file/section mapping.
     private: bool,
@@ -251,10 +252,28 @@ struct MapperInner {
     req_send: mesh::Sender<MappingRequest>,
     /// Maintains a weak reference to avoid a reference cycle with the partition.
     host_access: OnceLock<HostAccess>,
+    copy_only: AtomicBool,
 }
 
 #[derive(Clone)]
 struct HostAccess(std::sync::Weak<dyn virt::PartitionHostAccess>);
+
+struct HostAccessGuard {
+    guard: Box<dyn virt::PartitionHostAccessGuard>,
+    address: u64,
+}
+
+impl guestmem::GuestMemoryAccessGuard for HostAccessGuard {
+    fn finish(self: Box<Self>) -> Result<(), GuestMemoryBackingError> {
+        self.guard.finish().map_err(|err| {
+            GuestMemoryBackingError::new(
+                GuestMemoryErrorKind::Other,
+                self.address,
+                std::io::Error::other(err),
+            )
+        })
+    }
+}
 
 impl std::fmt::Debug for HostAccess {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -386,6 +405,7 @@ impl MapperTask {
         self.inner.record_mapping(
             params.range,
             MappingProps {
+                writable: params.writable,
                 private,
                 stats: FaultStats::default(),
                 soft_lp,
@@ -615,6 +635,44 @@ pub enum VaMapperError {
 pub struct NoMapping(MemoryRange);
 
 impl MapperInner {
+    fn validate_copy_range(
+        &self,
+        address: u64,
+        len: usize,
+        write: bool,
+    ) -> Result<(), GuestMemoryBackingError> {
+        let end = address
+            .checked_add(len as u64)
+            .filter(|end| *end <= self.mapping.len() as u64)
+            .ok_or_else(|| {
+                GuestMemoryBackingError::new(
+                    GuestMemoryErrorKind::OutOfRange,
+                    address,
+                    UnexpectedPageFault,
+                )
+            })?;
+        let mappings = self.mappings.read();
+        let mut next = address;
+        while next < end {
+            let Some(&(_, last, ref props)) = mappings.get_entry(&next) else {
+                return Err(GuestMemoryBackingError::new(
+                    GuestMemoryErrorKind::OutOfRange,
+                    next,
+                    UnexpectedPageFault,
+                ));
+            };
+            if write && !props.writable {
+                return Err(GuestMemoryBackingError::new(
+                    GuestMemoryErrorKind::Other,
+                    next,
+                    UnexpectedPageFault,
+                ));
+            }
+            next = end.min(last + 1);
+        }
+        Ok(())
+    }
+
     /// Records an established mapping in the index, replacing any stale entry
     /// for the same range.
     fn record_mapping(&self, range: MemoryRange, props: MappingProps) {
@@ -771,6 +829,7 @@ impl VaMapper {
             supports_memory_fault_resolution,
             req_send,
             host_access: OnceLock::new(),
+            copy_only: AtomicBool::new(false),
         });
 
         // Spawn the mapper thread *before* the AddMapper RPC. The manager
@@ -826,7 +885,13 @@ impl VaMapper {
 
     /// Installs the callback used to recover eager-mapper faults caused by
     /// missing host permission.
+    ///
+    /// Install before exporting mappings, locking pages, or creating secondary
+    /// mappers. Copy-only policy cannot revoke previously exported handles.
     pub(crate) fn install_host_access(&self, host_access: Arc<dyn virt::PartitionHostAccess>) {
+        if host_access.requires_copy_only() {
+            self.inner.copy_only.store(true, Ordering::Release);
+        }
         assert!(
             self.inner
                 .host_access
@@ -860,6 +925,62 @@ impl VaMapper {
 /// SAFETY: the underlying VA mapping is guaranteed to be valid for the lifetime
 /// of this object.
 unsafe impl GuestMemoryAccess for VaMapper {
+    fn io_policy(&self) -> guestmem::GuestMemoryIoPolicy {
+        if self.inner.copy_only.load(Ordering::Acquire) {
+            return guestmem::GuestMemoryIoPolicy::CopyOnly;
+        }
+        if self
+            .inner
+            .host_access
+            .get()
+            .and_then(|host| host.0.upgrade())
+            .is_some_and(|host| host.requires_copy_only())
+        {
+            self.inner.copy_only.store(true, Ordering::Release);
+        }
+        if self.inner.copy_only.load(Ordering::Acquire) {
+            guestmem::GuestMemoryIoPolicy::CopyOnly
+        } else {
+            guestmem::GuestMemoryIoPolicy::Direct
+        }
+    }
+
+    fn acquire_access(
+        &self,
+        address: u64,
+        len: usize,
+        write: bool,
+    ) -> Result<Option<Box<dyn guestmem::GuestMemoryAccessGuard + '_>>, GuestMemoryBackingError>
+    {
+        if len == 0 || self.io_policy() == guestmem::GuestMemoryIoPolicy::Direct {
+            return Ok(None);
+        }
+        let Some(host) = self
+            .inner
+            .host_access
+            .get()
+            .and_then(|host| host.0.upgrade())
+        else {
+            return Err(GuestMemoryBackingError::other(address, UnexpectedPageFault));
+        };
+        // Release the mapping-index lock before the host callback or copy.
+        self.inner.validate_copy_range(address, len, write)?;
+        host.acquire_host_access_scoped(address, len as u64, write)
+            .map(|guard| {
+                guard.map(|guard| {
+                    Box::new(HostAccessGuard { guard, address })
+                        as Box<dyn guestmem::GuestMemoryAccessGuard>
+                })
+            })
+            .map_err(|err| {
+                GuestMemoryBackingError::new(
+                    GuestMemoryErrorKind::Other,
+                    address,
+                    std::io::Error::other(err),
+                )
+            })
+    }
+
     fn mapping(&self) -> Option<NonNull<u8>> {
         // No one should be using this as a GuestMemoryAccess for remote
         // mappings, but it's convenient to have the same type for both local
@@ -882,6 +1003,15 @@ unsafe impl GuestMemoryAccess for VaMapper {
         bitmap_failure: bool,
     ) -> PageFaultAction {
         assert!(!bitmap_failure, "bitmaps are not used");
+
+        // A scoped copy already holds its permission. Reacquiring here could
+        // nest leases or turn an ineligible fault into an endless retry.
+        if self.io_policy() == guestmem::GuestMemoryIoPolicy::CopyOnly {
+            return PageFaultAction::Fail(PageFaultError::new(
+                GuestMemoryErrorKind::Other,
+                UnexpectedPageFault,
+            ));
+        }
 
         // Soft large pages (Windows): THP-eligible ranges on the primary mapper
         // are committed/mapped read-only, so the first *write* traps here (reads
@@ -1028,7 +1158,238 @@ impl ResolveMemoryFault for VaMapper {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use guestmem::GuestMemory;
+    use guestmem::GuestMemoryIoPolicy;
     use sparse_mmap::SparseMapping;
+    use test_with_tracing::test;
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum HostEvent {
+        Acquire(u64, u64, bool),
+        Finish,
+    }
+
+    struct TestHost {
+        events: Arc<Mutex<Vec<HostEvent>>>,
+        copy_only: AtomicBool,
+        live: AtomicBool,
+        fail_acquire: AtomicBool,
+        fail_finish: AtomicBool,
+        mapper: std::sync::Weak<MapperInner>,
+    }
+
+    struct TestHostGuard {
+        events: Arc<Mutex<Vec<HostEvent>>>,
+        fail_finish: bool,
+    }
+
+    impl virt::PartitionHostAccessGuard for TestHostGuard {
+        fn finish(self: Box<Self>) -> anyhow::Result<()> {
+            self.events.lock().push(HostEvent::Finish);
+            anyhow::ensure!(!self.fail_finish, "release failure");
+            Ok(())
+        }
+    }
+
+    impl virt::PartitionHostAccess for TestHost {
+        fn requires_copy_only(&self) -> bool {
+            self.copy_only.load(Ordering::Relaxed)
+        }
+
+        fn acquire_host_access_scoped(
+            &self,
+            addr: u64,
+            size: u64,
+            write: bool,
+        ) -> anyhow::Result<Option<Box<dyn virt::PartitionHostAccessGuard>>> {
+            // No mapping-index lock may span this callback.
+            assert!(
+                self.mapper
+                    .upgrade()
+                    .unwrap()
+                    .mappings
+                    .try_write()
+                    .is_some()
+            );
+            if !self.live.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            self.events
+                .lock()
+                .push(HostEvent::Acquire(addr, size, write));
+            anyhow::ensure!(
+                !self.fail_acquire.load(Ordering::Relaxed),
+                "acquire failure"
+            );
+            Ok(Some(Box::new(TestHostGuard {
+                events: self.events.clone(),
+                fail_finish: self.fail_finish.load(Ordering::Relaxed),
+            })))
+        }
+
+        fn acquire_host_access(&self, _addr: u64, _size: u64, _write: bool) -> anyhow::Result<()> {
+            panic!("scoped copies must not use legacy fault acquisition")
+        }
+    }
+
+    fn test_mapper(populated: bool) -> Arc<VaMapper> {
+        let mapping = SparseMapping::new(4 * SparseMapping::page_size()).unwrap();
+        if populated {
+            mapping.alloc(0, mapping.len()).unwrap();
+        }
+        let (req_send, _req_recv) = mesh::channel();
+        Arc::new(VaMapper {
+            inner: Arc::new(MapperInner {
+                mapping,
+                waiters: Mutex::new(Some(Vec::new())),
+                mappings: RwLock::new(RangeMap::new()),
+                eager: AtomicBool::new(true),
+                primary: true,
+                supports_memory_fault_resolution: false,
+                req_send,
+                host_access: OnceLock::new(),
+                copy_only: AtomicBool::new(false),
+            }),
+            id: MapperId(0),
+            process: None,
+            _thread: std::thread::spawn(|| {}),
+        })
+    }
+
+    fn record(mapper: &VaMapper, start: u64, end: u64, writable: bool) {
+        mapper.inner.record_mapping(
+            MemoryRange::new(start..end),
+            MappingProps {
+                writable,
+                private: false,
+                stats: FaultStats::default(),
+                soft_lp: None,
+            },
+        );
+    }
+
+    fn install_test_host(mapper: &VaMapper) -> Arc<TestHost> {
+        let host = Arc::new(TestHost {
+            events: Arc::new(Mutex::new(Vec::new())),
+            copy_only: AtomicBool::new(true),
+            live: AtomicBool::new(true),
+            fail_acquire: AtomicBool::new(false),
+            fail_finish: AtomicBool::new(false),
+            mapper: Arc::downgrade(&mapper.inner),
+        });
+        mapper.install_host_access(host.clone());
+        host
+    }
+
+    #[test]
+    fn direct_mapper_does_not_acquire_scoped_access() {
+        let mapper = test_mapper(true);
+        record(&mapper, 0, mapper.len() as u64, true);
+        let host = Arc::new(TestHost {
+            events: Arc::new(Mutex::new(Vec::new())),
+            copy_only: AtomicBool::new(false),
+            live: AtomicBool::new(true),
+            fail_acquire: AtomicBool::new(false),
+            fail_finish: AtomicBool::new(false),
+            mapper: Arc::downgrade(&mapper.inner),
+        });
+        mapper.install_host_access(host.clone());
+        let gm = GuestMemory::new("direct", mapper);
+        assert_eq!(gm.io_policy(), GuestMemoryIoPolicy::Direct);
+        gm.write_plain(8, &42u64).unwrap();
+        assert_eq!(gm.read_plain::<u64>(8).unwrap(), 42);
+        assert!(host.events.lock().is_empty());
+    }
+
+    #[test]
+    fn scoped_mapper_checks_holes_and_permissions_before_host_access() {
+        let mapper = test_mapper(true);
+        let page = SparseMapping::page_size() as u64;
+        record(&mapper, 0, page, true);
+        record(&mapper, page, 2 * page, false);
+        record(&mapper, 3 * page, 4 * page, true);
+        let gm = GuestMemory::new("scoped", mapper.clone());
+        let range = gm.subrange(0, page, false).unwrap();
+        assert!(gm.full_mapping().is_some());
+        let host = install_test_host(&mapper);
+        assert_eq!(gm.io_policy(), GuestMemoryIoPolicy::CopyOnly);
+        assert_eq!(range.io_policy(), GuestMemoryIoPolicy::CopyOnly);
+        assert!(gm.full_mapping().is_none());
+        assert!(!gm.supports_locking());
+        gm.read_at(page - 1, &mut [0; 2]).unwrap();
+        assert_eq!(
+            std::mem::take(&mut *host.events.lock()),
+            [HostEvent::Acquire(page - 1, 2, false), HostEvent::Finish]
+        );
+        gm.write_at(page - 1, &[0; 2]).unwrap_err();
+        gm.read_at(2 * page - 1, &mut [0; 2]).unwrap_err();
+        gm.read_at(4 * page - 1, &mut [0; 2]).unwrap_err();
+        gm.read_at(0, &mut []).unwrap();
+        gm.read_plain::<()>(0).unwrap();
+        assert!(host.events.lock().is_empty());
+        range.fill_at(8, 0, 8).unwrap();
+        assert_eq!(
+            std::mem::take(&mut *host.events.lock()),
+            [HostEvent::Acquire(8, 8, true), HostEvent::Finish]
+        );
+        drop(host);
+        assert_eq!(gm.io_policy(), GuestMemoryIoPolicy::CopyOnly);
+        assert!(gm.read_plain::<u8>(0).is_err());
+    }
+
+    #[test]
+    fn scoped_mapper_prelaunch_and_release_errors() {
+        let mapper = test_mapper(true);
+        record(&mapper, 0, mapper.len() as u64, true);
+        let host = install_test_host(&mapper);
+        let gm = GuestMemory::new("scoped", mapper.clone());
+        host.live.store(false, Ordering::Relaxed);
+        gm.write_plain(8, &42u64).unwrap();
+        assert!(host.events.lock().is_empty());
+        host.live.store(true, Ordering::Relaxed);
+        host.fail_finish.store(true, Ordering::Relaxed);
+        let err = gm.read_plain::<u8>(8).unwrap_err();
+        assert_eq!(err.kind(), GuestMemoryErrorKind::Other);
+        assert_eq!(
+            std::mem::take(&mut *host.events.lock()),
+            [HostEvent::Acquire(8, 1, false), HostEvent::Finish]
+        );
+        let err = mapper
+            .acquire_access(8, 1, false)
+            .unwrap()
+            .unwrap()
+            .finish()
+            .unwrap_err();
+        assert_eq!(err.gpa, 8);
+        assert!(err.err.to_string().contains("release failure"));
+        host.fail_acquire.store(true, Ordering::Relaxed);
+        let err = match mapper.acquire_access(16, 1, true) {
+            Ok(_) => panic!("acquisition must fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.gpa, 16);
+        assert!(err.err.to_string().contains("acquire failure"));
+    }
+
+    #[test]
+    fn scoped_mapper_fault_does_not_reacquire_and_still_finishes() {
+        let mapper = test_mapper(false);
+        record(&mapper, 0, mapper.len() as u64, true);
+        let host = install_test_host(&mapper);
+        let gm = GuestMemory::new("scoped", mapper);
+        gm.read_plain::<u8>(8).unwrap_err();
+        assert_eq!(
+            std::mem::take(&mut *host.events.lock()),
+            [HostEvent::Acquire(8, 1, false), HostEvent::Finish]
+        );
+        host.fail_finish.store(true, Ordering::Relaxed);
+        gm.read_plain::<u8>(8).unwrap_err();
+        assert_eq!(
+            std::mem::take(&mut *host.events.lock()),
+            [HostEvent::Acquire(8, 1, false), HostEvent::Finish]
+        );
+    }
 
     /// Tests that private RAM pages can be allocated, written to, and read from.
     #[test]

@@ -68,10 +68,39 @@ pub trait PartitionMemoryMap: Send + Sync {
 /// merely because the guest marked it shared. The VMM must also ask the
 /// hypervisor to grant the host permission to touch the existing backing.
 pub trait PartitionHostAccess: Send + Sync {
+    /// Returns whether guest-memory views must use synchronous copies only.
+    ///
+    /// Attach before exporting or locking guest memory. Strengthening this
+    /// policy does not revoke handles exported before attachment.
+    fn requires_copy_only(&self) -> bool {
+        false
+    }
+
+    /// Acquires permission for one synchronous host copy.
+    ///
+    /// Called only when `requires_copy_only()` is true.
+    /// The guard owns its release state so that weak callback adapters can
+    /// return it without retaining the partition.
+    fn acquire_host_access_scoped(
+        &self,
+        addr: u64,
+        size: u64,
+        write: bool,
+    ) -> anyhow::Result<Option<Box<dyn PartitionHostAccessGuard>>> {
+        let _ = (addr, size, write);
+        Ok(None)
+    }
+
     /// Acquires host access without changing guest visibility.
     ///
-    /// TODO: This trait is sufficient for MSHV bring-up, but a redesign is
-    /// required to safely lower host access and track that pages are not
-    /// currently in use before revoking access.
+    /// Legacy fault recovery for backings without scoped copy permission.
     fn acquire_host_access(&self, addr: u64, size: u64, write: bool) -> anyhow::Result<()>;
+}
+
+/// Owned permission for a synchronous host copy.
+pub trait PartitionHostAccessGuard {
+    /// Releases permission and reports release failures.
+    ///
+    /// Implementations should also provide a non-panicking drop backstop.
+    fn finish(self: Box<Self>) -> anyhow::Result<()>;
 }
