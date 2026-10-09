@@ -829,8 +829,13 @@ impl GuestMemoryManager {
 
         if vtl == Vtl::Vtl2 {
             if let Some(offset) = self.vtl0_alias_map_offset {
-                let partition =
-                    PartitionMapper::new(partition, va_mapper.clone(), offset, self.pin_mappings);
+                let partition = PartitionMapper::new(
+                    partition,
+                    va_mapper.clone(),
+                    offset,
+                    self.pin_mappings,
+                    Arc::new((self.ram_regions.clone(), va_mapper.clone())),
+                );
                 self.region_manager
                     .client()
                     .add_partition(partition)
@@ -839,7 +844,13 @@ impl GuestMemoryManager {
             }
         }
 
-        let partition = PartitionMapper::new(partition, va_mapper, 0, self.pin_mappings);
+        let partition = PartitionMapper::new(
+            partition,
+            va_mapper.clone(),
+            0,
+            self.pin_mappings,
+            Arc::new((self.ram_regions.clone(), va_mapper)),
+        );
         self.region_manager
             .client()
             .add_partition(partition)

@@ -6,6 +6,16 @@
 
 /// Trait for mapping process memory into a partition.
 pub trait PartitionMemoryMap: Send + Sync {
+    /// Retains the RAM allocation and VA mapping owners until partition teardown.
+    ///
+    /// Returning `true` transfers teardown responsibility to the partition:
+    /// the caller must not unmap any region on mapper drop, and the partition must retain
+    /// `backing` until all kernel partition references and copy guards are gone.
+    /// Explicit runtime unmaps still use `unmap_range`.
+    fn retain_memory_backing(&self, _backing: std::sync::Arc<dyn Send + Sync>) -> bool {
+        false
+    }
+
     /// Unmaps any ranges in the given guest physical address range.
     ///
     /// The specified range may overlap zero, one, or many ranges mapped with
