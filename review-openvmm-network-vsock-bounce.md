@@ -72,16 +72,49 @@ candidate emitted owned TX and RX path events. Both guests powered off normally;
 the host partition set returned to its baseline and no new host kernel errors
 were recorded.
 
-The existing guest returns errno 97 when creating AF_VSOCK sockets in both
-configurations. **Real SNP vsock acceptance is blocked by that guest artifact.**
-Local virtio-vsock queue/Unix-socket integration tests pass, but they are not
-presented as a real SNP vsock result. No search for a replacement kernel or
-host-kernel change was pursued.
+The initially reused guest returned errno 97 when creating AF_VSOCK sockets in
+both configurations. That was a limitation of the old cached fixture, not the
+published upstream SNP guest. The published-guest retest below resolves it.
 
 Full logs, exact commands, framed traffic results, helper source, captured host
 logs, and input hashes are retained in the session's `files/net-vsock-hardware/`
 directory. Temporary remote test files are isolated under
 `/home/chris/nv-bounce-5e10ff8d`.
+
+## Published upstream SNP guest retest, 2026-10-09
+
+At the user's request, fetched the SNP guest artifact from
+`microsoft/openvmm-deps` release `0.3.0-155`:
+`openvmm-test-linux-snp-guest.x86_64.0.3.0-155.tar.gz`.
+Its manifest identifies Linux `6.18.53`. The extracted final configuration
+enables `CONFIG_VSOCKETS=y`, `CONFIG_VIRTIO_VSOCKETS=y`, and
+`CONFIG_VIRTIO_VSOCKETS_COMMON=y`. The kernel image SHA-256 matches the release
+manifest:
+`1ac6e1ed682af6fd6cb464bdd135b742a7efaee71587abd4d9e152b992273512`.
+
+Kept the same static test helper/initrd and committed OpenVMM candidate. The
+host kernel, old fixture, and host network configuration were unchanged. A
+private Unix relay socket created by the root-run VMM needed ownership assigned
+to the test client; only that socket inside the private test directory changed.
+
+| Configuration | Transport | Verified frames | Bytes each direction | Exit |
+|---|---|---:|---:|---:|
+| Baseline | Consomme TCP | 28 | 1,853,464 | 0 |
+| Baseline | In-process virtio-vsock | 28 | 1,853,464 | 0 |
+| Bounce enabled | Consomme TCP | 28 | 1,853,464 | 0 |
+| Bounce enabled | In-process virtio-vsock | 28 | 1,853,464 | 0 |
+
+Both guests confirmed SNP encryption and powered off normally. Their partition
+sets returned to the baseline, and neither kernel-log interval contained new
+host errors. The bounce run emitted owned-buffer events in all four paths:
+network TX/RX and vsock TX/RX. Payloads ranged from one byte to 256 KiB, using
+fragmented writes and deterministic verified responses.
+
+**Real SNP vsock hardware acceptance now passes.** The earlier blocked result
+is superseded, not counted as a pass. Release archive, final configuration,
+manifest, exact commands, input hashes, full logs, and path-event counts are
+saved in the session's `files/net-vsock-upstream/` directory. Remote inputs/logs
+are isolated under `/home/chris/nv-bounce-upstream-5e10ff8d`.
 
 ## Limits
 
