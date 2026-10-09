@@ -271,6 +271,12 @@ describes the source definitions.
   `auto`. `--virtio-rng-pcie-port` overrides this option.
 * `--virtio-vsock-path <PATH>`: Add a virtio-vsock device using the OpenVMM
   hybrid Unix socket relay.
+* `--virtio-vsock-bounce`: Stage data in owned buffers for the in-process
+  virtio-vsock device. The default is off. Requires `--virtio-vsock-path`;
+  it cannot be used with `--virtio-vsock-vhost-cid`. The bus selection, guest
+  CID, socket paths, and Unix relay connection protocol do not change. See
+  [per-device network and vsock bounce I/O](#per-device-network-and-vsock-bounce-io)
+  for the phase 1a limits.
 * `--virtio-vsock-bus <mmio|pci|pcie[:PORT]>`: Select the bus for a
   virtio-vsock device created by `--virtio-vsock-path` or
   `--virtio-vsock-vhost-cid`. When omitted, OpenVMM selects the bus
@@ -505,7 +511,7 @@ and brackets. If omitted, OpenVMM uses the disk ID or `openvmm-virtio-blk`.
 
 Add `bounce` to one `--virtio-blk` option to stage its block data in owned
 buffers. The default is off. Other disks and all network devices keep their
-existing I/O path. For example:
+existing I/O path unless you opt in separately. For example:
 
 ```bash
 --virtio-blk file:path/to/disk.raw,pcie_port=rp0,bounce
@@ -562,10 +568,54 @@ The `mem:<len>` value sets the emulated HDM size and allocates backing memory.
 
 **NICs** (colon-prefixed): `--net`, `--virtio-net`, `--mana`
 
-```sh
+```bash
 --virtio-net pcie_port=rp0:tap:tap0  # TAP is Linux-only
 --net pcie_port=rp0:consomme
 --mana pcie_port=rp0:tap:tap0        # TAP is Linux-only
+```
+
+#### Per-device network and vsock bounce I/O
+
+Prefix one `--virtio-net` value with `bounce:` to stage its transmitted and
+received data in owned buffers. The default is off. Other NICs keep their
+existing I/O path. Prefixes can appear in either order:
+
+```bash
+--virtio-net bounce:pcie_port=rp0:consomme
+--virtio-net pcie_port=rp0:bounce:queues=2:consomme:10.0.0.0/24,hostfwd=tcp::8080-:80
+--virtio-net bounce:tap:tap0
+--virtio-vsock-path path/to/vsock --virtio-vsock-bounce --virtio-vsock-bus pci
+```
+
+Network bounce I/O supports Consomme, Linux TAP, and `none` for tests without
+network traffic. It is limited to VTL0 virtio-net devices. It rejects `--net`,
+`--mana`, `uh:`, `vtl2:`, Direct I/O, assigned NICs, and vhost-user backends.
+It does not change MAC address generation, Consomme CIDR and port-forwarding
+options, or host NIC configuration. `queues=` and `pcie_port=` remain
+available. There is no VM-wide bounce switch.
+
+Vsock bounce I/O supports only the in-process Unix relay selected by
+`--virtio-vsock-path`. It preserves the relay protocol and guest connection
+behavior. `--virtio-vsock-bus` still accepts `mmio`, `pci`, and `pcie[:PORT]`.
+Kernel vhost-vsock and external vhost-user devices do not support this mode.
+
+This phase 1a mode uses bounded owned TX/RX scratch buffers for network I/O.
+Each active network queue pair reserves 4.25 MiB: 32 RX and 32 TX slots of
+68 KiB each. Packets are limited to 64 KiB and 256 descriptors. Full arenas
+apply backpressure instead of allocating from guest-provided queue lengths.
+Backend and queue metadata can use additional memory.
+
+Vsock uses the existing fallback paths within its credit bounds. RX allocation
+is capped by the posted capacity, available credit, and the 64 KiB stream
+buffer limit. Save and restore are not supported for devices that use bounce
+I/O in this phase.
+Only software backends are supported; hardware DMA support is deferred.
+
+```admonish warning
+Bounce I/O stages data; it is not memory isolation or memory management.
+Host access to guest memory remains acquire-only. This phase does not release
+host access, change the kernel ABI, or prevent other devices from accessing
+guest memory.
 ```
 
 **Filesystems and other virtio devices** (colon-prefixed):
