@@ -418,7 +418,9 @@ impl VirtioQueue {
         }
     }
 
-    fn try_complete_prepared(
+    /// Completes a prepared token once, returning publication errors.
+    /// On error the caller must retire the queue, not retry the token.
+    pub fn try_complete_prepared(
         &mut self,
         completion: QueueCompletion,
         bytes_written: u32,

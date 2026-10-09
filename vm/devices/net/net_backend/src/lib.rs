@@ -232,13 +232,19 @@ pub trait Queue: Send + InspectMut {
 /// between the frontend and backend for buffer access—the borrow
 /// checker enforces exclusive access statically.
 pub trait BufferAccess {
-    /// The associated guest memory accessor.
+    /// The memory namespace for this queue's TX segments and RX addresses.
+    ///
+    /// The name is historical: a frontend can supply separate owned scratch
+    /// memory instead of actual guest memory. Backends must resolve addresses
+    /// against this accessor, not a separately retained guest mapping. A
+    /// frontend must retain packet storage until backend completion.
     fn guest_memory(&self) -> &GuestMemory;
 
     /// Writes data to the specified buffer.
     fn write_data(&mut self, id: RxId, data: &[u8]);
 
-    /// Appends the guest address segments for the specified buffer to `buf`.
+    /// Appends address segments in [`Self::guest_memory`]'s namespace for the
+    /// specified buffer to `buf`.
     ///
     /// Callers must clear `buf` before calling if they do not want segments
     /// from a previous call to be retained.

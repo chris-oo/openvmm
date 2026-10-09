@@ -47,6 +47,7 @@ pub struct InOrderCompletion {
     /// device detects and treats as fatal.
     #[inspect(skip)]
     completed: Vec<Option<Completed>>,
+    failed: bool,
 }
 
 struct Completed {
@@ -60,6 +61,7 @@ impl InOrderCompletion {
         Self {
             order: VecDeque::with_capacity(queue_size as usize),
             completed: (0..queue_size).map(|_| None).collect(),
+            failed: false,
         }
     }
 
@@ -71,6 +73,9 @@ impl InOrderCompletion {
         &mut self,
         queue: &mut VirtioQueue,
     ) -> Result<Option<VirtioQueueCallbackWork>, Error> {
+        if self.failed {
+            return Err(Error::other("in-order queue is retired"));
+        }
         let work = queue.try_next()?;
         if let Some(work) = &work {
             let idx = work.descriptor_index() as usize;
@@ -100,10 +105,10 @@ impl InOrderCompletion {
     /// Use this in place of [`VirtioQueue::complete_prepared`].
     ///
     /// Each `completion` must be for a descriptor still outstanding from
-    /// [`try_next`](Self::try_next), completed once. Some violations panic (an
-    /// out-of-range index, or a collision with a still-buffered slot); a
-    /// completion for a no-longer-outstanding descriptor is not caught and
-    /// would strand an entry in `completed`, eventually stalling publication.
+    /// [`try_next`](Self::try_next), completed once. Invalid indices and
+    /// duplicate buffered completions are internal invariant violations and
+    /// panic. Publication errors are logged and retire the tracker. Use
+    /// [`try_complete`](Self::try_complete) to handle errors in the caller.
     pub fn complete(
         &mut self,
         queue: &mut VirtioQueue,
@@ -111,6 +116,53 @@ impl InOrderCompletion {
         bytes_written: u32,
     ) {
         let idx = completion.descriptor_index();
+        let slot = self
+            .completed
+            .get(idx as usize)
+            .expect("completed descriptor index must be within the queue size");
+        assert!(
+            slot.is_none(),
+            "descriptor {idx} completed more than once while outstanding"
+        );
+        if let Err(err) = self.try_complete(queue, completion, bytes_written) {
+            tracelimit::error_ratelimited!(
+                error = &err as &dyn std::error::Error,
+                "in-order completion failed"
+            );
+        }
+    }
+
+    /// Completes once in available order. A publication error retires this
+    /// tracker because the used marker might already be visible to the guest.
+    pub fn try_complete(
+        &mut self,
+        queue: &mut VirtioQueue,
+        completion: QueueCompletion,
+        bytes_written: u32,
+    ) -> Result<(), Error> {
+        if self.failed {
+            return Err(Error::other("in-order queue is retired"));
+        }
+        let result = self.complete_fallible(queue, completion, bytes_written);
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
+    fn complete_fallible(
+        &mut self,
+        queue: &mut VirtioQueue,
+        completion: QueueCompletion,
+        bytes_written: u32,
+    ) -> Result<(), Error> {
+        let idx = completion.descriptor_index();
+        if self.order.front() != Some(&idx)
+            && (!self.order.contains(&idx)
+                || self.completed.get(idx as usize).is_none_or(Option::is_some))
+        {
+            return Err(Error::other("invalid or duplicate in-order completion"));
+        }
 
         // Fast path: the completing descriptor is the one at the front of the
         // consumption order — the overwhelmingly common case, since an ordered
@@ -121,11 +173,13 @@ impl InOrderCompletion {
         // on entry.)
         if self.order.front() == Some(&idx) {
             self.order.pop_front();
-            queue.complete_prepared(completion, bytes_written);
+            queue
+                .try_complete_prepared(completion, bytes_written)
+                .map_err(Error::other)?;
             if !self.order.is_empty() {
-                self.drain_completed_prefix(queue);
+                self.drain_completed_prefix(queue)?;
             }
-            return;
+            return Ok(());
         }
 
         // Slow path: an out-of-order completion. Buffer it until the
@@ -143,11 +197,12 @@ impl InOrderCompletion {
             completion,
             bytes_written,
         });
+        Ok(())
     }
 
     /// Publishes the longest run of already-completed descriptors at the front
     /// of the consumption order, in order.
-    fn drain_completed_prefix(&mut self, queue: &mut VirtioQueue) {
+    fn drain_completed_prefix(&mut self, queue: &mut VirtioQueue) -> Result<(), Error> {
         while let Some(&front) = self.order.front() {
             let Some(Completed {
                 completion,
@@ -157,8 +212,11 @@ impl InOrderCompletion {
                 break;
             };
             self.order.pop_front();
-            queue.complete_prepared(completion, bytes_written);
+            queue
+                .try_complete_prepared(completion, bytes_written)
+                .map_err(Error::other)?;
         }
+        Ok(())
     }
 
     /// Returns the number of descriptors consumed but not yet published.
