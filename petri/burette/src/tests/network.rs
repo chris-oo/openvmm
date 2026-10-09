@@ -512,6 +512,7 @@ mod tap {
                     max_queues: None,
                     mac_address: TAP_MAC_ADDRESS,
                     endpoint,
+                    bounce_io: false,
                 }
                 .into_resource(),
             )

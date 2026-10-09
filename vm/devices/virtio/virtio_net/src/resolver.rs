@@ -33,6 +33,9 @@ impl AsyncResolveResource<VirtioDeviceHandle, VirtioNetHandle> for VirtioNetReso
         resource: VirtioNetHandle,
         input: VirtioResolveInput<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        if resource.bounce_io {
+            anyhow::bail!("bounce I/O is not yet implemented");
+        }
         let mut builder = Device::builder();
         if let Some(max_queues) = resource.max_queues {
             builder = builder.max_queues(max_queues);

@@ -821,6 +821,7 @@ async fn vm_config_from_command_line(
                 max_queues: None,
                 underhill: false,
                 pcie_port: None,
+                bounce_io: false,
             },
             &mut nic_index,
             &mut resources,
@@ -1892,6 +1893,7 @@ async fn vm_config_from_command_line(
             max_queues: vport.max_queues,
             mac_address: vport.mac_address,
             endpoint: vport.endpoint,
+            bounce_io: false,
         }
         .into_resource();
         if let Some(pcie_port) = &cli_cfg.pcie_port {
@@ -2062,6 +2064,7 @@ async fn vm_config_from_command_line(
             guest_cid: 0x3,
             base_path: vsock_path.clone(),
             listener,
+            bounce_io: false,
         }
         .into_resource();
         add_virtio_device(virtio_vsock_bus.clone(), resource, &mut pcie_devices);

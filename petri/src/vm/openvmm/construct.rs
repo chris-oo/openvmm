@@ -642,6 +642,7 @@ impl PetriVmConfigOpenVmm {
                     guest_cid: 0x3,
                     base_path: vsock_path_string.to_string(),
                     listener: vsock_listener.take().unwrap(),
+                    bounce_io: false,
                 }
                 .into_resource(),
             };

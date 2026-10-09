@@ -28,6 +28,9 @@ impl ResolveResource<VirtioDeviceHandle, VirtioVsockHandle> for VirtioVsockResol
         resource: VirtioVsockHandle,
         input: VirtioResolveInput<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        if resource.bounce_io {
+            anyhow::bail!("bounce I/O is not yet implemented");
+        }
         let device = VirtioVsockDevice::new(
             input.driver_source,
             resource.guest_cid,
