@@ -31,6 +31,8 @@ pub(super) enum HostAccessError {
     Allocation(#[source] std::collections::TryReserveError),
     #[error("SNP host-access state is uncertain; partition execution is stopped")]
     Poisoned,
+    #[error("legacy host-access acquisition is disabled in scoped mode")]
+    LegacyAcquisition,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +132,11 @@ impl Drop for HostAccessCoordinator {
 }
 
 impl HostAccessCoordinator {
+    #[cfg(test)]
+    pub fn ledger_for_test_is_empty(&self) -> bool {
+        self.ledger.lock().active.is_none()
+    }
+
     pub fn set_kick(&self, kick: Kick) {
         *self.kick.lock() = Some(kick);
     }

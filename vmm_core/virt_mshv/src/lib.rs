@@ -112,6 +112,7 @@ impl VcpuFdExt for VcpuFd {
 pub struct LinuxMshv {
     mshv: Mshv,
     snp_disable_cpuid_offload: bool,
+    snp_scoped_host_access: bool,
 }
 
 impl LinuxMshv {
@@ -126,6 +127,12 @@ impl LinuxMshv {
         self.snp_disable_cpuid_offload = disabled;
         self
     }
+
+    /// Configures opt-in scoped host access for SNP partitions.
+    pub fn with_snp_scoped_host_access(mut self, enabled: bool) -> Self {
+        self.snp_scoped_host_access = enabled;
+        self
+    }
 }
 
 impl From<std::fs::File> for LinuxMshv {
@@ -135,6 +142,7 @@ impl From<std::fs::File> for LinuxMshv {
             // TODO: fix mshv_bindings to not need this unsafe code.
             mshv: unsafe { Mshv::new_with_fd_number(file.into_raw_fd()) },
             snp_disable_cpuid_offload: false,
+            snp_scoped_host_access: false,
         }
     }
 }
@@ -364,11 +372,11 @@ mod memory_owner_tests {
 
 #[derive(Inspect)]
 struct MshvPartitionInner {
+    // VP fds also hold kernel partition references; close the BSP first.
     /// The BSP's VcpuFd, retained for partition-level register access
     /// (VM state get/set). Only used while VPs are stopped.
     #[inspect(skip)]
     bsp_vcpufd: VcpuFd,
-    // Close the BSP's kernel reference before the RAM owner.
     #[inspect(skip)]
     vmfd: Arc<MshvMemoryOwner>,
     #[inspect(skip)]
@@ -458,6 +466,41 @@ impl virt::PartitionTimeControl for MshvPartition {
 }
 
 impl MshvPartitionInner {
+    #[cfg(guest_arch = "x86_64")]
+    fn kick_host_access_vps(&self) {
+        for vp in &self.vps {
+            vp.needs_yield.request_yield();
+            if let Some(waker) = vp.waker.read().clone() {
+                waker.wake();
+            }
+            let thread = *vp.thread.read();
+            if let Some(thread) = thread {
+                if thread != Pthread::current() {
+                    if let Err(error) = thread.signal(libc::SIGRTMIN()) {
+                        tracelimit::error_ratelimited!(
+                            error = &error as &dyn std::error::Error,
+                            "failed to interrupt poisoned SNP VP"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn check_host_access_run(&self) -> Result<(), VpHaltReason> {
+        #[cfg(guest_arch = "x86_64")]
+        if let Some(snp) = self.isolation.snp() {
+            snp.check_host_access_run().map_err(|error| {
+                tracelimit::error_ratelimited!(
+                    error = &*error,
+                    "stopping VP after uncertain SNP host access"
+                );
+                VpHaltReason::TripleFault { vtl: Vtl::Vtl0 }
+            })?;
+        }
+        Ok(())
+    }
+
     fn vp(&self, vp_index: VpIndex) -> &MshvVpInner {
         &self.vps[vp_index.index() as usize]
     }
@@ -720,7 +763,10 @@ impl virt::Processor for MshvProcessor<'_> {
                 }
             }
 
-            match self.runner.run() {
+            self.partition.check_host_access_run()?;
+            let exit = self.runner.run();
+            self.partition.check_host_access_run()?;
+            match exit {
                 Ok(exit) => {
                     self.handle_exit(&exit, dev).await?;
                 }
@@ -992,16 +1038,32 @@ impl virt::PartitionMemoryMapper for MshvPartition {
 
 // TODO: figure out a better abstraction that also works for KVM and WHP.
 impl virt::PartitionHostAccess for MshvPartitionInner {
-    fn acquire_host_access(&self, _addr: u64, _size: u64, _write: bool) -> anyhow::Result<()> {
-        // TODO: The current prototype only provides the acquisition half of
-        // the host-visibility lifecycle. This is sufficient for single-threaded
-        // bring-up with no concurrent page-state changes, but the GPA attribute
-        // intercept revocation path must share serialized state with
-        // acquire_snp_host_access before concurrent use is safe.
-        // TODO: Investigate whether MSHV supports read-only host-access
-        // requests and use `_write` to avoid granting write access for reads.
+    fn requires_copy_only(&self) -> bool {
         #[cfg(guest_arch = "x86_64")]
-        if self.isolation.snp().is_some() {
+        if let Some(snp) = self.isolation.snp() {
+            return snp.scoped_host_access;
+        }
+        false
+    }
+
+    fn acquire_host_access_scoped(
+        &self,
+        addr: u64,
+        size: u64,
+        write: bool,
+    ) -> anyhow::Result<Option<Box<dyn virt::PartitionHostAccessGuard>>> {
+        #[cfg(guest_arch = "x86_64")]
+        if let Some(snp) = self.isolation.snp() {
+            return snp.acquire_host_access_scoped(self, addr, size, write);
+        }
+        let _ = (addr, size, write);
+        Ok(None)
+    }
+
+    fn acquire_host_access(&self, _addr: u64, _size: u64, _write: bool) -> anyhow::Result<()> {
+        #[cfg(guest_arch = "x86_64")]
+        if let Some(snp) = self.isolation.snp() {
+            snp.check_legacy_host_access()?;
             return arch::acquire_snp_host_access(self, _addr, _size);
         }
         anyhow::bail!("acquiring host access is not supported")
@@ -1032,6 +1094,19 @@ impl virt::PartitionMemoryMap for MshvPartitionInner {
         exec: bool,
     ) -> anyhow::Result<()> {
         let mut state = self.memory.lock();
+        #[cfg(guest_arch = "x86_64")]
+        if let Some(snp) = self.isolation.snp() {
+            snp.check_mapping_change(addr, size as u64)?;
+            // Moving an existing backing also changes its old GPA identity.
+            for range in state.ranges.iter().flatten() {
+                if range.region.userspace_addr == data as u64 {
+                    snp.check_mapping_change(
+                        range.region.guest_pfn << HV_PAGE_SHIFT,
+                        range.region.size,
+                    )?;
+                }
+            }
+        }
 
         // Memory slots cannot be resized but can be moved within the guest
         // address space. Find the existing slot if there is one.
@@ -1090,6 +1165,10 @@ impl virt::PartitionMemoryMap for MshvPartitionInner {
             .ok_or_else(|| anyhow::anyhow!("unmap range overflows the guest address space"))?
             >> HV_PAGE_SHIFT;
         let mut state = self.memory.lock();
+        #[cfg(guest_arch = "x86_64")]
+        if let Some(snp) = self.isolation.snp() {
+            snp.check_mapping_change(addr, size)?;
+        }
         for range in state.ranges.iter().flatten() {
             let region_start = range.region.guest_pfn;
             let region_end = region_start
@@ -1182,7 +1261,6 @@ impl MshvDoorbellEntry {
         if ret < 0 {
             return Err(io::Error::last_os_error());
         }
-
         Ok(Self {
             partition: Arc::downgrade(partition),
             event,

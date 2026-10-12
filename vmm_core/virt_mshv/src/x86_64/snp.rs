@@ -3,8 +3,17 @@
 
 //! AMD SEV-SNP support for the x86_64 MSHV backend.
 
+use super::snp_host_access::HostAccessBackend;
+use super::snp_host_access::HostAccessCoordinator;
+use super::snp_host_access::HostAccessError;
+use super::snp_host_access::PageRange;
+use super::snp_host_access::RootAccessGuard;
+use super::snp_host_access::attribute_ranges;
+use super::snp_host_access::validate_ram;
 use super::*;
 use crate::KernelError;
+use mshv_bindings::MSHV_SET_MEM_BIT_WRITABLE;
+use mshv_ioctls::VmFd;
 use std::io;
 
 pub(super) const SNP_IMPORT_CHUNK_PAGES: usize = 256;
@@ -170,6 +179,10 @@ pub(crate) struct SnpPartitionState {
     pub(super) sev_features: Mutex<Option<u64>>,
     pub(super) cpuid_offloads_enabled: bool,
     pub(crate) scoped_host_access: bool,
+    #[inspect(skip)]
+    host_access: Arc<HostAccessCoordinator>,
+    #[inspect(skip)]
+    control_ranges: Mutex<Vec<PageRange>>,
     config: Option<Box<MshvSnpConfig>>,
 }
 
@@ -180,6 +193,8 @@ impl SnpPartitionState {
             sev_features: Mutex::new(None),
             cpuid_offloads_enabled: !disable_cpuid_offload,
             scoped_host_access: false,
+            host_access: Arc::new(HostAccessCoordinator::default()),
+            control_ranges: Mutex::new(Vec::new()),
             config: None,
         }
     }
@@ -187,10 +202,184 @@ impl SnpPartitionState {
     pub(super) fn with_config(
         disable_cpuid_offload: bool,
         config: Option<Box<MshvSnpConfig>>,
+        scoped_host_access: bool,
     ) -> Self {
         let mut state = Self::new(disable_cpuid_offload);
         state.config = config;
+        state.scoped_host_access = scoped_host_access;
         state
+    }
+
+    pub(crate) fn install_host_access_kick(&self, partition: &Arc<MshvPartitionInner>) {
+        let partition = Arc::downgrade(partition);
+        self.host_access.set_kick(Arc::new(move || {
+            if let Some(partition) = partition.upgrade() {
+                partition.kick_host_access_vps();
+            }
+        }));
+    }
+
+    pub(crate) fn check_host_access_run(&self) -> anyhow::Result<()> {
+        self.host_access.check_run()?;
+        Ok(())
+    }
+
+    pub(crate) fn check_legacy_host_access(&self) -> anyhow::Result<()> {
+        if self.scoped_host_access {
+            return Err(HostAccessError::LegacyAcquisition.into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reserve_root_operation(
+        &self,
+        partition: &MshvPartitionInner,
+        addresses: &[u64],
+        operation: &'static str,
+    ) -> anyhow::Result<Option<RootAccessGuard>> {
+        if !self.scopes_active()? {
+            return Ok(None);
+        }
+        let ranges = addresses
+            .iter()
+            .map(|addr| PageRange::new(*addr, hvdef::HV_PAGE_SIZE))
+            .collect::<Result<Vec<_>, _>>()?;
+        // Reserve before validation so admission waits cannot block the
+        // mapping lock used by a fault/intercept handler.
+        let guard = self.host_access.reserve_root(ranges.clone(), operation)?;
+        {
+            let memory = partition.memory.lock();
+            let (ram, mappings) = host_access_ram(partition, &memory)?;
+            let controls = self.control_ranges.lock();
+            for range in &ranges {
+                validate_ram(*range, true, &ram, &mappings, &controls)?;
+            }
+        }
+        Ok(Some(guard))
+    }
+
+    pub(crate) fn check_mapping_change(&self, addr: u64, size: u64) -> anyhow::Result<()> {
+        if self.scoped_host_access {
+            self.host_access
+                .check_change(&[PageRange::new(addr, size)?])?;
+        }
+        Ok(())
+    }
+
+    fn scopes_active(&self) -> Result<bool, SnpError> {
+        if !self.scoped_host_access {
+            return Ok(false);
+        }
+        match *self.launch_state.lock() {
+            SnpLaunchState::Finished => Ok(true),
+            SnpLaunchState::NotStarted | SnpLaunchState::Started => Ok(false),
+            SnpLaunchState::Failed => Err(SnpError::LaunchFailed),
+        }
+    }
+
+    pub(crate) fn acquire_host_access_scoped(
+        &self,
+        partition: &MshvPartitionInner,
+        addr: u64,
+        size: u64,
+        write: bool,
+    ) -> anyhow::Result<Option<Box<dyn virt::PartitionHostAccessGuard>>> {
+        if !self.scopes_active()? {
+            return Ok(None);
+        }
+        let range = PageRange::new(addr, size)?;
+        let mut guard = self.host_access.reserve(
+            range,
+            0,
+            write,
+            Arc::new(MshvHostAccessBackend {
+                vmfd: partition.vmfd.clone(),
+                _memory: partition.gm.clone(),
+            }),
+        )?;
+        {
+            let memory = partition.memory.lock();
+            let (ram, mappings) = host_access_ram(partition, &memory)?;
+            let backing = validate_ram(range, write, &ram, &mappings, &self.control_ranges.lock())?;
+            guard.set_backing(backing);
+        }
+        // No mapping or ledger mutex is held across the ioctl or the copy.
+        Ok(Some(Box::new(guard.acquire()?)))
+    }
+
+    fn check_gpa_attribute_change(
+        &self,
+        partition: &MshvPartitionInner,
+        message: &hvdef::HvX64GpaAttributeInterceptMessage,
+    ) -> anyhow::Result<()> {
+        let ranges = attribute_ranges(message)?;
+        let memory = partition.memory.lock();
+        let (ram, mappings) = host_access_ram(partition, &memory)?;
+        let controls = self.control_ranges.lock();
+        // Validate every range before checking the whole request against the
+        // partition ledger. A second VP shares this same admission state.
+        for range in &ranges {
+            validate_ram(*range, false, &ram, &mappings, &controls)?;
+        }
+        self.host_access.check_change(&ranges)?;
+        // Do not reserve or resume an intercept without a proven completion
+        // contract. CompletePartitionIntercept's value encoding is unresolved.
+        Ok(())
+    }
+}
+
+type HostAccessMapping = (PageRange, u64, bool);
+
+fn host_access_ram(
+    partition: &MshvPartitionInner,
+    memory: &crate::MshvMemoryRangeState,
+) -> Result<(Vec<PageRange>, Vec<HostAccessMapping>), HostAccessError> {
+    let ram = partition
+        .mem_layout
+        .ram()
+        .iter()
+        .map(|ram| PageRange {
+            start: ram.range.start(),
+            end: ram.range.end(),
+        })
+        .collect();
+    let mappings = memory
+        .ranges
+        .iter()
+        .flatten()
+        .filter(|mapping| mapping.mapped)
+        .map(|mapping| {
+            let region = &mapping.region;
+            let addr = region
+                .guest_pfn
+                .checked_mul(hvdef::HV_PAGE_SIZE)
+                .ok_or(HostAccessError::InvalidRange)?;
+            Ok((
+                PageRange::new(addr, region.size)?,
+                region.userspace_addr,
+                region.flags & (1 << MSHV_SET_MEM_BIT_WRITABLE) != 0,
+            ))
+        })
+        .collect::<Result<_, HostAccessError>>()?;
+    Ok((ram, mappings))
+}
+
+struct MshvHostAccessBackend {
+    vmfd: Arc<crate::MshvMemoryOwner>,
+    // Keep the registered RAM backing alive even if the weak host callback
+    // was the last partition reference.
+    _memory: GuestMemory,
+}
+
+impl HostAccessBackend for MshvHostAccessBackend {
+    fn modify(&self, range: PageRange, acquire: bool, write: bool) -> anyhow::Result<()> {
+        modify_snp_host_access(
+            &self.vmfd,
+            range.start,
+            range.end - range.start,
+            acquire,
+            write,
+        )
     }
 }
 
@@ -426,27 +615,37 @@ pub(crate) fn acquire_snp_host_access(
     addr: u64,
     size: u64,
 ) -> anyhow::Result<()> {
-    // TODO: Coordinate acquisition with guest visibility changes using
-    // per-page state before supporting revocation. GPA attribute intercepts
-    // currently halt the VP rather than revoke host access.
+    // Legacy single-threaded bring-up intentionally retains its RW grant.
+    modify_snp_host_access(&partition.vmfd, addr, size, true, true)
+}
+
+fn modify_snp_host_access(
+    vmfd: &VmFd,
+    addr: u64,
+    size: u64,
+    acquire: bool,
+    write: bool,
+) -> anyhow::Result<()> {
     anyhow::ensure!(
         addr.is_multiple_of(hvdef::HV_PAGE_SIZE)
             && size.is_multiple_of(hvdef::HV_PAGE_SIZE)
             && size != 0,
         "host-access range must be page aligned and nonempty"
     );
+    anyhow::ensure!(
+        addr.checked_add(size).is_some(),
+        "host-access range overflows GPA space"
+    );
     let page_count = size / hvdef::HV_PAGE_SIZE;
-    let flags = (1 << mshv_bindings::MSHV_GPA_HOST_ACCESS_BIT_ACQUIRE)
-        | (1 << mshv_bindings::MSHV_GPA_HOST_ACCESS_BIT_READABLE)
-        | (1 << mshv_bindings::MSHV_GPA_HOST_ACCESS_BIT_WRITABLE);
+    let flags = host_access_flags(acquire, write);
     let mut buf = HeaderVec::<ModifyGpaHostAccessHeader, u64, 0>::new(ModifyGpaHostAccessHeader {
         flags,
         rsvd: [0; 7],
         page_count,
     });
-    let gpas = (0..page_count)
-        .map(|page| addr + page * hvdef::HV_PAGE_SIZE)
-        .collect::<Vec<_>>();
+    let mut gpas = Vec::new();
+    gpas.try_reserve_exact(usize::try_from(page_count)?)?;
+    gpas.extend((0..page_count).map(|page| addr + page * hvdef::HV_PAGE_SIZE));
     buf.extend_tail_from_slice(&gpas);
     // SAFETY: The custom header matches `mshv_modify_gpa_host_access`,
     // followed by `page_count` contiguous GPA values.
@@ -455,8 +654,21 @@ pub(crate) fn acquire_snp_host_access(
             .as_ptr()
             .cast::<mshv_bindings::mshv_modify_gpa_host_access>()
     };
-    partition.vmfd.modify_gpa_host_access(args)?;
+    vmfd.modify_gpa_host_access(args)?;
     Ok(())
+}
+
+fn host_access_flags(acquire: bool, write: bool) -> u8 {
+    if !acquire {
+        return 0;
+    }
+    (1 << mshv_bindings::MSHV_GPA_HOST_ACCESS_BIT_ACQUIRE)
+        | (1 << mshv_bindings::MSHV_GPA_HOST_ACCESS_BIT_READABLE)
+        | if write {
+            1 << mshv_bindings::MSHV_GPA_HOST_ACCESS_BIT_WRITABLE
+        } else {
+            0
+        }
 }
 
 pub(super) fn sanitize_snp_cpuid(
@@ -625,8 +837,8 @@ impl MshvPartitionInner {
                 .lock()
                 .push(Arc::new(config.vmsa_memory.clone()));
         }
-        let flags = (1 << mshv_bindings::MSHV_SET_MEM_BIT_WRITABLE)
-            | (1 << mshv_bindings::MSHV_SET_MEM_BIT_EXECUTABLE);
+        let flags =
+            (1 << MSHV_SET_MEM_BIT_WRITABLE) | (1 << mshv_bindings::MSHV_SET_MEM_BIT_EXECUTABLE);
         let region = mshv_bindings::mshv_user_mem_region {
             size: hvdef::HV_PAGE_SIZE,
             guest_pfn: config.vmsa_gpa / hvdef::HV_PAGE_SIZE,
@@ -673,6 +885,10 @@ impl MshvPartitionInner {
         pages: &[virt::InitialPageImport],
     ) -> Result<(), Error> {
         let (vmsa_gpa, cpuid_gpa) = snp_launch_pages(pages)?;
+        snp.control_ranges.lock().push(
+            PageRange::new(vmsa_gpa, hvdef::HV_PAGE_SIZE)
+                .map_err(|_| SnpError::InvalidPageRange)?,
+        );
         let sev_features = if let Some(config) = &snp.config {
             if vmsa_gpa != config.vmsa_gpa {
                 return Err(ErrorInner::InvalidSnpVmsaImport.into());
@@ -1143,6 +1359,17 @@ impl MshvProcessor<'_> {
                 Err(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 })
             }
             HvMessageType::HvMessageTypeGpaAttributeIntercept => {
+                if let Some(snp) = self.partition.isolation.snp() {
+                    let info = exit.as_message::<hvdef::HvX64GpaAttributeInterceptMessage>();
+                    if let Err(error) = snp.check_gpa_attribute_change(self.partition, info) {
+                        tracelimit::warn_ratelimited!(
+                            error = &*error,
+                            vp_index = info.vp_index,
+                            "rejected SNP GPA attribute request"
+                        );
+                        return Err(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 });
+                    }
+                }
                 Self::handle_snp_gpa_attribute_intercept(exit)
             }
             HvMessageType::HvMessageTypeHypercallIntercept => {
@@ -1214,29 +1441,16 @@ impl MshvProcessor<'_> {
     ) -> Result<(), VpHaltReason> {
         let info = message.as_message::<hvdef::HvX64GpaAttributeInterceptMessage>();
         let range_count = info.flags.range_count() as usize;
-        if info.flags.adjust() || info.flags.memory_type() != 0 {
-            // Normal guest visibility changes require adjust permission.
-            // TODO: Support host-access revocation by blocking new acquisitions
-            // and draining active host/device users before releasing access and
-            // resuming the VP. Until then, fail closed.
-            tracelimit::warn_ratelimited!(
-                vp_index = info.vp_index,
-                adjust = info.flags.adjust(),
-                host_visibility = info.flags.host_visibility(),
-                memory_type = info.flags.memory_type(),
-                range_count,
-                ranges = ?info.ranges.get(..range_count),
-                "unsupported SNP GPA attribute change; halting VP"
-            );
-            return Err(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 });
-        }
-
+        // Admission alone cannot resume the VP. The kernel's
+        // CompletePartitionIntercept value encoding is not yet established.
         tracelimit::warn_ratelimited!(
             vp_index = info.vp_index,
+            adjust = info.flags.adjust(),
             host_visibility = info.flags.host_visibility(),
+            memory_type = info.flags.memory_type(),
             range_count,
             ranges = ?info.ranges.get(..range_count),
-            "unsupported SNP GPA attribute intercept; halting VP"
+            "SNP GPA attribute completion is unresolved; halting VP"
         );
         Err(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 })
     }
@@ -1246,6 +1460,25 @@ impl MshvProcessor<'_> {
         name: HvX64RegisterName,
         value: u64,
     ) -> Result<(), VpHaltReason> {
+        let mut control = if name == HvX64RegisterName::SevDoorbellGpa {
+            if let Some(snp) = self.partition.isolation.snp() {
+                snp.reserve_root_operation(self.partition, &[value & !1], "SNP doorbell")
+                    .map_err(|error| {
+                        tracelimit::warn_ratelimited!(
+                            error = &*error,
+                            "SNP doorbell admission failed"
+                        );
+                        VpHaltReason::TripleFault { vtl: Vtl::Vtl0 }
+                    })?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(control) = &mut control {
+            control.start();
+        }
         self.runner
             .vcpufd
             .set_hvdef_regs(&[HvRegisterAssoc::from((name, value))])
@@ -1256,7 +1489,11 @@ impl MshvProcessor<'_> {
                     "failed to set SNP VP register"
                 );
                 VpHaltReason::TripleFault { vtl: Vtl::Vtl0 }
-            })
+            })?;
+        if let Some(control) = control {
+            control.retain();
+        }
+        Ok(())
     }
 
     pub(super) fn sev_get_reg(&self, name: HvX64RegisterName) -> Result<u64, VpHaltReason> {
@@ -1718,6 +1955,23 @@ impl MshvProcessor<'_> {
             req_gpa: request.request_gpa,
             rsp_gpa: request.response_gpa,
         };
+        let mut control = self
+            .partition
+            .isolation
+            .snp()
+            .ok_or(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 })?
+            .reserve_root_operation(
+                self.partition,
+                &[request.req_gpa, request.rsp_gpa],
+                "PSP guest request",
+            )
+            .map_err(|error| {
+                tracelimit::warn_ratelimited!(error = &*error, "SNP PSP admission failed");
+                VpHaltReason::TripleFault { vtl: Vtl::Vtl0 }
+            })?;
+        if let Some(control) = &mut control {
+            control.start();
+        }
         if let Err(error) = self.partition.vmfd.psp_issue_guest_request(&request) {
             tracelimit::error_ratelimited!(
                 error = &error as &dyn std::error::Error,
@@ -1726,6 +1980,9 @@ impl MshvProcessor<'_> {
                 "MSHV SNP guest request failed"
             );
             return Err(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 });
+        }
+        if let Some(control) = control {
+            control.complete();
         }
 
         let ghcb = self.runner.ghcb_page().ok_or_else(|| {
@@ -1826,6 +2083,15 @@ impl MshvProcessor<'_> {
             vp_id: u64::from(target_vp.index()),
             vmsa_gpa: request.vmsa_gpa,
         };
+        let mut control = snp
+            .reserve_root_operation(self.partition, &[request.vmsa_gpa], "AP VMSA")
+            .map_err(|error| {
+                tracelimit::warn_ratelimited!(error = &*error, "SNP AP VMSA admission failed");
+                VpHaltReason::TripleFault { vtl: Vtl::Vtl0 }
+            })?;
+        if let Some(control) = &mut control {
+            control.start();
+        }
         if let Err(error) = self.partition.vmfd.sev_snp_ap_create(&request) {
             tracelimit::error_ratelimited!(
                 error = &error as &dyn std::error::Error,
@@ -1839,6 +2105,9 @@ impl MshvProcessor<'_> {
                 .ok_or(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 })?;
             set_ghcb_error(ghcb, GHCB_ERROR_INVALID_INPUT);
             return Ok(());
+        }
+        if let Some(control) = control {
+            control.retain();
         }
 
         let ghcb = self
@@ -1855,6 +2124,38 @@ impl MshvProcessor<'_> {
 mod tests {
     use super::*;
     use test_with_tracing::test;
+
+    #[test]
+    fn scoped_host_access_starts_only_after_launch() {
+        let scoped = SnpPartitionState::with_config(false, None, true);
+        for state in [SnpLaunchState::NotStarted, SnpLaunchState::Started] {
+            *scoped.launch_state.lock() = state;
+            assert!(!scoped.scopes_active().expect("boot loading"));
+            assert!(scoped.host_access.ledger_for_test_is_empty());
+        }
+        *scoped.launch_state.lock() = SnpLaunchState::Finished;
+        assert!(scoped.scopes_active().expect("finished"));
+        assert!(scoped.check_legacy_host_access().is_err());
+        *scoped.launch_state.lock() = SnpLaunchState::Failed;
+        assert!(scoped.scopes_active().is_err());
+
+        let legacy = SnpPartitionState::new(false);
+        *legacy.launch_state.lock() = SnpLaunchState::Finished;
+        assert!(!legacy.scoped_host_access);
+        assert!(!legacy.scopes_active().expect("legacy"));
+        assert!(legacy.check_legacy_host_access().is_ok());
+    }
+
+    #[test]
+    fn scoped_host_access_flags_keep_guest_ownership_and_release_all_permissions() {
+        let acquire = 1 << mshv_bindings::MSHV_GPA_HOST_ACCESS_BIT_ACQUIRE;
+        let readable = 1 << mshv_bindings::MSHV_GPA_HOST_ACCESS_BIT_READABLE;
+        let writable = 1 << mshv_bindings::MSHV_GPA_HOST_ACCESS_BIT_WRITABLE;
+        assert_eq!(host_access_flags(true, false), acquire | readable);
+        assert_eq!(host_access_flags(true, true), acquire | readable | writable);
+        assert_eq!(host_access_flags(false, false), 0);
+        assert_eq!(host_access_flags(false, true), 0);
+    }
 
     fn snp_config(features: x86defs::snp::SevFeatures) -> virt::SnpConfig {
         let mut page = Box::new([0; 4096]);
