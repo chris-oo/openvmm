@@ -573,7 +573,7 @@ impl ProtoPartition for MshvProtoPartition<'_> {
             )),
         };
         let inner = Arc::new(MshvPartitionInner {
-            vmfd: self.vmfd,
+            vmfd: Arc::new(crate::MshvMemoryOwner::new(self.vmfd)),
             bsp_vcpufd: self.bsp,
             memory: Default::default(),
             gm: config.guest_memory.clone(),

@@ -169,6 +169,7 @@ pub(crate) struct SnpPartitionState {
     /// feature set for subsequent requests.
     pub(super) sev_features: Mutex<Option<u64>>,
     pub(super) cpuid_offloads_enabled: bool,
+    pub(crate) scoped_host_access: bool,
     config: Option<Box<MshvSnpConfig>>,
 }
 
@@ -178,6 +179,7 @@ impl SnpPartitionState {
             launch_state: Mutex::new(SnpLaunchState::NotStarted),
             sev_features: Mutex::new(None),
             cpuid_offloads_enabled: !disable_cpuid_offload,
+            scoped_host_access: false,
             config: None,
         }
     }
@@ -613,6 +615,16 @@ impl MshvPartitionInner {
         let Some(vmsa_bytes) = config.vmsa_memory.inner_buf() else {
             return Err(ErrorInner::InvalidSnpVmsaBacking.into());
         };
+        if self
+            .isolation
+            .snp()
+            .is_some_and(|snp| snp.scoped_host_access)
+        {
+            self.vmfd
+                .backing
+                .lock()
+                .push(Arc::new(config.vmsa_memory.clone()));
+        }
         let flags = (1 << mshv_bindings::MSHV_SET_MEM_BIT_WRITABLE)
             | (1 << mshv_bindings::MSHV_SET_MEM_BIT_EXECUTABLE);
         let region = mshv_bindings::mshv_user_mem_region {

@@ -296,14 +296,81 @@ impl MshvIsolationState {
     }
 }
 
+struct MshvMemoryOwner<F = VmFd> {
+    // Closing the last partition fd must precede releasing RAM region handles.
+    vmfd: F,
+    #[cfg(guest_arch = "x86_64")]
+    backing: Mutex<Vec<Arc<dyn Send + Sync>>>,
+}
+
+impl<F> MshvMemoryOwner<F> {
+    fn new(vmfd: F) -> Self {
+        Self {
+            vmfd,
+            #[cfg(guest_arch = "x86_64")]
+            backing: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl<F> std::ops::Deref for MshvMemoryOwner<F> {
+    type Target = F;
+
+    fn deref(&self) -> &Self::Target {
+        &self.vmfd
+    }
+}
+
+#[cfg(all(test, guest_arch = "x86_64"))]
+mod memory_owner_tests {
+    use super::MshvMemoryOwner;
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+    use test_with_tracing::test;
+
+    struct DropEvent {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        name: &'static str,
+    }
+
+    impl Drop for DropEvent {
+        fn drop(&mut self) {
+            self.events.lock().push(self.name);
+        }
+    }
+
+    #[test]
+    fn final_kernel_owner_closes_before_ram_backing() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let owner = Arc::new(MshvMemoryOwner::new(DropEvent {
+            events: events.clone(),
+            name: "kernel closed",
+        }));
+        let backing = Arc::new(DropEvent {
+            events: events.clone(),
+            name: "backing released",
+        });
+        let backing_weak = Arc::downgrade(&backing);
+        owner.backing.lock().push(backing);
+        let copy_owner = owner.clone();
+        drop(owner);
+        assert!(backing_weak.upgrade().is_some());
+        assert!(events.lock().is_empty());
+        drop(copy_owner);
+        assert!(backing_weak.upgrade().is_none());
+        assert_eq!(*events.lock(), ["kernel closed", "backing released"]);
+    }
+}
+
 #[derive(Inspect)]
 struct MshvPartitionInner {
-    #[inspect(skip)]
-    vmfd: VmFd,
     /// The BSP's VcpuFd, retained for partition-level register access
     /// (VM state get/set). Only used while VPs are stopped.
     #[inspect(skip)]
     bsp_vcpufd: VcpuFd,
+    // Close the BSP's kernel reference before the RAM owner.
+    #[inspect(skip)]
+    vmfd: Arc<MshvMemoryOwner>,
     #[inspect(skip)]
     memory: Mutex<MshvMemoryRangeState>,
     gm: GuestMemory,
@@ -468,11 +535,12 @@ impl MshvPartitionInner {
 
 /// Binds a virtual processor to the current thread.
 pub struct MshvProcessorBinder {
-    partition: Arc<MshvPartitionInner>,
     vcpufd: Option<VcpuFd>,
     vpindex: VpIndex,
     #[cfg(guest_arch = "x86_64")]
     snp: Option<arch::SnpVpState>,
+    // Drop the VP fd and GHCB mapping before the partition's RAM owner.
+    partition: Arc<MshvPartitionInner>,
 }
 
 /// Wraps a VcpuFd for running a VP. On x86_64, also provides access to the
@@ -941,6 +1009,20 @@ impl virt::PartitionHostAccess for MshvPartitionInner {
 }
 
 impl virt::PartitionMemoryMap for MshvPartitionInner {
+    fn retain_memory_backing(&self, backing: Arc<dyn Send + Sync>) -> bool {
+        #[cfg(guest_arch = "x86_64")]
+        if self
+            .isolation
+            .snp()
+            .is_some_and(|snp| snp.scoped_host_access)
+        {
+            self.vmfd.backing.lock().push(backing);
+            return true;
+        }
+        let _ = backing;
+        false
+    }
+
     unsafe fn map_range(
         &self,
         data: *mut u8,
