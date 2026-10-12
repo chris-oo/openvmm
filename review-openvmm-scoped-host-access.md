@@ -2,6 +2,9 @@
 
 ## Status
 
+The remaining issues and their acceptance gates are tracked in
+[Outstanding OpenVMM SNP host-access issues](pending-openvmm-snp-host-access.md).
+
 Phase 1b is not complete. The scoped-copy foundation is committed in jj change
 ID `znmztzpx`. All pending code, configuration, and documentation changes have
 been split into reviewed, default-off experimental commits. Committing these
