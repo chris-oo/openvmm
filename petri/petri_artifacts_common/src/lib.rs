@@ -8,6 +8,15 @@
 
 /// Published payload identities for the qualified CCA v15 incubators.
 pub mod cca_payload {
+    /// Unchanged reference Realm guest used by the TDISP AHCI test.
+    pub mod tdisp_guest {
+        /// Image qualified with the reference kvmtool guest.
+        pub const LINUX_IMAGE_SHA256: &str =
+            "6bef4c54ac93d8513ad7f125737c9ff0a8b0b7e34720e77253e2b63460002437";
+        /// Unmodified guest driver and TDISP/AHCI test script archive.
+        pub const INITRD_SHA256: &str =
+            "d3ba987d83bd46a60cf2199d7989a7b940499065e1011125775034b5710dad92";
+    }
     /// Local integration payload for the in-place guest_memfd memory mode.
     /// These identities do not qualify device assignment.
     pub mod guest_memfd_in_place {

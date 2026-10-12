@@ -28,6 +28,8 @@ use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
+use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Component;
@@ -37,9 +39,10 @@ use std::process::Command;
 
 /// Checked-in append-only runtime overlay, applied after the platform overlay.
 pub const INITRD_OVERLAY: &str = include_str!("../../platforms/fvp-initrd-overlay.yaml");
-/// Required JSON array declaring the source-matched share input list.
+/// Required JSON array declaring relative share files and directories.
 /// Unlisted content, including previous outputs and downloaded archives, is not
-/// copied. The manifest is not exposed to the guest.
+/// copied. Directory entries preserve empty roots without authorizing children.
+/// The manifest is not exposed to the guest.
 pub const SHARE_MANIFEST: &str = ".openvmm-fvp-share.json";
 
 const MAX_MANIFEST_SIZE: u64 = 4 * 1024 * 1024;
@@ -116,6 +119,7 @@ pub struct PreparedFvpRun {
     root: PathBuf,
     cleaned: bool,
     allocation: super::lifecycle::WorkspaceAllocation,
+    release_package: std::cell::Cell<bool>,
 }
 
 impl PreparedFvpRun {
@@ -162,8 +166,9 @@ impl PreparedFvpRun {
         deadline: &Deadline,
         cancellation: &Cancellation,
     ) -> anyhow::Result<Self> {
+        let parent = std::env::current_dir()?;
         Self::prepare_in(
-            Path::new("/tmp"),
+            &parent,
             platform,
             (kernel, patched_initrd),
             share,
@@ -207,7 +212,19 @@ impl PreparedFvpRun {
         deadline: &Deadline,
         cancellation: &Cancellation,
     ) -> anyhow::Result<Self> {
-        Self::allocate_checked(Path::new("/tmp"), platform, share, deadline, cancellation)
+        let parent = std::env::current_dir()?;
+        Self::allocate_checked(&parent, platform, share, deadline, cancellation)
+    }
+
+    /// Allocate native snapshots below the validated persistent output root.
+    pub(crate) fn allocate_for_session_in(
+        parent: &Path,
+        platform: &PlatformSources,
+        share: &Path,
+        deadline: &Deadline,
+        cancellation: &Cancellation,
+    ) -> anyhow::Result<Self> {
+        Self::allocate_checked(parent, platform, share, deadline, cancellation)
     }
 
     #[expect(
@@ -294,9 +311,28 @@ impl PreparedFvpRun {
             )?;
         }
         snapshot_share_with_inputs(share, &self.share(), additional, deadline, cancellation)?;
-        fs::write(self.root.join("config/openvmm-initrd.yaml"), INITRD_OVERLAY)?;
+        let release = platform.overlay.path().file_name()
+            == Some(std::ffi::OsStr::new("runtime-overlay.yaml"));
+        self.release_package.set(release);
+        let overlay = if release {
+            self.prepare_release_semihost()?;
+            INITRD_OVERLAY.replace("$${SEMIHOSTDIR}", "${rtvar:SEMIHOSTDIR}")
+        } else {
+            INITRD_OVERLAY.to_owned()
+        };
+        fs::write(self.root.join("config/openvmm-initrd.yaml"), overlay)?;
         check(deadline, cancellation)?;
         Ok(())
+    }
+
+    fn prepare_release_semihost(&self) -> anyhow::Result<()> {
+        // Shrinkwrap mounts path rtvars before running the package's mkdir.
+        // Docker creates absent mount sources as root, which its mapped user
+        // cannot write. Allocate this mutable directory ourselves, not inputs.
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(self.root.join("build/semihost"))
+            .context("cannot create owned writable FVP semihost directory")
     }
 
     #[expect(
@@ -326,6 +362,7 @@ impl PreparedFvpRun {
             root: directory.keep(),
             cleaned: false,
             allocation,
+            release_package: std::cell::Cell::new(false),
         })
     }
 
@@ -477,6 +514,12 @@ impl PreparedFvpRun {
                 .arg(format!("{name}={}", self.root.join(relative).display()));
         }
         command.args(["--rtvar", "CMDLINE="]);
+        if self.release_package.get() {
+            command.arg("--rtvar").arg(format!(
+                "SEMIHOSTDIR={}",
+                self.root.join("build/semihost").display()
+            ));
+        }
         if config.platform == crate::profile::FvpPlatform::RealmVfio {
             command.arg("--rtvar").arg(format!(
                 "PCI_HIERARCHY_FILE_FIXED={}",
@@ -660,7 +703,7 @@ fn copy_verified_with_progress(
     Ok(())
 }
 
-fn share_file(root: &Path, relative: &Path) -> anyhow::Result<PathBuf> {
+fn share_input(root: &Path, relative: &Path) -> anyhow::Result<(PathBuf, fs::Metadata)> {
     ensure!(
         !relative.as_os_str().is_empty()
             && relative
@@ -676,11 +719,43 @@ fn share_file(root: &Path, relative: &Path) -> anyhow::Result<PathBuf> {
             "FVP share inventory contains a symlink"
         );
     }
+    let metadata = fs::symlink_metadata(&path)?;
     ensure!(
-        path.is_file(),
-        "FVP share inventory entry is not a regular file"
+        metadata.is_file() || metadata.is_dir(),
+        "FVP share inventory entry must be a regular file or directory"
     );
-    Ok(path)
+    Ok((path, metadata))
+}
+
+fn create_share_directory(
+    root: &Path,
+    relative: &Path,
+    deadline: &Deadline,
+    cancellation: &Cancellation,
+) -> anyhow::Result<()> {
+    ensure!(
+        fs::symlink_metadata(root)?.is_dir(),
+        "FVP share snapshot root must be a directory, not a symlink"
+    );
+    let mut path = root.to_owned();
+    for part in relative.components() {
+        check(deadline, cancellation)?;
+        ensure!(
+            matches!(part, Component::Normal(_)),
+            "invalid FVP share directory path"
+        );
+        path.push(part);
+        match fs::create_dir(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error).context("cannot create FVP share directory"),
+        }
+        ensure!(
+            fs::symlink_metadata(&path)?.is_dir(),
+            "FVP share snapshot directory must not be a symlink or file"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -691,6 +766,74 @@ fn snapshot_share(
     cancellation: &Cancellation,
 ) -> anyhow::Result<()> {
     snapshot_share_with_inputs(source, destination, &[], deadline, cancellation)
+}
+
+/// Snapshot one explicitly required regular file, including a selected runner
+/// under a temporary directory. No siblings are copied and output paths remain
+/// forbidden. Uses the same checks as manifest and additional runner inputs.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "resolve the source share before checking relative input containment"
+)]
+pub fn snapshot_additional_share_input(
+    source: &Path,
+    destination: &Path,
+    relative: &Path,
+    deadline: &Deadline,
+    cancellation: &Cancellation,
+) -> anyhow::Result<()> {
+    let root =
+        fs::canonicalize(source).context("cannot resolve additional FVP share input root")?;
+    ensure!(
+        root.is_dir(),
+        "additional FVP share input root must be a directory"
+    );
+    snapshot_share_input(&root, destination, relative, true, deadline, cancellation)
+}
+
+fn snapshot_share_input(
+    root: &Path,
+    destination: &Path,
+    relative: &Path,
+    require_file: bool,
+    deadline: &Deadline,
+    cancellation: &Cancellation,
+) -> anyhow::Result<()> {
+    check(deadline, cancellation)?;
+    ensure!(
+        relative != Path::new(SHARE_MANIFEST),
+        "FVP share inventory cannot include itself"
+    );
+    ensure!(
+        !relative.starts_with("test_results"),
+        "FVP share inputs cannot include the guest output directory"
+    );
+    let (input, metadata) = share_input(root, relative)?;
+    let output = destination.join(relative);
+    ensure!(
+        !require_file || metadata.is_file(),
+        "additional FVP share inputs must be regular files"
+    );
+    if metadata.is_dir() {
+        create_share_directory(destination, relative, deadline, cancellation)?;
+    } else {
+        create_share_directory(
+            destination,
+            relative.parent().context("invalid FVP share path")?,
+            deadline,
+            cancellation,
+        )?;
+        copy_verified(&input, &output, None, deadline, cancellation)?;
+    }
+    let (current, after) = share_input(root, relative)?;
+    ensure!(
+        current == input
+            && after.dev() == metadata.dev()
+            && after.ino() == metadata.ino()
+            && after.file_type() == metadata.file_type(),
+        "FVP share path changed while copying"
+    );
+    Ok(())
 }
 
 #[expect(
@@ -734,23 +877,14 @@ fn snapshot_share_with_inputs(
         }
     }
     for relative in entries {
-        check(deadline, cancellation)?;
-        ensure!(
-            relative != Path::new(SHARE_MANIFEST),
-            "FVP share inventory cannot include itself"
-        );
-        ensure!(
-            !relative.starts_with("test_results"),
-            "FVP share inputs cannot include the guest output directory"
-        );
-        let input = share_file(&root, &relative)?;
-        let output = destination.join(&relative);
-        fs::create_dir_all(output.parent().context("invalid FVP share path")?)?;
-        copy_verified(&input, &output, None, deadline, cancellation)?;
-        ensure!(
-            share_file(&root, &relative)? == input,
-            "FVP share path changed while copying"
-        );
+        snapshot_share_input(
+            &root,
+            destination,
+            &relative,
+            additional.contains(&relative),
+            deadline,
+            cancellation,
+        )?;
     }
     ensure!(
         digest(&mut open_regular(&manifest_path)?, deadline, cancellation)? == manifest_digest,
@@ -871,6 +1005,149 @@ mod tests {
         }
         assert!(!output.contains("${rtvar:"));
         output.replace("$$", "$")
+    }
+
+    #[test]
+    fn release_prerun_uses_preallocated_writable_semihost_without_changing_inputs() {
+        let directory = directory();
+        let prepared = PreparedFvpRun::allocate(directory.path(), &deadline()).unwrap();
+        let semihost = prepared.root().join("build/semihost");
+        assert!(!semihost.exists());
+        prepared.prepare_release_semihost().unwrap();
+        let metadata = fs::symlink_metadata(&semihost).unwrap();
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.uid(), prepared.root().metadata().unwrap().uid());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+
+        let mut variables = BTreeMap::from([
+            ("SEMIHOSTDIR", semihost.display().to_string()),
+            ("CMDLINE", String::new()),
+        ]);
+        for (name, file, contents) in [
+            ("KERNEL", "Image", "kernel"),
+            ("DTB", "fdt.dtb", "device tree"),
+            ("INITRD", "initrd", "patched archive"),
+        ] {
+            let source = prepared.root().join("inputs").join(file);
+            fs::write(&source, contents).unwrap();
+            fs::set_permissions(&source, fs::Permissions::from_mode(0o444)).unwrap();
+            variables.insert(name, source.display().to_string());
+        }
+        // These are the admitted portable package's prerun commands. The
+        // append-only Petri overlay supplies the initrd and final startup line.
+        let mut prerun = [
+            "SEMIHOSTDIR=\"${rtvar:SEMIHOSTDIR}\"",
+            "test -n \"$$SEMIHOSTDIR\"",
+            "mkdir -p \"$$SEMIHOSTDIR\"",
+            "cp \"${rtvar:KERNEL}\" \"$$SEMIHOSTDIR/Image\"",
+            "cp \"${rtvar:DTB}\" \"$$SEMIHOSTDIR/fdt.dtb\"",
+            "printf '%s\\n' 'Image dtb=fdt.dtb' > \"$$SEMIHOSTDIR/startup.nsh\"",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        let overlay: Value = serde_yaml::from_str(
+            &INITRD_OVERLAY.replace("$${SEMIHOSTDIR}", "${rtvar:SEMIHOSTDIR}"),
+        )
+        .unwrap();
+        prerun.extend(
+            overlay["run"]["prerun"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_str().unwrap().to_owned()),
+        );
+        let script = format!(
+            "set -eu\n{}",
+            prerun
+                .iter()
+                .map(|line| render(line, &variables))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let output = run_command_cancellable(
+            Command::new("/bin/sh").arg("-c").arg(script),
+            &deadline(),
+            &Cancellation::default(),
+        )
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for (file, contents) in [
+            ("Image", "kernel"),
+            ("fdt.dtb", "device tree"),
+            ("initrd", "patched archive"),
+        ] {
+            let source = prepared.root().join("inputs").join(file);
+            assert_eq!(fs::read_to_string(&source).unwrap(), contents);
+            assert_eq!(
+                source.metadata().unwrap().permissions().mode() & 0o777,
+                0o444
+            );
+            assert_eq!(fs::read_to_string(semihost.join(file)).unwrap(), contents);
+        }
+        assert_eq!(
+            fs::read_to_string(semihost.join("startup.nsh")).unwrap(),
+            "Image dtb=fdt.dtb initrd=initrd rdinit=/cca-init.sh console=ttyAMA0 earlycon=pl011,0x1c090000 ip=off\n"
+        );
+        prepared.release_package.set(true);
+        let config = FvpCcaConfig {
+            platform: crate::profile::FvpPlatform::RealmVfio,
+            consoles: vec![FvpConsole::Host],
+            primary_console: FvpConsole::Host,
+            capabilities: vec!["cca".into()],
+            deadlines: Default::default(),
+            port_retries: 20,
+        };
+        let mut command = Command::new("isolated-python");
+        prepared
+            .populate_command(&mut command, 12345, &config, 1)
+            .unwrap();
+        assert!(
+            command
+                .get_args()
+                .any(|arg| arg
+                    == std::ffi::OsStr::new(&format!("SEMIHOSTDIR={}", semihost.display())))
+        );
+        prepared.cleanup().unwrap();
+    }
+
+    #[test]
+    fn release_semihost_rejects_existing_paths_instead_of_changing_permissions() {
+        let directory = directory();
+        let external = directory.path().join("external");
+        fs::create_dir(&external).unwrap();
+        fs::write(external.join("Image"), "unchanged").unwrap();
+        for kind in ["directory", "file", "symlink"] {
+            let prepared = PreparedFvpRun::allocate(directory.path(), &deadline()).unwrap();
+            let semihost = prepared.root().join("build/semihost");
+            match kind {
+                "directory" => fs::create_dir(&semihost).unwrap(),
+                "file" => fs::write(&semihost, "unchanged").unwrap(),
+                "symlink" => std::os::unix::fs::symlink(&external, &semihost).unwrap(),
+                _ => unreachable!(),
+            }
+            let before = fs::symlink_metadata(&semihost)
+                .unwrap()
+                .permissions()
+                .mode();
+            assert!(prepared.prepare_release_semihost().is_err());
+            assert_eq!(
+                fs::symlink_metadata(&semihost)
+                    .unwrap()
+                    .permissions()
+                    .mode(),
+                before
+            );
+            assert_eq!(
+                fs::read_to_string(external.join("Image")).unwrap(),
+                "unchanged"
+            );
+            prepared.cleanup().unwrap();
+        }
     }
 
     #[test]
@@ -1030,8 +1307,8 @@ command cp "$SEMIHOSTDIR/startup.nsh" "$CAPTURE"
         fs::write(directory.path().join("foreign"), "foreign").unwrap();
         std::os::unix::fs::symlink(directory.path().join("foreign"), source.join("escape"))
             .unwrap();
-        fs::create_dir(source.join("folder")).unwrap();
-        for entry in ["../foreign", "/foreign", "escape", "missing", "folder"] {
+        nix::unistd::mkfifo(&source.join("fifo"), nix::sys::stat::Mode::S_IRUSR).unwrap();
+        for entry in ["../foreign", "/foreign", "escape", "missing", "fifo"] {
             let output = tempfile::Builder::new()
                 .tempdir_in(directory.path())
                 .unwrap();
@@ -1091,6 +1368,100 @@ command cp "$SEMIHOSTDIR/startup.nsh" "$CAPTURE"
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn explicit_nested_runner_survives_both_snapshot_stages_without_temp_siblings() {
+        let directory = directory();
+        let content = directory.path().join("content");
+        let producer = directory.path().join("producer");
+        let target = directory.path().join("snapshot");
+        fs::create_dir_all(content.join("temp/cache")).unwrap();
+        fs::create_dir_all(producer.join("testcontent")).unwrap();
+        fs::create_dir(&target).unwrap();
+        let relative = Path::new("temp/.tmp-selected-runner");
+        fs::write(content.join(relative), "selected").unwrap();
+        fs::set_permissions(content.join(relative), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(content.join("temp/cache/unrelated"), "unlisted").unwrap();
+        snapshot_additional_share_input(
+            &content,
+            &producer.join("testcontent"),
+            relative,
+            &deadline(),
+            &Cancellation::default(),
+        )
+        .unwrap();
+        let entry = Path::new("testcontent").join(relative);
+        fs::write(
+            producer.join(SHARE_MANIFEST),
+            serde_json::to_vec(&[PathBuf::from("testcontent"), entry.clone()]).unwrap(),
+        )
+        .unwrap();
+        snapshot_share(&producer, &target, &deadline(), &Cancellation::default()).unwrap();
+        assert_eq!(fs::read(target.join(&entry)).unwrap(), b"selected");
+        assert_eq!(
+            target.join(entry).metadata().unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert!(!producer.join("testcontent/temp/cache").exists());
+        assert!(!target.join("testcontent/temp/cache").exists());
+    }
+
+    #[test]
+    fn explicit_runner_copy_preserves_containment_and_no_overwrite_guards() {
+        let directory = directory();
+        let source = directory.path().join("source");
+        let target = directory.path().join("target");
+        fs::create_dir_all(source.join("temp")).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(source.join("temp/runner"), "runner").unwrap();
+        fs::write(source.join(SHARE_MANIFEST), "inventory").unwrap();
+        fs::create_dir_all(source.join("test_results")).unwrap();
+        fs::write(source.join("test_results/log"), "output").unwrap();
+        std::os::unix::fs::symlink(source.join("temp/runner"), source.join("temp/link")).unwrap();
+        std::os::unix::fs::symlink(source.join("temp"), source.join("alias")).unwrap();
+        for relative in [
+            "../foreign",
+            "/foreign",
+            SHARE_MANIFEST,
+            "test_results/log",
+            "temp",
+            "temp/link",
+            "alias/runner",
+        ] {
+            assert!(
+                snapshot_additional_share_input(
+                    &source,
+                    &target,
+                    Path::new(relative),
+                    &deadline(),
+                    &Cancellation::default()
+                )
+                .is_err(),
+                "{relative}"
+            );
+        }
+        let relative = Path::new("temp/runner");
+        snapshot_additional_share_input(
+            &source,
+            &target,
+            relative,
+            &deadline(),
+            &Cancellation::default(),
+        )
+        .unwrap();
+        fs::write(source.join(relative), "changed").unwrap();
+        assert!(
+            snapshot_additional_share_input(
+                &source,
+                &target,
+                relative,
+                &deadline(),
+                &Cancellation::default()
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(target.join(relative)).unwrap(), b"runner");
     }
 
     #[test]
@@ -1175,6 +1546,105 @@ command cp "$SEMIHOSTDIR/startup.nsh" "$CAPTURE"
             .is_err()
         );
         assert!(!invalid.join("test_results").exists());
+    }
+
+    #[test]
+    fn share_snapshot_preserves_empty_tag_roots_without_copying_unlisted_children() {
+        let directory = directory();
+        let source = directory.path().join("source");
+        let target = directory.path().join("snapshot");
+        fs::create_dir_all(source.join("testimages")).unwrap();
+        fs::create_dir_all(source.join("testcontent/empty/nested")).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(source.join("testcontent/runner"), "runner").unwrap();
+        fs::write(source.join("testcontent/unlisted"), "private").unwrap();
+        fs::write(
+            source.join(SHARE_MANIFEST),
+            serde_json::to_vec(&[
+                "testimages",
+                "testcontent",
+                "testcontent/empty",
+                "testcontent/empty/nested",
+                "testcontent/runner",
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        snapshot_share(&source, &target, &deadline(), &Cancellation::default()).unwrap();
+        for relative in ["testimages", "testcontent/empty/nested"] {
+            assert!(target.join(relative).is_dir());
+            assert_eq!(fs::read_dir(target.join(relative)).unwrap().count(), 0);
+        }
+        assert_eq!(
+            fs::read_to_string(target.join("testcontent/runner")).unwrap(),
+            "runner"
+        );
+        assert!(!target.join("testcontent/unlisted").exists());
+        assert!(!target.join(SHARE_MANIFEST).exists());
+        assert!(target.join("test_results").is_dir());
+    }
+
+    #[test]
+    fn directory_share_entries_reject_traversal_links_and_special_files() {
+        let directory = directory();
+        let source = directory.path().join("source");
+        let external = directory.path().join("external");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir_all(external.join("nested")).unwrap();
+        std::os::unix::fs::symlink(&external, source.join("link")).unwrap();
+        nix::unistd::mkfifo(&source.join("fifo"), nix::sys::stat::Mode::S_IRUSR).unwrap();
+        for (index, relative) in [
+            "",
+            "../external",
+            "/external",
+            "link",
+            "link/nested",
+            "fifo",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let target = directory.path().join(format!("snapshot-{index}"));
+            fs::create_dir(&target).unwrap();
+            fs::write(
+                source.join(SHARE_MANIFEST),
+                serde_json::to_vec(&[relative]).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                snapshot_share(&source, &target, &deadline(), &Cancellation::default()).is_err()
+            );
+            assert_eq!(fs::read_dir(target).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn share_snapshot_rejects_destination_directory_links_and_additional_directories() {
+        let directory = directory();
+        let source = directory.path().join("source");
+        let target = directory.path().join("snapshot");
+        let external = directory.path().join("external");
+        fs::create_dir_all(source.join("testimages/empty")).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::create_dir(&external).unwrap();
+        std::os::unix::fs::symlink(&external, target.join("testimages")).unwrap();
+        fs::write(source.join(SHARE_MANIFEST), r#"["testimages/empty"]"#).unwrap();
+        assert!(snapshot_share(&source, &target, &deadline(), &Cancellation::default()).is_err());
+        assert_eq!(fs::read_dir(&external).unwrap().count(), 0);
+        let other = directory.path().join("other");
+        fs::create_dir(&other).unwrap();
+        fs::write(source.join(SHARE_MANIFEST), r#"["testimages"]"#).unwrap();
+        assert!(
+            snapshot_share_with_inputs(
+                &source,
+                &other,
+                &["testimages".into()],
+                &deadline(),
+                &Cancellation::default(),
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read_dir(other).unwrap().count(), 0);
     }
 
     #[test]

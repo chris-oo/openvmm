@@ -31,6 +31,9 @@ use std::path::PathBuf;
 /// runner: cargo invokes `incubator <test-binary> <args>` with no flags, and
 /// the configuration is read from the environment.
 #[derive(Parser)]
+#[clap(
+    after_long_help = "Checked native FVP recovery without launching a model:\n  incubator recover-fvp-native --help"
+)]
 struct Args {
     /// Path to a TOML profile file.
     #[clap(long, env = "INCUBATOR_PROFILE")]
@@ -93,6 +96,52 @@ struct Args {
     command: Vec<String>,
 }
 
+/// Retire only the explicitly authorized native run after its original owner exits.
+#[derive(Parser)]
+#[clap(
+    name = "incubator recover-fvp-native",
+    bin_name = "incubator recover-fvp-native"
+)]
+struct FvpRecoveryArgs {
+    /// Pinned Shrinkwrap toolchain root.
+    #[clap(long)]
+    platform_root: PathBuf,
+    /// Extracted qualified portable FVP firmware package.
+    #[clap(long)]
+    package_root: PathBuf,
+    /// JSON with run_id, full recorded owner, and independently captured owner_sha256.
+    /// The original executable must still exist at its recorded canonical path.
+    #[clap(long)]
+    evidence: PathBuf,
+}
+
+fn recover_fvp_native() -> anyhow::Result<()> {
+    let args = FvpRecoveryArgs::parse_from(
+        std::iter::once(std::env::args_os().next().unwrap_or_default())
+            .chain(std::env::args_os().skip(2)),
+    );
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Read;
+        let mut data = Vec::new();
+        std::fs::File::open(&args.evidence)?
+            .take(64 * 1024 + 1)
+            .read_to_end(&mut data)?;
+        anyhow::ensure!(
+            data.len() <= 64 * 1024,
+            "FVP recovery evidence is too large"
+        );
+        let evidence: incubator::fvp::lifecycle::RecoveryEvidence =
+            serde_json::from_slice(&data).context("invalid FVP recovery evidence")?;
+        incubator::fvp::runtime::recover_native(&args.platform_root, &args.package_root, &evidence)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = args;
+        anyhow::bail!("native FVP recovery requires Linux")
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_target(false)
@@ -102,6 +151,10 @@ fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("recover-fvp-native")) {
+        return recover_fvp_native();
+    }
 
     let matches = Args::command().get_matches();
     let args = Args::from_arg_matches(&matches)?;

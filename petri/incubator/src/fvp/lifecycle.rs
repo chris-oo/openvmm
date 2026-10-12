@@ -54,7 +54,26 @@ const ROLE_LABEL: &str = "io.openvmm.fvp.role";
 pub(super) const WORKSPACE_MARKER: &str = ".openvmm-fvp-workspace.json";
 const OUTPUT_MARKER: &str = ".openvmm-fvp-outputs.json";
 const TREE_ENTRY_LIMIT: usize = 4096;
-const TREE_BYTE_LIMIT: u64 = 1024 * 1024 * 1024;
+const TREE_BYTE_LIMIT: u64 = 2 * 1024 * 1024 * 1024;
+const LAUNCHER_BYTE_LIMIT: u64 = 1024 * 1024 * 1024;
+
+/// Separate process-cleanup and file-verification budgets for recovery.
+#[derive(Clone, Copy)]
+pub struct RecoveryBudgets {
+    /// Bound process and container cleanup.
+    pub cleanup: Duration,
+    /// Bound each launcher, output, and workspace verification phase.
+    pub validation: Duration,
+}
+
+impl From<Duration> for RecoveryBudgets {
+    fn from(timeout: Duration) -> Self {
+        Self {
+            cleanup: timeout,
+            validation: timeout,
+        }
+    }
+}
 
 /// A cryptographically random identity, not a PID or timestamp.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -501,17 +520,58 @@ impl RuntimeLock {
     /// validated tuple, not the state file. Foreign, newer, corrupt, reused-PID,
     /// or still-live-owner state remains untouched.
     /// Earlier-boot identities never authorize current-boot PID or group probes.
-    /// Process cleanup, output preservation, and filesystem retirement each use
-    /// one non-resetting `timeout` budget, as in normal finalization.
+    /// Process cleanup uses the cleanup budget. Launcher verification, output
+    /// preservation, and filesystem retirement each use a non-resetting
+    /// validation budget, as in normal finalization.
     pub fn recover(
         &self,
         docker: &Docker,
         expected_image: &str,
         expected_model: &Path,
-        timeout: Duration,
+        budgets: impl Into<RecoveryBudgets>,
         cancellation: &Cancellation,
     ) -> anyhow::Result<()> {
-        let deadline = Deadline::new(timeout)?;
+        self.recover_inner(
+            docker,
+            expected_image,
+            expected_model,
+            budgets.into(),
+            cancellation,
+            None,
+        )
+    }
+
+    /// Recover only the exact run explicitly authorized by original-launcher
+    /// evidence. All process, daemon, container and workspace guards still apply.
+    /// Normal startup must use [`Self::recover`] instead.
+    pub fn recover_with_evidence(
+        &self,
+        docker: &Docker,
+        expected_image: &str,
+        expected_model: &Path,
+        budgets: impl Into<RecoveryBudgets>,
+        cancellation: &Cancellation,
+        evidence: &RecoveryEvidence,
+    ) -> anyhow::Result<()> {
+        self.recover_inner(
+            docker,
+            expected_image,
+            expected_model,
+            budgets.into(),
+            cancellation,
+            Some(evidence),
+        )
+    }
+
+    fn recover_inner(
+        &self,
+        docker: &Docker,
+        expected_image: &str,
+        expected_model: &Path,
+        budgets: RecoveryBudgets,
+        cancellation: &Cancellation,
+        evidence: Option<&RecoveryEvidence>,
+    ) -> anyhow::Result<()> {
         cancellation.check()?;
         let Some(mut state) = self.read_state()? else {
             return Ok(());
@@ -519,13 +579,20 @@ impl RuntimeLock {
         anyhow::ensure!(
             state.expected_image == expected_image
                 && state.expected_model == canonical(expected_model)?
-                && state.owner.executable == canonical(&std::env::current_exe()?)?,
+                && (evidence.is_some()
+                    || state.owner.executable == canonical(&std::env::current_exe()?)?),
             "foreign FVP state does not match this launcher and platform; preserving it"
         );
         anyhow::ensure!(
             state.owner.observe()? == ProcessObservation::Gone,
             "FVP state owner is live or its PID was reused; preserving it"
         );
+        if let Some(evidence) = evidence {
+            let deadline = Deadline::new(budgets.validation)?;
+            evidence
+                .authorize(&state, &deadline, cancellation)
+                .context("failed to authorize original FVP recovery launcher")?;
+        }
         anyhow::ensure!(
             state.post_verification != PostVerification::InFlight,
             "FVP owner died during post-verification; preserving recovery state"
@@ -552,7 +619,10 @@ impl RuntimeLock {
                 "FVP model PID was reused; preserving state and resources"
             );
         }
-        let containers = docker.cleanup(&state, &deadline)?;
+        let deadline = Deadline::new(budgets.cleanup)?;
+        let containers = docker
+            .cleanup(&state, &deadline)
+            .context("failed to clean up recorded FVP recovery containers")?;
         if let Some(process) = &state.model
             && process.boot_id == current_boot_id()?
         {
@@ -595,13 +665,17 @@ impl RuntimeLock {
         deadline
             .remaining()
             .context("FVP recovery deadline exceeded; preserving state")?;
-        let output_deadline = Deadline::new(timeout)?;
+        let output_deadline = Deadline::new(budgets.validation)?;
         let mut recovered = state.clone();
         recovered.resources_stopped = true;
         if let Some(workspace) = &mut recovered.workspace
             && workspace.outputs.is_none()
         {
-            workspace.outputs = Some(workspace.seal_outputs(&output_deadline, true)?);
+            workspace.outputs = Some(
+                workspace
+                    .seal_outputs(&output_deadline, true)
+                    .context("failed to preserve FVP recovery workspace outputs")?,
+            );
         }
         if recovered.post_verification == PostVerification::Pending {
             recovered.post_verification = PostVerification::Failed;
@@ -615,9 +689,11 @@ impl RuntimeLock {
             state = recovered;
         }
         output_deadline.remaining()?;
-        let deadline = Deadline::new(timeout)?;
+        let deadline = Deadline::new(budgets.validation)?;
         if let Some(workspace) = state.workspace.clone() {
-            workspace.preflight(&deadline)?;
+            workspace
+                .preflight(&deadline)
+                .context("failed to verify FVP recovery workspace before retirement")?;
             if !workspace.removal_started {
                 let mut next = state.clone();
                 next.resources_stopped = true;
@@ -628,7 +704,9 @@ impl RuntimeLock {
                 self.write_state(Some(&state), &next)?;
                 state = next;
             }
-            workspace.remove(&deadline)?;
+            workspace
+                .remove(&deadline)
+                .context("failed to retire verified FVP recovery workspace")?;
             let mut next = state.clone();
             next.workspace = None;
             self.write_state(Some(&state), &next)?;
@@ -677,6 +755,81 @@ pub struct ProcessIdentity {
     boot_id: String,
     executable: PathBuf,
     run_id: Option<RunId>,
+}
+
+/// Explicit operator authorization for one retained native run.
+/// Capture this evidence before the original launcher is removed. The launcher
+/// must remain at its recorded path until checked recovery completes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryEvidence {
+    /// Exact retained run identity.
+    pub run_id: RunId,
+    /// Full recorded owner identity, including PID, boot and start time.
+    pub owner: ProcessIdentity,
+    /// Independently captured SHA-256 of the original launcher.
+    pub owner_sha256: String,
+}
+
+impl RecoveryEvidence {
+    fn authorize(
+        &self,
+        state: &RunState,
+        deadline: &Deadline,
+        cancellation: &Cancellation,
+    ) -> anyhow::Result<()> {
+        self.run_id.validate()?;
+        anyhow::ensure!(
+            self.run_id == state.run_id && self.owner == state.owner,
+            "recovery evidence does not identify this exact retained run and owner; preserving state"
+        );
+        anyhow::ensure!(
+            is_hex_id(&self.owner_sha256),
+            "invalid recovery launcher SHA-256"
+        );
+        let path = &self.owner.executable;
+        anyhow::ensure!(
+            std::fs::symlink_metadata(path)?.is_file() && canonical(path)? == *path,
+            "original recovery launcher must remain a regular file at its recorded canonical path"
+        );
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+            .open(path)?;
+        let before = file.metadata()?;
+        anyhow::ensure!(
+            before.is_file()
+                && before.uid() == std::fs::metadata("/proc/self")?.uid()
+                && before.nlink() == 1
+                && before.mode() & 0o111 != 0
+                && before.len() <= LAUNCHER_BYTE_LIMIT,
+            "original recovery launcher ownership or file type is invalid"
+        );
+        let mut hasher = sha2::Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            cancellation.check()?;
+            deadline.remaining()?;
+            let length = file.read(&mut buffer)?;
+            if length == 0 {
+                break;
+            }
+            hasher.update(&buffer[..length]);
+        }
+        let after = std::fs::symlink_metadata(path)?;
+        anyhow::ensure!(
+            before.dev() == after.dev()
+                && before.ino() == after.ino()
+                && before.len() == after.len()
+                && before.mtime() == after.mtime()
+                && before.mtime_nsec() == after.mtime_nsec()
+                && before.ctime() == after.ctime()
+                && before.ctime_nsec() == after.ctime_nsec()
+                && hex::encode(hasher.finalize()) == self.owner_sha256,
+            "original recovery launcher identity changed or SHA-256 does not match; preserving state"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1266,7 +1419,7 @@ fn snapshot_tree(root: &File, deadline: &Deadline, sync: bool) -> anyhow::Result
                         .bytes
                         .checked_add(metadata.len())
                         .context("FVP tree size overflow")?;
-                    anyhow::ensure!(self.bytes <= TREE_BYTE_LIMIT, "FVP tree exceeds one GiB");
+                    anyhow::ensure!(self.bytes <= TREE_BYTE_LIMIT, "FVP tree exceeds two GiB");
                     self.hasher.update(metadata.len().to_le_bytes());
                     let mut reader = &file;
                     let mut count = 0u64;
@@ -3070,6 +3223,12 @@ impl Session {
     /// verification can outlast the process cleanup phase. Failed or incomplete
     /// helper scopes remain recorded, even if the known model was stopped.
     pub fn retire_state(&mut self) -> anyhow::Result<()> {
+        self.retire_state_with_deadline(&Deadline::new(self.forced_cleanup)?)
+    }
+
+    /// Retire verified workspace state within a file-validation deadline.
+    /// Repeated calls retain the original retirement deadline.
+    pub fn retire_state_with_deadline(&mut self, deadline: &Deadline) -> anyhow::Result<()> {
         if self.cleaned {
             return Ok(());
         }
@@ -3086,14 +3245,7 @@ impl Session {
             ),
             "FVP post-verification is unfinished; preserving state"
         );
-        let deadline = match self.retirement_deadline {
-            Some(deadline) => deadline,
-            None => {
-                let deadline = Deadline::new(self.forced_cleanup)?;
-                self.retirement_deadline = Some(deadline);
-                deadline
-            }
-        };
+        let deadline = *self.retirement_deadline.get_or_insert(*deadline);
         self.retire_state_inner(&deadline)
     }
 
@@ -3529,6 +3681,255 @@ mod tests {
             assert!(lock.write_state(None, &state()).is_err());
             assert_eq!(std::fs::read(&path).unwrap(), bytes);
         }
+    }
+
+    #[test]
+    fn stable_native_state_refuses_foreign_launcher_recovery_without_docker_calls() {
+        let directory = directory();
+        let lock = RuntimeDirectory::open(&directory.path().join("petri-native"), &[])
+            .unwrap()
+            .lock(Duration::ZERO, &Cancellation::default())
+            .unwrap();
+        let mut record = state();
+        dead_owner(&mut record);
+        record.owner.executable = directory.path().join("previous-nextest-archive/launcher");
+        lock.write_state(None, &record).unwrap();
+        let before = std::fs::read(lock.state_path()).unwrap();
+        let (docker, fake) = fake_docker(Vec::new());
+        let error = lock
+            .recover(
+                &docker,
+                IMAGE,
+                &record.expected_model,
+                Duration::from_secs(1),
+                &Cancellation::default(),
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("foreign FVP state"));
+        assert_eq!(std::fs::read(lock.state_path()).unwrap(), before);
+        assert!(fake.borrow().calls.is_empty());
+    }
+
+    #[test]
+    fn successful_native_cleanup_retires_journal_without_removing_lock_inode() {
+        let directory = directory();
+        let native = RuntimeDirectory::open(&directory.path().join("petri-native"), &[]).unwrap();
+        let native_path = native.path().to_owned();
+        let token = Cancellation::default();
+        let lock = native.lock(Duration::ZERO, &token).unwrap();
+        let inode = lock.file.metadata().unwrap().ino();
+        let (docker, _) = fake_docker(Vec::new());
+        let mut session = Session::new(
+            lock,
+            docker,
+            IMAGE.to_owned(),
+            &std::env::current_exe().unwrap(),
+            Duration::from_secs(10),
+            token,
+        )
+        .unwrap();
+        session.cleanup().unwrap();
+        assert!(session.lock.read_state().unwrap().is_none());
+        assert_eq!(
+            std::fs::metadata(native_path.join("model.lock"))
+                .unwrap()
+                .ino(),
+            inode
+        );
+    }
+
+    fn retained_launcher_evidence(root: &Path) -> (RunState, RecoveryEvidence) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let launcher = root.join("original-launcher");
+        std::fs::write(&launcher, b"original").unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut record = state();
+        record.owner.pid = i32::MAX as u32;
+        record.owner.executable = canonical(&launcher).unwrap();
+        assert_eq!(record.owner.observe().unwrap(), ProcessObservation::Gone);
+        let evidence = RecoveryEvidence {
+            run_id: record.run_id.clone(),
+            owner: record.owner.clone(),
+            owner_sha256: hex::encode(sha2::Sha256::digest(b"original")),
+        };
+        (record, evidence)
+    }
+
+    #[test]
+    fn explicit_recovery_requires_original_launcher_and_exact_retained_run() {
+        let dir = directory();
+        let lock = lock(dir.path());
+        let (record, evidence) = retained_launcher_evidence(dir.path());
+        lock.write_state(None, &record).unwrap();
+        let (docker, calls) = fake_docker(Vec::new());
+        let token = Cancellation::default();
+        assert!(
+            lock.recover(
+                &docker,
+                IMAGE,
+                &record.expected_model,
+                Duration::from_secs(5),
+                &token
+            )
+            .is_err()
+        );
+        assert!(calls.borrow().calls.is_empty());
+        let before = std::fs::read(lock.state_path()).unwrap();
+        let mut wrong_run = evidence.clone();
+        wrong_run.run_id = RunId::new().unwrap();
+        let mut wrong_owner = evidence.clone();
+        wrong_owner.owner.start_ticks += 1;
+        let mut wrong_hash = evidence.clone();
+        wrong_hash.owner_sha256 = "0".repeat(64);
+        for invalid in [&wrong_run, &wrong_owner, &wrong_hash] {
+            assert!(
+                lock.recover_with_evidence(
+                    &docker,
+                    IMAGE,
+                    &record.expected_model,
+                    Duration::from_secs(5),
+                    &token,
+                    invalid
+                )
+                .is_err()
+            );
+            assert_eq!(std::fs::read(lock.state_path()).unwrap(), before);
+            assert!(calls.borrow().calls.is_empty());
+        }
+        lock.recover_with_evidence(
+            &docker,
+            IMAGE,
+            &record.expected_model,
+            Duration::from_secs(5),
+            &token,
+            &evidence,
+        )
+        .unwrap();
+        assert!(lock.read_state().unwrap().is_none());
+        assert!(!calls.borrow().calls.is_empty());
+    }
+
+    #[test]
+    fn recovery_launcher_verification_does_not_use_process_cleanup_budget() {
+        let dir = directory();
+        let lock = lock(dir.path());
+        let (record, evidence) = retained_launcher_evidence(dir.path());
+        lock.write_state(None, &record).unwrap();
+        let before = std::fs::read(lock.state_path()).unwrap();
+        let (docker, _) = fake_docker(Vec::new());
+        let error = lock
+            .recover_with_evidence(
+                &docker,
+                IMAGE,
+                &record.expected_model,
+                RecoveryBudgets {
+                    cleanup: Duration::ZERO,
+                    validation: Duration::from_secs(5),
+                },
+                &Cancellation::default(),
+                &evidence,
+            )
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("failed to clean up recorded FVP recovery containers")
+        );
+        assert_eq!(std::fs::read(lock.state_path()).unwrap(), before);
+    }
+
+    #[test]
+    fn recovery_launcher_verification_retains_its_validation_deadline() {
+        let dir = directory();
+        let lock = lock(dir.path());
+        let (record, evidence) = retained_launcher_evidence(dir.path());
+        lock.write_state(None, &record).unwrap();
+        let before = std::fs::read(lock.state_path()).unwrap();
+        let (docker, calls) = fake_docker(Vec::new());
+        let error = lock
+            .recover_with_evidence(
+                &docker,
+                IMAGE,
+                &record.expected_model,
+                RecoveryBudgets {
+                    cleanup: Duration::from_secs(5),
+                    validation: Duration::ZERO,
+                },
+                &Cancellation::default(),
+                &evidence,
+            )
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("failed to authorize original FVP recovery launcher")
+        );
+        assert!(calls.borrow().calls.is_empty());
+        assert_eq!(std::fs::read(lock.state_path()).unwrap(), before);
+    }
+
+    #[test]
+    fn workspace_byte_limit_rejects_oversized_files_before_hashing() {
+        let dir = directory();
+        let file = File::create(dir.path().join("oversized")).unwrap();
+        file.set_len(TREE_BYTE_LIMIT + 1).unwrap();
+        let root = File::open(dir.path()).unwrap();
+        let error = snapshot_tree(
+            &root,
+            &Deadline::new(Duration::from_secs(5)).unwrap(),
+            false,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("FVP tree exceeds two GiB"));
+        assert_eq!(file.metadata().unwrap().len(), TREE_BYTE_LIMIT + 1);
+    }
+
+    #[test]
+    fn explicit_recovery_never_overrides_live_reused_or_missing_launcher_guards() {
+        let dir = directory();
+        let lock = lock(dir.path());
+        let (mut record, mut evidence) = retained_launcher_evidence(dir.path());
+        let original = record.owner.clone();
+        let (docker, calls) = fake_docker(Vec::new());
+        let token = Cancellation::default();
+        for reused in [false, true] {
+            record.owner = state().owner;
+            if reused {
+                record.owner.start_ticks += 1;
+            }
+            evidence.owner = record.owner.clone();
+            lock.write_state(None, &record).unwrap();
+            let before = std::fs::read(lock.state_path()).unwrap();
+            assert!(
+                lock.recover_with_evidence(
+                    &docker,
+                    IMAGE,
+                    &record.expected_model,
+                    Duration::from_secs(5),
+                    &token,
+                    &evidence
+                )
+                .is_err()
+            );
+            assert_eq!(std::fs::read(lock.state_path()).unwrap(), before);
+            assert!(calls.borrow().calls.is_empty());
+            lock.remove_state(&record).unwrap();
+        }
+        record.owner = original;
+        evidence.owner = record.owner.clone();
+        std::fs::remove_file(&record.owner.executable).unwrap();
+        lock.write_state(None, &record).unwrap();
+        let before = std::fs::read(lock.state_path()).unwrap();
+        assert!(
+            lock.recover_with_evidence(
+                &docker,
+                IMAGE,
+                &record.expected_model,
+                Duration::from_secs(5),
+                &token,
+                &evidence
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(lock.state_path()).unwrap(), before);
+        assert!(calls.borrow().calls.is_empty());
     }
 
     #[test]
@@ -5378,6 +5779,63 @@ mod tests {
     }
 
     #[test]
+    fn explicit_retirement_uses_validation_budget_not_process_cleanup_budget() {
+        let dir = directory();
+        let (docker, _) = fake_docker(Vec::new());
+        let mut session = Session::new(
+            lock(dir.path()),
+            docker,
+            IMAGE.to_owned(),
+            &std::env::current_exe().unwrap(),
+            Duration::from_secs(10),
+            Cancellation::default(),
+        )
+        .unwrap();
+        session.stop_resources().unwrap();
+        session
+            .post_verify(&Deadline::new(Duration::from_secs(5)).unwrap(), |_, _| {
+                Ok(Ok(()))
+            })
+            .unwrap()
+            .unwrap();
+        session.forced_cleanup = Duration::ZERO;
+        session
+            .retire_state_with_deadline(&Deadline::new(Duration::from_secs(5)).unwrap())
+            .unwrap();
+        assert!(session.lock.read_state().unwrap().is_none());
+    }
+
+    #[test]
+    fn explicit_retirement_does_not_reset_expired_validation_budget() {
+        let dir = directory();
+        let (docker, _) = fake_docker(Vec::new());
+        let mut session = Session::new(
+            lock(dir.path()),
+            docker,
+            IMAGE.to_owned(),
+            &std::env::current_exe().unwrap(),
+            Duration::from_secs(10),
+            Cancellation::default(),
+        )
+        .unwrap();
+        session.stop_resources().unwrap();
+        session
+            .post_verify(&Deadline::new(Duration::from_secs(5)).unwrap(), |_, _| {
+                Ok(Ok(()))
+            })
+            .unwrap()
+            .unwrap();
+        for budget in [Duration::ZERO, Duration::from_secs(5)] {
+            assert!(
+                session
+                    .retire_state_with_deadline(&Deadline::new(budget).unwrap())
+                    .is_err()
+            );
+            assert!(session.lock.read_state().unwrap().is_some());
+        }
+    }
+
+    #[test]
     fn post_verification_does_not_erase_an_earlier_unresolved_callback() {
         let dir = directory();
         let (docker, _) = fake_docker(Vec::new());
@@ -5617,25 +6075,20 @@ mod tests {
             )
             .unwrap();
             let path = staging.root().to_owned();
-            let volatile = tempfile::Builder::new()
-                .permissions(std::fs::Permissions::from_mode(0o700))
-                .tempdir_in("/tmp")
-                .unwrap();
             if cancelled {
                 cancellation.cancel();
             }
             let error = session
                 .register_workspace_with_output(
                     staging.root(),
-                    volatile.path(),
+                    Path::new("/tmp"),
                     &Deadline::new(Duration::from_secs(5)).unwrap(),
                 )
                 .unwrap_err();
-            assert!(format!("{error:#}").contains(if cancelled {
-                "cancelled"
-            } else {
-                "persistent"
-            }));
+            assert!(
+                format!("{error:#}").contains(if cancelled { "cancelled" } else { "private" }),
+                "{error:#}"
+            );
             assert!(session.state.workspace.is_none());
             assert!(
                 session
@@ -5653,7 +6106,7 @@ mod tests {
             finish_session(
                 &mut session,
                 None,
-                volatile.path(),
+                Path::new("/tmp"),
                 Duration::from_secs(5),
                 Duration::from_secs(5),
                 |_, token| {

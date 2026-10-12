@@ -130,7 +130,7 @@ pub struct PackageManifest {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct OverlayManifest {
-    /// Declared root name; must be `fvp_platform_root`.
+    /// Platform root for manual runs, or package root for admitted releases.
     pub root_input: String,
     /// Overlay path relative to the platform root.
     pub relative_path: PathBuf,
@@ -158,7 +158,7 @@ pub struct RuntimeManifest {
     pub dtb_sha256: String,
 }
 
-/// Approved mapping to the FIP hash, not revisions extracted from the binary.
+/// Approved source tuple, not revisions extracted from the firmware binary.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProvenanceManifest {
@@ -306,6 +306,7 @@ pub struct PlatformSources {
     /// Verified AHCI fixture assets; empty on every default platform.
     pub realm_vfio: Vec<VerifiedSource>,
     manifest: PlatformManifest,
+    qualification: PlatformManifest,
 }
 
 impl PlatformSources {
@@ -317,13 +318,172 @@ impl PlatformSources {
         deadline: &Deadline,
     ) -> anyhow::Result<Self> {
         manifest.require_pinned()?;
-        Self::resolve_sources(manifest, platform_root, package_root, deadline)
+        Self::resolve_sources(manifest, platform_root, package_root, None, deadline)
+    }
+
+    /// Validate a release package selected by an externally pinned archive digest.
+    ///
+    /// Firmware bytes may differ between reproducible rebuilds. The release must
+    /// identify the approved sources and configuration and hash every consumed
+    /// input. The licensed model and live toolchain retain their exact pins.
+    pub fn validate_release(
+        platform_root: &Path,
+        package_root: &Path,
+        deadline: &Deadline,
+    ) -> anyhow::Result<Self> {
+        #[derive(Deserialize)]
+        struct ReleaseFile {
+            sha256: String,
+            bytes: u64,
+        }
+        #[derive(Deserialize)]
+        struct Source {
+            path: String,
+            url: String,
+            revision: String,
+        }
+        #[derive(Deserialize)]
+        struct Release {
+            schema_version: u32,
+            architecture: String,
+            sources: Vec<Source>,
+            configuration: serde_json::Value,
+            files: BTreeMap<String, ReleaseFile>,
+        }
+        let root = canonical_root(package_root)?;
+        let path = resolve(&root, Path::new("manifest.json"), PathKind::File)?;
+        let release: Release = serde_json::from_slice(&fs::read(path)?)
+            .context("invalid FVP release package manifest")?;
+        ensure!(
+            release.schema_version == 1 && release.architecture == "aarch64",
+            "unsupported FVP release package"
+        );
+        let expected = PlatformManifest::for_platform(crate::profile::FvpPlatform::RealmVfio)?;
+        for (source_path, url, revision) in [
+            (
+                "tfa",
+                "https://git.trustedfirmware.org/TF-A/trusted-firmware-a.git",
+                expected.provenance.tf_a_revision.as_str(),
+            ),
+            (
+                "rmm",
+                "https://github.com/TF-RMM/tf-rmm.git",
+                expected.provenance.tf_rmm_revision.as_str(),
+            ),
+            (
+                "edk2",
+                "https://gitlab.arm.com/linux-arm/edk2-cca.git",
+                expected.provenance.edk2_revision.as_str(),
+            ),
+            (
+                "dt",
+                "https://git.kernel.org/pub/scm/linux/kernel/git/devicetree/devicetree-rebasing.git",
+                expected.provenance.dt_revision.as_str(),
+            ),
+            (
+                "edk2-platforms",
+                "https://gitlab.arm.com/linux-arm/edk2-platforms-cca.git",
+                "bc67cf53bc5eae9bab26497a4c6e7c8804fa014e",
+            ),
+            (
+                "acpica",
+                "https://github.com/acpica/acpica.git",
+                "232ff3f8ae1a4da11c709f61d9154482cfe8e6df",
+            ),
+        ] {
+            let mut matches = release
+                .sources
+                .iter()
+                .filter(|source| source.path == source_path);
+            ensure!(
+                matches
+                    .next()
+                    .is_some_and(|source| source.url == url && source.revision == revision)
+                    && matches.next().is_none(),
+                "FVP release does not uniquely identify approved source {source_path} at revision {revision}"
+            );
+        }
+        ensure!(
+            release
+                .configuration
+                .get("rmm_config")
+                .and_then(|v| v.as_str())
+                == Some(expected.provenance.tf_rmm_config.as_str()),
+            "FVP release has unsupported RMM configuration"
+        );
+        // Portable release inputs are independent of the historical local
+        // checkout YAML and overlay pins in the qualification manifest.
+        for (path, sha256, bytes) in [
+            (
+                "cca-3world.yaml",
+                "55060f13d116106ded8c4a0ddf146c3a2c8b8c5d744d9526c4ca51cc342bf44f",
+                8255,
+            ),
+            (
+                "runtime-overlay.yaml",
+                "05d0d5fd7e7e1d3287cfbf8bccc03d1f9ba49a1bcfa915e6ce7c96f4a6700d0b",
+                456,
+            ),
+        ] {
+            ensure!(
+                release
+                    .files
+                    .get(path)
+                    .is_some_and(|record| record.sha256 == sha256 && record.bytes == bytes),
+                "FVP release portable input identity mismatch: {path}"
+            );
+        }
+        let hash = |relative: &str| -> anyhow::Result<String> {
+            let record = release
+                .files
+                .get(relative)
+                .with_context(|| format!("FVP manifest missing {relative}"))?;
+            ensure!(
+                record.sha256.len() == 64 && record.sha256.bytes().all(|c| c.is_ascii_hexdigit()),
+                "invalid FVP package file digest"
+            );
+            let path = resolve(&root, Path::new(relative), PathKind::File)?;
+            ensure!(
+                fs::metadata(&path)?.len() == record.bytes,
+                "FVP package file length mismatch"
+            );
+            verify_hash(&path, &record.sha256, deadline)?;
+            Ok(record.sha256.clone())
+        };
+        let mut rebuilt = expected.clone();
+        rebuilt.package.sha256 = hash("cca-3world.yaml")?;
+        rebuilt.overlay.relative_path = "runtime-overlay.yaml".into();
+        rebuilt.overlay.root_input = "shrinkwrap_package_root".into();
+        rebuilt.overlay.sha256 = hash("runtime-overlay.yaml")?;
+        rebuilt.runtime.bl1_sha256 = hash("cca-3world/bl1.bin")?;
+        rebuilt.runtime.fip_sha256 = hash("cca-3world/fip.bin")?;
+        rebuilt.runtime.dtb_sha256 = hash("cca-3world/dt_bootargs.dtb")?;
+        ensure!(
+            rebuilt.runtime.dtb_sha256 == expected.runtime.dtb_sha256,
+            "FVP release device tree does not match the approved input"
+        );
+        for fixture in &expected.realm_vfio {
+            ensure!(
+                hash(
+                    fixture
+                        .relative_path
+                        .to_str()
+                        .context("non-UTF8 fixture path")?
+                )? == fixture.sha256,
+                "FVP release fixture differs from approved input"
+            );
+        }
+        let mut sources =
+            Self::resolve_sources(&rebuilt, platform_root, &root, Some(&root), deadline)?;
+        sources.qualification = expected;
+        Ok(sources)
     }
 
     fn resolve_sources(
         manifest: &PlatformManifest,
         platform_root: &Path,
         package_root: &Path,
+        overlay_root: Option<&Path>,
         deadline: &Deadline,
     ) -> anyhow::Result<Self> {
         deadline.remaining()?;
@@ -357,7 +517,7 @@ impl PlatformSources {
                 &manifest.package.sha256,
             )?,
             overlay: source(
-                &platform_root,
+                overlay_root.unwrap_or(&platform_root),
                 &manifest.overlay.relative_path,
                 &manifest.overlay.sha256,
             )?,
@@ -386,7 +546,18 @@ impl PlatformSources {
             shrinkwrap_root,
             shrinkwrap_executable,
             manifest: manifest.clone(),
+            qualification: manifest.clone(),
         })
+    }
+
+    /// Identities of the files actually admitted and consumed by this run.
+    pub fn manifest(&self) -> &PlatformManifest {
+        &self.manifest
+    }
+
+    /// Reference qualification policy, not the identities of rebuilt firmware.
+    pub fn qualification(&self) -> &PlatformManifest {
+        &self.qualification
     }
 
     /// All consumed platform files, followed by any pinned fixture inputs.
@@ -460,7 +631,7 @@ impl PlatformSources {
         cancellation: &Cancellation,
     ) -> anyhow::Result<ToolchainIdentity> {
         cancellation.check()?;
-        self.manifest.require_pinned()?;
+        self.qualification.require_pinned()?;
         for source in self.sources() {
             source.revalidate_cancellable(deadline, cancellation)?;
         }
@@ -585,7 +756,7 @@ impl PlatformSources {
             "--ignored=matching",
         ])?;
         let overlay = checkout_overlay_path(
-            &self.manifest,
+            &self.qualification,
             &self.overlay.canonical,
             &self.shrinkwrap_root,
         )?;
@@ -1388,7 +1559,7 @@ mod tests {
         for path in &paths {
             fs::write(path, b"fixture").unwrap();
         }
-        PlatformSources::resolve_sources(&manifest, platform, package, &deadline()).unwrap()
+        PlatformSources::resolve_sources(&manifest, platform, package, None, &deadline()).unwrap()
     }
 
     #[test]
@@ -1410,12 +1581,142 @@ mod tests {
             fs::write(path, b"modified").unwrap();
             assert!(sources.revalidate_sources(&deadline()).is_err());
             assert!(
-                PlatformSources::resolve_sources(manifest, &platform, &package, &deadline())
+                PlatformSources::resolve_sources(manifest, &platform, &package, None, &deadline())
                     .is_err()
             );
             fs::write(path, b"fixture").unwrap();
         }
         sources.revalidate_sources(&deadline()).unwrap();
+    }
+
+    #[test]
+    fn release_package_rejects_unapproved_sources_before_tool_launch() {
+        let dir = fixture();
+        let manifest = serde_json::json!({
+            "schema_version": 1,
+            "architecture": "aarch64",
+            "sources": [],
+            "configuration": { "rmm_config": "fvp_defcfg" },
+            "files": {},
+        });
+        fs::write(
+            dir.path().join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let error =
+            PlatformSources::validate_release(dir.path(), dir.path(), &deadline()).unwrap_err();
+        assert!(format!("{error:#}").contains("approved source tfa"));
+        fs::remove_file(dir.path().join("manifest.json")).unwrap();
+        symlink("untrusted", dir.path().join("manifest.json")).unwrap();
+        assert!(PlatformSources::validate_release(dir.path(), dir.path(), &deadline()).is_err());
+    }
+
+    fn release_manifest_fixture(dir: &Path) -> serde_json::Value {
+        let expected =
+            PlatformManifest::for_platform(crate::profile::FvpPlatform::RealmVfio).unwrap();
+        fs::write(dir.join("cca-3world.yaml"), vec![0u8; 8255]).unwrap();
+        serde_json::json!({
+            "schema_version": 1,
+            "architecture": "aarch64",
+            "sources": [
+                { "path": "tfa", "url": "https://git.trustedfirmware.org/TF-A/trusted-firmware-a.git", "revision": expected.provenance.tf_a_revision },
+                { "path": "rmm", "url": "https://github.com/TF-RMM/tf-rmm.git", "revision": expected.provenance.tf_rmm_revision },
+                { "path": "edk2", "url": "https://gitlab.arm.com/linux-arm/edk2-cca.git", "revision": expected.provenance.edk2_revision },
+                { "path": "dt", "url": "https://git.kernel.org/pub/scm/linux/kernel/git/devicetree/devicetree-rebasing.git", "revision": expected.provenance.dt_revision },
+                { "path": "edk2-platforms", "url": "https://gitlab.arm.com/linux-arm/edk2-platforms-cca.git", "revision": "bc67cf53bc5eae9bab26497a4c6e7c8804fa014e" },
+                { "path": "acpica", "url": "https://github.com/acpica/acpica.git", "revision": "232ff3f8ae1a4da11c709f61d9154482cfe8e6df" },
+            ],
+            "configuration": { "rmm_config": "fvp_defcfg" },
+            "files": {
+                "cca-3world.yaml": { "sha256": "55060f13d116106ded8c4a0ddf146c3a2c8b8c5d744d9526c4ca51cc342bf44f", "bytes": 8255 },
+                "runtime-overlay.yaml": { "sha256": "05d0d5fd7e7e1d3287cfbf8bccc03d1f9ba49a1bcfa915e6ce7c96f4a6700d0b", "bytes": 456 },
+            },
+        })
+    }
+
+    fn release_admission_error(dir: &Path, manifest: &serde_json::Value) -> String {
+        fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_vec(manifest).unwrap(),
+        )
+        .unwrap();
+        let error = PlatformSources::validate_release(dir, dir, &deadline()).unwrap_err();
+        format!("{error:#}")
+    }
+
+    #[test]
+    fn release_admission_pins_portable_inputs_independently() {
+        let dir = fixture();
+        let original = release_manifest_fixture(dir.path());
+        assert!(release_admission_error(dir.path(), &original).contains("FVP SHA-256 mismatch"));
+        for path in ["cca-3world.yaml", "runtime-overlay.yaml"] {
+            for field in ["sha256", "bytes"] {
+                let mut manifest = original.clone();
+                manifest["files"][path][field] = if field == "sha256" {
+                    // A manifest-consistent substitute must still fail policy admission.
+                    serde_json::json!(hex::encode(Sha256::digest(vec![0u8; 8255])))
+                } else {
+                    serde_json::json!(8256)
+                };
+                assert!(
+                    release_admission_error(dir.path(), &manifest)
+                        .contains(&format!("portable input identity mismatch: {path}"))
+                );
+            }
+        }
+        let historical =
+            PlatformManifest::for_platform(crate::profile::FvpPlatform::RealmVfio).unwrap();
+        historical.require_pinned().unwrap();
+        assert_ne!(
+            historical.package.sha256,
+            original["files"]["cca-3world.yaml"]["sha256"]
+                .as_str()
+                .unwrap()
+        );
+        assert_ne!(
+            historical.overlay.sha256,
+            original["files"]["runtime-overlay.yaml"]["sha256"]
+                .as_str()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn release_admission_requires_six_unique_top_level_source_identities() {
+        let dir = fixture();
+        let original = release_manifest_fixture(dir.path());
+        for index in 0..6 {
+            for field in ["path", "url", "revision"] {
+                let mut manifest = original.clone();
+                manifest["sources"][index][field] = serde_json::json!("unapproved");
+                assert!(release_admission_error(dir.path(), &manifest).contains("approved source"));
+            }
+            let mut duplicate = original.clone();
+            duplicate["sources"]
+                .as_array_mut()
+                .unwrap()
+                .push(original["sources"][index].clone());
+            assert!(release_admission_error(dir.path(), &duplicate).contains("approved source"));
+        }
+        let mut submodule = original.clone();
+        let mut source = original["sources"][0].clone();
+        source["path"] = serde_json::json!("rmm/ext/another-checkout");
+        submodule["sources"].as_array_mut().unwrap().push(source);
+        assert!(release_admission_error(dir.path(), &submodule).contains("FVP SHA-256 mismatch"));
+    }
+
+    #[test]
+    fn consumed_manifest_keeps_actual_hashes_separate_from_reference_policy() {
+        let dir = fixture();
+        let mut sources =
+            platform_fixture(&dir.path().join("platform"), &dir.path().join("package"));
+        sources.qualification = PlatformManifest::pinned().unwrap();
+        sources.qualification().require_pinned().unwrap();
+        assert!(sources.manifest().require_pinned().is_err());
+        assert_eq!(sources.manifest().runtime.bl1_sha256, sources.bl1.sha256());
+        assert_eq!(sources.manifest().runtime.fip_sha256, sources.fip.sha256());
+        assert_eq!(sources.manifest().package.sha256, sources.package.sha256());
     }
 
     #[test]

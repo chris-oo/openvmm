@@ -7,8 +7,10 @@ use super::lifecycle::Cancellation;
 use super::lifecycle::Docker;
 use super::lifecycle::LaunchConfirmation;
 use super::lifecycle::PortBudget;
+use super::lifecycle::RecoveryBudgets;
 use super::lifecycle::RunState;
 use super::lifecycle::RuntimeDirectory;
+use super::lifecycle::RuntimeLock;
 use super::lifecycle::Session;
 use super::platform::PlatformManifest;
 use super::platform::PlatformSources;
@@ -499,18 +501,123 @@ fn write_outcome_snapshot(
 pub fn run(
     config: crate::run::FvpCcaIncubatorConfig,
 ) -> anyhow::Result<crate::run::IncubatorOutput> {
+    run_inner(config, None, Cancellation::default())
+}
+
+/// Operation performed while the validated FVP and its pipette connection stay live.
+pub type LiveGuestOperation = Box<
+    dyn FnOnce(PipetteClient) -> futures::future::BoxFuture<'static, anyhow::Result<i32>> + Send,
+>;
+
+/// Check all native L1 and unchanged Realm guest payloads before preparing a run.
+pub fn validate_native_payload(root: &Path) -> anyhow::Result<()> {
+    use petri_artifacts_common::cca_payload;
+    let deadline = Deadline::new(seconds(300))?;
+    let cancellation = Cancellation::default();
+    for (relative, hash) in [
+        (
+            "host/Image",
+            cca_payload::guest_memfd_in_place::LINUX_IMAGE_SHA256,
+        ),
+        ("host/initrd", cca_payload::BASE_INITRD_SHA256),
+        ("guest/Image", cca_payload::tdisp_guest::LINUX_IMAGE_SHA256),
+        ("guest/initrd", cca_payload::tdisp_guest::INITRD_SHA256),
+    ] {
+        verify_payload(&root.join(relative), hash, &deadline, &cancellation)?;
+    }
+    Ok(())
+}
+
+/// Run a native VM session, retaining the existing supervisor and finalization.
+///
+/// The operation completes before fixture teardown and guest poweroff. An operation
+/// error uses forced cleanup and remains an error, including any cleanup failure.
+/// Native model state and launcher logs use a stable per-user namespace outside
+/// disposable test output. All runs hold the global exclusive model lock and
+/// shared toolchain-use lock. Foreign retained journals fail checked recovery.
+pub fn run_live(
+    config: crate::run::FvpCcaIncubatorConfig,
+    operation: LiveGuestOperation,
+    cancellation: Cancellation,
+) -> anyhow::Result<crate::run::IncubatorOutput> {
+    run_inner(config, Some(operation), cancellation)
+}
+
+/// Recover one explicitly authorized retained native run without launching a
+/// model. Legacy state is not read or changed. The original owner must be gone.
+pub fn recover_native(
+    platform_root: &Path,
+    package_root: &Path,
+    evidence: &super::lifecycle::RecoveryEvidence,
+) -> anyhow::Result<()> {
+    let profile = crate::IncubatorProfile::from_toml(include_str!(
+        "../../profiles/aarch64-fvp-cca-realm-vfio.toml"
+    ))?;
+    let crate::IncubatorBackend::FvpCca(profile) = profile.incubator else {
+        anyhow::bail!("native FVP recovery requires the qualified FVP profile");
+    };
+    profile.validate()?;
+    let cancellation = Cancellation::default();
+    let _signals = cancellation.install_signal_handlers()?;
+    let base = RuntimeDirectory::default_base()?;
+    let excluded = [platform_root, package_root];
+    let global_directory = RuntimeDirectory::open(&base, &excluded)?;
+    let native_directory = native_runtime_directory(&base, &excluded)?;
+    let locks = Deadline::new(seconds(profile.deadlines.model_lock))?;
+    let _toolchain_lock = global_directory.lock_toolchain(locks.remaining()?, &cancellation)?;
+    let (lock, _global_model_guard) = acquire_model_locks(
+        global_directory,
+        Some(native_directory),
+        locks.remaining()?,
+        &cancellation,
+    )?;
+    anyhow::ensure!(
+        lock.read_state()?.is_some(),
+        "no retained native FVP state to recover"
+    );
+    let validation = Deadline::new(seconds(profile.deadlines.validation))?;
+    let sources = PlatformSources::validate_release(platform_root, package_root, &validation)?;
+    let manifest = PlatformManifest::for_platform(profile.platform)?;
+    let (_, launcher) = sources.shrinkwrap_command_with_identity()?;
+    let docker = connect_docker(&validation, &cancellation)?;
+    lock.recover_with_evidence(
+        &docker,
+        &manifest.shrinkwrap.container.digest,
+        &launcher,
+        RecoveryBudgets {
+            cleanup: seconds(profile.deadlines.forced_cleanup),
+            validation: seconds(profile.deadlines.validation),
+        },
+        &cancellation,
+        evidence,
+    )
+}
+
+fn run_inner(
+    config: crate::run::FvpCcaIncubatorConfig,
+    mut operation: Option<LiveGuestOperation>,
+    cancellation: Cancellation,
+) -> anyhow::Result<crate::run::IncubatorOutput> {
     let started = Instant::now();
     let crate::profile::IncubatorBackend::FvpCca(profile) = &config.profile.incubator else {
         anyhow::bail!("FVP runtime requires an FVP CCA profile");
     };
     profile.validate()?;
-    let (program, arguments) = config
-        .guest_command
-        .split_first()
-        .context("empty FVP guest command")?;
-    let additional = [shared_program_input(program)?];
-    let cancellation = Cancellation::default();
-    let _signals = cancellation.install_signal_handlers()?;
+    let (program, arguments) = match config.guest_command.split_first() {
+        Some((program, arguments)) => (program.as_str(), arguments),
+        None if operation.is_some() => ("", &[][..]),
+        None => anyhow::bail!("empty FVP guest command"),
+    };
+    let additional = if operation.is_some() {
+        Vec::new()
+    } else {
+        vec![shared_program_input(program)?]
+    };
+    let _signals = if operation.is_none() {
+        Some(cancellation.install_signal_handlers()?)
+    } else {
+        None
+    };
     let initial = Deadline::new(seconds(profile.deadlines.validation))?;
     let manifest = PlatformManifest::for_platform(profile.platform)?;
     let kernel_sha256 = match profile.platform {
@@ -521,12 +628,20 @@ pub fn run(
             petri_artifacts_common::cca_payload::guest_memfd_in_place::LINUX_IMAGE_SHA256
         }
     };
-    let sources = PlatformSources::validate(
-        &manifest,
-        &config.platform_root,
-        &config.shrinkwrap_package_root,
-        &initial,
-    )?;
+    let sources = if operation.is_some() {
+        PlatformSources::validate_release(
+            &config.platform_root,
+            &config.shrinkwrap_package_root,
+            &initial,
+        )?
+    } else {
+        PlatformSources::validate(
+            &manifest,
+            &config.platform_root,
+            &config.shrinkwrap_package_root,
+            &initial,
+        )?
+    };
     let output_base = output_path(
         &config.output_dir,
         &[&sources.platform_root, &sources.package_root],
@@ -539,15 +654,27 @@ pub fn run(
     };
     verify_payload(&config.kernel, kernel_sha256, &initial, &cancellation)?;
     verify_payload(&config.initrd, INITRD_SHA256, &initial, &cancellation)?;
-    let directory = RuntimeDirectory::open(
-        &RuntimeDirectory::default_base()?,
-        &[
-            &sources.platform_root,
-            &sources.package_root,
-            &config.share_dir,
-        ],
-    )?;
-    let runtime_path = directory.path().to_owned();
+    let excluded = [
+        sources.platform_root.as_path(),
+        sources.package_root.as_path(),
+        config.share_dir.as_path(),
+    ];
+    let base = RuntimeDirectory::default_base()?;
+    let global_directory = RuntimeDirectory::open(&base, &excluded)?;
+    let native_directory = if operation.is_some() {
+        Some(native_runtime_directory(
+            &base,
+            &[excluded[0], excluded[1], excluded[2], &output_base],
+        )?)
+    } else {
+        None
+    };
+    let runtime_path = native_directory
+        .as_ref()
+        .unwrap_or(&global_directory)
+        .path()
+        .to_owned();
+    tracing::info!(path = %runtime_path.display(), "FVP runtime state");
     let lock_deadline = Deadline::new(seconds(profile.deadlines.model_lock))?;
     let lock_time = || {
         if profile.deadlines.model_lock == 0 {
@@ -556,8 +683,13 @@ pub fn run(
             lock_deadline.remaining()
         }
     };
-    let _toolchain_lock = directory.lock_toolchain(lock_time()?, &cancellation)?;
-    let lock = directory.lock(lock_time()?, &cancellation)?;
+    let _toolchain_lock = global_directory.lock_toolchain(lock_time()?, &cancellation)?;
+    let (lock, _global_model_guard) = acquire_model_locks(
+        global_directory,
+        native_directory,
+        lock_time()?,
+        &cancellation,
+    )?;
     let inventory_deadline = Deadline::new(seconds(profile.deadlines.validation))?;
     let docker = connect_docker(&inventory_deadline, &cancellation)?;
     let (_, expected_launcher) = sources.shrinkwrap_command_with_identity()?;
@@ -565,7 +697,10 @@ pub fn run(
         &docker,
         &manifest.shrinkwrap.container.digest,
         &expected_launcher,
-        seconds(profile.deadlines.forced_cleanup),
+        RecoveryBudgets {
+            cleanup: seconds(profile.deadlines.forced_cleanup),
+            validation: seconds(profile.deadlines.validation),
+        },
         &cancellation,
     )?;
     let mut session = Session::new(
@@ -593,12 +728,22 @@ pub fn run(
     let driver = pool.driver();
     let mut client: Option<PipetteClient> = None;
     let outcome: anyhow::Result<i32> = (|| {
-        prepared = Some(PreparedFvpRun::allocate_for_session(
-            &sources,
-            &config.share_dir,
-            &inventory_deadline,
-            &cancellation,
-        )?);
+        prepared = Some(if operation.is_some() {
+            PreparedFvpRun::allocate_for_session_in(
+                &output_base,
+                &sources,
+                &config.share_dir,
+                &inventory_deadline,
+                &cancellation,
+            )?
+        } else {
+            PreparedFvpRun::allocate_for_session(
+                &sources,
+                &config.share_dir,
+                &inventory_deadline,
+                &cancellation,
+            )?
+        });
         let staging = prepared.as_ref().context("missing FVP staging")?;
         staging.verify_unregistered(&inventory_deadline)?;
         anyhow::ensure!(
@@ -693,7 +838,12 @@ pub fn run(
         std::fs::write(
             output.join("platform-identity.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
-                "platform": manifest,
+                "platform": sources.manifest(),
+                "qualification_policy": sources.qualification(),
+                "consumed_files": sources.sources().map(|source| serde_json::json!({
+                    "path": source.path(),
+                    "sha256": source.sha256(),
+                })).collect::<Vec<_>>(),
                 "kernel_sha256": kernel_sha256,
                 "base_initrd_sha256": INITRD_SHA256,
                 "patched_initrd_sha256": patched_hash,
@@ -850,7 +1000,25 @@ pub fn run(
         let connected = client
             .as_ref()
             .context("FVP readiness did not establish pipette")?;
-        let completion = session.execute_test(seconds(profile.deadlines.test_execution), |deadline, cancellation| {
+        let completion = if let Some(operation) = operation.take() {
+            session
+                .execute_test(
+                    seconds(profile.deadlines.test_execution),
+                    |deadline, cancellation| {
+                        Ok(
+                            pool.run_until(bounded(&driver, deadline, cancellation, async {
+                                let code = operation(connected.clone()).await?;
+                                Ok(CompletedCommand {
+                                    exit_code: code,
+                                    capture: Ok(()),
+                                })
+                            })),
+                        )
+                    },
+                )
+                .and_then(|result| result)
+        } else {
+            session.execute_test(seconds(profile.deadlines.test_execution), |deadline, cancellation| {
             Ok(pool.run_until(bounded(&driver, deadline, cancellation, async {
                 let realm_vfio = profile.platform == crate::profile::FvpPlatform::RealmVfio;
                 if realm_vfio {
@@ -873,6 +1041,7 @@ pub fn run(
                 command.env("PETRI_CAPABILITIES", profile.capabilities.join(","));
                 if realm_vfio {
                     command.env("INCUBATOR_VFIO_BDF_CCA_REALM_VFIO", "0000:01:00.0");
+                    command.env("PETRI_VFIO_BDF_CCA_REALM_VFIO", "0000:01:00.0");
                 }
                 if let Some(directory) = &config.guest_current_dir { command.current_dir(directory); }
                 command
@@ -899,7 +1068,8 @@ pub fn run(
                     drain_command_output(stderr, output.join("command.stderr.log"), stderr_target, deadline, cancellation),
                 ).await
             })))
-        }).and_then(|result| result);
+        }).and_then(|result| result)
+        };
         ledger.report.guest_command.observe(&completion);
         ledger.checkpoint("guest_command_result");
         let completion = completion?;
@@ -973,7 +1143,6 @@ pub fn run(
         });
         combine_guest_outcome(exit_code, combine(teardown, shutdown))
     })();
-    drop(client);
     ledger.report.finalization = FinalizationOutcomeReport::Unknown;
     ledger.checkpoint("finalization_start");
     let finalization = finish_session(
@@ -981,7 +1150,7 @@ pub fn run(
         prepared,
         &output,
         seconds(profile.deadlines.validation),
-        seconds(profile.deadlines.forced_cleanup),
+        seconds(profile.deadlines.validation),
         |deadline, token| {
             scope_result(match &identity {
                 Some(identity) => sources.verify_toolchain_after(identity, deadline, token),
@@ -989,6 +1158,27 @@ pub fn run(
             })
         },
     );
+    // Petri may retain a clone after the supervisor returns. Close its shared
+    // mesh and join all transport tasks while their executor is still running.
+    // Cancelling those tasks after dropping the executor can deadlock port
+    // destruction on the caller's thread.
+    let disconnected = (|| {
+        if let Some(client) = &client {
+            let deadline = Deadline::new(seconds(profile.deadlines.forced_cleanup))?;
+            let cleanup = Cancellation::default();
+            pool.run_until(bounded(&driver, &deadline, &cleanup, async {
+                client.close().await;
+                Ok(())
+            }))
+            .context("failed to close FVP pipette connection")?;
+        }
+        Ok(())
+    })();
+    drop(client);
+    drop(driver);
+    // Also drain cancellations from failed or interrupted connection attempts.
+    pool.run();
+    let finalization = combine(finalization, disconnected);
     ledger.report.finalization = match &finalization {
         Ok(()) => FinalizationOutcomeReport::Succeeded,
         Err(error) => FinalizationOutcomeReport::Failed {
@@ -1034,10 +1224,14 @@ pub(super) fn finish_session(
             Ok(())
         })();
         let retired = if saved.is_ok() {
-            session.retire_state().and_then(|()| match prepared.take() {
-                Some(staging) => staging.confirm_retired(),
-                None => Ok(()),
-            })
+            (|| {
+                let deadline = Deadline::new(output_budget)?;
+                session.retire_state_with_deadline(&deadline)?;
+                match prepared.take() {
+                    Some(staging) => staging.confirm_retired(),
+                    None => Ok(()),
+                }
+            })()
         } else {
             Ok(())
         };
@@ -1262,6 +1456,39 @@ fn output_path(path: &Path, roots: &[&Path]) -> anyhow::Result<PathBuf> {
     }
     super::lifecycle::validate_output_location(&path)?;
     Ok(path)
+}
+
+fn native_runtime_directory(
+    persistent_base: &Path,
+    excluded: &[&Path],
+) -> anyhow::Result<RuntimeDirectory> {
+    RuntimeDirectory::open(&persistent_base.join("petri-native"), excluded)
+}
+
+fn acquire_model_locks(
+    global: RuntimeDirectory,
+    native: Option<RuntimeDirectory>,
+    budget: Duration,
+    cancellation: &Cancellation,
+) -> anyhow::Result<(RuntimeLock, Option<RuntimeLock>)> {
+    let deadline = Deadline::new(budget)?;
+    let remaining = || {
+        if budget.is_zero() {
+            Ok(Duration::ZERO)
+        } else {
+            deadline.remaining()
+        }
+    };
+    let global_lock = global.lock(remaining()?, cancellation)?;
+    match native {
+        // Keep the global guard through native teardown and post-verification.
+        // Legacy journals are neither read nor changed by native recovery.
+        Some(directory) => Ok((
+            directory.lock(remaining()?, cancellation)?,
+            Some(global_lock),
+        )),
+        None => Ok((global_lock, None)),
+    }
 }
 
 fn seconds(value: u64) -> Duration {
@@ -2410,9 +2637,103 @@ mod tests {
         assert!(output_path(&alias.join("results"), &[&root]).is_err());
         assert!(!root.join("results").exists());
         output_path(&directory.path().join("results"), &[&root]).unwrap();
-        let volatile = tempfile::tempdir().unwrap();
-        assert!(output_path(&volatile.path().join("results"), &[]).is_err());
-        assert!(!volatile.path().join("results").exists());
+        assert!(output_path(Path::new("/tmp/openvmm-rejected-output"), &[]).is_err());
+    }
+
+    #[test]
+    fn native_state_survives_output_removal_and_launcher_rebuilds() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().join("persistent-state");
+        let launcher = directory.path().join("launcher");
+        let token = Cancellation::default();
+        let first = native_runtime_directory(&base, &[]).unwrap();
+        let first_path = first.path().to_owned();
+        assert_eq!(first_path, base.join("petri-native/fvp-v1"));
+        assert_eq!(
+            std::fs::metadata(&first_path).unwrap().mode() & 0o777,
+            0o700
+        );
+        let first_lock = first.lock(Duration::ZERO, &token).unwrap();
+        let retained = first_path.join("state.json");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&retained)
+            .unwrap();
+        file.write_all(b"foreign state must remain unchanged")
+            .unwrap();
+        file.sync_all().unwrap();
+        assert!(first_lock.read_state().is_err());
+
+        for name in ["build-one", "build-two"] {
+            std::fs::write(&launcher, name).unwrap();
+            let output = directory.path().join(name);
+            std::fs::create_dir(&output).unwrap();
+            let reopened = native_runtime_directory(&base, &[&output]).unwrap();
+            assert_eq!(reopened.path(), first_path);
+            assert!(reopened.lock(Duration::ZERO, &token).is_err());
+            std::fs::remove_dir_all(&output).unwrap();
+        }
+        drop(first_lock);
+        let reopened = native_runtime_directory(&base, &[]).unwrap();
+        assert!(
+            reopened
+                .lock(Duration::ZERO, &token)
+                .unwrap()
+                .read_state()
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(&retained).unwrap(),
+            b"foreign state must remain unchanged"
+        );
+    }
+
+    #[test]
+    fn native_state_rejects_input_and_disposable_output_overlap() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().join("persistent-state");
+        let output = base.join("petri-native/fvp-v1/outputs");
+        assert!(native_runtime_directory(&base, &[&base]).is_err());
+        assert!(native_runtime_directory(&base, &[&output]).is_err());
+        assert!(!base.exists());
+    }
+
+    #[test]
+    fn global_model_lock_serializes_legacy_and_native_without_changing_legacy_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path();
+        let token = Cancellation::default();
+        let global = || RuntimeDirectory::open(base, &[]).unwrap();
+        let native = || native_runtime_directory(base, &[]).unwrap();
+        let legacy_state = global().path().join("state.json");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&legacy_state)
+            .unwrap();
+        file.write_all(b"retained legacy state").unwrap();
+        let legacy_lock = global().lock(Duration::ZERO, &token).unwrap();
+        assert!(acquire_model_locks(global(), Some(native()), Duration::ZERO, &token).is_err());
+        drop(legacy_lock);
+        let (native_lock, guard) =
+            acquire_model_locks(global(), Some(native()), Duration::ZERO, &token).unwrap();
+        assert!(guard.is_some());
+        assert!(global().lock(Duration::ZERO, &token).is_err());
+        assert!(acquire_model_locks(global(), Some(native()), Duration::ZERO, &token).is_err());
+        assert!(native().lock(Duration::ZERO, &token).is_err());
+        drop(native_lock);
+        assert!(global().lock(Duration::ZERO, &token).is_err());
+        drop(guard);
+        assert!(global().lock(Duration::ZERO, &token).is_ok());
+        assert_eq!(
+            std::fs::read(legacy_state).unwrap(),
+            b"retained legacy state"
+        );
+        token.cancel();
+        assert!(acquire_model_locks(global(), Some(native()), Duration::ZERO, &token).is_err());
     }
 
     #[test]

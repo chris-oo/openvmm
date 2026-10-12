@@ -45,6 +45,7 @@ pub use profile::Arch;
 pub use profile::FvpCcaConfig;
 pub use profile::FvpConsole;
 pub use profile::FvpDeadlines;
+pub use profile::FvpPlatform;
 pub use profile::IncubatorBackend;
 pub use profile::IncubatorProfile;
 pub use run::FvpCcaIncubatorConfig;

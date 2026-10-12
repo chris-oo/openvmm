@@ -43,12 +43,21 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 /// A client to a running `pipette` instance inside a VM.
+#[derive(Clone)]
 pub struct PipetteClient {
     send: PipetteSender,
-    watch: mesh::OneshotReceiver<()>,
-    _mesh: PointToPointMesh,
-    _log_task: Task<()>,
-    _diag_task: Task<()>,
+    connection: std::sync::Arc<PipetteConnection>,
+}
+
+struct PipetteConnection {
+    watch: futures::lock::Mutex<Option<mesh::OneshotReceiver<()>>>,
+    tasks: futures::lock::Mutex<Option<PipetteConnectionTasks>>,
+}
+
+struct PipetteConnectionTasks {
+    mesh: PointToPointMesh,
+    log_task: Task<()>,
+    diag_task: Task<()>,
 }
 
 /// Maximum time to wait for a single pipette connection attempt — the mesh
@@ -103,10 +112,14 @@ impl PipetteClient {
 
         let client = Self {
             send: PipetteSender::new(requests),
-            watch,
-            _mesh: mesh,
-            _log_task: log_task,
-            _diag_task: diag_task,
+            connection: std::sync::Arc::new(PipetteConnection {
+                watch: futures::lock::Mutex::new(Some(watch)),
+                tasks: futures::lock::Mutex::new(Some(PipetteConnectionTasks {
+                    mesh,
+                    log_task,
+                    diag_task,
+                })),
+            }),
         };
 
         // A successful mesh handshake is not, on its own, proof of a usable
@@ -122,6 +135,23 @@ impl PipetteClient {
             .context("pipette liveness ping failed")?;
 
         Ok(client)
+    }
+
+    /// Close the shared connection for all clones and join its tasks.
+    ///
+    /// Call this on the connection's executor before stopping that executor.
+    /// Clones may outlive it, but cannot issue further guest requests.
+    pub async fn close(&self) {
+        let mut tasks = self.connection.tasks.lock().await;
+        if let Some(PipetteConnectionTasks {
+            mesh,
+            log_task,
+            diag_task,
+        }) = tasks.take()
+        {
+            mesh.shutdown().await;
+            futures::join!(log_task.cancel(), diag_task.cancel());
+        }
     }
 
     /// Pings the agent to check if it's alive.
@@ -298,8 +328,14 @@ impl PipetteClient {
     }
 
     /// Waits for the agent to exit.
+    ///
+    /// Only one client sharing this connection can consume the exit notification.
     pub async fn wait(self) -> Result<(), mesh::RecvError> {
-        self.watch.await
+        let watch = self.connection.watch.lock().await.take();
+        match watch {
+            Some(watch) => watch.await,
+            None => Err(mesh::RecvError::Closed),
+        }
     }
 
     /// Returns the current time in the guest.
@@ -373,5 +409,99 @@ async fn recv_diag_files(output_dir: PathBuf, mut diag_file_recv: mesh::Receiver
             .expect("failed to canonicalize attachment path");
         // Use the inline junit syntax to attach the file to the test result.
         println!("[[ATTACHMENT|{}]]", canonical_path.display());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::AsyncRead;
+    use futures::AsyncWrite;
+    use pal_async::DefaultPool;
+    use std::pin::Pin;
+    use std::task::Context;
+    use std::task::Poll;
+    use test_with_tracing::test;
+
+    struct Duplex(mesh::pipe::ReadPipe, mesh::pipe::WritePipe);
+
+    impl AsyncRead for Duplex {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.0).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for Duplex {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.1).poll_write(cx, buf)
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.1).poll_flush(cx)
+        }
+        fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.1).poll_close(cx)
+        }
+    }
+
+    #[test]
+    fn client_drop_after_supervisor_pool_exits_does_not_block() {
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut pool = DefaultPool::new();
+            let driver = pool.driver();
+            let (host_read, guest_write) = mesh::pipe::pipe();
+            let (guest_read, host_write) = mesh::pipe::pipe();
+            let (bootstrap_send, bootstrap_recv) = mesh::oneshot::<PipetteBootstrap>();
+            let guest_mesh = PointToPointMesh::new(
+                &driver,
+                Duplex(guest_read, guest_write),
+                bootstrap_recv.into(),
+            );
+            let (requests, mut request_recv) = mesh::channel();
+            let (_diag, diag_file_recv) = mesh::channel();
+            let (_watch, watch) = mesh::oneshot();
+            let (log, _log_write) = mesh::pipe::pipe();
+            bootstrap_send.send(PipetteBootstrap {
+                requests,
+                diag_file_recv,
+                watch,
+                log,
+            });
+            let guest = driver.spawn("mock-pipette", async move {
+                while let Some(request) = request_recv.next().await {
+                    if let PipetteRequest::Ping(rpc) = request {
+                        rpc.complete(());
+                    }
+                }
+            });
+            let client = pool
+                .run_until(PipetteClient::new(
+                    &driver,
+                    Duplex(host_read, host_write),
+                    Path::new("."),
+                ))
+                .unwrap();
+            let surviving_client = client.clone();
+            pool.run_until(client.close());
+            pool.run_until(surviving_client.close());
+            drop(client);
+            drop(guest_mesh);
+            drop(guest);
+            drop(driver);
+            pool.run();
+            drop(surviving_client);
+            done.send(()).unwrap();
+        });
+        result
+            .recv_timeout(Duration::from_secs(5))
+            .expect("client destruction blocked after its supervisor pool exited");
     }
 }
