@@ -119,6 +119,46 @@ describes the source definitions.
   SNP GHCB CPUID requests so they are forwarded to OpenVMM. The default is
   offloading enabled. This diagnostic parameter is meaningful only with
   `--isolation snp`.
+* `--hypervisor mshv:snp_scoped_host_access=true`: Opt in to experimental
+  scoped host access for SNP. The default is `false`; ordinary SNP bring-up
+  does not change. This parameter requires `--isolation snp` and MSHV.
+  It can be combined with `snp_disable_cpuid_offload=false` or `true`.
+  Base-page backing is required: pass `--memory size=<SIZE>,thp=off`.
+  Transparent huge pages and explicit huge pages are not supported in this
+  mode. For NUMA configurations, pass `thp=off` on every `--numa` node instead
+  of using `--memory`. Existing guest-memory backing files are not supported.
+
+  Each virtio block device must explicitly select `bounce`. Each virtio
+  network device must explicitly select `bounce:` with Consomme, Linux TAP,
+  or `none`. In-process vsock requires `--virtio-vsock-bounce`. Block
+  backends are limited to plain buffered regular files and RAM disks.
+  See [block bounce I/O](#per-device-block-bounce-io) and
+  [network and vsock bounce I/O](#per-device-network-and-vsock-bounce-io)
+  for syntax and limits. The option does not enable bounce I/O implicitly.
+
+  The initial device allowlist contains these three bounced virtio devices,
+  serial ports, and the minimal chipset. Other devices are rejected before
+  their resources are opened. This includes kernel vhost, vhost-user, assigned
+  devices, remote PCIe devices, CXL, persistent memory, filesystem devices,
+  RNG, and virtio console. With `--hv`, also pass `--no-vmbus`.
+  Snapshot restore, guest memory dumps, and the debugger are not supported.
+
+  This experimental mode uses existing MSHV calls. It does not add a Hyper-V
+  ABI, kernel memory-management enforcement, or large-page support. Hardware
+  tests must still verify clean denial of intercept access and private-page
+  access cycles. Do not treat this option as a completed isolation feature.
+  GPA-attribute intercepts currently halt the guest rather than complete the
+  request. Race-free VP-entry cancellation and explicit private/shared/private
+  acceptance also remain unfinished.
+
+  Control-page reservations remain until partition teardown. AP recreation
+  and SNP doorbell disable/rebind are not supported. Reusing a reserved page
+  can halt the guest. The coordinator allows at most 4,096 root-operation
+  reservations; exhausting this limit also prevents PSP guest requests.
+  A failed root-operation ioctl stops the partition when its result is
+  uncertain, even if an AP-start error was returned to the guest.
+  For guest-driver tests with the published `0.3.0-155` image, the driver is
+  built in: use device unbind/rebind, not `rmmod`.
 * `--nested-virt`: Expose hardware virtualization (VMX/SVM) to the guest so it
   can run its own hypervisor (Hyper-V, KVM, etc.). Only supported on `x86_64`,
   and only by backends that support nested virtualization (currently WHP and

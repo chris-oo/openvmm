@@ -1046,6 +1046,11 @@ flags:
     ///   user_mode_apic       - use user-mode APIC emulator
     ///   no_enlightenments    - disable in-hypervisor enlightenments
     ///
+    /// MSHV parameters (default: false):
+    ///   snp_disable_cpuid_offload - forward SNP GHCB CPUID requests to OpenVMM
+    ///   snp_scoped_host_access - opt in to scoped SNP host access; requires
+    ///                           explicit per-device bounce I/O
+    ///
     /// Examples:
     ///   --hypervisor whp
     ///   --hypervisor whp:user_mode_apic
@@ -1537,15 +1542,16 @@ impl Options {
 
     /// Validates isolation-specific command-line option combinations.
     pub fn validate_isolation_options(&self) -> anyhow::Result<()> {
+        let hypervisor = self
+            .hypervisor
+            .as_deref()
+            .map(openvmm_helpers::hypervisor::HypervisorParamRoot::parse)
+            .transpose()?;
         if self.snp_restricted_injection && !matches!(self.isolation, Some(IsolationCli::Snp)) {
             anyhow::bail!("--snp-restricted-injection requires --isolation snp");
         }
         if self.snp_restricted_injection
-            && self
-                .hypervisor
-                .as_deref()
-                .and_then(|value| value.split(':').next())
-                != Some("mshv")
+            && hypervisor.as_ref().map(|value| value.name) != Some("mshv")
         {
             anyhow::bail!("--snp-restricted-injection requires --hypervisor mshv");
         }
@@ -1570,6 +1576,134 @@ impl Options {
                 anyhow::bail!("SNP isolation currently does not support hugetlb memory");
             }
         }
+        if hypervisor
+            .as_ref()
+            .map(|value| value.scoped_host_access())
+            .transpose()?
+            .unwrap_or(false)
+        {
+            self.validate_scoped_host_access_options()?;
+        }
+        Ok(())
+    }
+
+    fn validate_scoped_host_access_options(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            matches!(self.isolation, Some(IsolationCli::Snp)),
+            "snp_scoped_host_access requires --isolation snp"
+        );
+        if let Some(nodes) = &self.numa {
+            anyhow::ensure!(
+                nodes.iter().all(|node| {
+                    node.memory.transparent_hugepages == Some(false) && !node.memory.hugepages
+                }),
+                "snp_scoped_host_access requires thp=off on every NUMA node"
+            );
+        } else {
+            anyhow::ensure!(
+                !self.transparent_hugepages() && !self.memory.hugepages,
+                "snp_scoped_host_access requires base-page backing; pass --memory thp=off"
+            );
+        }
+        anyhow::ensure!(
+            self.memory_backing_file().is_none(),
+            "snp_scoped_host_access forbids existing guest-memory backing files"
+        );
+        self.validate_bounce_options()?;
+        for disk in &self.virtio_blk {
+            anyhow::ensure!(
+                disk.bounce_io,
+                "snp_scoped_host_access requires `bounce` on every --virtio-blk"
+            );
+            anyhow::ensure!(
+                matches!(
+                    disk.kind,
+                    DiskCliKind::File { direct: false, .. } | DiskCliKind::Memory(_)
+                ),
+                "snp_scoped_host_access requires buffered regular-file or RAM block backends"
+            );
+        }
+        for nic in &self.virtio_net {
+            anyhow::ensure!(
+                nic.bounce_io,
+                "snp_scoped_host_access requires `bounce:` on every --virtio-net"
+            );
+        }
+        anyhow::ensure!(
+            self.virtio_vsock_path.is_none() || self.virtio_vsock_bounce,
+            "snp_scoped_host_access requires --virtio-vsock-bounce"
+        );
+        #[cfg(target_os = "linux")]
+        anyhow::ensure!(
+            self.vhost_user.is_empty()
+                && self.virtio_vsock_vhost_cid.is_none()
+                && self.vfio.is_empty()
+                && self.iommu.is_empty(),
+            "snp_scoped_host_access forbids vhost-user, kernel vhost-vsock, and assigned devices"
+        );
+        #[cfg(windows)]
+        anyhow::ensure!(
+            self.device.is_empty(),
+            "snp_scoped_host_access forbids assigned devices"
+        );
+        #[cfg(guest_arch = "x86_64")]
+        anyhow::ensure!(
+            self.amd_iommu.is_empty() && self.intel_vtd.is_empty(),
+            "snp_scoped_host_access forbids IOMMU devices"
+        );
+        #[cfg(guest_arch = "aarch64")]
+        anyhow::ensure!(
+            self.smmu.is_empty(),
+            "snp_scoped_host_access forbids IOMMU devices"
+        );
+        anyhow::ensure!(
+            self.disk.is_empty()
+                && self.nvme.is_empty()
+                && self.nvme_pci.is_empty()
+                && self.vmbus_scsi.is_empty()
+                && self.openhcl_controller.is_empty()
+                && self.ide.is_empty()
+                && self.floppy.is_empty()
+                && self.net.is_empty()
+                && self.mana.is_empty()
+                && self.kernel_vmnic.is_empty()
+                && !self.nic
+                && self.virtio_9p.is_empty()
+                && self.virtio_fs.is_empty()
+                && self.virtio_fs_shmem.is_empty()
+                && self.virtio_pmem.is_none()
+                && !self.virtio_rng
+                && self.virtio_console.is_none()
+                && self.pcie_remote.is_empty()
+                && self.cxl_test.is_empty()
+                && !self.gfx
+                && !self.vnc.vnc
+                && !self.vtl2_gfx
+                && !self.vtl2
+                && !self.get
+                && (!self.hv || self.no_vmbus)
+                && self.vmbus_vsock_path.is_none()
+                && self.vmbus_vtl2_vsock_path.is_none()
+                && self.vmbus_com1_serial.is_none()
+                && self.vmbus_com2_serial.is_none()
+                && self.tpm.is_none()
+                && !self.battery
+                && !self.guest_watchdog
+                && self.debugcon.is_none()
+                && self.gdb.is_none()
+                && self.crash_dump_path.is_none()
+                && self.restore_snapshot.is_none()
+                && !self.hibernation,
+            "snp_scoped_host_access only supports bounced virtio-blk/net/vsock, serial, and the minimal chipset"
+        );
+        Ok(())
+    }
+
+    /// Validates VM options before resource construction or other side effects.
+    pub fn validate_vm_options(&self) -> anyhow::Result<()> {
+        self.validate_isolation_options()?;
+        self.validate_igvm_options()?;
+        self.validate_bounce_options()?;
         Ok(())
     }
 
@@ -5852,6 +5986,240 @@ mod tests {
             opt.validate_isolation_options().unwrap_err().to_string(),
             "SNP isolation currently only supports Linux direct boot"
         );
+    }
+
+    #[test]
+    fn test_scoped_host_access_requires_mshv_snp() {
+        for args in [
+            vec!["--hypervisor", "mshv:snp_scoped_host_access=true"],
+            vec![
+                "--hypervisor",
+                "kvm:snp_scoped_host_access=true",
+                "--isolation",
+                "snp",
+            ],
+            vec![
+                "--hypervisor",
+                "mshv:snp_scoped_host_access=true",
+                "--isolation",
+                "vbs",
+            ],
+            vec!["--hypervisor", "mshv:snp_scoped_host_access=invalid"],
+            vec!["--hypervisor", "mshv:unknown=true"],
+        ] {
+            let opt = Options::try_parse_from(std::iter::once("openvmm").chain(args)).unwrap();
+            assert!(opt.validate_vm_options().is_err());
+        }
+        for spec in ["mshv", "mshv:snp_scoped_host_access=false"] {
+            let opt = Options::try_parse_from(["openvmm", "--hypervisor", spec]).unwrap();
+            opt.validate_vm_options().unwrap();
+        }
+        let opt = Options::try_parse_from([
+            "openvmm",
+            "--hypervisor",
+            "mshv:snp_scoped_host_access=false",
+            "--isolation",
+            "snp",
+            "--virtio-blk",
+            "mem:1M",
+            "--virtio-net",
+            "consomme",
+        ])
+        .unwrap();
+        opt.validate_vm_options().unwrap();
+        for spec in [
+            "mshv:snp_scoped_host_access",
+            "mshv:snp_disable_cpuid_offload,snp_scoped_host_access=yes",
+        ] {
+            let opt = Options::try_parse_from([
+                "openvmm",
+                "--hypervisor",
+                spec,
+                "--isolation",
+                "snp",
+                "--memory",
+                "thp=off",
+            ])
+            .unwrap();
+            opt.validate_vm_options().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_scoped_host_access_requires_base_pages() {
+        for memory in ["192MB", "size=192MB,thp=on"] {
+            let opt = Options::try_parse_from([
+                "openvmm",
+                "--hypervisor",
+                "mshv:snp_scoped_host_access=true",
+                "--isolation",
+                "snp",
+                "--memory",
+                memory,
+            ])
+            .unwrap();
+            assert!(
+                opt.validate_vm_options()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("base-page backing")
+            );
+        }
+    }
+
+    #[test]
+    fn test_scoped_host_access_rejects_numa_thp_and_existing_backing() {
+        for (options, expected) in [
+            (vec!["--numa", "size=192MB"], "thp=off on every NUMA node"),
+            (
+                vec!["--numa", "size=192MB,thp=on"],
+                "thp=off on every NUMA node",
+            ),
+            (
+                vec!["--memory", "thp=off,file=path/to/ram"],
+                "forbids existing guest-memory backing files",
+            ),
+            (
+                vec![
+                    "--memory",
+                    "thp=off",
+                    "--memory-backing-file",
+                    "path/to/ram",
+                ],
+                "forbids existing guest-memory backing files",
+            ),
+        ] {
+            let opt = Options::try_parse_from(
+                [
+                    "openvmm",
+                    "--hypervisor",
+                    "mshv:snp_scoped_host_access=true",
+                    "--isolation",
+                    "snp",
+                ]
+                .into_iter()
+                .chain(options),
+            )
+            .unwrap();
+            assert!(
+                opt.validate_vm_options()
+                    .unwrap_err()
+                    .to_string()
+                    .contains(expected)
+            );
+        }
+        let opt = Options::try_parse_from([
+            "openvmm",
+            "--hypervisor",
+            "mshv:snp_scoped_host_access=true",
+            "--isolation",
+            "snp",
+            "--numa",
+            "size=192MB,thp=off",
+        ])
+        .unwrap();
+        opt.validate_vm_options().unwrap();
+    }
+
+    #[test]
+    fn test_scoped_host_access_requires_explicit_device_bounce() {
+        for device in [
+            vec!["--virtio-blk", "mem:1M"],
+            vec!["--virtio-net", "consomme"],
+            vec!["--virtio-vsock-path", "path/to/vsock"],
+        ] {
+            let opt = Options::try_parse_from(
+                [
+                    "openvmm",
+                    "--hypervisor",
+                    "mshv:snp_scoped_host_access=true",
+                    "--isolation",
+                    "snp",
+                    "--memory",
+                    "thp=off",
+                ]
+                .into_iter()
+                .chain(device),
+            )
+            .unwrap();
+            assert!(opt.validate_vm_options().is_err());
+        }
+        let opt = Options::try_parse_from([
+            "openvmm",
+            "--hypervisor",
+            "mshv:snp_scoped_host_access=true,snp_disable_cpuid_offload=false",
+            "--isolation",
+            "snp",
+            "--memory",
+            "thp=off",
+            "--virtio-blk",
+            "mem:1M,bounce",
+            "--virtio-blk",
+            "file:path/to/disk.raw,bounce",
+            "--virtio-net",
+            "bounce:consomme",
+            "--virtio-net",
+            "bounce:none",
+            "--virtio-vsock-path",
+            "path/to/vsock",
+            "--virtio-vsock-bounce",
+            "--com1",
+            "console",
+            "--hv",
+            "--no-vmbus",
+        ])
+        .unwrap();
+        opt.validate_vm_options().unwrap();
+    }
+
+    #[test]
+    fn test_scoped_host_access_rejects_other_devices() {
+        let mut devices = vec![
+            vec!["--virtio-blk", "file:path/to/disk.raw;direct,bounce"],
+            vec!["--disk", "mem:1M"],
+            vec!["--nvme", "mem:1M"],
+            vec!["--net", "none"],
+            vec!["--mana", "none"],
+            vec!["--virtio-fs", "tag,path/to/share"],
+            vec!["--virtio-fs-shmem", "tag,path/to/share"],
+            vec!["--virtio-pmem", "path/to/pmem"],
+            vec!["--virtio-rng"],
+            vec!["--virtio-console", "none"],
+            vec!["--virtio-9p", "tag,path/to/share"],
+            vec!["--pcie-remote", "rp0"],
+            vec!["--cxl-test", "mem:1M,pcie_port=rp0"],
+            vec!["--gfx"],
+            vec!["--vnc"],
+            vec!["--hv"],
+            vec!["--gdb", "9000"],
+            vec!["--restore-snapshot", "path/to/snapshot"],
+        ];
+        #[cfg(guest_arch = "x86_64")]
+        devices.extend([vec!["--amd-iommu", "rc0"], vec!["--intel-vtd", "rc0"]]);
+        #[cfg(target_os = "linux")]
+        devices.extend([
+            vec!["--vhost-user", "path/to/blk.sock,type=blk"],
+            vec!["--virtio-vsock-vhost-cid", "42"],
+            vec!["--vfio", "host=0000:01:00.0,port=rp0"],
+            vec!["--iommu", "id=iommu0"],
+        ]);
+        for device in devices {
+            let opt = Options::try_parse_from(
+                [
+                    "openvmm",
+                    "--hypervisor",
+                    "mshv:snp_scoped_host_access=true",
+                    "--isolation",
+                    "snp",
+                    "--memory",
+                    "thp=off",
+                ]
+                .into_iter()
+                .chain(device),
+            )
+            .unwrap();
+            assert!(opt.validate_vm_options().is_err());
+        }
     }
 
     #[test]

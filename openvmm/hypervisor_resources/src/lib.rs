@@ -48,10 +48,41 @@ pub struct MshvHandle {
     pub mshv: std::fs::File,
     /// Disable MSHV handling of SNP GHCB CPUID requests.
     pub snp_disable_cpuid_offload: bool,
+    /// Restrict SNP host access to explicit, temporary access scopes.
+    pub scoped_host_access: bool,
 }
 
 impl ResourceId<HypervisorKind> for MshvHandle {
     const ID: &'static str = "mshv";
+}
+
+/// Pure MSHV initialization parameters.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct MshvConfig {
+    /// Disable MSHV handling of SNP GHCB CPUID requests.
+    pub snp_disable_cpuid_offload: bool,
+    /// Restrict SNP host access to explicit, temporary access scopes.
+    pub scoped_host_access: bool,
+}
+
+impl MshvConfig {
+    /// Parses MSHV parameters without opening the hypervisor device.
+    pub fn parse(params: &[(&str, &str)]) -> anyhow::Result<Self> {
+        let mut config = Self::default();
+        for &(key, value) in params {
+            let target = match key {
+                "snp_disable_cpuid_offload" => &mut config.snp_disable_cpuid_offload,
+                "snp_scoped_host_access" => &mut config.scoped_host_access,
+                _ => anyhow::bail!("unknown mshv parameter: {key}"),
+            };
+            *target = match value {
+                "true" | "1" | "yes" => true,
+                "false" | "0" | "no" => false,
+                _ => anyhow::bail!("invalid boolean value for {key}: {value}"),
+            };
+        }
+        Ok(config)
+    }
 }
 
 /// Handle for the WHP hypervisor backend.
@@ -192,4 +223,76 @@ macro_rules! register_hypervisor_probes {
         };
         )*
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    #[derive(MeshPayload)]
+    struct LegacyMshvHandle {
+        mshv: std::fs::File,
+        snp_disable_cpuid_offload: bool,
+    }
+
+    #[test]
+    fn mshv_config_boolean_parameters() {
+        assert_eq!(MshvConfig::parse(&[]).unwrap(), MshvConfig::default());
+        for value in ["true", "1", "yes"] {
+            let config = MshvConfig::parse(&[
+                ("snp_scoped_host_access", value),
+                ("snp_disable_cpuid_offload", value),
+            ])
+            .unwrap();
+            assert!(config.scoped_host_access);
+            assert!(config.snp_disable_cpuid_offload);
+        }
+        for value in ["false", "0", "no"] {
+            assert_eq!(
+                MshvConfig::parse(&[
+                    ("snp_scoped_host_access", value),
+                    ("snp_disable_cpuid_offload", value),
+                ])
+                .unwrap(),
+                MshvConfig::default()
+            );
+        }
+        for params in [
+            [("snp_scoped_host_access", "invalid")],
+            [("snp_disable_cpuid_offload", "invalid")],
+            [("unknown", "false")],
+        ] {
+            assert!(MshvConfig::parse(&params).is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_mshv_handle_defaults_scoped_host_access_to_false() {
+        for snp_disable_cpuid_offload in [false, true] {
+            let legacy = LegacyMshvHandle {
+                mshv: std::fs::File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+                    .unwrap(),
+                snp_disable_cpuid_offload,
+            };
+            let message = mesh::OwnedMessage::new(legacy).serialize();
+            let handle: MshvHandle = mesh::OwnedMessage::serialized(message).parse().unwrap();
+            assert!(!handle.scoped_host_access);
+            assert_eq!(handle.snp_disable_cpuid_offload, snp_disable_cpuid_offload);
+            assert!(handle.mshv.metadata().unwrap().is_file());
+        }
+    }
+
+    #[test]
+    fn mshv_handle_preserves_scoped_host_access() {
+        let handle = MshvHandle {
+            mshv: std::fs::File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap(),
+            snp_disable_cpuid_offload: false,
+            scoped_host_access: true,
+        };
+        let message = mesh::OwnedMessage::new(handle).serialize();
+        let handle: MshvHandle = mesh::OwnedMessage::serialized(message).parse().unwrap();
+        assert!(handle.scoped_host_access);
+        assert!(!handle.snp_disable_cpuid_offload);
+    }
 }

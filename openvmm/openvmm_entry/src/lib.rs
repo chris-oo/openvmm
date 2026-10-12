@@ -315,9 +315,7 @@ async fn vm_config_from_command_line(
     mesh: &VmmMesh,
     opt: &Options,
 ) -> anyhow::Result<(Config, VmResources)> {
-    opt.validate_isolation_options()?;
-    opt.validate_igvm_options()?;
-    opt.validate_bounce_options()?;
+    opt.validate_vm_options()?;
 
     let (_, serial_driver) = DefaultPool::spawn_on_thread("serial");
     let uefi = opt.effective_uefi()?;
@@ -2734,6 +2732,7 @@ fn do_main(pidfile_guard: &mut Option<pidfile::Pidfile>) -> anyhow::Result<i32> 
     meshworker::run_vmm_mesh_host()?;
 
     let opt = cli_args::parse_options();
+    opt.validate_vm_options()?;
 
     // Print the version number. This comes after argument parsing to not interfere
     // with --version and --help.

@@ -5,6 +5,7 @@
 //! points.
 
 use hypervisor_resources::HypervisorKind;
+use hypervisor_resources::MshvConfig;
 use vm_resource::Resource;
 
 /// Returns a [`Resource<HypervisorKind>`] for the first available hypervisor
@@ -20,26 +21,52 @@ pub fn choose_hypervisor() -> anyhow::Result<Resource<HypervisorKind>> {
     anyhow::bail!("no hypervisor available");
 }
 
-/// Parses a hypervisor specifier of the form `name` or `name:key=val,key,...`.
-///
-/// Returns `(name, params)` where `params` is a list of `(key, value)` pairs.
-/// A bare key (no `=`) is treated as a boolean flag with value `"true"`.
-fn parse_hypervisor_spec(spec: &str) -> anyhow::Result<(&str, Vec<(&str, &str)>)> {
-    let (name, rest) = spec.split_once(':').unwrap_or((spec, ""));
-    anyhow::ensure!(!name.is_empty(), "empty hypervisor name in spec: {spec}");
-    let params = if rest.is_empty() {
-        Vec::new()
-    } else {
-        rest.split(',')
-            .filter(|item| !item.is_empty())
-            .map(|item| {
-                let (key, val) = item.split_once('=').unwrap_or((item, "true"));
-                anyhow::ensure!(!key.is_empty(), "empty parameter key in spec: {spec}");
-                Ok((key, val))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?
-    };
-    Ok((name, params))
+/// Parsed hypervisor selection, before any backend device is opened.
+pub struct HypervisorParamRoot<'a> {
+    /// Backend name.
+    pub name: &'a str,
+    /// Backend-specific key-value pairs.
+    pub params: Vec<(&'a str, &'a str)>,
+}
+
+impl<'a> HypervisorParamRoot<'a> {
+    /// Parses `name` or `name:key=val,key,...`.
+    ///
+    /// A bare parameter has the value `"true"`.
+    pub fn parse(spec: &'a str) -> anyhow::Result<Self> {
+        let (name, rest) = spec.split_once(':').unwrap_or((spec, ""));
+        anyhow::ensure!(!name.is_empty(), "empty hypervisor name in spec: {spec}");
+        let params = if rest.is_empty() {
+            Vec::new()
+        } else {
+            rest.split(',')
+                .filter(|item| !item.is_empty())
+                .map(|item| {
+                    let (key, val) = item.split_once('=').unwrap_or((item, "true"));
+                    anyhow::ensure!(!key.is_empty(), "empty parameter key in spec: {spec}");
+                    Ok((key, val))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?
+        };
+        Ok(Self { name, params })
+    }
+
+    /// Returns the opt-in scoped host access setting, with MSHV parameters
+    /// validated by the same parser as the backend probe.
+    pub fn scoped_host_access(&self) -> anyhow::Result<bool> {
+        if self.name == "mshv" {
+            Ok(MshvConfig::parse(&self.params)?.scoped_host_access)
+        } else {
+            anyhow::ensure!(
+                !self
+                    .params
+                    .iter()
+                    .any(|(key, _)| *key == "snp_scoped_host_access"),
+                "snp_scoped_host_access requires --hypervisor mshv"
+            );
+            Ok(false)
+        }
+    }
 }
 
 /// Returns a [`Resource<HypervisorKind>`] for the named backend, with
@@ -49,8 +76,8 @@ fn parse_hypervisor_spec(spec: &str) -> anyhow::Result<(&str, Vec<(&str, &str)>)
 /// Each backend validates its own parameters — see the probe
 /// implementations for supported keys.
 pub fn hypervisor_resource(spec: &str) -> anyhow::Result<Resource<HypervisorKind>> {
-    let (name, params) = parse_hypervisor_spec(spec)?;
-    let probe = hypervisor_resources::probe_by_name(name)
-        .ok_or_else(|| anyhow::anyhow!("unknown hypervisor: {name}"))?;
-    probe.new_resource(&params)
+    let parsed = HypervisorParamRoot::parse(spec)?;
+    let probe = hypervisor_resources::probe_by_name(parsed.name)
+        .ok_or_else(|| anyhow::anyhow!("unknown hypervisor: {}", parsed.name))?;
+    probe.new_resource(&parsed.params)
 }
