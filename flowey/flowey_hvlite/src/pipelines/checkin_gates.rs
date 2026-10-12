@@ -1861,6 +1861,8 @@ impl IntoPipeline for CheckinGatesCli {
                 uefi_x64: matches!(target_architecture, CommonArch::X86_64),
                 uefi_aarch64: matches!(target_architecture, CommonArch::Aarch64) || target_is_linux,
                 qemu_system_aarch64_linux_x64: target_is_linux,
+                fvp_cca_platform_aarch64: false,
+                fvp_cca_payload_aarch64: false,
             };
 
             vmm_tests_run_job = vmm_tests_run_job.dep_on(|ctx| {

@@ -50,6 +50,14 @@ flowey_request! {
         },
         /// Override UEFI mu_msvm with a local MSVM.fd path for this architecture
         LocalUefi(CommonArch, ReadVar<PathBuf>),
+        /// Select qualified prebuilt FVP firmware or payload packages.
+        FvpCcaPlatform {
+            version: String,
+            archive_sha256: Option<String>,
+            local_archive: Option<ReadVar<PathBuf>>,
+            payload_archive_sha256: Option<String>,
+            local_payload_archive: Option<ReadVar<PathBuf>>,
+        },
     }
 }
 
@@ -62,6 +70,7 @@ impl FlowNode for Node {
         ctx.import::<crate::resolve_openhcl_kernel_package::Node>();
         ctx.import::<crate::resolve_openvmm_deps::Node>();
         ctx.import::<crate::resolve_openvmm_qemu::Node>();
+        ctx.import::<crate::resolve_fvp_cca_platform::Node>();
         ctx.import::<crate::resolve_openvmm_test_initrd::Node>();
         ctx.import::<crate::resolve_openvmm_test_linux_kernel::Node>();
         ctx.import::<crate::resolve_openvmm_test_virtio_win::Node>();
@@ -87,6 +96,7 @@ impl FlowNode for Node {
         let mut local_protoc: Option<ReadVar<PathBuf>> = None;
         let mut local_kernel: BTreeMap<CommonArch, (ReadVar<PathBuf>, ReadVar<PathBuf>)> = BTreeMap::new();
         let mut local_uefi: BTreeMap<CommonArch, ReadVar<PathBuf>> = BTreeMap::new();
+        let mut fvp_platform = None;
 
         for req in requests {
             match req {
@@ -126,6 +136,16 @@ impl FlowNode for Node {
                     }
                     local_uefi.insert(arch, path);
                 }
+                Request::FvpCcaPlatform { version, archive_sha256, local_archive, payload_archive_sha256, local_payload_archive } => {
+                    anyhow::ensure!(fvp_platform.is_none(), "FVP packages configured multiple times");
+                    fvp_platform = Some(crate::resolve_fvp_cca_platform::Config {
+                        version: Some(version),
+                        archive_sha256,
+                        local_archive: local_archive.map(ConfigVar),
+                        payload_archive_sha256,
+                        local_payload_archive: local_payload_archive.map(ConfigVar),
+                    });
+                }
             }
         }
 
@@ -134,6 +154,10 @@ impl FlowNode for Node {
         let has_local_protoc = local_protoc.is_some();
         let has_local_kernel = !local_kernel.is_empty();
         let has_local_uefi = !local_uefi.is_empty();
+
+        if let Some(config) = fvp_platform {
+            ctx.config(config);
+        }
 
         // Set up local paths for openvmm_deps if provided
         if !local_openvmm_deps.is_empty() {

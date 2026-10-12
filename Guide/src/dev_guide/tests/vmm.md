@@ -181,48 +181,54 @@ cargo xflowey vmm-tests-run --filter "test(my_test_name)" --dir /tmp/vmm-tests-r
 ### Build without running
 
 Use `--build-only` to prepare the selected tests without running them.
-Native and ordinary TCG runs produce portable target-side scripts.
-CCA incubator runs instead produce a `run.sh` for the build host, retaining
-the resolved payload, firmware and model paths. Keep those inputs at their
-original locations.
+The generated target-side scripts use the prepared test content directory.
+When moving nested FVP tests to another machine, also provide the approved
+model and Shrinkwrap runtime there. These licensed runtime inputs are not
+included in the test archive.
 
-`vmm-tests-run-target` does not accept CCA incubator profiles. Use
-`vmm-tests-run` or its generated host-side script for CCA.
+### Nested tests and prebuilt FVP firmware
 
-### CCA incubator payloads
+Petri nested tests boot an L1 machine, connect pipette, and run a selected
+inner test inside that machine. Select the outer test for the host target;
+Flowey discovers and cross-compiles the inner test archive and its required
+artifacts. Do not use the old `--incubator` cargo target runner.
 
-The QEMU CCA incubator uses the unified AArch64 CCA kernel and test initrd
-from the pinned `openvmm-deps` release. The common CCA payload resolver
-selects the kernel and base initrd separately from QEMU's TF-A and TF-RMM
-firmware. Local release-shaped archive overrides remain available for
-development; they must match the configured archive identities.
+FVP firmware is a separate `openvmm-deps` package. It contains BL1, FIP,
+DTB, the packaged Shrinkwrap configuration, runtime overlay, and provenance.
+The package does not contain the licensed model or a Python virtualenv.
+The test runner calls `shrinkwrap run`, not `shrinkwrap build`.
 
-The incubator injects `/cca-init.sh` and host CA certificates into a temporary
-copy of the base initrd. It does not modify the published kernel or initrd
-and does not require a block root filesystem. QEMU CCA mounts the `host` 9P
-share and uses static QEMU user networking.
+FVP package-dependent cases are opt-in. Without an explicit
+`--fvp-deps-version`, artifact discovery excludes them, including in
+`--build-only` mode. FVP execution also requires an available runtime root.
 
-To run the shared CCA Realm boot test with QEMU:
+During package development, provide a locally built archive and its exact
+release identity:
 
 ```bash
-cargo xflowey vmm-tests-run \
-  --target linux-aarch64-musl \
-  --incubator petri/incubator/profiles/aarch64-qemu-cca.toml \
-  --filter 'binary(=tests) & test(boot_linux_direct_cca)'
+export PETRI_FVP_PLATFORM_ROOT=path/to/fvp-runtime
+FVP_PAYLOAD_ARCHIVE=path/to/openvmm-test-fvp-cca-payload.aarch64.<RELEASE>.tar.gz
+NEXTEST_TEST_THREADS=1 PYTHONDONTWRITEBYTECODE=1 \
+  cargo xflowey vmm-tests-run \
+  --filter 'test(cca_tdisp_ahci_on_fvp)' \
+  --fvp-deps-version <RELEASE> \
+  --fvp-package-archive path/to/openvmm-test-fvp-cca.aarch64.<RELEASE>.tar.gz \
+  --fvp-package-sha256 <ARCHIVE_SHA256> \
+  --fvp-payload-archive "$FVP_PAYLOAD_ARCHIVE" \
+  --fvp-payload-sha256 <PAYLOAD_ARCHIVE_SHA256>
 ```
 
-The `binary(=tests)` filter avoids launching an incubator to enumerate other
-test binaries. It does not bypass host-requirement checks or accelerate an
-individual boot. Omit this restriction when selecting tests in other
-binaries.
+The separate payload archive provides the approved host and reference-guest
+kernel and initrd pairs. The current payload recipe imports pinned reference
+binaries for local validation; it does not rebuild or publish them.
+Omit the local archive options only when the packages are available in the
+named `microsoft/openvmm-deps` release. Until packages are published and
+qualified, the release and both archive hashes must be explicit. A missing
+or mismatched package is an error; the runner does not rebuild firmware as a
+fallback.
 
-The opt-in FVP CCA backend requires a locally provisioned licensed model
-tuple. See [CCA incubator tests](vmm/qemu_cca.md) for FVP prerequisites,
-commands, and the binary filter that avoids unrelated enumeration boots.
-The runtime publishes `cca` only after validation, boot, and a pipette
-handshake. See the
-[`incubator::fvp` API](https://openvmm.dev/rustdoc/linux/incubator/fvp/index.html)
-for the validation and cleanup contracts.
+See [CCA and FVP tests](vmm/qemu_cca.md) for runtime prerequisites and
+qualification limits.
 
 ### Targeting a Platform
 

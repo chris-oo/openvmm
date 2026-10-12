@@ -23,7 +23,6 @@ paste.workspace = true
 serde = { workspace = true, features = ["std"] }
 serde_json.workspace = true
 target-lexicon = { workspace = true, features = ["serde_support"] }
-toml_edit.workspace = true
 
 [dev-dependencies]
 test_with_tracing.workspace = true

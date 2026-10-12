@@ -25,6 +25,24 @@ use petri_artifacts_core::ArtifactId;
 use petri_artifacts_core::ArtifactTarget;
 use petri_artifacts_vmm_test::artifacts::*;
 
+fn copy_artifact(source: &Path, destination: &Path) -> anyhow::Result<()> {
+    fs_err::create_dir_all(
+        destination
+            .parent()
+            .context("artifact path has no parent")?,
+    )?;
+    if fs_err::metadata(source)?.is_dir() {
+        if destination.try_exists()? {
+            fs_err::remove_dir_all(destination)?;
+        }
+        flowey_lib_common::_util::copy_dir_all(source, destination)?;
+    } else {
+        fs_err::copy(source, destination)?;
+        destination.make_executable()?;
+    }
+    Ok(())
+}
+
 macro_rules! define_vmm_tests_built_artifacts {
     (
         $name:ident,
@@ -97,9 +115,7 @@ macro_rules! define_vmm_tests_built_artifacts {
                             ));
                         };
 
-                        fs_err::create_dir_all(dst.parent().unwrap())?;
-                        fs_err::copy($member, &dst)?;
-                        dst.make_executable()?;
+                        copy_artifact(&$member, &dst)?;
                     })*)*
 
                     Ok(())
@@ -572,6 +588,18 @@ define_vmm_tests_built_artifacts!(
             QEMU_SYSTEM_AARCH64_LINUX_X64
         ),
     ) => PathBuf,
+    fvp_cca_platform(
+        aarch64(
+            (src, src),
+            FVP_CCA_PLATFORM_AARCH64
+        ),
+    ) => PathBuf,
+    fvp_cca_payload(
+        aarch64(
+            (src, src),
+            FVP_CCA_PAYLOAD_AARCH64
+        ),
+    ) => PathBuf,
 );
 
 flowey_request! {
@@ -617,6 +645,7 @@ impl SimpleFlowNode for Node {
         ctx.import::<crate::download_uefi_mu_msvm::Node>();
         ctx.import::<crate::download_release_igvm_files_from_gh::resolve::Node>();
         ctx.import::<crate::resolve_openvmm_qemu::Node>();
+        ctx.import::<crate::resolve_fvp_cca_platform::Node>();
     }
 
     fn process_request(request: Self::Request, ctx: &mut NodeCtx<'_>) -> anyhow::Result<()> {
@@ -711,6 +740,13 @@ impl SimpleFlowNode for Node {
                 })
             });
 
+        let fvp_cca_platform_aarch64 = prebuilt_artifacts
+            .fvp_cca_platform_aarch64
+            .then(|| ctx.reqv(crate::resolve_fvp_cca_platform::Request::Get));
+        let fvp_cca_payload_aarch64 = prebuilt_artifacts
+            .fvp_cca_payload_aarch64
+            .then(|| ctx.reqv(crate::resolve_fvp_cca_platform::Request::GetPayload));
+
         let prebuilt_artifacts = VmmTestsPreBuiltArtifacts {
             test_linux_kernel_x64,
             test_linux_kernel_aarch64,
@@ -721,6 +757,8 @@ impl SimpleFlowNode for Node {
             uefi_x64,
             uefi_aarch64,
             qemu_system_aarch64_linux_x64,
+            fvp_cca_platform_aarch64,
+            fvp_cca_payload_aarch64,
         };
 
         let virtio_win_dir = needs_virtio_win_drivers
@@ -968,4 +1006,40 @@ pub mod vmm_tests_artifact_builders {
             tmks_aarch64 => TmksOutput,
         )
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    #[test]
+    fn directory_artifacts_replace_old_package_contents() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let destination = directory.path().join("content/aarch64/fvp-cca");
+        fs_err::create_dir_all(source.join("cca-3world")).unwrap();
+        fs_err::write(source.join("cca-3world/bl1.bin"), b"new firmware").unwrap();
+        fs_err::create_dir_all(&destination).unwrap();
+        fs_err::write(destination.join("stale-fixture"), b"old package").unwrap();
+
+        copy_artifact(&source, &destination).unwrap();
+
+        assert_eq!(
+            fs_err::read(destination.join("cca-3world/bl1.bin")).unwrap(),
+            b"new firmware"
+        );
+        assert!(!destination.join("stale-fixture").exists());
+        assert!(source.join("cca-3world/bl1.bin").exists());
+    }
+
+    #[test]
+    fn file_artifacts_keep_existing_copy_behavior() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("Image");
+        let destination = directory.path().join("content/aarch64/Image");
+        fs_err::write(&source, b"kernel").unwrap();
+        copy_artifact(&source, &destination).unwrap();
+        assert_eq!(fs_err::read(destination).unwrap(), b"kernel");
+    }
 }

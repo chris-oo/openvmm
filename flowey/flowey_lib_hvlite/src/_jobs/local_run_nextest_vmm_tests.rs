@@ -14,66 +14,6 @@ use flowey::node::prelude::*;
 use petri_artifacts_vmm_test::ErasedVmmTestImage;
 use std::num::NonZeroU64;
 
-/// Reject host-bound CCA profiles before constructing a portable target-run graph.
-///
-/// CCA artifacts and local FVP roots belong to `vmm-tests-run`, which writes
-/// a host-bound `run.sh` in build-only mode.
-pub fn validate_target_incubator_profile(
-    profile: &IncubatorProfileNameOrPath,
-    test_content_dir: &Path,
-) -> anyhow::Result<()> {
-    let path = match profile {
-        IncubatorProfileNameOrPath::Name(name) => {
-            crate::build_incubator::incubator_profile_path(test_content_dir, name)
-        }
-        IncubatorProfileNameOrPath::Path(path) => path.clone(),
-    };
-    let backend = crate::write_incubator_target_runner::incubator_profile_backend(&path)?;
-    anyhow::ensure!(
-        backend == "qemu-tcg",
-        "vmm-tests-run-target supports only QEMU TCG incubator profiles, not {backend}; \
-         CCA needs resolved platform artifacts and, for FVP, local roots. \
-         Use vmm-tests-run with the CCA profile, or its generated run.sh on the build host"
-    );
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use test_with_tracing::test;
-
-    #[test]
-    fn portable_target_run_rejects_host_bound_profiles() {
-        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        validate_target_incubator_profile(
-            &IncubatorProfileNameOrPath::Name("aarch64-tcg-pcie".into()),
-            &repo,
-        )
-        .unwrap();
-        for name in [
-            "aarch64-qemu-cca",
-            "aarch64-qemu-cca-guest-memfd-in-place",
-            "aarch64-fvp-cca",
-            "aarch64-fvp-cca-guest-memfd-in-place",
-            "aarch64-fvp-cca-realm-vfio",
-        ] {
-            for profile in [
-                IncubatorProfileNameOrPath::Name(name.into()),
-                IncubatorProfileNameOrPath::Path(crate::build_incubator::incubator_profile_path(
-                    &repo, name,
-                )),
-            ] {
-                let error = validate_target_incubator_profile(&profile, &repo).unwrap_err();
-                assert!(
-                    error.to_string().contains("supports only QEMU TCG"),
-                    "{error:#}"
-                );
-            }
-        }
-    }
-}
-
 flowey_request! {
     pub struct Params {
         pub target: CommonTriple,
@@ -128,9 +68,6 @@ impl SimpleFlowNode for Node {
         } = request;
 
         let test_content_dir = test_content_dir.absolute()?;
-        if let Some(profile) = &incubator_profile {
-            validate_target_incubator_profile(profile, &test_content_dir)?;
-        }
 
         let target_triple = target.as_triple();
         let test_label = build_test_label(&target_triple);

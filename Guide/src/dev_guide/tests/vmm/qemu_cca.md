@@ -1,459 +1,195 @@
-# CCA Incubator VMM Tests
+# CCA and FVP nested tests
 
-The shared CCA boot test runs an OpenVMM Realm inside a QEMU or licensed FVP
-Linux/KVM host.
+Petri nested tests run OpenVMM inside an emulated Linux host and use prebuilt
+platform dependencies rather than compiling firmware on the test machine.
 
-The default profiles use the unified AArch64 CCA kernel and base test initrd from
-`openvmm-deps` release `0.3.0-139`. The incubator injects `/cca-init.sh` and
-host CA certificates into a temporary initrd copy. The published kernel and
-base initrd remain unchanged. No block root filesystem is required.
+## Test topology
 
-## Run with QEMU
+The outer test runs on the development host. Its Petri backend boots an L1
+Linux machine and connects pipette. Petri then runs the selected inner test
+from an AArch64 nextest archive inside L1. For CCA tests, the inner test uses
+KVM to create a Realm guest.
 
-From the repository root:
+Select the outer test for the development host. Flowey discovers the nested
+archive and its artifacts, then builds OpenVMM, pipette, and the test binaries
+for their required targets. Do not cross-compile the outer test to AArch64
+and use a cargo target runner to boot FVP.
 
-```bash
-cargo xflowey vmm-tests-run \
-  --target linux-aarch64-musl \
-  --incubator petri/incubator/profiles/aarch64-qemu-cca.toml \
-  --filter 'binary(=tests) & test(boot_linux_direct_cca)'
+The old `vmm-tests-run --incubator` and `--fvp-single-test` options are no
+longer part of the nested-test path. The standalone `incubator` tool remains
+separate from native Petri test registration.
+
+## Prebuilt FVP firmware
+
+The `openvmm-deps` FVP firmware archive is named:
+
+```text
+openvmm-test-fvp-cca.aarch64.<RELEASE>.tar.gz
 ```
 
-Flowey resolves the official kernel, initrd, QEMU, TF-A, and TF-RMM assets,
-then builds OpenVMM, pipette, incubator, and the VMM test archive from the
-current source.
+It supplies BL1, FIP, DTB, the resolved Shrinkwrap package configuration, and
+the runtime overlay. FIP contains the FVP RMM and EDK2 firmware. The package
+also records source and build identities, file hashes, and license notices.
+QEMU firmware is not interchangeable with this FVP firmware.
 
-The QEMU CCA host mounts the `host` 9P tag and uses static QEMU user
-networking. QEMU uses Linux-direct TF-A rather than EDK2.
+The firmware package is separate from Linux payloads and the licensed model.
+Use the kernel and initrd qualified for the selected CCA configuration. In
+particular, the guest_memfd in-place tuple is not the older CCA v15 kernel
+tuple. Device-assignment tests also need their approved fixture and guest
+payloads.
 
-## Run with FVP
+To test a locally built firmware package:
+
+```bash
+export PETRI_FVP_PLATFORM_ROOT=path/to/fvp-runtime
+FVP_PAYLOAD_ARCHIVE=path/to/openvmm-test-fvp-cca-payload.aarch64.<RELEASE>.tar.gz
+NEXTEST_TEST_THREADS=1 PYTHONDONTWRITEBYTECODE=1 \
+  cargo xflowey vmm-tests-run \
+  --filter 'test(cca_tdisp_ahci_on_fvp)' \
+  --fvp-deps-version <RELEASE> \
+  --fvp-package-archive path/to/openvmm-test-fvp-cca.aarch64.<RELEASE>.tar.gz \
+  --fvp-package-sha256 <ARCHIVE_SHA256> \
+  --fvp-payload-archive "$FVP_PAYLOAD_ARCHIVE" \
+  --fvp-payload-sha256 <PAYLOAD_ARCHIVE_SHA256> \
+  --dir path/to/test-output
+```
+
+The separate payload archive supplies `host/Image`, `host/initrd`,
+`guest/Image`, and `guest/initrd`, with its own manifest and checksums.
+The current payload recipe imports pinned qualification binaries. It marks
+them as local-only reference inputs, not rebuilt or publishable outputs.
+Use an exact outer-test filter when checking one case. Omit the local
+archive options only when both packages are available in the named
+`microsoft/openvmm-deps` release. Until packages are published and qualified,
+provide their release identity and both SHA-256 values explicitly.
+
+Flowey verifies the archive before extracting and staging its contents.
+Missing inputs and identity mismatches are errors. There is no fallback
+that builds local firmware.
+
+Without `--fvp-deps-version`, artifact discovery excludes FVP
+package-dependent cases, including in `--build-only` mode. Payload-only
+cases can use the release and payload options without firmware options.
+
+## Runtime prerequisites
 
 ```admonish warning
-FVP is opt-in and requires a user-provisioned licensed model and the exact
-supported local firmware/toolchain tuple. Hosted CI does not provide the
-licensed model. A mismatch is an error, not a skipped test or a request to
-rebuild local firmware automatically.
+FVP remains opt-in. Acquire the model under the applicable Arm license.
+The firmware archive does not distribute the model, a model container,
+or a copied Python virtualenv. Hosted CI does not provide the model.
 ```
 
 Use Linux or WSL2 with a local Docker daemon accessible through a Unix
-socket. The model is installed inside the pinned Docker image, not at a
-host executable path.
+socket. Our qualified runtime uses FVP 11.31.28 inside a digest-pinned
+container. Shrinkwrap and its Python dependencies must match the selected
+toolchain identity. The checked-in platform manifests record the supported
+model, tool, container, and source identities.
 
-Provide two read-only roots:
+Set `PETRI_FVP_PLATFORM_ROOT` to the approved toolchain root. Its
+`cca-test/shrinkwrap/venv/bin/shrinkwrap` must match that identity. Firmware,
+Linux payloads, and device-assignment fixtures come from the resolved
+packages, not from this toolchain root.
 
-| Input | Contents |
-|---|---|
-| FVP platform root | `shrinkwrap/` checkout, its `venv/`, and the provisioned platform overlay |
-| Shrinkwrap package root | `cca-3world.yaml` and its `cca-3world/` firmware files |
+Do not modify the Shrinkwrap checkout or virtualenv during a run. A copied
+virtualenv is not a portable tool distribution: its interpreter and editable
+installation contain absolute paths.
 
-The exact supported model, container digest, Shrinkwrap revision, package,
-overlay, BL1, FIP, and DTB identities are checked in under
-`petri/incubator/platforms/fvp-cca-v15.yaml`. The normalized Python package
-identity is in the adjacent `fvp-cca-v15.pip-freeze` file. The runtime rejects
-tracked source changes and unapproved untracked files in the toolchain.
-Do not change its checkout or virtualenv during a run.
+## What runs locally
 
-```bash
-cargo xflowey vmm-tests-run \
-  --target linux-aarch64-musl \
-  --incubator petri/incubator/profiles/aarch64-fvp-cca.toml \
-  --fvp-platform-root /path/to/fvp-platform \
-  --shrinkwrap-package-root /path/to/shrinkwrap-package \
-  --filter 'binary(=tests) & test(boot_linux_direct_cca)'
-```
+The development host builds OpenVMM, pipette, and the VMM test binaries from
+the current source. It downloads or consumes prebuilt firmware and Linux
+payloads. Per-run configuration and initrd preparation are packaging steps,
+not firmware or kernel compilation.
 
-FVP resolves the common kernel/initrd payload without downloading QEMU
-platform firmware. Flowey prepares a small share containing the required
-source-matched binaries and Realm payload. The runtime copies verified
-inputs into an owned writable Shrinkwrap workspace and uses explicit
-firmware paths. It does not load artifacts from Shrinkwrap's default
-workspace.
+The FVP launcher calls `shrinkwrap run`, not `shrinkwrap build`. It supplies
+explicit paths for BL1, FIP, DTB, kernel, initrd, and the guest share. It uses
+an owned writable workspace rather than Shrinkwrap's default package
+directory.
 
-The initial FVP tuple requires the qualified release and payload identities.
-Local kernel/initrd archive paths may select copies of those official
-archives; incompatible version or hash overrides fail before launch.
-QEMU's development overrides are unchanged.
+Native tests keep recovery journals and launcher logs under
+`~/.local/state/openvmm/petri-native/fvp-v1`, outside disposable test output.
+They use separate recovery state from the standalone `incubator` CLI, but
+share an exclusive model lock. Unknown ownership or incomplete cleanup keeps
+the recovery state and makes the test fail. A new output directory or rebuilt
+test binary does not bypass retained native state.
 
-FVP commands must name a snapshotted binary under the guest share. Flowey
-maps the selected nextest executable there and includes it in the explicit
-share inventory. Arbitrary commands outside that share are not supported.
+For explicit native recovery, first confirm that the recorded owner has exited.
+Preserve its executable and independently record its SHA-256 before nextest
+removes the extracted test binaries. Recovery requires that exact executable
+at its recorded canonical path. An exact-byte copy can restore a removed
+executable; a rebuilt binary cannot replace it.
 
-The profile's `[incubator.deadlines]` table accepts a `validation` override
-in seconds (default 300, allowed range 30..1800). It separately bounds initial
-input validation, locked inventory/snapshot preparation, and post-run
-toolchain verification. Retries share their phase's deadline. Lock waiting
-does not consume the subsequent inventory budget.
-
-EDK2 loads the initrd through SemihostFs. `startup.nsh` is the only source
-of the EFI kernel command line, including `initrd=initrd` and
-`rdinit=/cca-init.sh`. The host mounts the `FM` 9P tag and runs bounded
-userspace DHCP on `eth0`, with kernel DHCP disabled by `ip=off`.
-
-There is no FVP rootfs option. The runtime overlay fixes the virtio-blk
-backing-image path to empty. An unbacked, zero-capacity device may still
-appear in the host; it is not used as the root filesystem.
-
-### Local in-place guest_memfd profile
-
-`aarch64-fvp-cca-guest-memfd-in-place.toml` selects a separate, pinned local
-firmware and kernel tuple. It does not change the default v15 profile.
-The tuple is recorded in
-`petri/incubator/platforms/fvp-cca-guest-memfd-in-place.yaml`.
-The kernel comes from linux-cca integration-v7, but the profile names the
-memory mode, not that source branch.
-
-This profile requires `--cca-in-place-payload-root`. Its directory must
-contain `Image`, `config`, `manifest.txt`, and `initrd`. The manifest uses
-the same `key=value` fields as the published kernel manifest. The Image,
-configuration, revision, and release must match the constants in
-`petri_artifacts_common::cca_payload::guest_memfd_in_place`. Both host and
-Realm use that Image. The initrd must be the unmodified official base
-initrd from release `0.3.0-139`, not a local probe initrd. Archive, release,
-and hash overrides are rejected.
-
-The FVP host NIC must be built in (`CONFIG_SMC91X=y`); the base initrd does
-not load its module. Payload validation checks this before launching FVP.
-
-The local layout places the existing clean toolchain at
-`<PLATFORM_ROOT>/cca-test/shrinkwrap` and the isolated runtime overlay at
-`<PLATFORM_ROOT>/cca-tdisp-stage-a/test-platform/overlay.yaml`. Copy the
-checked-in `fvp-guest-memfd-in-place-overlay.yaml` to that overlay path.
-Provide the separately pinned package through `--shrinkwrap-package-root`.
-Keep output outside all input roots. The canonical payload root must neither
-contain the output directory nor be inside it, including through symlinks.
-Both CLI and direct Flowey job requests reject overlap before output creation
-or cleanup:
+Provide a JSON evidence file with `run_id`, the full recorded `owner` object
+from the native journal, and `owner_sha256`. Then run:
 
 ```bash
-cargo xflowey vmm-tests-run \
-  --target linux-aarch64-musl \
-  --incubator petri/incubator/profiles/aarch64-fvp-cca-guest-memfd-in-place.toml \
-  --fvp-platform-root path/to/platform-root \
-  --shrinkwrap-package-root path/to/in-place-package \
-  --cca-in-place-payload-root path/to/in-place-payload \
-  --dir path/to/separate-output \
-  --filter 'binary(=tests) & test(boot_linux_direct_cca_in_place)'
+PYTHONDONTWRITEBYTECODE=1 cargo run -p incubator -- recover-fvp-native \
+  --platform-root path/to/fvp-runtime \
+  --package-root path/to/test-output/aarch64/fvp-cca \
+  --evidence path/to/recovery-evidence.json
 ```
 
-Tests must require both `cca` and `guest_memfd_in_place` and select the
-OpenVMM memory mode themselves. The profile only selects host inputs and
-publishes capabilities after the normal readiness handshake. Use an explicit
-filter; this profile does not qualify the legacy memory mode on the new host.
+This command authorizes only the named native run. It keeps the process,
+container, workspace, and post-run verification checks. Do not delete the
+journal to bypass recovery, and do not change its recorded owner identity.
 
-The default QEMU and FVP profiles qualify the existing CCA Virtio-vsock
-pipette boot case. They do not advertise `guest_memfd_in_place`. The official
-v15 payload has not been qualified for the full in-place ABI sequence,
-including mmap, INIT_SHARED, ATTRIBUTES2, and INIT_RIPAS. Do not infer support
-from one ioctl or add an ENOTTY fallback. Use the separate pinned candidate
-to run the same CCA test body with the in-place memory mode selected.
-Generic TCG VFIO/P2P tests are separate regressions, not Realm memory-mode
-parity evidence.
+Workspace verification allows up to 2 GiB and 4096 tree entries, including
+the nested test runner. It uses the file-validation budget, not the shorter
+process-cleanup budget. The original launcher evidence remains limited to
+1 GiB. FVP's watchdog and cancellation wait include these separate phases;
+other backends keep their existing watchdog behavior.
 
-For QEMU, `aarch64-qemu-cca-guest-memfd-in-place.toml` selects the same pinned
-local kernel and official initrd while reusing the published QEMU, TF-A and
-TF-RMM archives from `openvmm-deps` release `0.3.0-139`. It does not rebuild
-firmware or change the default QEMU profile. Supply the payload directory;
-firmware, release and hash overrides are rejected for this profile.
+Shrinkwrap resolves the model arguments, runs the packaged pre-launch
+commands, starts the model container, and captures its serial consoles.
+Petri owns the pipette connection, nested-test execution, and VM teardown.
+The FVP supervisor also checks fixture cleanup and model shutdown; a passing
+inner test does not hide a failed outer lifecycle.
 
-```admonish warning
-The in-place QEMU profile is a diagnostic candidate, not a qualified tuple.
-The current local kernel and published firmware boot the host, but the
-Realm stalls before pipette. A block-test console run stopped during ITS
-initialization. This does not yet identify the component that needs a fix.
-Use `INCUBATOR_TIMEOUT` to bound each incubator invocation while debugging.
-```
+The qualified FVP model exports one `FM` 9P share. The backend must make the
+nested test-content and image directories available at Petri's expected
+guest paths rather than assuming QEMU's multiple-9P-device implementation.
+EDK2 loads the Linux initrd through SemihostFs and `startup.nsh`.
 
-The effective package uses the model's default PCI hierarchy. It removes the
-DA recipe's PCI JSON fixup command and its unused PCI hierarchy and sample-key
-runtime variables. Its remaining CPU/SMMU model parameters and firmware
-bytes are unchanged. These differences are recorded beside the package hash.
-The package omits `pci.hierarchy_file_name`; an empty filename is not the
-model default and causes a PCI hierarchy parser error.
-There are no assigned devices, DA certificates, or DA disk images in the
-staged runtime. This is an in-process Virtio test input, not evidence of
-TDISP or host VFIO support. A prior no-device boot of the source package
-does not qualify this effective package; run the Petri tests to qualify it.
+## Qualification limits
 
-The paired CCA Virtio-vsock test has passed on the pinned in-place FVP tuple,
-including pipette ping, Realm poweroff, OpenVMM teardown, and outer host
-shutdown. The original separate-backing test also passes on the default
-QEMU and FVP tuples. The dedicated block and network tests below extend
-guest-VM coverage. Rng and console crate tests remain separate regression
-coverage, not CCA guest-VM coverage.
+The in-place Virtio block and network tests have passed on the pinned FVP
+tuple. These are in-process Virtio tests, not assigned-device private-DMA
+qualification.
 
-### Virtio block and network I/O
+Before migration to native Petri nesting, the 2026-10-12 reference TDISP
+run passed exactly one guest test. It completed LOCK/RUN, matched a 64 MiB
+AHCI read, completed checked UNLOCK and explicit OpenVMM assignment teardown,
+and completed fixture cleanup. Kernel/RMM Realm destruction still returned
+`RMI_ERROR_REALM`, and the outer FVP launcher failed during L1 shutdown.
+That run was not a clean end-to-end lifecycle pass.
 
-`virtio_blk_cca_in_place` and `virtio_net_cca_in_place` require both `cca` and
-`guest_memfd_in_place`. Each explicitly enables in-place backing in a
-Linux-direct Realm and keeps Virtio-vsock as the independent pipette control
-channel.
+A native packaged run also completed the guest LOCK/RUN, AHCI hash check,
+and UNLOCK sequence. Its inner test failed during clean OpenVMM teardown:
+the assignment owner reported completion, but RAM unmap still hit the
+frozen-assignment guard. RMM Realm destruction returned `RMI_ERROR_REALM`.
+Fixture cleanup and supervisor finalization succeeded; L1 shutdown still
+returned a failing launcher status. This is not a passing nested test.
 
-The block test attaches a temporary 8-MiB scratch file as a PCIe Virtio disk.
-It checks distinct 64-KiB patterns near each end, performs guest direct writes
-and direct readback, then checks the backing file from the host after clean
-teardown. Direct I/O prevents guest page-cache hits from replacing device
-reads.
+Keep guest execution, checked OpenVMM teardown, fixture cleanup, and model
+shutdown as separate outcomes. Neither an AHCI read nor a guest UNLOCK
+marker proves host protected-map reclamation or private-DMA isolation.
+Do not qualify a tuple that skips cleanup or treats model failure as success.
 
-The network test attaches a PCIe Virtio-net NIC backed by Consomme. It uses
-a dynamically allocated loopback forwarding port and a guest TCP listener,
-with distinct 64-KiB payloads in each direction. Both receivers check all
-bytes. The exchange has a deadline and needs no external network service.
-Both tests require Realm poweroff and clean OpenVMM teardown.
+## Firmware development and recovery
 
-Use the in-place FVP invocation above with this filter. Run one test at a
-time so model instances do not compete for the FVP lock:
+The `openvmm-deps` package recipe is the normal place to build and publish
+FVP firmware. Source revisions, configuration, toolchain, and output hashes
+must remain explicit. Do not update runtime identities merely to accept an
+unverified rebuild.
 
-```bash
-NEXTEST_TEST_THREADS=1 cargo xflowey vmm-tests-run \
-  --target linux-aarch64-musl \
-  --incubator petri/incubator/profiles/aarch64-fvp-cca-guest-memfd-in-place.toml \
-  --fvp-platform-root path/to/platform-root \
-  --shrinkwrap-package-root path/to/in-place-package \
-  --cca-in-place-payload-root path/to/in-place-payload \
-  --dir path/to/separate-output \
-  --filter 'binary(=tests) & test(virtio_) & test(cca_in_place)'
-```
+For recovery of the older local qualification inputs, the tracked
+`petri/incubator/platforms/rebuild-realm-firmware.py` recipe and adjacent
+JSON pins rebuild TF-A, RMM, and EDK2 in the pinned container. They require
+the preserved package configuration and exact approved DTB. The script
+preserves sources, commands, manifests, and output hashes outside `target/`.
+Rebuilt firmware need not be byte-identical to historical output.
 
-Attempt the same tests on QEMU with upstream firmware and bounded execution:
-
-```bash
-NEXTEST_TEST_THREADS=1 INCUBATOR_TIMEOUT=180 cargo xflowey vmm-tests-run \
-  --target linux-aarch64-musl \
-  --incubator petri/incubator/profiles/aarch64-qemu-cca-guest-memfd-in-place.toml \
-  --cca-in-place-payload-root path/to/in-place-payload \
-  --dir path/to/separate-qemu-output \
-  --filter 'binary(=tests) & test(virtio_) & test(cca_in_place)'
-```
-
-These are in-process Virtio tests, not assigned-device or TDISP DMA tests.
-Both have passed on the pinned in-place FVP tuple. Neither has completed on
-the current in-place QEMU candidate.
-
-### Realm host-object preflight
-
-`realm_vfio_objects_cca_in_place` requires a separate DA-capable FVP fixture
-with `cca`, `guest_memfd_in_place`, and `cca_realm_vfio`. The fixture must
-prepare the modeled AHCI controller through the host TSM and VFIO cdev path,
-then publish `INCUBATOR_VFIO_BDF_CCA_REALM_VFIO`. The ordinary in-place
-Virtio profile does not provide this fixture.
-
-```admonish warning
-This DA fixture has no clean-lifecycle qualification. FVP 11.31.28 has aborted
-during shutdown even after VFIO unbind and host TSM disconnect complete.
-Earlier enumeration boots failed before the Realm-object test ran.
-A smaller host-only TSM connect/disconnect
-sequence also fails without VFIO, a Realm VM, or GDB; AHCI unbind alone exits
-cleanly. The corrupting operation remains unidentified.
-```
-
-The separate `aarch64-fvp-cca-realm-vfio.toml` profile selects the identities
-in `petri/incubator/platforms/fvp-cca-realm-vfio.yaml`. The original Stage A
-provisioner remains available for historical inputs:
-
-```bash
-python3 petri/incubator/platforms/provision-realm-vfio.py
-```
-
-This requires the recorded Stage A package under
-`target/cca-tdisp-stage-a/package`, including firmware, measurements and public
-sample certificate/key. The AHCI disk comes from the saved
-`runs/run-20260914-3/package/cca-3world/ahci-disk.img` under that Stage A tree,
-not the zero-filled firmware-build image. It creates the separate
-`target/cca-tdisp-stage-a/realm-vfio-reference-platform` package and overlay, refuses
-an existing destination, and does not rebuild firmware or change source
-inputs. These remain local test assets, not a published FVP release.
-Its old BL1/FIP hashes do not match the current rebuilt-firmware profile.
-Use the durable recovery path below for that profile.
-
-### Durable firmware and test inputs
-
-Keep firmware outside `target/`. The verified rebuild is stored under
-`.packages/cca-tdisp-fvp/artifacts/rebuild-20260917-verified/`, with
-`manifest.json` and `SHA256SUMS`. It contains BL1, FIP, RMM, EDK2 and the
-reused DTB. `cargo clean` does not remove this directory.
-
-The tracked `petri/incubator/platforms/rebuild-realm-firmware.py` recipe and
-its adjacent JSON pins rebuild TF-A, RMM and EDK2 in the pinned container.
-They require the recorded package YAML and DTB, refuse an existing run name,
-and preserve sources, commands and output hashes outside `target/`.
-Rebuilt firmware is not byte-identical to the deleted original firmware.
-Do not change runtime hash pins merely to accept an unverified build.
-
-Recover the unchanged host/guest payloads and DA assets from a preserved
-single-boot run:
-
-```bash
-python3 petri/incubator/platforms/restore-realm-test-inputs.py \
-  path/to/saved-single-boot-run .packages/cca-tdisp-runtime
-```
-
-This checks input hashes and refuses existing destination payloads. Add the
-verified BL1, FIP and DTB to its `package/cca-3world/` directory separately.
-Restore the pinned Shrinkwrap checkout at `cca-test/shrinkwrap/` under the
-runtime root, with an editable install in `venv/`, not `.venv/`.
-The package set must match `petri/incubator/platforms/fvp-cca-v15.pip-freeze`.
-The repository-root `plan-arm-cca-tdisp.md` records the exact recovery commands.
-
-### Dormant Realm-object test
-
-The test runs natively on the AArch64 Linux host. It creates a dormant
-one-VP Realm using the real KVM backend and prepares in-place backing,
-GICv3 and ITS state. It does not map or populate RAM or run the VP.
-It then uses the production Realm object owner to prepare, attach with a
-synthetic requester ID, and explicitly close the IOMMUFD graph.
-
-Two cycles on the same partition reopen the VFIO cdev and IOMMUFD context
-to check that the prior binding was released. Both cycles and outer
-incubator shutdown must succeed. An ignored or enumeration-only run does
-not qualify the fixture. Cleanup errors remain failures, with the remaining
-owner state logged for recovery.
-
-This checks host-object creation and teardown only. It does not qualify
-guest PCI enumeration, BAR access, interrupts, private DMA, or TDISP LOCK/RUN.
-
-```bash
-NEXTEST_TEST_THREADS=1 PYTHONDONTWRITEBYTECODE=1 cargo xflowey vmm-tests-run \
-  --target linux-aarch64-musl \
-  --incubator petri/incubator/profiles/aarch64-fvp-cca-realm-vfio.toml \
-  --fvp-platform-root .packages/cca-tdisp-runtime \
-  --shrinkwrap-package-root .packages/cca-tdisp-runtime/package \
-  --cca-in-place-payload-root .packages/cca-tdisp-runtime/host-payload \
-  --dir vmm_test_results/realm-vfio-objects \
-  --filter 'binary(=tests) & test(realm_vfio_objects_cca_in_place)'
-```
-
-### Unchanged reference guest
-
-`tdisp_ahci::boot_linux_direct_cca_tdisp_ahci` uses the exact Image and initrd
-from Stage A run 3. The initrd already contains the guest TSM and 64 MiB disk
-read test, so this test adds neither pipette nor a guest helper. Flowey and
-the test check both input hashes. OpenVMM uses its own PL011 console arguments.
-Agent-free Linux direct boot skips empty agent media and the serial-agent
-RTS handshake; neither is required by this initrd.
-The original guest script, disk hash oracle and provenance are checked in under
-`vmm_tests/vmm_tests/test_data/cca_tdisp/`. That directory also contains
-`generate-reference-disk.py`, which reproduces the patterned disk without
-overwriting an existing file. Keep source scripts in the repo: `target/` is
-disposable build output. The checked-in script is a byte-identical extraction
-from the validated initrd, not a replacement injected into the guest.
-The committed execution stack with rebuilt FVP firmware has demonstrated
-LOCK/RUN, a matching 64 MiB read, checked UNLOCK and explicit OpenVMM
-assignment teardown. Validation after the 2026-10-12 rebase passed exactly
-one native reference test and completed fixture teardown. Kernel/RMM Realm
-destruction still returns `RMI_ERROR_REALM`, and the outer FVP launcher fails
-during L1 shutdown. This is not a clean end-to-end lifecycle pass.
-
-Use the DA profile and roots above, add `--cca-tdisp-guest-root` pointing to
-`.packages/cca-tdisp-runtime/guest-payload`, and replace `--filter`
-with the exact single-boot selection:
-
-```bash
---fvp-single-test \
-  aarch64_exclusive::tdisp_ahci::openvmm_linux_aarch64_boot_linux_direct_cca_tdisp_ahci
-```
-
-Single-boot execution runs native nextest enumeration and the selected test
-before L1 shutdown. It records guest execution, cleanup and model shutdown
-separately; model failure still fails the command. The original guest's
-unlock marker is not proof of host protected-map reclamation. I/O followed
-by a passing native test does not establish clean model shutdown or
-private-DMA qualification.
-
-The fixture must unbind its VFIO driver and disconnect its owned host TSM
-connection before L1 poweroff. Fixture cleanup errors and model shutdown
-failures remain failures even when a test command succeeds.
-
-## Build now, run later
-
-For ordinary CCA runs, add `--build-only` to prepare the artifacts without
-running the tests. Run the generated `run.sh` on the same build host.
-It retains the resolved payload, firmware and FVP input paths, so keep those
-inputs at their original locations. This script is not a portable target-side
-test package.
-
-With `--fvp-single-test`, `--build-only` prepares the private test inputs
-without booting FVP or emitting a multi-boot `run.sh`. Run the original
-command without `--build-only` to execute that test.
-
-`vmm-tests-run-target --incubator` rejects CCA profiles before constructing
-the execution pipeline. Use `vmm-tests-run` or its generated host-side script;
-the portable target-side path does not carry the required CCA overrides.
-
-## Avoid unnecessary enumeration boots
-
-The `tests` executable contains `boot_linux_direct_cca`. The explicit
-`binary(=tests)` filter lets nextest exclude the separate `cca` and `tmks`
-executables before running them to enumerate their tests.
-
-```admonish tip
-Use the binary filter for this focused CCA test. A test-name filter alone
-can require booting the incubator to enumerate unrelated test binaries.
-Do not restrict the binary when you intend to run a multi-binary suite.
-```
-
-This optimization avoids unrelated boots; it does not accelerate an
-individual boot or bypass host-property checks. Normal and ignored-test
-enumeration for the selected executable still runs inside the chosen
-backend. The exact number of enumeration invocations depends on nextest
-and the selected suite.
-
-Initial artifact discovery is different: Flowey may use native execution
-or QEMU user-mode emulation to collect required artifacts, including ignored
-candidates. That does not qualify the execution backend or advertise its
-runtime capabilities.
-
-See [nextest binary exclusions](https://nexte.st/docs/filtersets/reference/#basic-predicates).
-
-## Results and cleanup
-
-The selected test creates a one-VP, 256-MiB CCA Realm, pings its pipette agent
-over virtio-vsock, requests Realm poweroff, and waits for OpenVMM teardown.
-The outer incubator then powers off. Enumeration-only or ignored-test
-success is not evidence that a Realm booted.
-
-FVP logs include the launcher, named consoles, model version inventory,
-DHCP/network diagnostics, and nested VMM test output. The runtime reports
-the per-run output directory. Persistent ownership state and model locks
-are separate from the user-provided input roots and temporary workspace.
-Use a persistent output filesystem outside `/tmp` and `/run`. Unsupported
-output locations are rejected before session resources are registered.
-Each launch attempt has separate console logs, a generated overlay, and a
-command record. A port-collision retry cannot reuse stale readiness markers.
-
-Cancellation and phase deadlines trigger owned-resource cleanup. Foreign,
-newer-version, corrupt, or ambiguous state is preserved with an explicit
-diagnostic. If a prior owner died while an unrecorded helper might have
-been running, recovery can require manual intervention. Do not delete the
-persistent lock file or remove containers solely by a name prefix.
-
-When ownership and helper termination are proven, recovery can preserve
-logs in the registered output directory before removing an interrupted
-workspace. It treats the previous run as failed, not qualified. Process
-cleanup, output preservation, and retirement have separate non-resetting
-cleanup budgets. Partial or changed workspace trees remain preserved.
-
-Automatic retirement supports trees of at most 4096 entries, 32 directory
-levels, and one GiB each. Unsupported trees, nested mounts, symlinks, and
-hard links require manual preservation; the runtime reports an error
-rather than deleting unverified data.
-
-Inventory errors identify the failing operation and status without blindly
-printing output that might contain credentials. Reproduce the named check
-locally with the same isolated interpreter or selected Docker endpoint.
-Redact credentials and private environment values before sharing logs.
-
-## Current limits
-
-The pinned CCA kernel does not permit MPIDR register writes for Realm VPs.
-OpenVMM checks that the requested topology matches KVM's reset MPIDR values
-and rejects mismatches instead of changing the Realm's CPU identities.
-Ordinary KVM guests still use the configurable MPIDR path.
-
-The initial FVP mode targets basic Realm boot, not FVP device assignment.
-The known kernel Realm-teardown warning and RMM SMMUv3 initialization
-diagnostic remain visible follow-ups. They must not be interpreted as
-evidence of working FVP SMMU/VFIO assignment.
-
-Persistent incubator sessions, host-side runnable-test enumeration, and
-model checkpoint/restore are not part of this mode. Do not assume that a
-passing basic Realm test validates those features.
+`petri/incubator/platforms/restore-realm-test-inputs.py` recovers the unchanged
+host and guest payloads and DA assets from a preserved single-boot run.
+It checks input hashes and refuses existing destination payloads. Those
+recovery scripts do not acquire or redistribute the licensed model.
