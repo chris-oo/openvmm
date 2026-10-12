@@ -68,6 +68,8 @@ use zerocopy::FromZeros;
 use zerocopy::IntoBytes;
 
 mod snp;
+#[cfg(test)]
+mod snp_host_access;
 
 pub(crate) use snp::MshvSnpConfig;
 pub(super) use snp::SnpError;
