@@ -24,6 +24,12 @@
 # https://nexte.st/docs/configuration/?h=hierar#hierarchical-configuration
 
 [[profile.ci.overrides]]
+filter = 'package(~vmm_tests) and test(/(^|::|_on_)fvp_/)'
+# FVP boot and nested execution have a larger backend watchdog budget.
+# Keep this as a backup, with time for checked cleanup before termination.
+slow-timeout = { period = "10m", terminate-after = 15 }
+
+[[profile.ci.overrides]]
 # use fuzzy-matching for the package() to allow out-of-tree tests to use the
 # same profile
 filter = 'package(~vmm_tests)'

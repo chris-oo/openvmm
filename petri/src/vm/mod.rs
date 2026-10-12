@@ -1,6 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+/// Licensed Arm FVP CCA host management.
+#[cfg(target_os = "linux")]
+pub mod fvp;
 /// Hyper-V VM management
 #[cfg(windows)]
 pub mod hyperv;
@@ -260,6 +263,10 @@ fn agent_disk_required(
     })
 }
 
+fn shutdown_ic_configured(supports_vmbus: bool, no_vmbus: bool, minimal_mode: bool) -> bool {
+    supports_vmbus && !no_vmbus && !minimal_mode
+}
+
 impl<T: PetriVmmBackend> Debug for PetriVmBuilder<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PetriVmBuilder")
@@ -391,6 +398,9 @@ pub struct PetriVmProperties {
     pub no_vmbus: bool,
     /// The hypervisor (HV#1) enlightenments are entirely disabled
     pub no_hv: bool,
+    /// Resolved nested runner that snapshotting backends must include explicitly.
+    /// The VM retains its temporary source until teardown.
+    pub nested_test_binary: Option<PathBuf>,
 }
 
 /// VM configuration that can be changed after the VM is created
@@ -424,6 +434,8 @@ pub trait PetriVmmBackend: Debug {
     type VmRuntime: PetriVmRuntime;
 
     /// Whether the backend supports VMBus.
+    ///
+    /// Backends without VMBus start with HV#1 enlightenments disabled.
     const SUPPORTS_VMBUS: bool;
 
     /// Whether the backend supports full CPU emulation
@@ -524,6 +536,16 @@ const NESTED_TEST_BINARY: &str = "nested_test";
 const NESTED_TEMP_DIR: &str = "temp";
 const NESTED_CONTENT_TAG: &str = "testcontent";
 const NESTED_IMAGES_TAG: &str = "testimages";
+
+/// A nested test process exited with a confirmed unsuccessful status.
+///
+/// Other errors from `run_nested_test` do not establish process completion.
+#[derive(Debug, thiserror::Error)]
+#[error("nested test exited with status {status}: {stderr}")]
+pub struct NestedTestFailure {
+    status: String,
+    stderr: String,
+}
 
 /// A constructed Petri VM
 pub struct PetriVm<T: PetriVmmBackend> {
@@ -727,7 +749,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
             #[cfg(target_os = "linux")]
             vhost_vsock_guest_cid: None,
             no_vmbus: !T::SUPPORTS_VMBUS,
-            no_hv: false,
+            no_hv: !T::SUPPORTS_VMBUS,
             capture_inspect_on_failure: false,
             nested_test: artifacts
                 .nested_test
@@ -1264,6 +1286,10 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
             vhost_vsock_guest_cid: self.vhost_vsock_guest_cid,
             no_vmbus: self.no_vmbus,
             no_hv: self.no_hv,
+            nested_test_binary: self
+                .nested_test
+                .as_ref()
+                .map(|nested| nested.test_binary.to_path_buf()),
         }
     }
 
@@ -1402,17 +1428,14 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
         let mut tasks = Vec::new();
 
         {
-            const TIMEOUT_DURATION_MINUTES: u64 = 10;
-            const TIMER_DURATION: Duration = Duration::from_secs(TIMEOUT_DURATION_MINUTES * 60);
+            let timeout = runtime.watchdog_timeout();
 
             // The panic unwinds out of the task pool, which drops the VM and
             // triggers the same inspect capture as any other failure.
             let driver = resources.driver.clone();
             tasks.push(resources.driver.spawn("timer-watchdog", async move {
-                PolledTimer::new(&driver).sleep(TIMER_DURATION).await;
-                tracing::error!(
-                    "Test timeout reached after {TIMEOUT_DURATION_MINUTES} minutes, aborting."
-                );
+                PolledTimer::new(&driver).sleep(timeout).await;
+                tracing::error!(?timeout, "Test timeout reached, aborting.");
                 panic!("Test timed out");
             }));
         }
@@ -2321,7 +2344,13 @@ impl<T: PetriVmmBackend> PetriVm<T> {
         //
         // This is a no-op when the shutdown IC is not configured (e.g.,
         // no VMBus or minimal mode).
-        self.runtime.wait_for_enlightened_shutdown_ready().await?;
+        if shutdown_ic_configured(
+            T::SUPPORTS_VMBUS,
+            self.properties.no_vmbus,
+            self.properties.minimal_mode,
+        ) {
+            self.runtime.wait_for_enlightened_shutdown_ready().await?;
+        }
         self.runtime.wait_for_agent(false).await
     }
 
@@ -2388,6 +2417,14 @@ impl<T: PetriVmmBackend> PetriVm<T> {
     /// Wait for the Hyper-V shutdown IC to be ready and use it to instruct
     /// the guest to shutdown.
     pub async fn send_enlightened_shutdown(&mut self, kind: ShutdownKind) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            shutdown_ic_configured(
+                T::SUPPORTS_VMBUS,
+                self.properties.no_vmbus,
+                self.properties.minimal_mode,
+            ),
+            "Hyper-V shutdown IC is not configured for this VM"
+        );
         tracing::info!("Waiting for enlightened shutdown to be ready");
         self.runtime.wait_for_enlightened_shutdown_ready().await?;
 
@@ -2626,6 +2663,12 @@ impl<T: PetriVmmBackend> PetriVm<T> {
             .detach();
 
         let output = child.wait_with_output().await?;
+        let exit_code = output
+            .status
+            .code()
+            .or_else(|| output.status.signal().map(|signal| 128 + signal))
+            .context("nested test returned no exit status")?;
+        self.runtime.record_nested_test_exit(exit_code)?;
 
         // copy the files if we aren't sharing the results folder directly
         if !T::SUPPORTS_FILE_SHARING {
@@ -2645,11 +2688,11 @@ impl<T: PetriVmmBackend> PetriVm<T> {
         }
 
         if !output.status.success() {
-            anyhow::bail!(
-                "nested test exited with status {}: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
-            );
+            return Err(NestedTestFailure {
+                status: output.status.to_string(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            }
+            .into());
         }
 
         Ok(())
@@ -2663,6 +2706,16 @@ pub trait PetriVmRuntime: Send + Sync + 'static {
     type VmInspector: PetriVmInspector;
     /// Interface for accessing the framebuffer
     type VmFramebufferAccess: PetriVmFramebufferAccess;
+
+    /// Whole-lifecycle watchdog budget, including backend startup and cleanup.
+    fn watchdog_timeout(&self) -> Duration {
+        Duration::from_mins(10)
+    }
+
+    /// Record confirmed nested process completion for backend lifecycle reports.
+    fn record_nested_test_exit(&self, _exit_code: i32) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     /// Cleanly tear down the VM immediately.
     async fn teardown(self) -> anyhow::Result<()>;
@@ -4390,6 +4443,44 @@ mod tests {
     use crate::VmbusStorageController;
     use crate::VmbusStorageType;
     use crate::Vtl;
+    mod nested_completion {
+        use super::*;
+        use test_with_tracing::test;
+
+        #[test]
+        fn nested_exit_failure_distinguishes_confirmed_completion() {
+            let failure = anyhow::Error::new(NestedTestFailure {
+                status: "1".into(),
+                stderr: "inner test failed".into(),
+            })
+            .context("running nested test");
+            assert!(failure.is::<NestedTestFailure>());
+            assert!(format!("{failure:#}").contains("inner test failed"));
+            assert!(!anyhow::anyhow!("guest connection closed").is::<NestedTestFailure>());
+        }
+
+        #[test]
+        fn shutdown_ic_readiness_requires_backend_and_configured_devices() {
+            assert!(shutdown_ic_configured(true, false, false));
+            assert!(!shutdown_ic_configured(false, false, false));
+            assert!(!shutdown_ic_configured(true, true, false));
+            assert!(!shutdown_ic_configured(true, false, true));
+            #[cfg(target_os = "linux")]
+            assert!(!shutdown_ic_configured(
+                fvp::FvpPetriBackend::SUPPORTS_VMBUS,
+                false,
+                false,
+            ));
+        }
+
+        #[test]
+        fn default_backend_watchdog_remains_ten_minutes() {
+            assert_eq!(
+                TestRuntime(TestInspectBehavior::Success).watchdog_timeout(),
+                Duration::from_mins(10)
+            );
+        }
+    }
 
     #[test_with_tracing::test]
     fn agent_free_linux_direct_does_not_add_empty_cloud_init_media() {

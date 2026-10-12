@@ -3,7 +3,9 @@
 
 //! Run the unchanged Linux guest and sysfs/I/O script qualified with kvmtool.
 
-use super::incubator_vfio_bdf;
+use super::super::nested::vm_host_fvp;
+use super::emulator_vfio_bdf;
+use super::open_pinned_cca_payload as open_pinned;
 use super::open_vfio_cdev;
 use anyhow::Context;
 use openvmm_defs::config::LinuxDirectBootMode;
@@ -12,46 +14,20 @@ use openvmm_defs::config::PcieDeviceConfig;
 use openvmm_defs::config::PcieMmioRangeConfig;
 use petri::IsolationType;
 use petri::PetriVmBuilder;
+use petri::ResolvedArtifact;
 use petri::openvmm::OpenVmmPetriBackend;
-use sha2::Digest;
+use petri_artifacts_common::artifacts::FVP_CCA_PAYLOAD_AARCH64;
+use petri_artifacts_vmm_test::artifacts::host_tools::NEXTEST_VMM_TESTS_ARCHIVE_LINUX_AARCH64_MUSL;
 use std::fs::File;
-use std::io::Read;
-use std::io::Seek;
 use std::path::Path;
 use vfio_assigned_device_resources::BarAddressConfig;
 use vfio_assigned_device_resources::VfioRealmDeviceHandle;
 use vm_resource::IntoResource;
 use vmm_test_macros::vmm_test_with;
 
-const GUEST_IMAGE_SHA256: &str = "6bef4c54ac93d8513ad7f125737c9ff0a8b0b7e34720e77253e2b63460002437";
-const GUEST_INITRD_SHA256: &str =
-    "d3ba987d83bd46a60cf2199d7989a7b940499065e1011125775034b5710dad92";
+use petri_artifacts_common::cca_payload::tdisp_guest::INITRD_SHA256 as GUEST_INITRD_SHA256;
+use petri_artifacts_common::cca_payload::tdisp_guest::LINUX_IMAGE_SHA256 as GUEST_IMAGE_SHA256;
 const DISK_SHA256: &str = "281e519df3077b557c6b03f5da83c4e8d397219259615dd7c3308f89cae8f2a6";
-
-fn open_pinned(path: &Path, expected: &str) -> anyhow::Result<File> {
-    let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let mut digest = sha2::Sha256::new();
-    let mut buffer = [0; 64 * 1024];
-    loop {
-        let count = file.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        digest.update(&buffer[..count]);
-    }
-    let actual: String = digest
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    anyhow::ensure!(
-        actual == expected,
-        "reference guest hash mismatch for {}: {actual}",
-        path.display()
-    );
-    file.rewind()?;
-    Ok(file)
-}
 
 /// The unchanged initrd owns the guest driver, TSM lock/accept, direct disk
 /// read, hash verification, unlock and poweroff sequence. No pipette is added.
@@ -59,18 +35,23 @@ fn open_pinned(path: &Path, expected: &str) -> anyhow::Result<File> {
     openvmm,
     noagent,
     requires(cca, guest_memfd_in_place, cca_realm_vfio),
-    configs(linux_direct_aarch64)
+    configs(
+        linux_direct_aarch64[FVP_CCA_PAYLOAD_AARCH64],
+        nested(
+            (vm_host_fvp, fvp_linux_direct_aarch64),
+            (NEXTEST_VMM_TESTS_ARCHIVE_LINUX_AARCH64_MUSL, "tests", "aarch64_exclusive::tdisp_ahci", linux_direct_aarch64[FVP_CCA_PAYLOAD_AARCH64]),
+        ),
+    )
 )]
 async fn boot_linux_direct_cca_tdisp_ahci(
     config: PetriVmBuilder<OpenVmmPetriBackend>,
+    (payload,): (ResolvedArtifact<FVP_CCA_PAYLOAD_AARCH64>,),
 ) -> anyhow::Result<()> {
     let output_dir = config.log_source().output_dir().to_path_buf();
-    let content = std::env::var_os("VMM_TESTS_CONTENT_DIR")
-        .context("VMM_TESTS_CONTENT_DIR is required for pinned reference guest inputs")?;
-    let guest = Path::new(&content).join("cca-tdisp-guest");
+    let guest = payload.get().join("guest");
     let kernel = open_pinned(&guest.join("Image"), GUEST_IMAGE_SHA256)?;
     let initrd = open_pinned(&guest.join("initrd"), GUEST_INITRD_SHA256)?;
-    let bdf = incubator_vfio_bdf("cca-realm-vfio")?;
+    let bdf = emulator_vfio_bdf("cca-realm-vfio")?;
     let sysfs = Path::new("/sys/bus/pci/devices").join(&bdf);
     for (field, expected) in [
         ("vendor", "0x0abc"),

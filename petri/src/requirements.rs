@@ -71,6 +71,8 @@ pub enum VmmType {
     HyperV,
     /// QEMU.
     Qemu,
+    /// Licensed Arm Fixed Virtual Platform.
+    Fvp,
 }
 
 /// Hypervisor backends that OpenVMM can use.
@@ -200,6 +202,8 @@ impl HostContext {
 
 /// A single requirement for a test to run.
 pub enum TestRequirement {
+    /// The selected backend has its explicit execution environment configured.
+    VmmAvailable(VmmType),
     /// Execution environment requirement.
     ExecutionEnvironment(ExecutionEnvironment),
     /// Vendor requirement.
@@ -252,6 +256,10 @@ impl TestRequirement {
     /// Evaluate if this requirement is satisfied with the given host context
     pub fn is_satisfied(&self, context: &HostContext) -> bool {
         match self {
+            TestRequirement::VmmAvailable(vmm) => vmm_execution_available(
+                *vmm,
+                std::env::var_os("PETRI_FVP_PLATFORM_ROOT").as_deref(),
+            ),
             TestRequirement::ExecutionEnvironment(env) => context.execution_environment == *env,
             TestRequirement::Vendor(vendor) => context.vendor == *vendor,
             TestRequirement::Isolation(isolation_type) => {
@@ -290,8 +298,35 @@ pub fn is_known_capability(name: &str) -> bool {
     known_capability(name).is_some()
 }
 
+fn vmm_execution_available(vmm: VmmType, fvp_root: Option<&std::ffi::OsStr>) -> bool {
+    match vmm {
+        VmmType::Fvp => {
+            cfg!(target_os = "linux")
+                && fvp_root
+                    .is_some_and(|root| !root.is_empty() && std::path::Path::new(root).is_dir())
+        }
+        VmmType::OpenVmm | VmmType::HyperV | VmmType::Qemu => true,
+    }
+}
+
 fn available_capabilities(context: &HostContext, vmm: VmmType) -> BTreeSet<&'static str> {
+    available_capabilities_for(
+        context,
+        vmm,
+        std::env::var_os("PETRI_FVP_PLATFORM_ROOT").as_deref(),
+    )
+}
+
+fn available_capabilities_for(
+    context: &HostContext,
+    vmm: VmmType,
+    fvp_root: Option<&std::ffi::OsStr>,
+) -> BTreeSet<&'static str> {
     let mut capabilities = BTreeSet::new();
+
+    if !vmm_execution_available(vmm, fvp_root) {
+        return capabilities;
+    }
 
     if context.vpci_supported {
         capabilities.insert(capabilities::VPCI);
@@ -315,7 +350,7 @@ fn available_capabilities(context: &HostContext, vmm: VmmType) -> BTreeSet<&'sta
         (
             VmmType::OpenVmm,
             Some(OpenVmmHypervisor::Kvm | OpenVmmHypervisor::Whp)
-        ) | (VmmType::Qemu, _)
+        ) | (VmmType::Qemu | VmmType::Fvp, _)
     ) {
         capabilities.insert(capabilities::NESTED_VIRT);
     }
@@ -367,6 +402,39 @@ pub fn can_run_test_with_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_with_tracing::test;
+
+    #[test]
+    fn fvp_execution_requires_an_explicit_existing_platform_root() {
+        assert!(!vmm_execution_available(VmmType::Fvp, None));
+        assert!(!vmm_execution_available(
+            VmmType::Fvp,
+            Some(std::ffi::OsStr::new(""))
+        ));
+        let directory = tempfile::tempdir().unwrap();
+        assert!(!vmm_execution_available(
+            VmmType::Fvp,
+            Some(directory.path().join("missing").as_os_str()),
+        ));
+        assert_eq!(
+            vmm_execution_available(VmmType::Fvp, Some(directory.path().as_os_str())),
+            cfg!(target_os = "linux"),
+        );
+        assert!(vmm_execution_available(VmmType::Qemu, None));
+        assert!(vmm_execution_available(VmmType::OpenVmm, None));
+    }
+
+    #[test]
+    fn unconfigured_fvp_exposes_no_execution_capabilities() {
+        let context = host_context(OpenVmmHypervisor::Kvm);
+        assert!(available_capabilities_for(&context, VmmType::Fvp, None).is_empty());
+        let directory = tempfile::tempdir().unwrap();
+        assert_eq!(
+            available_capabilities_for(&context, VmmType::Fvp, Some(directory.path().as_os_str()))
+                .contains(capabilities::NESTED_VIRT),
+            cfg!(target_os = "linux"),
+        );
+    }
 
     fn host_context(openvmm_hypervisor: OpenVmmHypervisor) -> HostContext {
         HostContext {

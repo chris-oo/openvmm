@@ -100,6 +100,7 @@ vmswitch.workspace = true
 windows-version.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
+incubator.workspace = true
 vmsocket.workspace = true
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]

@@ -106,6 +106,10 @@ pub mod artifacts {
         PIPETTE_WINDOWS_AARCH64("pipette.exe", WINDOWS_AARCH64),
         /// Pipette linux aarch64 musl executable
         PIPETTE_LINUX_AARCH64_MUSL("pipette", LINUX_AARCH64_MUSL),
+        /// Pinned FVP CCA firmware package directory.
+        FVP_CCA_PLATFORM_AARCH64("fvp-cca", AARCH64),
+        /// Qualified FVP host and unchanged TDISP guest payload directory.
+        FVP_CCA_PAYLOAD_AARCH64("fvp-cca-payload", AARCH64),
         /// Directory to put petri test logs in
         TEST_LOG_DIRECTORY("test_results", ANY),
     }

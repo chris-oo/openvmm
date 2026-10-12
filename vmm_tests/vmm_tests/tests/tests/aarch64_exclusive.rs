@@ -390,7 +390,7 @@ async fn realm_vfio_objects_cca_in_place(
     use vmcore::vmtime::VmTimeKeeper;
 
     const RID: u32 = 0x100;
-    let bdf = incubator_vfio_bdf("cca-realm-vfio")?;
+    let bdf = emulator_vfio_bdf("cca-realm-vfio")?;
     // This preflight is restricted to the single modeled AHCI fixture.
     anyhow::ensure!(bdf == "0000:01:00.0", "unexpected Realm fixture BDF: {bdf}");
     let sysfs = std::path::Path::new("/sys/bus/pci/devices").join(&bdf);
