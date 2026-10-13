@@ -88,8 +88,17 @@ or a copied Python virtualenv. Hosted CI does not provide the model.
 ```
 
 Use Linux or WSL2 with a local Docker daemon accessible through a Unix
-socket. Our qualified runtime uses FVP 11.31.28 inside a digest-pinned
-container. Shrinkwrap and its Python dependencies must match the selected
+socket. The checked-in runtime uses FVP 11.32.19 inside the published,
+digest-pinned `shrinkwraptool/base-slim:2026.9.1` container. No local container
+build or model compilation is required. Cache the approved image:
+
+```bash
+FVP_IMAGE=shrinkwraptool/base-slim@sha256:7379a13f850d93a540b6aa34685c9da7828c9df4bad5d4fbcf7e3436a8c266cc
+docker pull "$FVP_IMAGE"
+docker tag "$FVP_IMAGE" shrinkwraptool/base-slim:2026.9.1
+```
+
+Shrinkwrap and its Python dependencies must match the selected
 toolchain identity. The checked-in platform manifests record the supported
 model, tool, container, and source identities.
 
@@ -183,8 +192,16 @@ on top of the baseline image, and the launcher used `docker-local`.
 The inner test, fixture teardown, and Shrinkwrap each exited 0; supervisor
 finalization succeeded. No allocator abort occurred in this run. This is
 one non-TDISP smoke result, not assigned-device qualification or a fix for
-the separate TDISP teardown failure. The built-in runtime pins remain
-FVP 11.31.28; the local comparison image is not a published dependency.
+the separate TDISP teardown failure. The local comparison image is not a
+published dependency. The built-in runtime now selects the published
+Shrinkwrap 2026.9.1 image containing the same FVP model version.
+
+The native non-TDISP smoke test also passed end to end with this published
+image: `cargo xflowey vmm-tests-run` reported one passing test and exited 0.
+The inner test, fixture teardown, and Shrinkwrap each exited 0; supervisor
+finalization succeeded, the native journal retired, and the model container
+was removed. No allocator abort occurred. This validates the selected smoke
+case and its full lifecycle, not the other CCA profiles or TDISP teardown.
 
 Before migration to native Petri nesting, the 2026-10-12 reference TDISP
 run passed exactly one guest test. It completed LOCK/RUN, matched a 64 MiB

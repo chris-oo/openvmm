@@ -12,16 +12,16 @@
 # and .packages/cca-tdisp-fvp/artifacts/rebuild-20260917-verified/manifest.json.
 schema_version: 1
 fvp:
-  executable_in_container: /tools/FVP_Base_RevC_AEMvA_11.31_28/bin/FVP_Base_RevC-2xAEMvA
-  version_output: Fast Models [11.31.28 (Mar  1 2026)]
+  executable_in_container: /tools/FVP_Base_RevC_AEMvA_11.32_19/bin/FVP_Base_RevC-2xAEMvA
+  version_output: Fast Models [11.32+19 (Jul 29 2026)]
 shrinkwrap:
   root_relative_path: cca-test/shrinkwrap
   executable_relative_path: cca-test/shrinkwrap/venv/bin/shrinkwrap
   checkout_revision: 1c6b7a5278b47be11cad3bcd3a20416fc43fd388
   package_version: 2026.9.0.dev0
   container:
-    tag: shrinkwraptool/base-slim:2026.9.0.dev0
-    digest: shrinkwraptool/base-slim@sha256:dc5ac44b4cd8d8142c8df0f7fab4b5ecb11f9a399c6b94320b14f07f1476ea99
+    tag: shrinkwraptool/base-slim:2026.9.1
+    digest: shrinkwraptool/base-slim@sha256:7379a13f850d93a540b6aa34685c9da7828c9df4bad5d4fbcf7e3436a8c266cc
 package:
   root_input: shrinkwrap_package_root
   yaml_relative_path: cca-3world.yaml
