@@ -482,7 +482,7 @@ impl PreparedFvpRun {
             .env("SHRINKWRAP_CONFIG", self.root.join("config"))
             .env("TMPDIR", self.root.join("build"))
             .args([
-                "--runtime=docker",
+                "--runtime=docker-local",
                 &format!(
                     "--image={}",
                     PlatformManifest::for_platform(config.platform)?
@@ -1786,6 +1786,16 @@ command cp "$SEMIHOSTDIR/startup.nsh" "$CAPTURE"
             .collect::<Vec<_>>();
         assert_eq!(command.get_program(), "isolated-python");
         assert_eq!(&args[..4], ["-I", "-B", "-u", "/trusted/shrinkwrap"]);
+        assert!(args.contains(&"--runtime=docker-local"));
+        let expected_image = format!(
+            "--image={}",
+            PlatformManifest::for_platform(config.platform)
+                .unwrap()
+                .shrinkwrap
+                .container
+                .digest
+        );
+        assert!(args.contains(&expected_image.as_str()));
         let overlays = args
             .windows(2)
             .filter(|pair| pair[0] == "--overlay")

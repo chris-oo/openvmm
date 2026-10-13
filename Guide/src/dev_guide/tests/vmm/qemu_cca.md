@@ -114,6 +114,10 @@ explicit paths for BL1, FIP, DTB, kernel, initrd, and the guest share. It uses
 an owned writable workspace rather than Shrinkwrap's default package
 directory.
 
+The launcher uses Shrinkwrap's `docker-local` runtime. The supervisor checks
+the cached image's exact digest before launch; it does not pull an image
+during the run. Provision the pinned model image before starting the test.
+
 Native tests keep recovery journals and launcher logs under
 `~/.local/state/openvmm/petri-native/fvp-v1`, outside disposable test output.
 They use separate recovery state from the standalone `incubator` CLI, but
@@ -171,6 +175,16 @@ still failed: FVP 11.31.28 reported `corrupted size vs. prev_size` and aborted
 with status 134 after L1 poweroff; Shrinkwrap returned 1. The same model abort
 also occurred in a run that failed before Realm creation. This is a separate
 model-shutdown blocker, not a clean end-to-end lifecycle pass.
+
+A controlled comparison with FVP 11.32.19 passed the same native smoke test
+end to end. It kept the same firmware, Linux payloads, Shrinkwrap checkout,
+and Debian 13/glibc 2.41 container userspace. The newer model was installed
+on top of the baseline image, and the launcher used `docker-local`.
+The inner test, fixture teardown, and Shrinkwrap each exited 0; supervisor
+finalization succeeded. No allocator abort occurred in this run. This is
+one non-TDISP smoke result, not assigned-device qualification or a fix for
+the separate TDISP teardown failure. The built-in runtime pins remain
+FVP 11.31.28; the local comparison image is not a published dependency.
 
 Before migration to native Petri nesting, the 2026-10-12 reference TDISP
 run passed exactly one guest test. It completed LOCK/RUN, matched a 64 MiB

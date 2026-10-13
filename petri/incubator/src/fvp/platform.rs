@@ -1929,7 +1929,7 @@ mod tests {
             serde_json::json!([]),
             serde_json::json!(null),
             serde_json::json!([container.digest, container.digest]),
-            serde_json::json!([container.digest, "shrinkwraptool/base-slim@sha256:wrong"]),
+            serde_json::json!([container.digest, format!("{}wrong", container.digest)]),
             serde_json::json!(["other@sha256:wrong"]),
         ] {
             assert!(verify_repo_digests(&serde_json::to_vec(&value).unwrap(), &container).is_err());
