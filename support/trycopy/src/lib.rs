@@ -84,6 +84,13 @@ mod aarch64;
 mod memcpy;
 mod x86_64;
 
+#[cfg(all(
+    feature = "revocation-experiment",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+pub mod experiment;
+
 #[cfg(target_arch = "aarch64")]
 use aarch64::*;
 #[cfg(target_arch = "x86_64")]

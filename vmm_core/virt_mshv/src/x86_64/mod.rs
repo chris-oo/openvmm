@@ -610,6 +610,10 @@ impl ProtoPartition for MshvProtoPartition<'_> {
         });
         if let Some(snp) = inner.isolation.snp() {
             snp.install_host_access_kick(&inner);
+            // xtask-fmt allow-target-arch dependency
+            #[cfg(all(feature = "revocation-experiment", target_arch = "x86_64"))]
+            snp::install_revocation_experiment(&inner)
+                .map_err(|_| ErrorInner::InvalidConfiguration("invalid revocation experiment"))?;
         }
         inner.add_snp_vmsa_mapping()?;
 

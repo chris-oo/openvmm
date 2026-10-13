@@ -6,6 +6,9 @@ name = "virt_mshv"
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+revocation-experiment = ["dep:trycopy", "trycopy/revocation-experiment"]
+
 [target.'cfg(target_os = "linux")'.dependencies]
 aarch64defs.workspace = true
 headervec.workspace = true
@@ -37,6 +40,7 @@ signal-hook.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 zerocopy.workspace = true
+trycopy = { workspace = true, optional = true }
 
 [dev-dependencies]
 test_with_tracing.workspace = true

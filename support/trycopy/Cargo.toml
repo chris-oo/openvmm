@@ -6,6 +6,9 @@ name = "trycopy"
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+revocation-experiment = []
+
 [dependencies]
 thiserror.workspace = true
 
@@ -30,6 +33,7 @@ harness = false
 
 [dev-dependencies]
 criterion.workspace = true
+test_with_tracing.workspace = true
 
 [lints]
 workspace = true

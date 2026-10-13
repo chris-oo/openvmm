@@ -671,6 +671,345 @@ fn host_access_flags(acquire: bool, write: bool) -> u8 {
         }
 }
 
+/// Test-only legacy shared-DMA probe. Never used by scoped or fd-backed RAM.
+// xtask-fmt allow-target-arch dependency
+#[cfg(all(feature = "revocation-experiment", target_arch = "x86_64"))]
+pub(super) fn install_revocation_experiment(
+    partition: &Arc<MshvPartitionInner>,
+) -> anyhow::Result<()> {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+    use trycopy::experiment::Width;
+
+    let Some(setting) = std::env::var_os("OPENVMM_SHARED_REVOKE_EXPERIMENT") else {
+        return Ok(());
+    };
+    let setting = setting
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("experiment setting is not UTF-8"))?;
+    let (direction, width) = setting
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("expected read|write:u8|u64|simd|rep"))?;
+    let write = match direction {
+        "read" => false,
+        "write" => true,
+        _ => anyhow::bail!("invalid experiment direction"),
+    };
+    let width = match width {
+        "u8" => Width::Byte,
+        "u64" => Width::Word,
+        "simd" => Width::Simd,
+        "rep" => Width::Rep,
+        _ => anyhow::bail!("invalid experiment width"),
+    };
+    anyhow::ensure!(
+        partition
+            .isolation
+            .snp()
+            .is_some_and(|snp| !snp.scoped_host_access),
+        "experiment requires legacy SNP access, not scoped grants"
+    );
+    let partition = Arc::downgrade(partition);
+    let fired = AtomicBool::new(false);
+    trycopy::experiment::install_dma_probe(move |lease, owned, dma_write| {
+        // This fixture marker is carried by a real pending virtio-blk request,
+        // not by arbitrary RAM scanning or MAP_SHARED ownership inference.
+        if dma_write != write
+            || !owned.starts_with(b"MSHV-SHARED-REVOKE-v1")
+            || owned.len() < 4096
+            || !lease.payload_gpa.is_multiple_of(4096)
+            || fired.swap(true, Ordering::AcqRel)
+        {
+            return Ok(());
+        }
+        let partition = partition
+            .upgrade()
+            .ok_or_else(|| "experiment partition retired".to_owned())?;
+        run_shared_revocation_probe(&partition, lease, owned, write, width)
+            .map_err(|error| format!("{error:#}"))
+    })
+    .map_err(anyhow::Error::msg)?;
+    eprintln!("MSHV_REVOKE_EXPERIMENT_ARMED direction={direction} width={width:?} legacy=true");
+    Ok(())
+}
+
+// xtask-fmt allow-target-arch dependency
+#[cfg(all(feature = "revocation-experiment", target_arch = "x86_64"))]
+fn run_shared_revocation_probe(
+    partition: &Arc<MshvPartitionInner>,
+    lease: trycopy::experiment::DmaLease,
+    owned: &mut [u8],
+    write: bool,
+    width: trycopy::experiment::Width,
+) -> anyhow::Result<()> {
+    use std::sync::atomic::AtomicU8;
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc;
+    use std::time::Duration;
+    use trycopy::experiment::CopyError;
+    use trycopy::experiment::Rendezvous;
+
+    const GUARD: usize = 64;
+    const PREFIX: usize = 64;
+    let gpa = lease.payload_gpa;
+    let page_range = PageRange::new(gpa, owned.len() as u64)?;
+    anyhow::ensure!(owned.len() <= 65536, "experiment payload exceeds 64 KiB");
+    let pointer = {
+        let memory = partition.memory.lock();
+        let (ram, mappings) = host_access_ram(partition, &memory)?;
+        let snp = partition
+            .isolation
+            .snp()
+            .ok_or_else(|| anyhow::anyhow!("experiment requires SNP isolation"))?;
+        validate_ram(
+            page_range,
+            true,
+            &ram,
+            &mappings,
+            &snp.control_ranges.lock(),
+        )?;
+        let mapping = memory
+            .ranges
+            .iter()
+            .flatten()
+            .find(|mapping| {
+                let start = mapping.region.guest_pfn * hvdef::HV_PAGE_SIZE;
+                mapping.mapped && start <= gpa && page_range.end <= start + mapping.region.size
+            })
+            .ok_or_else(|| anyhow::anyhow!("experiment DMA backing not found"))?;
+        mapping.region.userspace_addr + (gpa - mapping.region.guest_pfn * hvdef::HV_PAGE_SIZE)
+    };
+    let guest = pointer as *mut u8;
+    // Successful RW acquisition checks the guest's maximum access. Together
+    // with the pending SNP virtio DMA request, this is the shared-page evidence.
+    modify_snp_host_access(
+        &partition.vmfd,
+        page_range.start,
+        page_range.end - page_range.start,
+        true,
+        true,
+    )?;
+    eprintln!(
+        "MSHV_REVOKE_LEASE payload_gpa={gpa:#x} bytes={} head={} sector={} header_gpa={:#x} status_gpa={:#x} request_uncompleted=true rw_acquire=true guest_shared_dma=true",
+        owned.len(),
+        lease.descriptor_index,
+        lease.sector,
+        lease.header_gpa,
+        lease.status_gpa,
+    );
+    let mut before = vec![0u8; owned.len()];
+    // SAFETY: validated registered backing stays owned by the partition; the
+    // cooperative guest retains the pending DMA request and does not reset it.
+    unsafe { trycopy::try_copy(guest.cast_const(), before.as_mut_ptr(), before.len())? };
+    let mut offset = GUARD + (32 - (pointer as usize + GUARD) % 32) % 32;
+    let mut copy_gpa = gpa + offset as u64;
+    if 4096 - copy_gpa % 4096 <= PREFIX as u64 {
+        offset += (4096 - copy_gpa % 4096) as usize + GUARD;
+        copy_gpa = gpa + offset as u64;
+    }
+    let len = owned
+        .len()
+        .checked_sub(offset + GUARD)
+        .ok_or_else(|| anyhow::anyhow!("experiment guards exceed payload"))?
+        & !31;
+    let next_page = (copy_gpa & !4095) + 4096;
+    let cross_page = copy_gpa + (PREFIX as u64) < next_page && next_page < copy_gpa + len as u64;
+    let revoke_gpa = if cross_page {
+        next_page
+    } else {
+        copy_gpa & !4095
+    };
+    let expected_copied = if cross_page {
+        (revoke_gpa - copy_gpa) as usize
+    } else {
+        PREFIX
+    };
+    anyhow::ensure!(
+        revoke_gpa >= gpa && revoke_gpa + 4096 <= gpa + owned.len() as u64,
+        "experiment must revoke a complete page inside the leased payload"
+    );
+    eprintln!("MSHV_REVOKE_PAGE revoke_page_within_payload=true");
+    anyhow::ensure!(
+        len > PREFIX,
+        "experiment requires a copied prefix and an uncopied tail"
+    );
+    let expected = if write {
+        before[offset..offset + len]
+            .iter()
+            .map(|byte| byte ^ 0xa5)
+            .collect::<Vec<_>>()
+    } else {
+        before[offset..offset + len].to_vec()
+    };
+    let staging: Arc<[AtomicU8]> = (0..len + 2 * GUARD)
+        .map(|i| {
+            let byte = if (GUARD..GUARD + len).contains(&i) {
+                expected[i - GUARD] ^ if write { 0 } else { 0xa5 }
+            } else {
+                0xd3
+            };
+            AtomicU8::new(byte)
+        })
+        .collect();
+    // SAFETY: offset and length were checked within the retained DMA payload.
+    let guest_copy = unsafe { guest.add(offset) };
+    let (src, dest) = if write {
+        (
+            staging.as_ptr().cast::<u8>().wrapping_add(GUARD),
+            guest_copy,
+        )
+    } else {
+        (
+            guest_copy.cast_const(),
+            staging.as_ptr().cast::<u8>().cast_mut().wrapping_add(GUARD),
+        )
+    };
+    let rendezvous = Arc::new(Rendezvous::default());
+    let revoker_control = rendezvous.clone();
+    let vmfd = partition.vmfd.clone();
+    let memory = partition.gm.clone();
+    let staging_owner = staging.clone();
+    let prefix_address = dest.addr();
+    let expected_prefix = expected[..PREFIX].to_vec();
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    let revoker = std::thread::spawn(move || {
+        // Retain backing even if a failed/hung ioctl outlives the probe.
+        let _memory = memory;
+        let _staging = staging_owner;
+        let result = (|| {
+            let progress = revoker_control.wait_for_prefix(Duration::from_secs(2))?;
+            anyhow::ensure!(progress == PREFIX, "unexpected copy progress");
+            let mut observed_prefix = vec![0u8; PREFIX];
+            // SAFETY: published progress means assembly finished its stores
+            // and is paused. The retained, acquired destination and the owned
+            // staging buffer remain live until this thread resumes the tail.
+            unsafe {
+                trycopy::try_copy(
+                    prefix_address as *const u8,
+                    observed_prefix.as_mut_ptr(),
+                    PREFIX,
+                )?;
+            }
+            anyhow::ensure!(
+                observed_prefix == expected_prefix,
+                "prefix is not observable"
+            );
+            eprintln!(
+                "MSHV_REVOKE_PREFIX bytes={progress} verified=true revoke_gpa={revoke_gpa:#x}"
+            );
+            modify_snp_host_access(&vmfd, revoke_gpa, 4096, false, false)?;
+            eprintln!("MSHV_REVOKE_RETURN flags=0 pages=1 success=true");
+            Ok::<_, anyhow::Error>(())
+        })();
+        let success = result.is_ok();
+        let _ = result_tx.send(result);
+        if success {
+            revoker_control.resume();
+        } else {
+            revoker_control.cancel();
+        }
+    });
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let watchdog_control = rendezvous.clone();
+    let watchdog = std::thread::spawn(move || {
+        if done_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+            watchdog_control.cancel();
+        }
+    });
+    // SAFETY: disjoint guest and owned staging ranges stay live; the owned
+    // controls and independent watchdog bound the annotated mid-copy pause.
+    let fault = unsafe { trycopy::experiment::copy(src, dest, len, PREFIX, width, &rendezvous) };
+    let _ = done_tx.send(());
+    let _ = watchdog.join();
+    let release = result_rx
+        .recv_timeout(Duration::from_secs(1))
+        .map_err(|_| anyhow::anyhow!("revoker did not return; retain backing and stop VM"))?;
+    let _ = revoker.join();
+    release?;
+    eprintln!("MSHV_REVOKE_FAULT direction_write={write} width={width:?} result={fault:?}");
+    eprintln!(
+        "MSHV_REVOKE_FAULT_NOTE gp_address_and_offset_may_be_zero=true copied_bytes_measured=true linux_mprotect=false fd_pte_zap_variant=false"
+    );
+    // This is a known completed release, not an uncertain scoped guard. Keep
+    // the device request pending while explicitly reacquiring shared access.
+    modify_snp_host_access(&partition.vmfd, revoke_gpa, 4096, true, true)?;
+    eprintln!("MSHV_REVOKE_REACQUIRE success=true guest_request_uncompleted=true");
+    let mut after = before.clone();
+    if write {
+        // SAFETY: RW acquisition returned; the same DMA lease is still held.
+        unsafe { trycopy::try_copy(guest.cast_const(), after.as_mut_ptr(), after.len())? };
+    } else {
+        for (dest, source) in after[offset..offset + len]
+            .iter_mut()
+            .zip(&staging[GUARD..GUARD + len])
+        {
+            *dest = source.load(Ordering::Relaxed);
+        }
+    }
+    let actual = &after[offset..offset + len];
+    let copied = actual
+        .iter()
+        .zip(&expected)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let baseline_tail = if write {
+        &before[offset + copied..offset + len]
+    } else {
+        // The read destination was initialized to the complement of source.
+        &[]
+    };
+    let tail_unchanged = if write {
+        &actual[copied..] == baseline_tail
+    } else {
+        actual[copied..]
+            .iter()
+            .zip(&expected[copied..])
+            .all(|(a, b)| *a == (*b ^ 0xa5))
+    };
+    let guards_ok = staging[..GUARD]
+        .iter()
+        .chain(&staging[GUARD + len..])
+        .all(|b| b.load(Ordering::Relaxed) == 0xd3)
+        && after[..offset] == before[..offset]
+        && after[offset + len..] == before[offset + len..];
+    eprintln!(
+        "MSHV_REVOKE_PARTIAL copy_gpa={copy_gpa:#x} copy_bytes={len} copied_bytes={copied} expected_copied={expected_copied} cross_page={cross_page} guards_ok={guards_ok} tail_unchanged={tail_unchanged}",
+    );
+    anyhow::ensure!(
+        matches!(fault, Err(CopyError::Fault(_)))
+            && copied == expected_copied
+            && guards_ok
+            && tail_unchanged,
+        "unexpected revoke/copy outcome; stop further experiments"
+    );
+    let retry = Rendezvous::default();
+    retry.resume();
+    // SAFETY: unchanged buffers, successful reacquire, checkpoint pre-resumed
+    // for this one-shot full-primitive retry, without recursive lazy faults.
+    unsafe { trycopy::experiment::copy(src, dest, len, PREFIX, width, &retry)? };
+    if write {
+        let mut retried = vec![0u8; len];
+        // SAFETY: acquisition and the pending DMA lease remain valid.
+        unsafe { trycopy::try_copy(guest_copy.cast_const(), retried.as_mut_ptr(), len)? };
+        anyhow::ensure!(retried == expected, "write retry differs from owned source");
+        // SAFETY: same valid lease. Restore the probe's XOR data before normal
+        // disk completion copies its original owned data into the guest.
+        unsafe {
+            trycopy::try_copy(before.as_ptr().add(offset), guest_copy, len)?;
+        }
+    } else {
+        anyhow::ensure!(
+            staging[GUARD..GUARD + len]
+                .iter()
+                .zip(&expected)
+                .all(|(a, b)| a.load(Ordering::Relaxed) == *b),
+            "read retry differs from shared source"
+        );
+    }
+    eprintln!("MSHV_REVOKE_EXPERIMENT_PASS retry=true request_still_uncompleted=true");
+    Ok(())
+}
+
 pub(super) fn sanitize_snp_cpuid(
     function: u32,
     index: u32,

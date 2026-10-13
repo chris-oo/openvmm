@@ -708,6 +708,48 @@ fn copy_regions(
     Ok(())
 }
 
+#[cfg(all(
+    feature = "revocation-experiment",
+    target_os = "linux",
+    // xtask-fmt allow-target-arch dependency
+    target_arch = "x86_64"
+))]
+fn probe_pending_request(
+    work: &VirtioQueueCallbackWork,
+    regions: &[DataRegion],
+    owned: &mut [u8],
+    sector: u64,
+    write: bool,
+) {
+    let mut offset: usize = 0;
+    for region in regions {
+        let Some(end) = offset.checked_add(region.len as usize) else {
+            return;
+        };
+        let Some(buf) = owned.get_mut(offset..end) else {
+            return;
+        };
+        let (Some(header), Some(status)) = (work.payload.first(), work.payload.last()) else {
+            return;
+        };
+        let lease = trycopy::experiment::DmaLease {
+            payload_gpa: region.addr,
+            descriptor_index: work.descriptor_index(),
+            sector,
+            header_gpa: header.address,
+            status_gpa: status.address,
+        };
+        if let Err(error) = trycopy::experiment::probe_dma(lease, buf, write) {
+            // This explicit test fixture must not complete a failed probe's
+            // request. Exit closes the legacy partition; the outer harness
+            // checks retirement and stops further runs on uncertainty.
+            eprintln!("MSHV_REVOKE_EXPERIMENT_FATAL {error}");
+            std::process::exit(86);
+        }
+        offset = end;
+    }
+}
+
 /// Perform read or write I/O for a single request.
 ///
 /// Issues a single `disk.read_vectored` / `disk.write_vectored` call
@@ -809,6 +851,13 @@ async fn do_io(
             if !is_read {
                 let buf = bounce_mem.inner_buf_mut().ok_or(VIRTIO_BLK_S_IOERR)?;
                 copy_regions(buf, mem, &regions, true)?;
+                #[cfg(all(
+                    feature = "revocation-experiment",
+                    target_os = "linux",
+                    // xtask-fmt allow-target-arch dependency
+                    target_arch = "x86_64"
+                ))]
+                probe_pending_request(work, &regions, buf, start_disk_sector, false);
             }
 
             (
@@ -857,6 +906,13 @@ async fn do_io(
             .as_mut()
             .and_then(GuestMemory::inner_buf_mut)
             .ok_or(VIRTIO_BLK_S_IOERR)?;
+        #[cfg(all(
+            feature = "revocation-experiment",
+            target_os = "linux",
+            // xtask-fmt allow-target-arch dependency
+            target_arch = "x86_64"
+        ))]
+        probe_pending_request(work, &regions, buf, start_disk_sector, true);
         copy_regions(buf, mem, &regions, false)?;
     }
 

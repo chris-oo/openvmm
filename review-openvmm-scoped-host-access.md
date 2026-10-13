@@ -229,3 +229,57 @@ MSHV tests, the standalone coordinator snapshot passed 47, and the integrated
 MSHV snapshot passed 50. The configuration snapshot passed 151 tests with
 the MSHV producer and resolver features enabled. An aarch64 MSHV compile
 check also passed.
+
+## Shared-page mid-copy revocation experiment
+
+The `revocation-experiment` build feature adds an opt-in probe to the legacy
+MSHV SNP bounce path. It does not change normal copy selection, production
+fault policy, scoped grants, or guest ownership transitions. The runtime
+selector is `OPENVMM_SHARED_REVOKE_EXPERIMENT=read|write:u8|u64|simd|rep`.
+
+The probe runs while an actual virtio-blk request is pending. The cooperative
+guest holds its SNP shared DMA mapping until device completion. The host
+validates that the revoked 4 KiB page lies wholly inside that payload. A
+single annotated copy stores a 64-byte prefix, publishes progress, and pauses
+with its source, destination, and registers live. Another host thread
+verifies the prefix, releases host permissions with zero ownership flags,
+and resumes the copy only after the release returns successfully.
+
+Eight hardware cases passed on `chris-mshv`: reads and writes with byte,
+u64, SIMD, and `rep movsb` copies. In every case:
+
+- The release returned success, then the next guest-memory access faulted.
+- Linux delivered SIGSEGV (11), `SI_KERNEL` (128), CPU trap 13 (`#GP`).
+- Independently measured progress was exactly 64 bytes. Guards and the
+  uncopied tail were unchanged.
+- Explicit RW reacquisition and a fresh full-primitive retry succeeded.
+- The guest completed its I/O and powered off. Host dmesg, partition state,
+  and lite allocation counters returned to their baselines.
+
+The GP fault address and reported offset were zero. Even the write cases
+reported `MemoryError.is_write=false`; the caller's original operation
+direction is authoritative, not this diagnostic. The tests do not infer
+partial progress from that offset.
+
+These hardware cases used page-aligned 4 KiB payloads and same-page
+revocation. Cross-page recovery was tested locally with `mprotect`, not
+against Hyper-V. The hardware run did not use Linux `mprotect`, fd PTE
+invalidation, guest-private handoff, or physical-PFN probes.
+
+Two independent reviews approved the bounded experiment and its payload
+shape fix. Feature-enabled tests passed 95 cases; default tests passed 91.
+Clippy with warnings denied, rustdoc, formatting, and a static musl build
+passed. The initial non-terminal launch aborted before the probe; a terminal
+retry exposed the original 8 KiB eligibility mismatch with actual 4 KiB DMA
+descriptors. Both failed attempts are preserved separately.
+
+Successful evidence is retained in the session's
+`files/shared-revocation-preflight-20261013-1512/hardware-matrix/` directory.
+The tested VMM SHA256 is
+`f2f016898cc7bbc81b79915ab200068d397d60e6ee903696ad95f6edef83b511`.
+
+This establishes recoverable host-copy faults after shared-page permission
+revocation. The retry is manual, not the production GuestMemory/VaMapper
+automatic retry. It does not establish acquisition versus guest-private
+handoff ordering, revocation starvation behavior, or the safety of removing
+production reservations, locks, and per-copy release.
