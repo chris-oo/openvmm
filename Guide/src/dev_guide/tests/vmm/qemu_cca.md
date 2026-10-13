@@ -67,6 +67,14 @@ Flowey verifies the archive before extracting and staging its contents.
 Missing inputs and identity mismatches are errors. There is no fallback
 that builds local firmware.
 
+For a non-TDISP check, use the same package options with
+`--filter 'test(cca_in_place_smoke_on_fvp)'`. This case uses the packaged
+`host/Image`, qualified as a unified host and Realm kernel, with Petri's
+standard pipette initrd. It boots an in-place CCA Realm, pings pipette over
+Virtio-vsock, powers off, and requires clean OpenVMM teardown. It does not
+assign a device to the Realm. The current outer FVP profile still prepares
+and tears down its AHCI host fixture.
+
 Without `--fvp-deps-version`, artifact discovery excludes FVP
 package-dependent cases, including in `--build-only` mode. Payload-only
 cases can use the release and payload options without firmware options.
@@ -155,6 +163,14 @@ EDK2 loads the Linux initrd through SemihostFs and `startup.nsh`.
 The in-place Virtio block and network tests have passed on the pinned FVP
 tuple. These are in-process Virtio tests, not assigned-device private-DMA
 qualification.
+
+The native packaged non-TDISP smoke run passed its inner Realm test: boot,
+pipette ping, poweroff, and clean OpenVMM teardown. The nested process exited
+0, and fixture cleanup and supervisor finalization succeeded. The outer test
+still failed: FVP 11.31.28 reported `corrupted size vs. prev_size` and aborted
+with status 134 after L1 poweroff; Shrinkwrap returned 1. The same model abort
+also occurred in a run that failed before Realm creation. This is a separate
+model-shutdown blocker, not a clean end-to-end lifecycle pass.
 
 Before migration to native Petri nesting, the 2026-10-12 reference TDISP
 run passed exactly one guest test. It completed LOCK/RUN, matched a 64 MiB

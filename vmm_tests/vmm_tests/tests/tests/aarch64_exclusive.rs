@@ -3,6 +3,8 @@
 
 //! Integration tests for aarch64 guests.
 
+#[cfg(target_os = "linux")]
+use super::nested::vm_host_fvp;
 use anyhow::Context;
 use futures::AsyncReadExt;
 use futures::AsyncWriteExt;
@@ -22,6 +24,8 @@ use petri::qemu::devices::DeviceConfig;
 use petri::qemu::devices::EduDeviceConfig;
 use petri::qemu::devices::IvshmemPlainDeviceConfig;
 use petri::qemu::devices::VirtioBlkDeviceConfig;
+#[cfg(target_os = "linux")]
+use petri_artifacts_common::artifacts::FVP_CCA_PAYLOAD_AARCH64;
 use petri_artifacts_common::tags::IsLoadable;
 use petri_artifacts_vmm_test::artifacts::host_tools::NEXTEST_VMM_TESTS_ARCHIVE_LINUX_AARCH64_MUSL;
 use petri_artifacts_vmm_test::artifacts::loadable::LINUX_DIRECT_TEST_KERNEL_CCA_AARCH64;
@@ -39,7 +43,7 @@ mod tdisp_ahci;
 /// Boot a Linux-direct CCA Realm and verify the pipette agent over virtio-vsock.
 #[vmm_test_with(openvmm, requires(cca), configs(linux_direct_aarch64))]
 async fn boot_linux_direct_cca(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Result<()> {
-    boot_linux_direct_cca_with_backing(config, false).await
+    boot_linux_direct_cca_with_backing(config, false, None).await
 }
 
 /// Run the same CCA Virtio-vsock test with in-place guest_memfd backing.
@@ -51,14 +55,71 @@ async fn boot_linux_direct_cca(config: PetriVmBuilder<OpenVmmPetriBackend>) -> a
 async fn boot_linux_direct_cca_in_place(
     config: PetriVmBuilder<OpenVmmPetriBackend>,
 ) -> anyhow::Result<()> {
-    boot_linux_direct_cca_with_backing(config, true).await
+    boot_linux_direct_cca_with_backing(config, true, None).await
+}
+
+/// Boot an in-place Realm with the packaged kernel and the standard pipette initrd.
+#[cfg(target_os = "linux")]
+#[vmm_test_with(
+    openvmm,
+    requires(cca, guest_memfd_in_place),
+    configs(
+        nested(
+            (vm_host_fvp, fvp_linux_direct_aarch64),
+            (NEXTEST_VMM_TESTS_ARCHIVE_LINUX_AARCH64_MUSL, "tests", "aarch64_exclusive", linux_direct_aarch64[FVP_CCA_PAYLOAD_AARCH64]),
+        ),
+    )
+)]
+async fn boot_linux_direct_cca_in_place_smoke(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+    (payload,): (ResolvedArtifact<FVP_CCA_PAYLOAD_AARCH64>,),
+) -> anyhow::Result<()> {
+    let kernel = open_pinned_cca_payload(
+        &payload.get().join("host/Image"),
+        petri_artifacts_common::cca_payload::guest_memfd_in_place::LINUX_IMAGE_SHA256,
+    )?;
+    boot_linux_direct_cca_with_backing(config, true, Some(kernel)).await
+}
+
+#[cfg(target_os = "linux")]
+fn open_pinned_cca_payload(
+    path: &std::path::Path,
+    expected: &str,
+) -> anyhow::Result<std::fs::File> {
+    use sha2::Digest;
+    use std::io::Read;
+    use std::io::Seek;
+
+    let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut digest = sha2::Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    let actual: String = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    anyhow::ensure!(
+        actual == expected,
+        "CCA payload hash mismatch for {}: {actual}",
+        path.display()
+    );
+    file.rewind()?;
+    Ok(file)
 }
 
 async fn boot_linux_direct_cca_with_backing(
     config: PetriVmBuilder<OpenVmmPetriBackend>,
     in_place: bool,
+    kernel: Option<std::fs::File>,
 ) -> anyhow::Result<()> {
-    let (vm, agent) = cca_config(config, in_place, None).run().await?;
+    let (vm, agent) = cca_config(config, in_place, None, kernel).run().await?;
     agent.ping().await?;
     agent.power_off().await?;
     vm.wait_for_clean_teardown().await?;
@@ -70,6 +131,7 @@ fn cca_config(
     config: PetriVmBuilder<OpenVmmPetriBackend>,
     in_place: bool,
     device: Option<openvmm_defs::config::PcieDeviceConfig>,
+    kernel: Option<std::fs::File>,
 ) -> PetriVmBuilder<OpenVmmPetriBackend> {
     let root_ports = if device.is_some() { 2 } else { 1 };
     config
@@ -91,6 +153,16 @@ fn cca_config(
                 .with_pcie_root_topology(1, 1, root_ports)
                 .with_custom_config(move |config| {
                     config.hypervisor.guest_memfd_in_place = in_place;
+                    if let Some(kernel) = kernel {
+                        let openvmm_defs::config::LoadMode::Linux {
+                            kernel: guest_kernel,
+                            ..
+                        } = &mut config.load_mode
+                        else {
+                            unreachable!("CCA test requires Linux-direct boot");
+                        };
+                        *guest_kernel = kernel;
+                    }
                     if let Some(device) = device {
                         config.pcie_devices.push(device);
                     }
@@ -148,7 +220,7 @@ async fn virtio_blk_cca_in_place(
         )
         .into_resource(),
     };
-    let (vm, agent) = cca_config(config, true, Some(device)).run().await?;
+    let (vm, agent) = cca_config(config, true, Some(device), None).run().await?;
     agent.ping().await?;
     let sh = agent.unix_shell();
     let sectors: u64 = cmd!(sh, "cat /sys/block/vda/size")
@@ -250,7 +322,7 @@ async fn virtio_net_cca_in_place(
         )
         .into_resource(),
     };
-    let (vm, agent) = cca_config(config, true, Some(device)).run().await?;
+    let (vm, agent) = cca_config(config, true, Some(device), None).run().await?;
     agent.ping().await?;
     let to_guest = cca_io_pattern(29);
     let from_guest = cca_io_pattern(157);
