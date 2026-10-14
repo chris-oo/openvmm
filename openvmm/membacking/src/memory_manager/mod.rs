@@ -86,6 +86,9 @@ struct RamRegion {
 /// Errors when attaching a partition to a [`GuestMemoryManager`].
 #[derive(Error, Debug)]
 pub enum PartitionAttachError {
+    /// Failure to attach partition permission and user-lock callbacks.
+    #[error("failed to install partition host access")]
+    HostAccess(#[source] anyhow::Error),
     /// Failure to allocate a VA mapper.
     #[error("failed to reserve VA range for partition mapping")]
     VaMapper(#[source] VaMapperError),
@@ -579,7 +582,11 @@ impl GuestMemoryBuilder {
         .await
         .map_err(MemoryBuildError::VaMapper)?;
 
-        let region_manager = RegionManager::new(&spawner, mapping_manager.client().clone());
+        let region_manager = RegionManager::new_with_user_locks(
+            &spawner,
+            mapping_manager.client().clone(),
+            va_mapper.user_locks(),
+        );
 
         // Build RAM regions from each backing's ranges.
         let mut ram_regions = Vec::new();
@@ -814,7 +821,9 @@ impl GuestMemoryManager {
                 Vtl::Vtl0,
                 "host access must be installed while attaching VTL0"
             );
-            self.va_mapper.install_host_access(host_access);
+            self.va_mapper
+                .install_host_access(host_access)
+                .map_err(PartitionAttachError::HostAccess)?;
         }
 
         let va_mapper = if let Some(process) = process {
@@ -927,7 +936,11 @@ impl RamVisibilityControl {
                     .await
                     .map_err(|error| RamVisibilityError::Map { range, error })?;
             }
-            RamVisibility::Unmapped => region.handle.unmap().await,
+            RamVisibility::Unmapped => region
+                .handle
+                .unmap()
+                .await
+                .map_err(|error| RamVisibilityError::Map { range, error })?,
         }
         Ok(())
     }

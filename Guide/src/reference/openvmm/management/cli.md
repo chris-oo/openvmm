@@ -159,6 +159,25 @@ describes the source definitions.
   GPA-attribute conflicts release host access and let the next VP run retry
   the existing guest operation. Valid repeated requests remain supported.
 
+  `GuestMemory::supports_kernel_lock()` is false for SNP guest RAM. Supported
+  devices use owned staging when kernel locking is unavailable, even without
+  an explicit bounce flag. A backend without a supported staging path is
+  rejected instead of receiving guest pages for kernel I/O.
+  `requires_owned_io()` distinguishes this restriction from ordinary
+  translated memory that lacks raw locks but already copies through a safe
+  backend fallback. IOMMU translation preserves the underlying restriction.
+
+  CPU-only locks are separate: `GuestMemory::supports_user_lock()` becomes
+  available after SNP launch. `lock_user_gpns()` returns a scoped
+  `UserLockedPages` handle. Its pages cannot be revoked or remapped until the
+  last overlapping CPU loan closes. A conflicting guest attribute request
+  halts the requesting VP without releasing the locked pages' permissions.
+  This tracking applies to explicit pointer loans, not ordinary bounce copies.
+  It protects CPU addresses and permissions, not OS residency or concurrent
+  access to the bytes.
+  Kernel/DMA/sharing exports remain restricted; a CPU loan does not authorize
+  kernel pinning.
+
   This mode uses existing MSHV calls. It does not add a Hyper-V ABI, kernel
   memory-management enforcement, or large-page support. Do not treat it as
   a completed isolation feature. Private-page handoff race tests remain an
@@ -668,9 +687,9 @@ Only software backends are supported; hardware DMA support is deferred.
 
 ```admonish warning
 Bounce I/O stages data; it is not memory isolation or memory management.
-Host access to guest memory remains acquire-only. This phase does not release
-host access, change the kernel ABI, or prevent other devices from accessing
-guest memory.
+Per-device bounce options do not themselves select a host-permission protocol
+or add kernel memory-management enforcement. MSHV SNP has a separate
+fault-driven permission and guest-transition policy described above.
 ```
 
 **Filesystems and other virtio devices** (colon-prefixed):

@@ -124,12 +124,24 @@ pub mod blk {
         pub disk: Resource<DiskHandleKind>,
         pub read_only: bool,
         pub serial: Option<String>,
-        /// Stage block data in owned memory for this device only.
+        /// Force owned block staging, even when guest memory supports kernel locks.
+        /// Kernel-denied guest memory requires staging regardless of this flag.
         pub bounce_io: bool,
     }
 
     impl ResourceId<VirtioDeviceHandle> for VirtioBlkHandle {
         const ID: &'static str = "virtio-blk";
+    }
+
+    /// A block device with a reviewed alternative for kernel-denied memory.
+    #[derive(MeshPayload)]
+    pub struct VirtioBlkAutoHandle {
+        pub device: VirtioBlkHandle,
+        pub bounce_disk: Resource<DiskHandleKind>,
+    }
+
+    impl ResourceId<VirtioDeviceHandle> for VirtioBlkAutoHandle {
+        const ID: &'static str = "virtio-blk-auto";
     }
 
     /// Backends reviewed for virtio-blk bounce I/O.
@@ -185,6 +197,24 @@ pub mod blk {
                 assert_eq!(handle.bounce_io, bounce_io);
             }
         }
+
+        #[test]
+        fn automatic_handle_keeps_force_disabled_and_reviewed_alternative() {
+            let handle = VirtioBlkAutoHandle {
+                device: VirtioBlkHandle {
+                    disk: Resource::new(VirtioBlkBounceDiskHandle::Ram { len: 512 }),
+                    read_only: true,
+                    serial: Some("automatic".into()),
+                    bounce_io: false,
+                },
+                bounce_disk: Resource::new(VirtioBlkBounceDiskHandle::Ram { len: 512 }),
+            };
+            let handle: VirtioBlkAutoHandle = mesh::OwnedMessage::new(handle).parse().unwrap();
+            assert!(!handle.device.bounce_io);
+            assert!(handle.device.read_only);
+            assert_eq!(handle.device.serial.as_deref(), Some("automatic"));
+            assert_eq!(handle.bounce_disk.id(), VirtioBlkBounceDiskHandle::ID);
+        }
     }
 }
 
@@ -201,7 +231,8 @@ pub mod net {
         pub max_queues: Option<u16>,
         pub mac_address: MacAddress,
         pub endpoint: Resource<NetEndpointHandleKind>,
-        /// Stage network data in owned memory for this device only.
+        /// Force owned network staging, even when guest memory supports kernel locks.
+        /// Kernel-denied guest memory requires staging regardless of this flag.
         /// Missing mesh fields decode as false.
         pub bounce_io: bool,
     }
@@ -354,7 +385,8 @@ pub mod vsock {
         pub guest_cid: u64,
         pub base_path: String,
         pub listener: UnixListener,
-        /// Stage in-process vsock data in owned memory for this device only.
+        /// Force owned in-process vsock staging, even when guest memory supports kernel locks.
+        /// Kernel-denied guest memory requires staging regardless of this flag.
         /// Missing mesh fields decode as false.
         pub bounce_io: bool,
     }

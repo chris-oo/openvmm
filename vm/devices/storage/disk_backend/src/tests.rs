@@ -3,6 +3,7 @@
 
 use super::*;
 use guestmem::GuestMemory;
+use guestmem::GuestMemoryIoPolicy;
 use guestmem::ranges::PagedRange;
 use pal_async::async_test;
 use parking_lot::Mutex;
@@ -144,6 +145,10 @@ fn fixture(state: Arc<State>, policy: GuestMemoryIoPolicy) -> (Disk, GuestMemory
     let guest = GuestMemory::try_allocate(8192)
         .unwrap()
         .with_io_policy(policy);
+    assert_eq!(
+        guest.requires_owned_io(),
+        policy == GuestMemoryIoPolicy::CopyOnly
+    );
     guest.write_at(0, &[0x11; 8192]).unwrap();
     let disk = Disk::new(FakeDisk {
         state,
@@ -318,6 +323,32 @@ async fn direct_owned_requests_are_not_staged_again() {
         Err(DiskError::InvalidInput)
     ));
     assert_eq!(state.calls.load(Ordering::SeqCst), 2);
+}
+
+#[async_test]
+async fn kernel_denied_unmapped_memory_never_reaches_backend_without_staging() {
+    let guest = GuestMemory::empty().with_io_policy(GuestMemoryIoPolicy::CopyOnly);
+    assert_eq!(guest.io_policy(), GuestMemoryIoPolicy::CopyOnly);
+    assert!(!guest.supports_kernel_lock());
+    assert!(guest.requires_owned_io());
+    let state = Arc::new(State::default());
+    let disk = Disk::new(FakeDisk {
+        state: state.clone(),
+        guest: guest.clone(),
+        require_owned: true,
+    })
+    .unwrap();
+    let buffers = request(&guest, &[0], 0, 512, true);
+    assert!(matches!(
+        disk.write_vectored(&buffers, 7, false).await,
+        Err(DiskError::MemoryAccess(_))
+    ));
+    assert_eq!(state.calls.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        disk.read_vectored(&buffers, 7).await,
+        Err(DiskError::MemoryAccess(_))
+    ));
+    assert_eq!(state.calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]

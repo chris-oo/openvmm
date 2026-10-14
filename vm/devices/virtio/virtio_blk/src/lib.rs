@@ -69,6 +69,7 @@ pub struct VirtioBlkDevice {
     read_only: bool,
     supports_discard: bool,
     bounce_io: bool,
+    bounce_supported: bool,
     config: VirtioBlkConfig,
 }
 
@@ -340,6 +341,7 @@ impl VirtioBlkDevice {
             read_only,
             supports_discard,
             bounce_io: false,
+            bounce_supported: false,
             config,
         })
     }
@@ -349,11 +351,26 @@ impl VirtioBlkDevice {
     /// This restricts device-facing memory access, not kernel registration or
     /// hypervisor host-access permissions.
     pub fn with_bounce_io(mut self) -> Self {
+        self.bounce_supported = true;
+        self.enable_bounce_io();
+        self
+    }
+
+    fn with_bounce_support(mut self) -> Self {
+        self.bounce_supported = true;
+        self.configure_bounce_limits();
+        self
+    }
+
+    fn enable_bounce_io(&mut self) {
         self.bounce_io = true;
+        self.configure_bounce_limits();
+    }
+
+    fn configure_bounce_limits(&mut self) {
         self.config.size_max = self.config.blk_size.max(guestmem::PAGE_SIZE as u32);
         self.config.seg_max =
             DEFAULT_SEG_MAX.min((MAX_BOUNCE_IO_SIZE / self.config.size_max as usize).max(1) as u32);
-        self
     }
 }
 
@@ -382,7 +399,7 @@ impl VirtioDevice for VirtioBlkDevice {
         if self.read_only {
             features |= VIRTIO_BLK_F_RO;
         }
-        if self.bounce_io {
+        if self.bounce_supported {
             features |= VIRTIO_BLK_F_SIZE_MAX;
         }
         if self.supports_discard {
@@ -448,6 +465,26 @@ impl VirtioDevice for VirtioBlkDevice {
         let queue_event = PolledWait::new(&self.driver, resources.event)
             .context("failed to create queue event")?;
 
+        if resources.guest_memory.requires_owned_io() && !self.bounce_io {
+            anyhow::ensure!(
+                self.bounce_supported,
+                "kernel-denied virtio-blk memory requires reviewed bounce disk admission"
+            );
+            let required = VIRTIO_BLK_F_SIZE_MAX | VIRTIO_BLK_F_SEG_MAX;
+            anyhow::ensure!(
+                features.bank(0) & required == required,
+                "automatic block staging requires negotiated SIZE_MAX and SEG_MAX"
+            );
+            anyhow::ensure!(
+                self.config.blk_size as usize <= MAX_BOUNCE_IO_SIZE,
+                "bounce I/O does not support sectors larger than the request limit"
+            );
+            self.bounce_io = true;
+        }
+        anyhow::ensure!(
+            !self.bounce_io || initial_state.is_none(),
+            "owned block staging does not support restore"
+        );
         let memory = if self.bounce_io {
             resources
                 .guest_memory

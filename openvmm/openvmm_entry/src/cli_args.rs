@@ -560,7 +560,7 @@ valid disk kinds:
 
 flags:
     `ro`                           open disk as read-only
-    `bounce`                       stage block data in owned buffers (default: off)
+    `bounce`                       force owned block staging (default: automatic)
                                    only plain regular files and RAM disks; no wrappers
 
 options:
@@ -857,7 +857,8 @@ The openhcl personality requires explicit --hv --vtl2."#
     #[clap(long, value_name = "PATH")]
     pub virtio_vsock_path: Option<String>,
 
-    /// stage in-process vsock data in owned buffers (requires --virtio-vsock-path)
+    /// force owned in-process vsock staging (requires --virtio-vsock-path)
+    /// Kernel-denied guest memory uses owned staging automatically.
     #[clap(long, requires = "virtio_vsock_path")]
     #[cfg_attr(target_os = "linux", clap(conflicts_with = "virtio_vsock_vhost_cid"))]
     pub virtio_vsock_bounce: bool,
@@ -879,8 +880,9 @@ The openhcl personality requires explicit --hv --vtl2."#
     /// Prefix with `uh:` to add this NIC via Mana emulation through OpenHCL,
     /// `vtl2:` to assign this NIC to VTL2, or `pcie_port=<port_name>:` to
     /// expose the NIC over emulated PCIe at the specified port.
-    /// Prefix with `bounce:` to stage data in owned buffers for this NIC only
+    /// Prefix with `bounce:` to force owned staging for this NIC only
     /// (consomme, Linux tap, or none; VTL0 only).
+    /// Kernel-denied guest memory uses owned staging automatically.
     #[clap(long)]
     pub virtio_net: Vec<NicConfigCli>,
 

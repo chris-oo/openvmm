@@ -50,7 +50,7 @@ impl AsyncResolveResource<VirtioDeviceHandle, VirtioNetHandle> for VirtioNetReso
         input: VirtioResolveInput<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let mut builder = Device::builder();
-        if resource.bounce_io {
+        if input.bounce_io(resource.bounce_io) {
             validate_owned_endpoint(resource.endpoint.id())?;
             builder = builder.bounce_io(true);
         }
@@ -76,7 +76,50 @@ impl AsyncResolveResource<VirtioDeviceHandle, VirtioNetHandle> for VirtioNetReso
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pal_async::DefaultDriver;
+    use pal_async::async_test;
     use test_with_tracing::test;
+    use vm_resource::IntoResource;
+    use vm_resource::kind::NetEndpointHandleKind;
+    use vmcore::vm_task::SingleDriverBackend;
+    use vmcore::vm_task::VmTaskDriverSource;
+
+    #[derive(mesh::MeshPayload)]
+    struct UnsupportedEndpoint;
+
+    impl ResourceId<NetEndpointHandleKind> for UnsupportedEndpoint {
+        const ID: &'static str = "unreviewed-auto-bounce-test";
+    }
+
+    #[async_test]
+    async fn automatic_staging_rejects_endpoint_before_resolution(driver: DefaultDriver) {
+        let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver));
+        let memory = guestmem::GuestMemory::allocate(4096)
+            .with_io_policy(guestmem::GuestMemoryIoPolicy::CopyOnly);
+        let resource = VirtioNetHandle {
+            max_queues: None,
+            mac_address: net_backend_resources::mac_address::MacAddress::new([0; 6]),
+            endpoint: UnsupportedEndpoint.into_resource(),
+            bounce_io: false,
+        };
+        let error = VirtioNetResolver
+            .resolve(
+                &ResourceResolver::new(),
+                resource,
+                VirtioResolveInput {
+                    driver_source: &driver_source,
+                    guest_memory: Some(&memory),
+                },
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("owned virtio-net staging does not support endpoint resource")
+        );
+    }
 
     #[test]
     fn owned_endpoint_admission() {

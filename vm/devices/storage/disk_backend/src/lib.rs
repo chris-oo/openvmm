@@ -83,7 +83,6 @@ pub mod sync_wrapper;
 mod tests;
 
 use guestmem::AccessError;
-use guestmem::GuestMemoryIoPolicy;
 use guestmem::MemoryRead;
 use guestmem::MemoryWrite;
 use inspect::Inspect;
@@ -450,9 +449,7 @@ impl Disk {
         if !buffers.len().is_multiple_of(self.sector_size() as usize) {
             return Err(DiskError::InvalidInput);
         }
-        if buffers.guest_memory().io_policy() == GuestMemoryIoPolicy::CopyOnly
-            && buffers.len() > MAX_BOUNCE_IO_SIZE
-        {
+        if buffers.guest_memory().requires_owned_io() && buffers.len() > MAX_BOUNCE_IO_SIZE {
             return Err(DiskError::InvalidInput);
         }
         self.check_representable(sector, self.buffer_sectors(buffers))
@@ -521,7 +518,7 @@ impl Disk {
         sector: u64,
     ) -> Result<(), DiskError> {
         self.check_buffers(buffers, sector)?;
-        if buffers.guest_memory().io_policy() != GuestMemoryIoPolicy::CopyOnly {
+        if !buffers.guest_memory().requires_owned_io() {
             return self.0.disk.read_vectored(buffers, sector).await;
         }
         if buffers.is_empty() {
@@ -564,7 +561,7 @@ impl Disk {
         fua: bool,
     ) -> Result<(), DiskError> {
         self.check_buffers(buffers, sector)?;
-        if buffers.guest_memory().io_policy() != GuestMemoryIoPolicy::CopyOnly {
+        if !buffers.guest_memory().requires_owned_io() {
             return self.0.disk.write_vectored(buffers, sector, fua).await;
         }
         if buffers.is_empty() {

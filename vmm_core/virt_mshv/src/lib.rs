@@ -1018,6 +1018,23 @@ impl virt::PartitionMemoryMapper for MshvPartition {
 
 // TODO: figure out a better abstraction that also works for KVM and WHP.
 impl virt::PartitionHostAccess for MshvPartitionInner {
+    fn install_user_locks(&self, locks: Arc<guestmem::GuestMemoryUserLocks>) -> anyhow::Result<()> {
+        #[cfg(guest_arch = "x86_64")]
+        if let Some(snp) = self.isolation.snp() {
+            return snp.install_user_locks(locks);
+        }
+        let _ = locks;
+        Ok(())
+    }
+
+    fn supports_user_locks(&self) -> bool {
+        #[cfg(guest_arch = "x86_64")]
+        if let Some(snp) = self.isolation.snp() {
+            return snp.supports_user_locks();
+        }
+        false
+    }
+
     fn requires_copy_only(&self) -> bool {
         #[cfg(guest_arch = "x86_64")]
         {
@@ -1058,6 +1075,21 @@ impl virt::PartitionMemoryMap for MshvPartitionInner {
         exec: bool,
     ) -> anyhow::Result<()> {
         let mut state = self.memory.lock();
+        #[cfg(guest_arch = "x86_64")]
+        let _changes = if let Some(snp) = self.isolation.snp() {
+            let mut changes = vec![snp.prepare_mapping_change(addr, size as u64)?];
+            for range in state.ranges.iter().flatten() {
+                if range.region.userspace_addr == data as u64 {
+                    changes.push(snp.prepare_mapping_change(
+                        range.region.guest_pfn << HV_PAGE_SHIFT,
+                        range.region.size,
+                    )?);
+                }
+            }
+            changes
+        } else {
+            Vec::new()
+        };
 
         // Memory slots cannot be resized but can be moved within the guest
         // address space. Find the existing slot if there is one.
@@ -1116,6 +1148,12 @@ impl virt::PartitionMemoryMap for MshvPartitionInner {
             .ok_or_else(|| anyhow::anyhow!("unmap range overflows the guest address space"))?
             >> HV_PAGE_SHIFT;
         let mut state = self.memory.lock();
+        #[cfg(guest_arch = "x86_64")]
+        let _change = self
+            .isolation
+            .snp()
+            .map(|snp| snp.prepare_mapping_change(addr, size))
+            .transpose()?;
         for range in state.ranges.iter().flatten() {
             let region_start = range.region.guest_pfn;
             let region_end = region_start

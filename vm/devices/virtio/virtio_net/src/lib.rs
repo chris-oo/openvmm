@@ -8,8 +8,9 @@
 //! single queue pair (one RX, one TX) and supports synchronous and asynchronous
 //! TX completion modes depending on the backend.
 //!
-//! [`NicBuilder::bounce_io`] enables owned staging for Consomme, TAP, and null
-//! software endpoints. The frontend uses a copy-only guest view for all queue
+//! Kernel-denied guest memory automatically enables owned staging for Consomme,
+//! TAP, and null software endpoints. [`NicBuilder::bounce_io`] can force this mode.
+//! The frontend uses a copy-only guest view for all queue
 //! and packet access. Backend addresses refer only to a separate aligned arena:
 //! 32 receive slots and 32 transmit slots, each 68 KiB (4.25 MiB per queue pair).
 //! Packets are limited to 64 KiB; packets larger than the MTU require negotiated
@@ -56,6 +57,8 @@ use pal_async::wait::PolledWait;
 use std::future::pending;
 use std::mem::offset_of;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::task::Poll;
 use task_control::AsyncRun;
 use task_control::InspectTaskMut;
@@ -241,7 +244,14 @@ struct Adapter {
     tx_fast_completions: bool,
     mac_address: MacAddress,
     tx_offload_support: TxOffloadSupport,
-    bounce_io: bool,
+    bounce_io: AtomicBool,
+    supports_bounce_io: bool,
+}
+
+impl Adapter {
+    fn bounce_io(&self) -> bool {
+        self.bounce_io.load(Ordering::Relaxed)
+    }
 }
 
 pub struct Device {
@@ -339,7 +349,20 @@ impl VirtioDevice for Device {
         features: &VirtioDeviceFeatures,
         initial_state: Option<QueueState>,
     ) -> anyhow::Result<()> {
-        if self.adapter.bounce_io {
+        if resources.guest_memory.requires_owned_io() && !self.adapter.bounce_io() {
+            anyhow::ensure!(
+                self.adapter.supports_bounce_io,
+                "owned network staging requires a software endpoint"
+            );
+            anyhow::ensure!(
+                self.pairs
+                    .iter()
+                    .all(|pair| matches!(pair, QueuePairState::Empty)),
+                "cannot change network memory policy with active queues"
+            );
+            self.adapter.bounce_io.store(true, Ordering::Relaxed);
+        }
+        if self.adapter.bounce_io() {
             anyhow::ensure!(
                 initial_state.is_none(),
                 "owned network staging does not support restore"
@@ -394,7 +417,7 @@ impl VirtioDevice for Device {
                     (queue_size, *pending_size)
                 };
                 let mut active_state = ActiveState::new(guest_memory.clone(), rx_size, tx_size);
-                if self.adapter.bounce_io {
+                if self.adapter.bounce_io() {
                     active_state
                         .pending_rx_packets
                         .enable_owned()
@@ -489,7 +512,7 @@ impl VirtioDevice for Device {
     }
 
     fn supports_save_restore(&self) -> bool {
-        !self.adapter.bounce_io
+        !self.adapter.bounce_io()
     }
 }
 
@@ -580,7 +603,8 @@ pub struct NicBuilder {
 
 impl NicBuilder {
     /// Keeps backend packet access in bounded, frontend-owned scratch memory.
-    /// The default is disabled. Only software endpoints support this mode.
+    /// The default does not force staging. Kernel-denied guest memory enables
+    /// staging automatically. Only software endpoints support this mode.
     pub fn bounce_io(mut self, bounce_io: bool) -> Self {
         self.bounce_io = bounce_io;
         self
@@ -606,11 +630,11 @@ impl NicBuilder {
         endpoint: Box<dyn Endpoint>,
         mac_address: MacAddress,
     ) -> anyhow::Result<Device> {
+        let supports_bounce_io = matches!(endpoint.endpoint_type(), "consomme" | "tap" | "null")
+            || cfg!(test) && endpoint.endpoint_type() == "mock";
         if self.bounce_io {
-            let supported = matches!(endpoint.endpoint_type(), "consomme" | "tap" | "null")
-                || cfg!(test) && endpoint.endpoint_type() == "mock";
             anyhow::ensure!(
-                supported,
+                supports_bounce_io,
                 "owned network staging requires a software endpoint"
             );
         }
@@ -635,7 +659,8 @@ impl NicBuilder {
             tx_fast_completions: endpoint.tx_fast_completions(),
             mac_address,
             tx_offload_support,
-            bounce_io: self.bounce_io,
+            bounce_io: AtomicBool::new(self.bounce_io),
+            supports_bounce_io,
         });
 
         let coordinator = TaskControl::new(CoordinatorState {
@@ -832,7 +857,7 @@ impl Coordinator {
             worker.task_mut().state = None;
         }
 
-        if c_state.adapter.bounce_io && had_queues {
+        if c_state.adapter.bounce_io() && had_queues {
             // Endpoint::stop requires all queues to be dropped first. Do not
             // release any scratch or create a new consumer until it returns.
             self.owned_restart_pending = true;

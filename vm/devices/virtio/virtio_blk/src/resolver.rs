@@ -11,6 +11,7 @@ use disk_backend_resources::LayeredDiskHandle;
 use disk_backend_resources::layer::RamDiskLayerHandle;
 use virtio::resolve::ResolvedVirtioDevice;
 use virtio::resolve::VirtioResolveInput;
+use virtio_resources::blk::VirtioBlkAutoHandle;
 use virtio_resources::blk::VirtioBlkBounceDiskHandle;
 use virtio_resources::blk::VirtioBlkHandle;
 use vm_resource::AsyncResolveResource;
@@ -54,7 +55,30 @@ fn validate_bounce_file(file: &std::fs::File) -> anyhow::Result<()> {
 declare_static_async_resolver! {
     VirtioBlkResolver,
     (VirtioDeviceHandle, VirtioBlkHandle),
+    (VirtioDeviceHandle, VirtioBlkAutoHandle),
     (DiskHandleKind, VirtioBlkBounceDiskHandle),
+}
+
+#[async_trait]
+impl AsyncResolveResource<VirtioDeviceHandle, VirtioBlkAutoHandle> for VirtioBlkResolver {
+    type Output = ResolvedVirtioDevice;
+    type Error = anyhow::Error;
+
+    async fn resolve(
+        &self,
+        resolver: &ResourceResolver,
+        resource: VirtioBlkAutoHandle,
+        input: VirtioResolveInput<'_>,
+    ) -> Result<Self::Output, Self::Error> {
+        let mut device = resource.device;
+        if input.bounce_io(device.bounce_io) {
+            device.disk = resource.bounce_disk;
+        }
+        <Self as AsyncResolveResource<VirtioDeviceHandle, VirtioBlkHandle>>::resolve(
+            self, resolver, device, input,
+        )
+        .await
+    }
 }
 
 #[async_trait]
@@ -68,7 +92,10 @@ impl AsyncResolveResource<VirtioDeviceHandle, VirtioBlkHandle> for VirtioBlkReso
         resource: VirtioBlkHandle,
         input: VirtioResolveInput<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        if resource.bounce_io {
+        let bounce_io = input.bounce_io(resource.bounce_io);
+        let bounce_supported = resource.disk.id() == VirtioBlkBounceDiskHandle::ID;
+        let deferred_bounce = bounce_supported && input.guest_memory.is_none();
+        if bounce_io {
             validate_bounce_resource_id(resource.disk.id())?;
         }
         let disk = resolver
@@ -80,7 +107,9 @@ impl AsyncResolveResource<VirtioDeviceHandle, VirtioBlkHandle> for VirtioBlkReso
                 },
             )
             .await?;
-        if resource.bounce_io && disk.0.sector_size() as usize > scsi_buffers::MAX_BOUNCE_IO_SIZE {
+        if (bounce_io || deferred_bounce)
+            && disk.0.sector_size() as usize > scsi_buffers::MAX_BOUNCE_IO_SIZE
+        {
             anyhow::bail!("bounce I/O does not support sectors larger than the request limit");
         }
 
@@ -90,7 +119,12 @@ impl AsyncResolveResource<VirtioDeviceHandle, VirtioBlkHandle> for VirtioBlkReso
             resource.read_only,
             resource.serial,
         )?;
-        let device = if resource.bounce_io {
+        let device = if deferred_bounce {
+            device.with_bounce_support()
+        } else {
+            device
+        };
+        let device = if bounce_io {
             device.with_bounce_io()
         } else {
             device
@@ -145,6 +179,15 @@ mod tests {
         disk: Resource<DiskHandleKind>,
         driver: DefaultDriver,
     ) -> anyhow::Result<ResolvedVirtioDevice> {
+        resolve_disk(disk, driver, true, &guestmem::GuestMemory::allocate(4096)).await
+    }
+
+    async fn resolve_disk(
+        disk: Resource<DiskHandleKind>,
+        driver: DefaultDriver,
+        force: bool,
+        memory: &guestmem::GuestMemory,
+    ) -> anyhow::Result<ResolvedVirtioDevice> {
         let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver));
         let mut resolver = ResourceResolver::new();
         resolver.add_async_resolver::<VirtioDeviceHandle, _, VirtioBlkHandle, _>(VirtioBlkResolver);
@@ -157,14 +200,89 @@ mod tests {
                     disk,
                     read_only: false,
                     serial: None,
-                    bounce_io: true,
+                    bounce_io: force,
                 }
                 .into_resource(),
                 VirtioResolveInput {
                     driver_source: &driver_source,
+                    guest_memory: Some(memory),
                 },
             )
             .await?)
+    }
+
+    #[async_test]
+    async fn automatic_bounce_rejects_generic_resource_before_resolution(driver: DefaultDriver) {
+        let memory = guestmem::GuestMemory::allocate(4096)
+            .with_io_policy(guestmem::GuestMemoryIoPolicy::CopyOnly);
+        assert!(!memory.supports_kernel_lock());
+        let disk =
+            disk_backend_resources::FileDiskHandle(std::fs::File::open("Cargo.toml").unwrap())
+                .into_resource();
+        let error = resolve_disk(disk, driver, false, &memory)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            format!("{error:#}")
+                .contains("bounce I/O requires a reviewed regular-file or RAM disk resource"),
+            "{error:#}"
+        );
+    }
+
+    #[async_test]
+    async fn automatic_handle_does_not_admit_unreviewed_alternative(driver: DefaultDriver) {
+        let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver));
+        let memory = guestmem::GuestMemory::allocate(4096)
+            .with_io_policy(guestmem::GuestMemoryIoPolicy::CopyOnly);
+        let error = <VirtioBlkResolver as AsyncResolveResource<
+            VirtioDeviceHandle,
+            VirtioBlkAutoHandle,
+        >>::resolve(
+            &VirtioBlkResolver,
+            &ResourceResolver::new(),
+            VirtioBlkAutoHandle {
+                device: VirtioBlkHandle {
+                    disk: VirtioBlkBounceDiskHandle::Ram { len: 4096 }.into_resource(),
+                    read_only: false,
+                    serial: None,
+                    bounce_io: false,
+                },
+                bounce_disk: disk_backend_resources::FileDiskHandle(
+                    std::fs::File::open("Cargo.toml").unwrap(),
+                )
+                .into_resource(),
+            },
+            VirtioResolveInput {
+                driver_source: &driver_source,
+                guest_memory: Some(&memory),
+            },
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("requires a reviewed regular-file or RAM disk resource")
+        );
+    }
+
+    #[async_test]
+    async fn direct_memory_does_not_require_bounce_resource(driver: DefaultDriver) {
+        let memory = guestmem::GuestMemory::allocate(4096);
+        assert!(memory.supports_kernel_lock());
+        let disk =
+            disk_backend_resources::FileDiskHandle(std::fs::File::open("Cargo.toml").unwrap())
+                .into_resource();
+        match resolve_disk(disk, driver, false, &memory).await {
+            Ok(device) => assert!(device.0.supports_save_restore()),
+            Err(error) => assert!(
+                !format!("{error:#}")
+                    .contains("bounce I/O requires a reviewed regular-file or RAM disk resource"),
+                "{error:#}"
+            ),
+        }
     }
 
     #[async_test]

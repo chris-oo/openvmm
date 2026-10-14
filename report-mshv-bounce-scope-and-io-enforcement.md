@@ -37,6 +37,48 @@ The earlier control-registry discussion below is historical, not a claim that
 the removed table is required. Source-contract review does not establish an
 exact source-to-running-hypervisor binary match or complete isolation proof.
 
+## Follow-up: separate locking capabilities and protected CPU loans
+
+The next user-approved change separates `supports_kernel_lock()` from
+`supports_user_lock()`. `supports_locking()` retains its kernel-access
+meaning. Devices select owned staging from the actual memory's kernel-lock
+capability, while explicit bounce options still force staging. Unsupported
+kernel-dependent paths reject memory rather than export guest pages.
+`requires_owned_io()` distinguishes enforced ownership from raw-lock
+availability. Ordinary IOMMU-translated memory keeps its existing copying
+fallbacks, but forwards any underlying ownership restriction.
+
+`lock_user_gpns()` returns a CPU-only `UserLockedPages` handle. It reserves
+pages before probes, rolls back failed setup, and keeps the backing owner
+alive through unlock. These loans protect CPU addresses and permissions, not
+OS residency or concurrent byte access. They do not authorize GUP or DMA.
+
+MSHV SNP shares loan tracking with mapping and permission changes. A complete
+guest request is checked before permissions are released. A loan conflict
+halts the requesting VP and retains the locked permissions. Transient change
+guards exclude new loans while control or mapping operations run. Ordinary
+fault-contained copies remain revocable and do not register loans.
+
+This is not the deleted control-binding registry: it tracks explicit CPU
+pointer lifetimes, not persistent GHCB, doorbell, or VMSA identities. Kernel
+control-page ownership remains authoritative.
+
+Implementation and local validation are complete: 693 combined package
+tests passed, with package clippy/rustdoc, repository formatting, and an ARM
+MSHV check. Formal review accepted the mapping, teardown, and halt fixes;
+rubber-duck review accepted the device and foundation fixes. The static
+MSHV/Consomme candidate builds.
+
+Fresh hardware validation is blocked by test-host connectivity. The first
+SSH connection timed out before deployment or guest launch. A bounded retry
+and a Windows-side TCP check also failed. Candidate artifacts are retained
+in `target/protected-user-loans-hardware/`. Earlier hardware results do not
+validate the new CPU-loan paths, and the planned normal lifecycle does not
+exercise an explicit loan conflicting with a real guest transition.
+
+Logical submission groups remain queued for discussion. History has not yet
+been reorganized.
+
 ## Summary
 
 - Most virtio changes implement owned staging, asynchronous buffer retention,

@@ -338,6 +338,84 @@ mod tests {
     }
 
     #[pal_async::async_test]
+    async fn secondary_loans_precede_partition_unmap(spawn: impl Spawn) {
+        let mm = MappingManager::new_without_primary(&spawn, 0x10000, None);
+        let mapper = mm.client().new_mapper(true).await.unwrap();
+        let secondary = mm.client().new_local_secondary_mapper().await.unwrap();
+        let regions = RegionManager::new(&spawn, mm.client().clone());
+        let mut region = regions
+            .client()
+            .new_region(
+                "loan-partition".into(),
+                MemoryRange::new(0..0x4000),
+                0,
+                MappingType::Ram,
+            )
+            .await
+            .unwrap();
+        region
+            .add_mapping(
+                MemoryRange::new(0..0x4000),
+                MappingBacking::File {
+                    mappable: sparse_mmap::alloc_shared_memory(0x4000, "loan-partition")
+                        .unwrap()
+                        .into(),
+                    file_offset: 0,
+                },
+                true,
+                MemoryPolicy::none(),
+            )
+            .await
+            .unwrap();
+        region
+            .map(MapParams {
+                writable: true,
+                executable: false,
+                prefetch: false,
+            })
+            .await
+            .unwrap();
+        let unmaps = Arc::new(AtomicUsize::new(0));
+        let partition: Arc<dyn PartitionMemoryMap> = Arc::new(TestPartition {
+            owner: Arc::new(KernelOwner {
+                _kernel: DropEvent {
+                    events: Arc::new(Mutex::new(Vec::new())),
+                    name: "kernel",
+                },
+                backing: Mutex::new(Vec::new()),
+            }),
+            retain: false,
+            unmaps: unmaps.clone(),
+        });
+        regions
+            .client()
+            .add_partition(PartitionMapper::new(
+                &partition,
+                mapper,
+                0,
+                false,
+                Arc::new(()),
+            ))
+            .await
+            .unwrap();
+        let gm = GuestMemory::new("secondary partition", secondary);
+        let first = gm
+            .lock_user_gpns(guestmem::AccessType::Read, &[0, 1])
+            .unwrap();
+        let second = gm.lock_user_gpns(guestmem::AccessType::Read, &[1]).unwrap();
+        assert!(region.unmap().await.is_err());
+        assert!(region.teardown().await.is_err());
+        assert_eq!(unmaps.load(Ordering::Relaxed), 0);
+        drop(first);
+        assert!(region.teardown().await.is_err());
+        assert_eq!(unmaps.load(Ordering::Relaxed), 0);
+        drop(second);
+        region.teardown().await.unwrap();
+        assert_eq!(unmaps.load(Ordering::Relaxed), 1);
+        assert!(gm.read_plain::<u64>(0).is_err());
+    }
+
+    #[pal_async::async_test]
     async fn attached_file_backing_survives_memory_manager_drop() {
         use crate::memory_manager::GuestMemoryBuilder;
         use crate::memory_manager::RamBackingRequest;

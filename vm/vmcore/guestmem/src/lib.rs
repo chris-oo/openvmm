@@ -8,6 +8,9 @@
 #![expect(missing_docs)]
 
 pub mod ranges;
+mod user_locks;
+
+pub use user_locks::{GuestMemoryChangeGuard, GuestMemoryUserLockError, GuestMemoryUserLocks};
 
 use guestmem_core::ranges::PagedRange;
 use inspect::Inspect;
@@ -56,7 +59,7 @@ pub enum GuestMemoryIoPolicy {
     /// Allow direct IO through exported mappings or shared backing.
     #[default]
     Direct,
-    /// Allow bounded memory operations, but do not export the backing.
+    /// Require owned staging for IO. Protected CPU-only page loans remain allowed.
     CopyOnly,
 }
 
@@ -492,9 +495,20 @@ pub unsafe trait GuestMemoryAccess: 'static + Send + Sync {
     /// Locks the specified guest physical pages (GPNs), preventing any mapping
     /// or permission changes until they are unlocked.
     ///
+    /// Called before probes, permission acquisition, or kernel VA preparation.
+    /// Overlapping handles must remain valid independently. An error must
+    /// release every reservation acquired by this call.
+    ///
+    /// `with_kernel_access` is `true` for kernel IO and `false` for CPU-only
+    /// loans. It does not itself request a kernel pin or GUP operation.
+    ///
     /// Returns a boolean indicating whether unlocking is required.
-    fn lock_gpns(&self, gpns: &[u64]) -> Result<bool, GuestMemoryBackingError> {
-        let _ = gpns;
+    fn lock_gpns(
+        &self,
+        gpns: &[u64],
+        with_kernel_access: bool,
+    ) -> Result<bool, GuestMemoryBackingError> {
+        let _ = (gpns, with_kernel_access);
         Ok(false)
     }
 
@@ -516,6 +530,14 @@ pub unsafe trait GuestMemoryAccess: 'static + Send + Sync {
         None
     }
 
+    /// Retains an external mapping or partition owner through unlocking.
+    ///
+    /// Fail if a required owner is unavailable. This hook runs before the
+    /// reservation and probes. Its result is dropped only after unlocking.
+    fn lock_lifetime(&self) -> Result<Option<Arc<dyn Send + Sync>>, GuestMemoryBackingError> {
+        Ok(None)
+    }
+
     /// Returns whether this backing supports locking pages via
     /// [`lock_gpns`](Self::lock_gpns).
     ///
@@ -526,16 +548,55 @@ pub unsafe trait GuestMemoryAccess: 'static + Send + Sync {
     /// Callers that use locking as a zero-copy fast path should check this and
     /// fall back to a copying path when it returns `false`.
     ///
-    /// This is authoritative: when it returns `false`, the corresponding
-    /// [`GuestMemory`] locking APIs fail without invoking
-    /// [`lock_gpns`](Self::lock_gpns).
+    /// This is the legacy kernel capability. The split capabilities default to
+    /// this value, but a backing may separately allow protected CPU-only loans.
     fn supports_locking(&self) -> bool {
         self.mapping().is_some()
+    }
+
+    /// Returns whether locked pages can be prepared for kernel IO.
+    /// The default respects existing `supports_locking` overrides.
+    fn supports_kernel_lock(&self) -> bool {
+        self.supports_locking()
+    }
+
+    /// Returns whether IO must use owned staging instead of guest pointers.
+    ///
+    /// Translation-only backings may override this to delegate the underlying
+    /// memory's IO restriction even though they cannot expose a raw mapping.
+    fn requires_owned_io(&self) -> bool {
+        !self.supports_kernel_lock()
+    }
+
+    /// Returns whether a protected CPU-only loan has a stable mapping.
+    ///
+    /// Backings that deny kernel locking but support protected CPU access must
+    /// override this and provide the reservation contract in `lock_gpns`.
+    fn supports_user_lock(&self) -> bool {
+        self.mapping().is_some() && self.supports_locking()
+    }
+}
+
+/// An owned backing reservation, released when the lock handle is dropped.
+struct GuestMemoryBackingLock {
+    _guard: Box<dyn Send + Sync>,
+}
+
+impl GuestMemoryBackingLock {
+    /// Retains an owned guard that releases the reservation on drop.
+    fn new(guard: impl Send + Sync + 'static) -> Self {
+        Self {
+            _guard: Box::new(guard),
+        }
     }
 }
 
 trait DynGuestMemoryAccess: 'static + Send + Sync + Any {
     fn io_policy(&self) -> GuestMemoryIoPolicy;
+    fn supports_kernel_lock(&self) -> bool;
+    fn supports_user_lock(&self) -> bool;
+    fn requires_owned_io(&self) -> bool;
+    fn lock_lifetime(&self) -> Result<Option<Arc<dyn Send + Sync>>, GuestMemoryBackingError>;
 
     fn subrange(
         &self,
@@ -581,7 +642,13 @@ trait DynGuestMemoryAccess: 'static + Send + Sync + Any {
 
     fn expose_va(&self, address: u64, len: u64) -> Result<(), GuestMemoryBackingError>;
 
-    fn lock_gpns(&self, gpns: &[u64]) -> Result<bool, GuestMemoryBackingError>;
+    fn reserve_gpns(
+        &self,
+        owner: Arc<GuestMemoryInner>,
+        access: AccessType,
+        with_kernel_access: bool,
+        gpns: &[u64],
+    ) -> Result<GuestMemoryBackingLock, GuestMemoryBackingError>;
 
     fn unlock_gpns(&self, gpns: &[u64]);
 
@@ -591,6 +658,22 @@ trait DynGuestMemoryAccess: 'static + Send + Sync + Any {
 impl<T: GuestMemoryAccess> DynGuestMemoryAccess for T {
     fn io_policy(&self) -> GuestMemoryIoPolicy {
         GuestMemoryAccess::io_policy(self)
+    }
+
+    fn supports_kernel_lock(&self) -> bool {
+        GuestMemoryAccess::supports_kernel_lock(self)
+    }
+
+    fn supports_user_lock(&self) -> bool {
+        GuestMemoryAccess::supports_user_lock(self)
+    }
+
+    fn requires_owned_io(&self) -> bool {
+        GuestMemoryAccess::requires_owned_io(self)
+    }
+
+    fn lock_lifetime(&self) -> Result<Option<Arc<dyn Send + Sync>>, GuestMemoryBackingError> {
+        GuestMemoryAccess::lock_lifetime(self)
     }
 
     fn subrange(
@@ -649,8 +732,24 @@ impl<T: GuestMemoryAccess> DynGuestMemoryAccess for T {
         self.expose_va(address, len)
     }
 
-    fn lock_gpns(&self, gpns: &[u64]) -> Result<bool, GuestMemoryBackingError> {
-        self.lock_gpns(gpns)
+    fn reserve_gpns(
+        &self,
+        owner: Arc<GuestMemoryInner>,
+        access: AccessType,
+        with_kernel_access: bool,
+        gpns: &[u64],
+    ) -> Result<GuestMemoryBackingLock, GuestMemoryBackingError> {
+        if let Some(range) = (self as &dyn Any).downcast_ref::<GuestMemoryAccessRange>() {
+            return range.reserve_gpns(access, with_kernel_access, gpns);
+        }
+        if GuestMemoryAccess::lock_gpns(self, gpns, with_kernel_access)? {
+            Ok(GuestMemoryBackingLock::new(LegacyBackingLock {
+                owner,
+                gpns: gpns.into(),
+            }))
+        } else {
+            Ok(GuestMemoryBackingLock::new(()))
+        }
     }
 
     fn unlock_gpns(&self, gpns: &[u64]) {
@@ -687,102 +786,135 @@ pub struct BitmapInfo {
     pub bit_offset: u8,
 }
 
-// SAFETY: passing through guarantees from `T`.
-unsafe impl<T: GuestMemoryAccess> GuestMemoryAccess for Arc<T> {
-    fn io_policy(&self) -> GuestMemoryIoPolicy {
-        self.as_ref().io_policy()
-    }
+macro_rules! impl_guest_memory_access_ref {
+    ($wrapper:ty) => {
+        // SAFETY: passing through guarantees from `T`.
+        unsafe impl<T: GuestMemoryAccess> GuestMemoryAccess for $wrapper {
+            fn io_policy(&self) -> GuestMemoryIoPolicy {
+                (**self).io_policy()
+            }
 
-    fn mapping(&self) -> Option<NonNull<u8>> {
-        self.as_ref().mapping()
-    }
+            fn mapping(&self) -> Option<NonNull<u8>> {
+                (**self).mapping()
+            }
 
-    fn max_address(&self) -> u64 {
-        self.as_ref().max_address()
-    }
+            fn max_address(&self) -> u64 {
+                (**self).max_address()
+            }
 
-    #[cfg(feature = "bitmap")]
-    fn access_bitmap(&self) -> Option<BitmapInfo> {
-        self.as_ref().access_bitmap()
-    }
+            #[cfg(feature = "bitmap")]
+            fn access_bitmap(&self) -> Option<BitmapInfo> {
+                (**self).access_bitmap()
+            }
 
-    fn subrange(
-        &self,
-        offset: u64,
-        len: u64,
-        allow_preemptive_locking: bool,
-    ) -> Result<Option<GuestMemory>, GuestMemoryBackingError> {
-        self.as_ref()
-            .subrange(offset, len, allow_preemptive_locking)
-    }
+            fn subrange(
+                &self,
+                offset: u64,
+                len: u64,
+                allow_preemptive_locking: bool,
+            ) -> Result<Option<GuestMemory>, GuestMemoryBackingError> {
+                (**self).subrange(offset, len, allow_preemptive_locking)
+            }
 
-    fn page_fault(
-        &self,
-        addr: u64,
-        len: usize,
-        write: bool,
-        bitmap_failure: bool,
-    ) -> PageFaultAction {
-        self.as_ref().page_fault(addr, len, write, bitmap_failure)
-    }
+            fn page_fault(
+                &self,
+                addr: u64,
+                len: usize,
+                write: bool,
+                bitmap_failure: bool,
+            ) -> PageFaultAction {
+                (**self).page_fault(addr, len, write, bitmap_failure)
+            }
 
-    unsafe fn read_fallback(
-        &self,
-        addr: u64,
-        dest: *mut u8,
-        len: usize,
-    ) -> Result<(), GuestMemoryBackingError> {
-        // SAFETY: passing through guarantees from caller.
-        unsafe { self.as_ref().read_fallback(addr, dest, len) }
-    }
+            unsafe fn read_fallback(
+                &self,
+                addr: u64,
+                dest: *mut u8,
+                len: usize,
+            ) -> Result<(), GuestMemoryBackingError> {
+                // SAFETY: passing through guarantees from caller.
+                unsafe { (**self).read_fallback(addr, dest, len) }
+            }
 
-    unsafe fn write_fallback(
-        &self,
-        addr: u64,
-        src: *const u8,
-        len: usize,
-    ) -> Result<(), GuestMemoryBackingError> {
-        // SAFETY: passing through guarantees from caller.
-        unsafe { self.as_ref().write_fallback(addr, src, len) }
-    }
+            unsafe fn write_fallback(
+                &self,
+                addr: u64,
+                src: *const u8,
+                len: usize,
+            ) -> Result<(), GuestMemoryBackingError> {
+                // SAFETY: passing through guarantees from caller.
+                unsafe { (**self).write_fallback(addr, src, len) }
+            }
 
-    fn fill_fallback(&self, addr: u64, val: u8, len: usize) -> Result<(), GuestMemoryBackingError> {
-        self.as_ref().fill_fallback(addr, val, len)
-    }
+            fn fill_fallback(
+                &self,
+                addr: u64,
+                val: u8,
+                len: usize,
+            ) -> Result<(), GuestMemoryBackingError> {
+                (**self).fill_fallback(addr, val, len)
+            }
 
-    fn compare_exchange_fallback(
-        &self,
-        addr: u64,
-        current: &mut [u8],
-        new: &[u8],
-    ) -> Result<bool, GuestMemoryBackingError> {
-        self.as_ref().compare_exchange_fallback(addr, current, new)
-    }
+            fn compare_exchange_fallback(
+                &self,
+                addr: u64,
+                current: &mut [u8],
+                new: &[u8],
+            ) -> Result<bool, GuestMemoryBackingError> {
+                (**self).compare_exchange_fallback(addr, current, new)
+            }
 
-    fn expose_va(&self, address: u64, len: u64) -> Result<(), GuestMemoryBackingError> {
-        self.as_ref().expose_va(address, len)
-    }
+            fn expose_va(&self, address: u64, len: u64) -> Result<(), GuestMemoryBackingError> {
+                (**self).expose_va(address, len)
+            }
 
-    fn base_iova(&self) -> Option<u64> {
-        self.as_ref().base_iova()
-    }
+            fn base_iova(&self) -> Option<u64> {
+                (**self).base_iova()
+            }
 
-    fn sharing(&self) -> Option<GuestMemorySharing> {
-        self.as_ref().sharing()
-    }
+            fn sharing(&self) -> Option<GuestMemorySharing> {
+                (**self).sharing()
+            }
 
-    fn supports_locking(&self) -> bool {
-        self.as_ref().supports_locking()
-    }
+            fn supports_locking(&self) -> bool {
+                (**self).supports_locking()
+            }
 
-    fn lock_gpns(&self, gpns: &[u64]) -> Result<bool, GuestMemoryBackingError> {
-        self.as_ref().lock_gpns(gpns)
-    }
+            fn supports_kernel_lock(&self) -> bool {
+                (**self).supports_kernel_lock()
+            }
 
-    fn unlock_gpns(&self, gpns: &[u64]) {
-        self.as_ref().unlock_gpns(gpns)
-    }
+            fn supports_user_lock(&self) -> bool {
+                (**self).supports_user_lock()
+            }
+
+            fn requires_owned_io(&self) -> bool {
+                (**self).requires_owned_io()
+            }
+
+            fn lock_lifetime(
+                &self,
+            ) -> Result<Option<Arc<dyn Send + Sync>>, GuestMemoryBackingError> {
+                (**self).lock_lifetime()
+            }
+
+            fn lock_gpns(
+                &self,
+                gpns: &[u64],
+                with_kernel_access: bool,
+            ) -> Result<bool, GuestMemoryBackingError> {
+                (**self).lock_gpns(gpns, with_kernel_access)
+            }
+
+            fn unlock_gpns(&self, gpns: &[u64]) {
+                (**self).unlock_gpns(gpns)
+            }
+        }
+    };
 }
+
+impl_guest_memory_access_ref!(Arc<T>);
+impl_guest_memory_access_ref!(&'static T);
 
 // SAFETY: the allocation will stay valid for the lifetime of the object.
 unsafe impl GuestMemoryAccess for sparse_mmap::SparseMapping {
@@ -802,6 +934,7 @@ struct GuestMemoryAccessRange {
     offset: u64,
     len: u64,
     region: usize,
+    view: Option<GuestMemory>,
 }
 
 impl GuestMemoryAccessRange {
@@ -816,24 +949,114 @@ impl GuestMemoryAccessRange {
             ))
         }
     }
+
+    fn access(&self, address: u64) -> (&dyn DynGuestMemoryAccess, u64) {
+        match &self.view {
+            Some(view) => (&view.inner.imp, address),
+            None => (&self.base.imp, self.offset + address),
+        }
+    }
+
+    fn parent_gpns(&self, gpns: &[u64]) -> Result<Vec<u64>, GuestMemoryBackingError> {
+        let mut parent_gpns = Vec::new();
+        for &gpn in gpns {
+            let address = self.adjust_range(
+                gpn_to_gpa(gpn).map_err(GuestMemoryBackingError::gpn)?,
+                PAGE_SIZE64,
+            )?;
+            let first = address / PAGE_SIZE64;
+            let last = address.div_ceil(PAGE_SIZE64);
+            parent_gpns.extend(first..=last);
+        }
+        Ok(parent_gpns)
+    }
+
+    fn reserve_gpns(
+        &self,
+        access: AccessType,
+        with_kernel_access: bool,
+        gpns: &[u64],
+    ) -> Result<GuestMemoryBackingLock, GuestMemoryBackingError> {
+        let parent_gpns = self.parent_gpns(gpns)?;
+        let parent = self.base.imp.reserve_gpns(
+            self.base.clone(),
+            access,
+            with_kernel_access,
+            &parent_gpns,
+        )?;
+        let child = self
+            .view
+            .as_ref()
+            .map(|view| {
+                view.inner
+                    .imp
+                    .reserve_gpns(view.inner.clone(), access, with_kernel_access, gpns)
+            })
+            .transpose()?;
+        Ok(GuestMemoryBackingLock::new((parent, child)))
+    }
 }
 
 // SAFETY: `mapping()` is guaranteed to be valid for the lifetime of the object.
 unsafe impl GuestMemoryAccess for GuestMemoryAccessRange {
     fn io_policy(&self) -> GuestMemoryIoPolicy {
-        if self.io_policy == GuestMemoryIoPolicy::CopyOnly {
-            self.io_policy
+        if self.io_policy == GuestMemoryIoPolicy::CopyOnly
+            || self
+                .view
+                .as_ref()
+                .is_some_and(|view| view.io_policy() == GuestMemoryIoPolicy::CopyOnly)
+        {
+            GuestMemoryIoPolicy::CopyOnly
         } else {
             self.base.io_policy()
         }
     }
 
     fn supports_locking(&self) -> bool {
+        GuestMemoryAccess::supports_kernel_lock(self)
+    }
+
+    fn supports_kernel_lock(&self) -> bool {
         GuestMemoryAccess::io_policy(self) == GuestMemoryIoPolicy::Direct
-            && self.base.supports_locking
+            && self.base.imp.supports_kernel_lock()
+            && self
+                .view
+                .as_ref()
+                .is_none_or(GuestMemory::supports_kernel_lock)
+    }
+
+    fn supports_user_lock(&self) -> bool {
+        self.base.imp.supports_user_lock()
+            && self
+                .view
+                .as_ref()
+                .is_none_or(GuestMemory::supports_user_lock)
+    }
+
+    fn requires_owned_io(&self) -> bool {
+        GuestMemoryAccess::io_policy(self) == GuestMemoryIoPolicy::CopyOnly
+            || self.base.imp.requires_owned_io()
+            || self
+                .view
+                .as_ref()
+                .is_some_and(GuestMemory::requires_owned_io)
+    }
+
+    fn lock_lifetime(&self) -> Result<Option<Arc<dyn Send + Sync>>, GuestMemoryBackingError> {
+        let parent = self.base.imp.lock_lifetime()?;
+        let child = self
+            .view
+            .as_ref()
+            .map(|view| view.inner.imp.lock_lifetime())
+            .transpose()?
+            .flatten();
+        Ok(Some(Arc::new((parent, child))))
     }
 
     fn mapping(&self) -> Option<NonNull<u8>> {
+        if let Some(view) = &self.view {
+            return view.inner.regions.first()?.mapping.map(|mapping| mapping.0);
+        }
         let region = &self.base.regions[self.region];
         region.mapping.and_then(|mapping| {
             let offset = self.offset & self.base.region_def.region_mask;
@@ -849,11 +1072,44 @@ unsafe impl GuestMemoryAccess for GuestMemoryAccessRange {
         self.len
     }
 
+    fn subrange(
+        &self,
+        offset: u64,
+        len: u64,
+        _allow_preemptive_locking: bool,
+    ) -> Result<Option<GuestMemory>, GuestMemoryBackingError> {
+        let address = self.adjust_range(offset, len)?;
+        let view = self
+            .view
+            .as_ref()
+            .map(|view| {
+                view.subrange(offset, len, false)
+                    .map_err(|err| GuestMemoryBackingError::other(offset, err))
+            })
+            .transpose()?;
+        Ok(Some(GuestMemory::new(
+            self.base.debug_name.clone(),
+            GuestMemoryAccessRange {
+                base: self.base.clone(),
+                io_policy: GuestMemoryAccess::io_policy(self),
+                offset: address,
+                len,
+                region: self.region,
+                view,
+            },
+        )))
+    }
+
     #[cfg(feature = "bitmap")]
     fn access_bitmap(&self) -> Option<BitmapInfo> {
-        let region = &self.base.regions[self.region];
+        let (region, offset) = match &self.view {
+            Some(view) => (&view.inner.regions[0], 0),
+            None => (
+                &self.base.regions[self.region],
+                self.offset & self.base.region_def.region_mask,
+            ),
+        };
         region.bitmaps.map(|bitmaps| {
-            let offset = self.offset & self.base.region_def.region_mask;
             let bit_offset = region.bitmap_start as u64 + offset / PAGE_SIZE64;
             let [read_bitmap, write_bitmap] = bitmaps.map(|SendPtrU8(ptr)| {
                 // SAFETY: the bitmap is guaranteed to be big enough for the region
@@ -869,25 +1125,6 @@ unsafe impl GuestMemoryAccess for GuestMemoryAccessRange {
         })
     }
 
-    fn subrange(
-        &self,
-        offset: u64,
-        len: u64,
-        _allow_preemptive_locking: bool,
-    ) -> Result<Option<GuestMemory>, GuestMemoryBackingError> {
-        let address = self.adjust_range(offset, len)?;
-        Ok(Some(GuestMemory::new(
-            self.base.debug_name.clone(),
-            GuestMemoryAccessRange {
-                base: self.base.clone(),
-                io_policy: self.io_policy,
-                offset: address,
-                len,
-                region: self.region,
-            },
-        )))
-    }
-
     fn page_fault(
         &self,
         address: u64,
@@ -895,13 +1132,10 @@ unsafe impl GuestMemoryAccess for GuestMemoryAccessRange {
         write: bool,
         bitmap_failure: bool,
     ) -> PageFaultAction {
-        let address = self
-            .adjust_range(address, len as u64)
+        self.adjust_range(address, len as u64)
             .expect("the caller should have validated the range was in the mapping");
-
-        self.base
-            .imp
-            .page_fault(address, len, write, bitmap_failure)
+        let (imp, address) = self.access(address);
+        imp.page_fault(address, len, write, bitmap_failure)
     }
 
     unsafe fn write_fallback(
@@ -910,9 +1144,10 @@ unsafe impl GuestMemoryAccess for GuestMemoryAccessRange {
         src: *const u8,
         len: usize,
     ) -> Result<(), GuestMemoryBackingError> {
-        let address = self.adjust_range(address, len as u64)?;
+        self.adjust_range(address, len as u64)?;
+        let (imp, address) = self.access(address);
         // SAFETY: guaranteed by caller.
-        unsafe { self.base.imp.write_fallback(address, src, len) }
+        unsafe { imp.write_fallback(address, src, len) }
     }
 
     fn fill_fallback(
@@ -921,8 +1156,9 @@ unsafe impl GuestMemoryAccess for GuestMemoryAccessRange {
         val: u8,
         len: usize,
     ) -> Result<(), GuestMemoryBackingError> {
-        let address = self.adjust_range(address, len as u64)?;
-        self.base.imp.fill_fallback(address, val, len)
+        self.adjust_range(address, len as u64)?;
+        let (imp, address) = self.access(address);
+        imp.fill_fallback(address, val, len)
     }
 
     fn compare_exchange_fallback(
@@ -931,10 +1167,9 @@ unsafe impl GuestMemoryAccess for GuestMemoryAccessRange {
         current: &mut [u8],
         new: &[u8],
     ) -> Result<bool, GuestMemoryBackingError> {
-        let address = self.adjust_range(addr, new.len() as u64)?;
-        self.base
-            .imp
-            .compare_exchange_fallback(address, current, new)
+        self.adjust_range(addr, new.len() as u64)?;
+        let (imp, address) = self.access(addr);
+        imp.compare_exchange_fallback(address, current, new)
     }
 
     unsafe fn read_fallback(
@@ -943,17 +1178,26 @@ unsafe impl GuestMemoryAccess for GuestMemoryAccessRange {
         dest: *mut u8,
         len: usize,
     ) -> Result<(), GuestMemoryBackingError> {
-        let address = self.adjust_range(address, len as u64)?;
+        self.adjust_range(address, len as u64)?;
+        let (imp, address) = self.access(address);
         // SAFETY: guaranteed by caller.
-        unsafe { self.base.imp.read_fallback(address, dest, len) }
+        unsafe { imp.read_fallback(address, dest, len) }
     }
 
     fn expose_va(&self, address: u64, len: u64) -> Result<(), GuestMemoryBackingError> {
-        let address = self.adjust_range(address, len)?;
-        self.base.imp.expose_va(address, len)
+        self.adjust_range(address, len)?;
+        // The parent must approve kernel exposure even for a custom view.
+        self.base.imp.expose_va(self.offset + address, len)?;
+        if let Some(view) = &self.view {
+            view.inner.imp.expose_va(address, len)?;
+        }
+        Ok(())
     }
 
     fn base_iova(&self) -> Option<u64> {
+        if let Some(view) = &self.view {
+            return view.inner.regions.first()?.base_iova;
+        }
         let region = &self.base.regions[self.region];
         Some(region.base_iova? + (self.offset & self.base.region_def.region_mask))
     }
@@ -977,6 +1221,7 @@ fn create_memory_subrange(
             offset,
             len,
             region,
+            view: None,
         },
     ))
 }
@@ -1000,6 +1245,37 @@ impl<T> MultiRegionGuestMemoryAccess<T> {
 
 // SAFETY: `mapping()` is unreachable and panics if called.
 impl<T: GuestMemoryAccess> DynGuestMemoryAccess for MultiRegionGuestMemoryAccess<T> {
+    fn lock_lifetime(&self) -> Result<Option<Arc<dyn Send + Sync>>, GuestMemoryBackingError> {
+        let owners = self
+            .imps
+            .iter()
+            .flatten()
+            .map(GuestMemoryAccess::lock_lifetime)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(Arc::new(owners)))
+    }
+
+    fn supports_kernel_lock(&self) -> bool {
+        self.imps
+            .iter()
+            .flatten()
+            .all(GuestMemoryAccess::supports_kernel_lock)
+    }
+
+    fn supports_user_lock(&self) -> bool {
+        self.imps
+            .iter()
+            .flatten()
+            .all(GuestMemoryAccess::supports_user_lock)
+    }
+
+    fn requires_owned_io(&self) -> bool {
+        self.imps
+            .iter()
+            .flatten()
+            .any(GuestMemoryAccess::requires_owned_io)
+    }
+
     fn io_policy(&self) -> GuestMemoryIoPolicy {
         if self
             .imps
@@ -1083,13 +1359,31 @@ impl<T: GuestMemoryAccess> DynGuestMemoryAccess for MultiRegionGuestMemoryAccess
         }
     }
 
-    fn lock_gpns(&self, gpns: &[u64]) -> Result<bool, GuestMemoryBackingError> {
-        let mut ret = false;
-        for gpn in gpns {
-            let (region, offset_in_region) = self.region(gpn * PAGE_SIZE64, PAGE_SIZE64)?;
-            ret |= region.lock_gpns(&[offset_in_region / PAGE_SIZE64])?;
+    fn reserve_gpns(
+        &self,
+        owner: Arc<GuestMemoryInner>,
+        _access: AccessType,
+        with_kernel_access: bool,
+        gpns: &[u64],
+    ) -> Result<GuestMemoryBackingLock, GuestMemoryBackingError> {
+        let mut reservations = Vec::new();
+        // Validate every region before acquiring the first reservation.
+        for &gpn in gpns {
+            self.region(
+                gpn_to_gpa(gpn).map_err(GuestMemoryBackingError::gpn)?,
+                PAGE_SIZE64,
+            )?;
         }
-        Ok(ret)
+        for &gpn in gpns {
+            let (region, offset_in_region) = self.region(gpn * PAGE_SIZE64, PAGE_SIZE64)?;
+            if region.lock_gpns(&[offset_in_region / PAGE_SIZE64], with_kernel_access)? {
+                reservations.push(GuestMemoryBackingLock::new(LegacyBackingLock {
+                    owner: owner.clone(),
+                    gpns: vec![gpn].into_boxed_slice(),
+                }));
+            }
+        }
+        Ok(GuestMemoryBackingLock::new(reservations))
     }
 
     fn unlock_gpns(&self, gpns: &[u64]) {
@@ -1127,9 +1421,6 @@ struct GuestMemoryInner<T: ?Sized = dyn DynGuestMemoryAccess> {
     regions: Vec<MemoryRegion>,
     debug_name: Arc<str>,
     allocated: bool,
-    /// Cached result of [`GuestMemoryAccess::supports_locking`], since it is
-    /// queried on hot zero-copy paths and never changes for a given backing.
-    supports_locking: bool,
     imp: T,
 }
 
@@ -1240,7 +1531,7 @@ impl MemoryRegion {
                         .cast_const()
                         .cast::<AtomicU8>()
                         .add(bit_offset as usize / 8))
-                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .load(Ordering::Relaxed)
                         & (1 << (bit_offset % 8))
                 };
                 if bit == 0 {
@@ -1275,6 +1566,10 @@ unsafe impl GuestMemoryAccess for Empty {
     fn supports_locking(&self) -> bool {
         // This implementation trivially supports locking since there are no
         // pages to lock.
+        true
+    }
+
+    fn supports_user_lock(&self) -> bool {
         true
     }
 }
@@ -1328,7 +1623,6 @@ impl GuestMemory {
 
     fn new_inner(debug_name: Arc<str>, imp: impl GuestMemoryAccess, allocated: bool) -> Self {
         let regions = vec![MemoryRegion::new(&imp)];
-        let supports_locking = imp.supports_locking();
         Self {
             io_policy: imp.io_policy(),
             inner: Arc::new(GuestMemoryInner {
@@ -1342,7 +1636,6 @@ impl GuestMemory {
                 },
                 regions,
                 allocated,
-                supports_locking,
             }),
         }
     }
@@ -1359,9 +1652,8 @@ impl GuestMemory {
     /// `imps` must be a list of [`GuestMemoryAccess`] implementations, one for
     /// each region. Use `None` if the corresponding region is empty.
     ///
-    /// A region's mapping cannot fully fill the region. This is necessary to
-    /// avoid callers expecting to be able to access a memory range that spans
-    /// two regions.
+    /// An individual memory range cannot span two regions, even when both
+    /// regions are fully mapped.
     pub fn new_multi_region(
         debug_name: impl Into<Arc<str>>,
         region_size: u64,
@@ -1413,11 +1705,6 @@ impl GuestMemory {
         };
 
         imps.resize_with(region_count, || None);
-        // Locking is only supported if every backing region supports it.
-        let supports_locking = imps
-            .iter()
-            .flatten()
-            .all(GuestMemoryAccess::supports_locking);
         let io_policy = if imps
             .iter()
             .flatten()
@@ -1436,7 +1723,6 @@ impl GuestMemory {
             regions,
             imp,
             allocated: false,
-            supports_locking,
         };
 
         Ok(Self {
@@ -1579,7 +1865,31 @@ impl GuestMemory {
                     .imp
                     .subrange(offset, len, allow_preemptive_locking)?
             {
-                Ok(guest_memory.with_io_policy(self.io_policy()))
+                if self.inner.imp.type_id() == std::any::TypeId::of::<GuestMemoryAccessRange>() {
+                    // Built-in derived views already retain the parent. Keep
+                    // their flattened byte offsets so unaligned nested views
+                    // do not expand reservations through intermediate pages.
+                    return Ok(guest_memory.with_io_policy(self.io_policy()));
+                }
+                let (_, _, region) = self.inner.region(offset, len)?;
+                // Custom views must describe one mapped region with local
+                // addresses. Retain the parent so its reservations cannot be
+                // bypassed by replacing the backing.
+                if guest_memory.inner.regions.len() != 1 {
+                    return Err(GuestMemoryBackingError::other(offset, OutOfRange));
+                }
+                guest_memory.inner.region(0, len)?;
+                Ok(GuestMemory::new(
+                    self.inner.debug_name.clone(),
+                    GuestMemoryAccessRange {
+                        base: self.inner.clone(),
+                        io_policy: guest_memory.with_io_policy(self.io_policy()).io_policy(),
+                        offset,
+                        len,
+                        region,
+                        view: Some(guest_memory),
+                    },
+                ))
             } else {
                 create_memory_subrange(
                     self.inner.clone(),
@@ -1649,16 +1959,30 @@ impl GuestMemory {
         self.inner.imp.sharing()
     }
 
-    /// Returns whether this memory supports locking pages via
-    /// [`lock_gpns`](Self::lock_gpns) and [`lock_range`](Self::lock_range).
-    ///
-    /// Memory behind an emulated IOMMU has no stable host mapping and cannot
-    /// be locked; zero-copy callers should check this and fall back to a
-    /// copying path when it returns `false`. This is authoritative: when it
-    /// returns `false`, [`lock_gpns`](Self::lock_gpns) and
-    /// [`lock_range`](Self::lock_range) fail with a `NotLockable` error.
+    /// Compatibility alias for [`supports_kernel_lock`](Self::supports_kernel_lock).
+    /// IO callers must not substitute CPU-only loans for kernel locking.
     pub fn supports_locking(&self) -> bool {
-        self.io_policy() == GuestMemoryIoPolicy::Direct && self.inner.supports_locking
+        self.supports_kernel_lock()
+    }
+
+    /// Returns whether this view can prepare locked pages for kernel IO.
+    /// Copy-only views always return `false`; callers must use owned staging.
+    pub fn supports_kernel_lock(&self) -> bool {
+        self.io_policy() == GuestMemoryIoPolicy::Direct && self.inner.imp.supports_kernel_lock()
+    }
+
+    /// Returns whether this view can lend protected, stable CPU-only pointers.
+    /// This does not grant kernel IO, DMA, or backing export access.
+    pub fn supports_user_lock(&self) -> bool {
+        self.inner.imp.supports_user_lock()
+    }
+
+    /// Returns whether IO must use owned staging.
+    ///
+    /// This includes copy-only views and backing restrictions. Translation-only
+    /// memory can delegate this query without advertising a raw kernel mapping.
+    pub fn requires_owned_io(&self) -> bool {
+        self.io_policy() == GuestMemoryIoPolicy::CopyOnly || self.inner.imp.requires_owned_io()
     }
 
     /// Gets a pointer to the VA range for `gpa..gpa+len`.
@@ -2140,6 +2464,10 @@ impl GuestMemory {
     /// read-only-until-write backing (e.g. Windows soft large pages) is raised
     /// to read-write before the caller writes through the returned pointer,
     /// while a read-only lock (e.g. read-only DMA) only faults for read.
+    ///
+    /// `with_kernel_access` selects the kernel or CPU-only capability. Kernel
+    /// access prepares the VA but does not itself pin pages or invoke GUP.
+    /// Use [`lock_user_gpns`](Self::lock_user_gpns) for a typed CPU-only loan.
     pub fn lock_gpns(
         &self,
         access: AccessType,
@@ -2147,23 +2475,50 @@ impl GuestMemory {
         gpns: &[u64],
     ) -> Result<LockedPages, GuestMemoryError> {
         self.with_op(None, GuestMemoryOperation::Lock, || {
-            if !self.supports_locking() {
+            if !(if with_kernel_access {
+                self.supports_kernel_lock()
+            } else {
+                self.supports_user_lock()
+            }) {
                 let gpa = gpns.first().map_or(0, |&gpn| gpn.wrapping_mul(PAGE_SIZE64));
                 return Err(GuestMemoryBackingError::other(gpa, NotLockable));
             }
             let mut pages = Vec::with_capacity(gpns.len());
             for &gpn in gpns {
                 let gpa = gpn_to_gpa(gpn).map_err(GuestMemoryBackingError::gpn)?;
+                let (region, _, _) = self.inner.region(gpa, PAGE_SIZE64)?;
+                if region.mapping.is_none() {
+                    return Err(GuestMemoryBackingError::other(gpa, NotLockable));
+                }
+            }
+            let lifetime = self.inner.imp.lock_lifetime()?;
+            let reservation = self.inner.imp.reserve_gpns(
+                self.inner.clone(),
+                access,
+                with_kernel_access,
+                gpns,
+            )?;
+            for &gpn in gpns {
+                let gpa = gpn_to_gpa(gpn).map_err(GuestMemoryBackingError::gpn)?;
                 let page = self.probe_page_for_lock(access, with_kernel_access, gpa)?;
                 pages.push(PagePtr(page));
             }
-            let store_gpns = self.inner.imp.lock_gpns(gpns)?;
             Ok(LockedPages {
                 pages: pages.into_boxed_slice(),
-                gpns: store_gpns.then(|| gpns.to_vec().into_boxed_slice()),
-                mem: self.inner.clone(),
+                _reservation: Some(reservation),
+                _mem: self.inner.clone(),
+                _lifetime: lifetime,
             })
         })
+    }
+
+    /// Lends protected pages for CPU access without preparing kernel IO.
+    pub fn lock_user_gpns(
+        &self,
+        access: AccessType,
+        gpns: &[u64],
+    ) -> Result<UserLockedPages, GuestMemoryError> {
+        self.lock_gpns(access, false, gpns).map(UserLockedPages)
     }
 
     pub fn probe_gpns(&self, gpns: &[u64]) -> Result<(), GuestMemoryError> {
@@ -2202,11 +2557,13 @@ impl GuestMemory {
     /// space is known to be reserved.
     ///
     /// Panics if the requested buffer is out of range.
-    fn dangerous_access_pre_locked_memory(&self, gpa: u64, len: usize) -> &[AtomicU8] {
-        let addr = self
-            .mapping_range(AccessType::Write, gpa, len)
-            .unwrap()
-            .unwrap();
+    fn dangerous_access_pre_locked_memory(
+        &self,
+        access: AccessType,
+        gpa: u64,
+        len: usize,
+    ) -> &[AtomicU8] {
+        let addr = self.mapping_range(access, gpa, len).unwrap().unwrap();
         // SAFETY: addr..addr+len is checked above to be a valid VA range. It's
         // possible some of the pages aren't mapped and will cause AVs at
         // runtime when accessed, but, as discussed above, at a language level
@@ -2334,25 +2691,46 @@ impl GuestMemory {
     ) -> Result<LockedRangeImpl<'a, T>, GuestMemoryError> {
         self.with_op(None, GuestMemoryOperation::Lock, || {
             let gpns = paged_range.gpns();
-            if !self.supports_locking() {
+            if !self.supports_kernel_lock() {
                 let gpa = gpns.first().map_or(0, |&gpn| gpn.wrapping_mul(PAGE_SIZE64));
                 return Err(GuestMemoryBackingError::other(gpa, NotLockable));
             }
             for &gpn in gpns {
                 let gpa = gpn_to_gpa(gpn).map_err(GuestMemoryBackingError::gpn)?;
+                let (region, _, _) = self.inner.region(gpa, PAGE_SIZE64)?;
+                if region.mapping.is_none() {
+                    return Err(GuestMemoryBackingError::other(gpa, NotLockable));
+                }
+            }
+            // Resolve all range geometry before reserving or publishing slices.
+            let ranges = paged_range
+                .ranges()
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(GuestMemoryBackingError::gpn)?;
+            for range in &ranges {
+                self.inner.region(range.start, range.len())?;
+            }
+            let lifetime = self.inner.imp.lock_lifetime()?;
+            let reservation =
+                self.inner
+                    .imp
+                    .reserve_gpns(self.inner.clone(), access, true, gpns)?;
+            for &gpn in gpns {
+                let gpa = gpn_to_gpa(gpn).map_err(GuestMemoryBackingError::gpn)?;
                 self.probe_page_for_lock(access, true, gpa)?;
             }
-            for range in paged_range.ranges() {
-                let range = range.map_err(GuestMemoryBackingError::gpn)?;
-                locked_range.push_sub_range(
-                    self.dangerous_access_pre_locked_memory(range.start, range.len() as usize),
-                );
+            for range in ranges {
+                locked_range.push_sub_range(self.dangerous_access_pre_locked_memory(
+                    access,
+                    range.start,
+                    range.len() as usize,
+                ));
             }
-            let store_gpns = self.inner.imp.lock_gpns(paged_range.gpns())?;
             Ok(LockedRangeImpl {
-                mem: &self.inner,
-                gpns: store_gpns.then(|| paged_range.gpns().to_vec().into_boxed_slice()),
+                _mem: &self.inner,
+                _reservation: Some(reservation),
                 inner: locked_range,
+                _lifetime: lifetime,
             })
         })
     }
@@ -2367,7 +2745,7 @@ struct RegionDefinition {
 
 impl RegionDefinition {
     fn region(&self, gpa: u64, len: u64) -> Result<(usize, u64), GuestMemoryBackingError> {
-        if (gpa | len) & self.invalid_mask != 0 {
+        if gpa & self.invalid_mask != 0 {
             return Err(GuestMemoryBackingError::new(
                 GuestMemoryErrorKind::OutOfRange,
                 gpa,
@@ -2375,7 +2753,7 @@ impl RegionDefinition {
             ));
         }
         let offset = gpa & self.region_mask;
-        if offset.wrapping_add(len) & !self.region_mask != 0 {
+        if len > self.region_mask - offset + 1 {
             return Err(GuestMemoryBackingError::new(
                 GuestMemoryErrorKind::OutOfRange,
                 gpa,
@@ -2422,16 +2800,27 @@ impl GuestMemoryInner {
 
 pub struct LockedPages {
     pages: Box<[PagePtr]>,
-    gpns: Option<Box<[u64]>>,
+    _reservation: Option<GuestMemoryBackingLock>,
     // maintain a reference to the backing memory
-    mem: Arc<GuestMemoryInner>,
+    _mem: Arc<GuestMemoryInner>,
+    _lifetime: Option<Arc<dyn Send + Sync>>,
 }
 
 impl Drop for LockedPages {
     fn drop(&mut self) {
-        if let Some(gpns) = &self.gpns {
-            self.mem.imp.unlock_gpns(gpns);
-        }
+        // Unlock while both the backing and its external owner are alive.
+        self._reservation.take();
+    }
+}
+
+struct LegacyBackingLock {
+    owner: Arc<GuestMemoryInner>,
+    gpns: Box<[u64]>,
+}
+
+impl Drop for LegacyBackingLock {
+    fn drop(&mut self) {
+        self.owner.imp.unlock_gpns(&self.gpns);
     }
 }
 
@@ -2469,6 +2858,17 @@ impl<'a> AsRef<[&'a Page]> for &'a LockedPages {
     }
 }
 
+/// A CPU-only page loan. It has no conversion to a kernel IO lock handle.
+#[derive(Debug)]
+pub struct UserLockedPages(LockedPages);
+
+impl UserLockedPages {
+    /// Returns the pages for CPU access for the lifetime of this loan.
+    pub fn pages(&self) -> &[&Page] {
+        self.0.pages()
+    }
+}
+
 /// Represents a range of locked guest pages as an ordered list of the VA sub-ranges
 /// to which the guest pages are mapped.
 /// The range may only partially span the first and last page and must fully span all
@@ -2479,9 +2879,16 @@ pub trait LockedRange<'a> {
 }
 
 pub struct LockedRangeImpl<'a, T: LockedRange<'a>> {
-    mem: &'a GuestMemoryInner,
-    gpns: Option<Box<[u64]>>,
+    _mem: &'a GuestMemoryInner,
+    _reservation: Option<GuestMemoryBackingLock>,
     inner: T,
+    _lifetime: Option<Arc<dyn Send + Sync>>,
+}
+
+impl<'a, T: LockedRange<'a>> Drop for LockedRangeImpl<'a, T> {
+    fn drop(&mut self) {
+        self._reservation.take();
+    }
 }
 
 impl<'a, T: LockedRange<'a>> LockedRangeImpl<'a, T> {
@@ -2491,14 +2898,6 @@ impl<'a, T: LockedRange<'a>> LockedRangeImpl<'a, T> {
 
     pub fn get_mut(&mut self) -> &mut T {
         &mut self.inner
-    }
-}
-
-impl<'a, T: LockedRange<'a>> Drop for LockedRangeImpl<'a, T> {
-    fn drop(&mut self) {
-        if let Some(gpns) = &self.gpns {
-            self.mem.imp.unlock_gpns(gpns);
-        }
     }
 }
 
@@ -2868,10 +3267,7 @@ mod tests {
                 )
                 .is_err()
             );
-            assert!(
-                view.lock_gpns(crate::AccessType::Read, false, &[0])
-                    .is_err()
-            );
+            assert!(view.lock_gpns(crate::AccessType::Read, true, &[0]).is_err());
             assert!(view.lockable_subrange(0, 1).is_err());
             assert_eq!(
                 view.with_io_policy(crate::GuestMemoryIoPolicy::Direct)
@@ -3137,15 +3533,36 @@ mod tests {
         gm.into_inner_buf().unwrap();
     }
 
+    type LockEvents = Arc<parking_lot::Mutex<Vec<(&'static str, Vec<u64>)>>>;
+
+    struct LockOwner {
+        events: LockEvents,
+    }
+
+    impl Drop for LockOwner {
+        fn drop(&mut self) {
+            self.events.lock().push(("owner-drop", Vec::new()));
+        }
+    }
+
     /// A backing whose locking support can be toggled, used to exercise
     /// [`GuestMemory::supports_locking`] aggregation. Backed by a real mapping
     /// so it can participate in single- and multi-region construction.
     struct ToggleLockMapping {
         mapping: SparseMapping,
-        lockable: bool,
+        lockable: std::sync::atomic::AtomicBool,
+        user_lockable: std::sync::atomic::AtomicBool,
+        unlocking_required: bool,
+        fail_gpn: Option<u64>,
+        fail_exposure: bool,
+        events: LockEvents,
+        lifetime_owner: Option<std::sync::Weak<LockOwner>>,
+        #[cfg(feature = "bitmap")]
+        lock_bitmaps: Option<[Vec<u8>; 2]>,
         io_policy: crate::GuestMemoryIoPolicy,
         custom_range: Option<GuestMemory>,
         locks: AtomicUsize,
+        lock_modes: parking_lot::Mutex<Vec<bool>>,
         unlocks: AtomicUsize,
         exposures: AtomicUsize,
         subranges: AtomicUsize,
@@ -3159,10 +3576,19 @@ mod tests {
             mapping.alloc(0, size).unwrap();
             Self {
                 mapping,
-                lockable,
+                lockable: std::sync::atomic::AtomicBool::new(lockable),
+                user_lockable: std::sync::atomic::AtomicBool::new(lockable),
+                unlocking_required: true,
+                fail_gpn: None,
+                fail_exposure: false,
+                events: Arc::new(parking_lot::Mutex::new(Vec::new())),
+                lifetime_owner: None,
+                #[cfg(feature = "bitmap")]
+                lock_bitmaps: None,
                 io_policy: crate::GuestMemoryIoPolicy::Direct,
                 custom_range: None,
                 locks: AtomicUsize::new(0),
+                lock_modes: parking_lot::Mutex::new(Vec::new()),
                 unlocks: AtomicUsize::new(0),
                 exposures: AtomicUsize::new(0),
                 subranges: AtomicUsize::new(0),
@@ -3190,16 +3616,55 @@ mod tests {
             self.mapping.len() as u64
         }
 
+        #[cfg(feature = "bitmap")]
+        fn access_bitmap(&self) -> Option<crate::BitmapInfo> {
+            self.lock_bitmaps.as_ref().map(|bitmaps| crate::BitmapInfo {
+                read_bitmap: NonNull::new(bitmaps[0].as_ptr().cast_mut()).unwrap(),
+                write_bitmap: NonNull::new(bitmaps[1].as_ptr().cast_mut()).unwrap(),
+                bit_offset: 0,
+            })
+        }
+
         fn supports_locking(&self) -> bool {
-            self.lockable
+            self.lockable.load(Ordering::Relaxed)
         }
 
-        fn lock_gpns(&self, _gpns: &[u64]) -> Result<bool, crate::GuestMemoryBackingError> {
+        fn supports_user_lock(&self) -> bool {
+            self.user_lockable.load(Ordering::Relaxed) && self.mapping().is_some()
+        }
+
+        fn lock_lifetime(
+            &self,
+        ) -> Result<Option<Arc<dyn Send + Sync>>, crate::GuestMemoryBackingError> {
+            match &self.lifetime_owner {
+                Some(owner) => {
+                    self.events.lock().push(("lifetime", Vec::new()));
+                    owner
+                        .upgrade()
+                        .map(|owner| Some(owner as Arc<dyn Send + Sync>))
+                        .ok_or_else(|| crate::GuestMemoryBackingError::other(0, super::NotMapped))
+                }
+                None => Ok(None),
+            }
+        }
+
+        fn lock_gpns(
+            &self,
+            gpns: &[u64],
+            with_kernel_access: bool,
+        ) -> Result<bool, crate::GuestMemoryBackingError> {
+            self.lock_modes.lock().push(with_kernel_access);
+            self.events.lock().push(("lock", gpns.to_vec()));
+            if self.fail_gpn.is_some_and(|gpn| gpns.contains(&gpn)) {
+                return Err(crate::GuestMemoryBackingError::other(0, super::NotLockable));
+            }
             self.locks.fetch_add(1, Ordering::Relaxed);
-            Ok(true)
+            Ok(self.unlocking_required)
         }
 
-        fn unlock_gpns(&self, _gpns: &[u64]) {
+        fn unlock_gpns(&self, gpns: &[u64]) {
+            assert!(self.unlocking_required);
+            self.events.lock().push(("unlock", gpns.to_vec()));
             self.unlocks.fetch_add(1, Ordering::Relaxed);
         }
 
@@ -3209,7 +3674,23 @@ mod tests {
             _len: u64,
         ) -> Result<(), crate::GuestMemoryBackingError> {
             self.exposures.fetch_add(1, Ordering::Relaxed);
+            self.events.lock().push(("expose", Vec::new()));
+            if self.fail_exposure {
+                return Err(crate::GuestMemoryBackingError::other(0, super::NotMapped));
+            }
             Ok(())
+        }
+
+        fn page_fault(
+            &self,
+            _address: u64,
+            _len: usize,
+            _write: bool,
+            _bitmap_failure: bool,
+        ) -> PageFaultAction {
+            self.events.lock().push(("probe", Vec::new()));
+            assert!(self.locks.load(Ordering::Relaxed) > self.unlocks.load(Ordering::Relaxed));
+            PageFaultAction::Fail(PageFaultError::other(super::NotMapped))
         }
 
         fn base_iova(&self) -> Option<u64> {
@@ -3323,10 +3804,8 @@ mod tests {
         assert!(gm.inner_buf().is_none());
         assert!(gm.lockable_subrange(0, PAGE_SIZE64).is_err());
         for access in [crate::AccessType::Read, crate::AccessType::Write] {
-            for kernel_access in [false, true] {
-                assert!(gm.lock_gpns(access, kernel_access, &[0]).is_err());
-                assert!(gm.lock_gpns(access, kernel_access, &[]).is_err());
-            }
+            assert!(gm.lock_gpns(access, true, &[0]).is_err());
+            assert!(gm.lock_gpns(access, true, &[]).is_err());
             assert!(
                 gm.lock_range(
                     access,
@@ -3538,5 +4017,638 @@ mod tests {
         )
         .unwrap();
         assert!(!gm.supports_locking());
+    }
+
+    #[test]
+    fn user_and_kernel_lock_capabilities_are_separate_and_dynamic() {
+        let backing = Arc::new(ToggleLockMapping::new(3 * PAGE_SIZE, false));
+        let gm = GuestMemory::new("split", backing.clone());
+        let range = gm.subrange(PAGE_SIZE64, PAGE_SIZE64, false).unwrap();
+        let nested = range.subrange(0, PAGE_SIZE64, false).unwrap();
+        for view in [&gm, &range, &nested] {
+            assert!(!view.supports_kernel_lock());
+            assert!(!view.supports_locking());
+            assert!(!view.supports_user_lock());
+            assert!(view.lock_user_gpns(crate::AccessType::Read, &[0]).is_err());
+        }
+        backing.user_lockable.store(true, Ordering::Relaxed);
+        for view in [&gm, &range, &nested] {
+            assert!(view.supports_user_lock());
+            let pages = view.lock_user_gpns(crate::AccessType::Write, &[0]).unwrap();
+            assert_eq!(pages.pages().len(), 1);
+            assert!(view.lock_gpns(crate::AccessType::Read, true, &[0]).is_err());
+        }
+        assert_eq!(backing.locks.load(Ordering::Relaxed), 3);
+        assert_eq!(backing.unlocks.load(Ordering::Relaxed), 3);
+        assert_eq!(backing.exposures.load(Ordering::Relaxed), 0);
+        let multi = GuestMemory::new_multi_region(
+            "dynamic-multi",
+            4 * PAGE_SIZE64,
+            vec![Some(backing.clone()), None],
+        )
+        .unwrap();
+        assert!(multi.supports_user_lock());
+        backing.user_lockable.store(false, Ordering::Relaxed);
+        assert!(!multi.supports_user_lock());
+        assert!(!nested.supports_user_lock());
+    }
+
+    #[test]
+    fn copy_only_allows_protected_cpu_loans_and_preserves_lifetime() {
+        let backing = Arc::new(ToggleLockMapping::new(2 * PAGE_SIZE, true));
+        let weak = Arc::downgrade(&backing);
+        let gm = GuestMemory::new("copy-loan", backing.clone())
+            .with_io_policy(crate::GuestMemoryIoPolicy::CopyOnly);
+        assert_copy_only(&gm);
+        assert!(gm.supports_user_lock());
+        let first = gm.lock_user_gpns(crate::AccessType::Write, &[0]).unwrap();
+        let second = gm.lock_user_gpns(crate::AccessType::Read, &[0]).unwrap();
+        first.pages()[0][0].store(11, Ordering::Relaxed);
+        assert_eq!(second.pages()[0][0].load(Ordering::Relaxed), 11);
+        drop(first);
+        assert_eq!(backing.unlocks.load(Ordering::Relaxed), 1);
+        assert_eq!(second.pages()[0][0].load(Ordering::Relaxed), 11);
+        drop(gm);
+        drop(backing);
+        assert!(weak.upgrade().is_some());
+        drop(second);
+        assert!(weak.upgrade().is_none());
+        let heap =
+            GuestMemory::allocate(PAGE_SIZE).with_io_policy(crate::GuestMemoryIoPolicy::CopyOnly);
+        assert!(heap.supports_user_lock());
+        assert!(heap.lock_user_gpns(crate::AccessType::Read, &[0]).is_ok());
+    }
+
+    #[test]
+    fn reservation_precedes_probes_and_rolls_back_on_setup_error() {
+        let backing = ToggleLockMapping::new(2 * PAGE_SIZE, true);
+        backing.mapping.unmap(PAGE_SIZE, PAGE_SIZE).unwrap();
+        let backing = Arc::new(backing);
+        let gm = GuestMemory::new("probe-error", backing.clone());
+        for access in [crate::AccessType::Read, crate::AccessType::Write] {
+            assert!(gm.lock_user_gpns(access, &[0, 1]).is_err());
+            assert_eq!(
+                std::mem::take(&mut *backing.events.lock()),
+                [
+                    ("lock", vec![0, 1]),
+                    ("probe", vec![]),
+                    ("unlock", vec![0, 1])
+                ],
+            );
+        }
+        assert_eq!(backing.locks.load(Ordering::Relaxed), 2);
+        assert_eq!(backing.unlocks.load(Ordering::Relaxed), 2);
+        let mut backing = ToggleLockMapping::new(PAGE_SIZE, true);
+        backing.fail_exposure = true;
+        let backing = Arc::new(backing);
+        let gm = GuestMemory::new("expose-error", backing.clone());
+        assert!(gm.lock_gpns(crate::AccessType::Read, true, &[0]).is_err());
+        assert_eq!(
+            std::mem::take(&mut *backing.events.lock()),
+            [("lock", vec![0]), ("expose", vec![]), ("unlock", vec![0])],
+        );
+        assert!(
+            gm.lock_range(
+                crate::AccessType::Read,
+                crate::ranges::PagedRange::new(0, PAGE_SIZE, &[0]).unwrap(),
+                TestLockedRange,
+            )
+            .is_err()
+        );
+        assert_eq!(backing.unlocks.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn invalid_lock_geometry_does_not_acquire_or_probe() {
+        let backing = Arc::new(ToggleLockMapping::new(PAGE_SIZE, true));
+        let gm = GuestMemory::new("invalid-lock", backing.clone());
+        for gpns in [&[0, 1][..], &[0, u64::MAX][..]] {
+            assert!(gm.lock_user_gpns(crate::AccessType::Read, gpns).is_err());
+            assert!(gm.lock_gpns(crate::AccessType::Write, true, gpns).is_err());
+            assert!(
+                gm.lock_range(
+                    crate::AccessType::Read,
+                    crate::ranges::PagedRange::new(0, gpns.len() * PAGE_SIZE, gpns).unwrap(),
+                    TestLockedRange,
+                )
+                .is_err()
+            );
+        }
+        assert!(backing.events.lock().is_empty());
+        let short = gm.subrange(0, PAGE_SIZE64 - 1, false).unwrap();
+        assert!(short.lock_user_gpns(crate::AccessType::Read, &[0]).is_err());
+        assert!(backing.events.lock().is_empty());
+    }
+
+    #[test]
+    fn multi_region_reservations_rollback_and_skip_noop_unlocks() {
+        let first = Arc::new(ToggleLockMapping::new(2 * PAGE_SIZE, true));
+        let mut noop = ToggleLockMapping::new(PAGE_SIZE, true);
+        noop.unlocking_required = false;
+        let noop = Arc::new(noop);
+        let mut failing = ToggleLockMapping::new(PAGE_SIZE, true);
+        failing.fail_gpn = Some(0);
+        let failing = Arc::new(failing);
+        let gm = GuestMemory::new_multi_region(
+            "rollback-multi",
+            4 * PAGE_SIZE64,
+            vec![
+                Some(first.clone()),
+                Some(noop.clone()),
+                Some(failing.clone()),
+            ],
+        )
+        .unwrap();
+        assert!(
+            gm.lock_user_gpns(crate::AccessType::Read, &[0, 4, 8])
+                .is_err()
+        );
+        assert_eq!(first.unlocks.load(Ordering::Relaxed), 1);
+        assert_eq!(noop.unlocks.load(Ordering::Relaxed), 0);
+        assert_eq!(first.exposures.load(Ordering::Relaxed), 0);
+        let a = gm.lock_user_gpns(crate::AccessType::Read, &[0, 4]).unwrap();
+        let b = gm.lock_user_gpns(crate::AccessType::Read, &[0, 4]).unwrap();
+        drop(a);
+        assert_eq!(first.unlocks.load(Ordering::Relaxed), 2);
+        assert_eq!(b.pages().len(), 2);
+        drop(b);
+        assert_eq!(first.unlocks.load(Ordering::Relaxed), 3);
+        assert_eq!(noop.unlocks.load(Ordering::Relaxed), 0);
+        let events = std::mem::take(&mut *first.events.lock());
+        assert!(
+            gm.lock_user_gpns(crate::AccessType::Read, &[0, 12])
+                .is_err()
+        );
+        assert!(!events.is_empty());
+        assert!(first.events.lock().is_empty());
+    }
+
+    #[test]
+    fn derived_loans_translate_parent_gpns_and_keep_parent_alive() {
+        let backing = Arc::new(ToggleLockMapping::new(4 * PAGE_SIZE, true));
+        let weak = Arc::downgrade(&backing);
+        let gm = GuestMemory::new("derived", backing.clone());
+        let range = gm
+            .subrange(PAGE_SIZE64 + 17, PAGE_SIZE64 * 2, false)
+            .unwrap();
+        let nested = range.subrange(3, PAGE_SIZE64, false).unwrap();
+        let loan = nested
+            .lock_user_gpns(crate::AccessType::Write, &[0])
+            .unwrap();
+        assert_eq!(*backing.events.lock(), [("lock", vec![1, 2])]);
+        loan.pages()[0][0].store(77, Ordering::Relaxed);
+        assert_eq!(gm.read_plain::<u8>(PAGE_SIZE64 + 20).unwrap(), 77);
+        drop(nested);
+        drop(range);
+        drop(gm);
+        drop(backing);
+        assert!(weak.upgrade().is_some());
+        drop(loan);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn custom_subranges_cannot_bypass_parent_reservations() {
+        let mut backing = ToggleLockMapping::new(3 * PAGE_SIZE, true);
+        let child = Arc::new(ToggleLockMapping::new(3 * PAGE_SIZE, true));
+        backing.custom_range = Some(GuestMemory::new("child", child.clone()));
+        let backing = Arc::new(backing);
+        let gm = GuestMemory::new("parent", backing.clone());
+        let view = gm.subrange(PAGE_SIZE64, PAGE_SIZE64, false).unwrap();
+        let nested = view.subrange(0, PAGE_SIZE64, false).unwrap();
+        let loan = nested
+            .lock_user_gpns(crate::AccessType::Write, &[0])
+            .unwrap();
+        assert_eq!(*backing.events.lock(), [("lock", vec![1])]);
+        assert_eq!(*child.events.lock(), [("lock", vec![1])]);
+        loan.pages()[0][0].store(88, Ordering::Relaxed);
+        assert_eq!(
+            GuestMemory::new("check-child", child.clone())
+                .read_plain::<u8>(PAGE_SIZE64)
+                .unwrap(),
+            88
+        );
+        drop(loan);
+        assert_eq!(backing.unlocks.load(Ordering::Relaxed), 1);
+        assert_eq!(child.unlocks.load(Ordering::Relaxed), 1);
+        backing.user_lockable.store(false, Ordering::Relaxed);
+        assert!(!nested.supports_user_lock());
+    }
+
+    #[test]
+    fn static_reference_forwards_split_capabilities_and_reservations() {
+        // GuestMemoryAccess requires 'static; a static reference must preserve
+        // overrides just as an Arc does.
+        static BACKING: std::sync::OnceLock<ToggleLockMapping> = std::sync::OnceLock::new();
+        let backing = BACKING.get_or_init(|| ToggleLockMapping::new(PAGE_SIZE, false));
+        backing.user_lockable.store(true, Ordering::Relaxed);
+        let gm = GuestMemory::new("reference", backing);
+        assert!(!gm.supports_kernel_lock());
+        assert!(gm.supports_user_lock());
+        let pages = gm.lock_user_gpns(crate::AccessType::Read, &[0]).unwrap();
+        assert_eq!(backing.locks.load(Ordering::Relaxed), 1);
+        drop(pages);
+        assert_eq!(backing.unlocks.load(Ordering::Relaxed), 1);
+        assert_eq!(backing.exposures.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn kernel_lock_range_reserves_before_exposure_and_keeps_slices_valid() {
+        #[derive(Default)]
+        struct CollectRanges<'a>(Vec<&'a [std::sync::atomic::AtomicU8]>);
+        impl<'a> crate::LockedRange<'a> for CollectRanges<'a> {
+            fn push_sub_range(&mut self, range: &'a [std::sync::atomic::AtomicU8]) {
+                self.0.push(range);
+            }
+        }
+        let backing = Arc::new(ToggleLockMapping::new(3 * PAGE_SIZE, true));
+        let gm = GuestMemory::new("kernel-ranges", backing.clone());
+        let range = gm
+            .lock_range(
+                crate::AccessType::Write,
+                crate::ranges::PagedRange::new(1, 2 * PAGE_SIZE, &[0, 1, 2]).unwrap(),
+                CollectRanges::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            *backing.events.lock(),
+            [
+                ("lock", vec![0, 1, 2]),
+                ("expose", vec![]),
+                ("expose", vec![]),
+                ("expose", vec![]),
+            ]
+        );
+        assert_eq!(
+            range.get().0.iter().map(|r| r.len()).sum::<usize>(),
+            2 * PAGE_SIZE
+        );
+        range.get().0[0][0].store(91, Ordering::Relaxed);
+        assert_eq!(gm.read_plain::<u8>(1).unwrap(), 91);
+        assert_eq!(backing.unlocks.load(Ordering::Relaxed), 0);
+        assert_eq!(*backing.lock_modes.lock(), [true]);
+        drop(range);
+        assert_eq!(backing.unlocks.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn custom_view_reservation_failure_releases_parent() {
+        let mut child = ToggleLockMapping::new(PAGE_SIZE, true);
+        child.fail_gpn = Some(0);
+        let child = Arc::new(child);
+        let mut parent = ToggleLockMapping::new(PAGE_SIZE, true);
+        parent.custom_range = Some(GuestMemory::new("failing-child", child.clone()));
+        let parent = Arc::new(parent);
+        let gm = GuestMemory::new("custom-rollback", parent.clone());
+        let range = gm.subrange(0, PAGE_SIZE64, false).unwrap();
+        assert!(range.lock_user_gpns(crate::AccessType::Read, &[0]).is_err());
+        assert_eq!(
+            *parent.events.lock(),
+            [("lock", vec![0]), ("unlock", vec![0])]
+        );
+        assert_eq!(parent.exposures.load(Ordering::Relaxed), 0);
+        assert_eq!(child.unlocks.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn external_lock_owner_outlives_unlock_for_all_page_views() {
+        for mode in 0..4 {
+            let mut backing = ToggleLockMapping::new(2 * PAGE_SIZE, true);
+            let events = backing.events.clone();
+            let owner = Arc::new(LockOwner {
+                events: events.clone(),
+            });
+            let weak_owner = Arc::downgrade(&owner);
+            backing.lifetime_owner = Some(weak_owner.clone());
+            let backing = Arc::new(backing);
+            let gm = if mode == 2 {
+                GuestMemory::new_multi_region(
+                    "lifetime-multi",
+                    4 * PAGE_SIZE64,
+                    vec![Some(backing.clone()), None],
+                )
+                .unwrap()
+            } else {
+                GuestMemory::new("lifetime", backing.clone())
+            };
+            let view = if mode == 1 {
+                gm.subrange(PAGE_SIZE64, PAGE_SIZE64, false).unwrap()
+            } else {
+                gm.clone()
+            };
+            let loan = view
+                .lock_gpns(crate::AccessType::Read, mode == 3, &[0])
+                .unwrap();
+            assert_eq!(events.lock()[0].0, "lifetime");
+            assert_eq!(events.lock()[1].0, "lock");
+            drop(owner);
+            drop(view);
+            drop(gm);
+            drop(backing);
+            assert!(weak_owner.upgrade().is_some());
+            drop(loan);
+            assert!(weak_owner.upgrade().is_none());
+            let events = events.lock();
+            assert_eq!(events[events.len() - 2].0, "unlock");
+            assert_eq!(events[events.len() - 1].0, "owner-drop");
+        }
+    }
+
+    #[test]
+    fn external_lock_owner_setup_failures_release_owners_and_reservations() {
+        let mut backing = ToggleLockMapping::new(PAGE_SIZE, true);
+        let owner = Arc::new(LockOwner {
+            events: backing.events.clone(),
+        });
+        backing.lifetime_owner = Some(Arc::downgrade(&owner));
+        backing.fail_exposure = true;
+        let backing = Arc::new(backing);
+        let gm = GuestMemory::new("lifetime-failure", backing.clone());
+        assert!(gm.lock_gpns(crate::AccessType::Read, true, &[0]).is_err());
+        assert_eq!(Arc::strong_count(&owner), 1);
+        assert_eq!(
+            *backing.events.lock(),
+            [
+                ("lifetime", vec![]),
+                ("lock", vec![0]),
+                ("expose", vec![]),
+                ("unlock", vec![0]),
+            ]
+        );
+        backing.events.lock().clear();
+        drop(owner);
+        backing.events.lock().clear();
+        assert!(gm.lock_user_gpns(crate::AccessType::Read, &[0]).is_err());
+        assert_eq!(*backing.events.lock(), [("lifetime", vec![])]);
+        assert_eq!(backing.locks.load(Ordering::Relaxed), 1);
+        assert_eq!(backing.unlocks.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn external_lock_owner_outlives_kernel_range_unlock() {
+        struct IgnoreRanges;
+        impl<'a> crate::LockedRange<'a> for IgnoreRanges {
+            fn push_sub_range(&mut self, _range: &'a [std::sync::atomic::AtomicU8]) {}
+        }
+        let mut backing = ToggleLockMapping::new(PAGE_SIZE, true);
+        let events = backing.events.clone();
+        let owner = Arc::new(LockOwner {
+            events: events.clone(),
+        });
+        let weak_owner = Arc::downgrade(&owner);
+        backing.lifetime_owner = Some(weak_owner.clone());
+        let gm = GuestMemory::new("range-owner", backing);
+        let loan = gm
+            .lock_range(
+                crate::AccessType::Read,
+                crate::ranges::PagedRange::new(0, PAGE_SIZE, &[0]).unwrap(),
+                IgnoreRanges,
+            )
+            .unwrap();
+        drop(owner);
+        assert!(weak_owner.upgrade().is_some());
+        drop(loan);
+        assert!(weak_owner.upgrade().is_none());
+        assert_eq!(
+            *events.lock(),
+            [
+                ("lifetime", vec![]),
+                ("lock", vec![0]),
+                ("expose", vec![]),
+                ("unlock", vec![0]),
+                ("owner-drop", vec![]),
+            ]
+        );
+    }
+
+    #[test]
+    fn whole_multi_region_pages_fit_but_cross_region_ranges_fail_before_locking() {
+        let a = Arc::new(ToggleLockMapping::new(PAGE_SIZE, true));
+        let b = Arc::new(ToggleLockMapping::new(PAGE_SIZE, true));
+        let gm = GuestMemory::new_multi_region(
+            "whole-regions",
+            PAGE_SIZE64,
+            vec![Some(a.clone()), Some(b.clone())],
+        )
+        .unwrap();
+        let loan = gm.lock_user_gpns(crate::AccessType::Read, &[0, 1]).unwrap();
+        assert_eq!(loan.pages().len(), 2);
+        drop(loan);
+        a.events.lock().clear();
+        b.events.lock().clear();
+        assert!(
+            gm.lock_range(
+                crate::AccessType::Read,
+                crate::ranges::PagedRange::new(0, 2 * PAGE_SIZE, &[0, 1]).unwrap(),
+                TestLockedRange,
+            )
+            .is_err()
+        );
+        assert!(a.events.lock().is_empty());
+        assert!(b.events.lock().is_empty());
+    }
+
+    #[test]
+    fn owned_io_tracks_dynamic_policy_and_explicit_kernel_denial() {
+        let backing = Arc::new(ScopedMapping::new(true, ScopedFault::Fail));
+        let gm = GuestMemory::new("policy-owned-io", backing.clone());
+        let view = gm.subrange(PAGE_SIZE64, PAGE_SIZE64, false).unwrap();
+        assert!(!gm.requires_owned_io());
+        assert!(!view.requires_owned_io());
+        assert!(
+            gm.with_io_policy(crate::GuestMemoryIoPolicy::CopyOnly)
+                .requires_owned_io()
+        );
+        backing.copy_only.store(true, Ordering::Relaxed);
+        assert!(gm.requires_owned_io());
+        assert!(view.requires_owned_io());
+
+        let child = Arc::new(ToggleLockMapping::new(2 * PAGE_SIZE, true));
+        let mut parent = ToggleLockMapping::new(2 * PAGE_SIZE, true);
+        parent.custom_range = Some(GuestMemory::new("owned-io-child", child.clone()));
+        let parent = Arc::new(parent);
+        let gm = GuestMemory::new("owned-io-parent", parent.clone());
+        let view = gm.subrange(0, PAGE_SIZE64, false).unwrap();
+        let nested = view.subrange(0, PAGE_SIZE64, false).unwrap();
+        let multi = GuestMemory::new_multi_region(
+            "owned-io-multi",
+            4 * PAGE_SIZE64,
+            vec![Some(parent.clone()), Some(child.clone())],
+        )
+        .unwrap();
+        for memory in [&gm, &view, &nested, &multi] {
+            assert!(!memory.requires_owned_io());
+        }
+        parent.lockable.store(false, Ordering::Relaxed);
+        assert_eq!(gm.io_policy(), crate::GuestMemoryIoPolicy::Direct);
+        for memory in [&gm, &view, &nested, &multi] {
+            assert!(memory.requires_owned_io());
+        }
+        parent.lockable.store(true, Ordering::Relaxed);
+        child.lockable.store(false, Ordering::Relaxed);
+        assert!(!gm.requires_owned_io());
+        for memory in [&view, &nested, &multi] {
+            assert!(memory.requires_owned_io());
+        }
+        child.lockable.store(true, Ordering::Relaxed);
+        for memory in [&gm, &view, &nested, &multi] {
+            assert!(!memory.requires_owned_io());
+        }
+    }
+
+    struct TranslatedIoMapping {
+        memory: GuestMemory,
+    }
+
+    // SAFETY: this adapter has no raw mapping and delegates bounded reads.
+    unsafe impl crate::GuestMemoryAccess for TranslatedIoMapping {
+        fn mapping(&self) -> Option<NonNull<u8>> {
+            None
+        }
+
+        fn max_address(&self) -> u64 {
+            PAGE_SIZE64
+        }
+
+        fn requires_owned_io(&self) -> bool {
+            self.memory.requires_owned_io()
+        }
+
+        unsafe fn read_fallback(
+            &self,
+            address: u64,
+            dest: *mut u8,
+            len: usize,
+        ) -> Result<(), crate::GuestMemoryBackingError> {
+            // SAFETY: the caller guarantees that dest is valid for writes.
+            unsafe { self.memory.read_ptr(address, dest, len) }
+        }
+    }
+
+    #[test]
+    fn translated_owned_io_override_preserves_fallback_and_propagates_denial() {
+        let underlying = Arc::new(ToggleLockMapping::new(PAGE_SIZE, true));
+        let memory = GuestMemory::new("translated-inner", underlying.clone());
+        memory.write_plain(0, &67u8).unwrap();
+        let adapter = Arc::new(TranslatedIoMapping { memory });
+        let gm = GuestMemory::new("translated", adapter.clone());
+        let view = gm.subrange(0, PAGE_SIZE64, false).unwrap();
+        let nested = view.subrange(0, PAGE_SIZE64, false).unwrap();
+        let multi = GuestMemory::new_multi_region(
+            "translated-multi",
+            2 * PAGE_SIZE64,
+            vec![Some(adapter.clone()), None],
+        )
+        .unwrap();
+        for memory in [&gm, &view, &nested, &multi] {
+            assert!(!memory.supports_kernel_lock());
+            assert!(!memory.requires_owned_io());
+            assert_eq!(memory.read_plain::<u8>(0).unwrap(), 67);
+        }
+        assert!(
+            gm.with_io_policy(crate::GuestMemoryIoPolicy::CopyOnly)
+                .requires_owned_io()
+        );
+        underlying.lockable.store(false, Ordering::Relaxed);
+        for memory in [&gm, &view, &nested, &multi] {
+            assert!(memory.requires_owned_io());
+        }
+        underlying.lockable.store(true, Ordering::Relaxed);
+        let mut denied = ToggleLockMapping::new(PAGE_SIZE, false);
+        denied.custom_range = Some(gm.clone());
+        let denied = GuestMemory::new("denied-parent", denied);
+        let derived = denied.subrange(0, PAGE_SIZE64, false).unwrap();
+        assert!(derived.requires_owned_io());
+
+        static ADAPTER: std::sync::OnceLock<TranslatedIoMapping> = std::sync::OnceLock::new();
+        let reference = ADAPTER.get_or_init(|| TranslatedIoMapping {
+            memory: GuestMemory::allocate(PAGE_SIZE),
+        });
+        let referenced = GuestMemory::new("translated-reference", reference);
+        assert!(!referenced.supports_kernel_lock());
+        assert!(!referenced.requires_owned_io());
+    }
+
+    #[test]
+    fn kernel_access_flag_reaches_single_derived_and_multi_region_hooks() {
+        let child = Arc::new(ToggleLockMapping::new(2 * PAGE_SIZE, true));
+        let mut parent = ToggleLockMapping::new(2 * PAGE_SIZE, true);
+        parent.custom_range = Some(GuestMemory::new("flag-child", child.clone()));
+        let parent = Arc::new(parent);
+        let gm = GuestMemory::new("flag-parent", parent.clone());
+        let derived = gm.subrange(PAGE_SIZE64, PAGE_SIZE64, false).unwrap();
+        let nested = derived.subrange(0, PAGE_SIZE64, false).unwrap();
+        let multi = GuestMemory::new_multi_region(
+            "flag-multi",
+            4 * PAGE_SIZE64,
+            vec![Some(parent.clone()), Some(child.clone())],
+        )
+        .unwrap();
+        for kernel in [false, true] {
+            drop(gm.lock_gpns(crate::AccessType::Read, kernel, &[0]).unwrap());
+            drop(
+                nested
+                    .lock_gpns(crate::AccessType::Read, kernel, &[0])
+                    .unwrap(),
+            );
+            drop(
+                multi
+                    .lock_gpns(crate::AccessType::Read, kernel, &[0, 4])
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            *parent.lock_modes.lock(),
+            [false, false, false, true, true, true]
+        );
+        assert_eq!(*child.lock_modes.lock(), [false, false, true, true]);
+
+        static BACKING: std::sync::OnceLock<ToggleLockMapping> = std::sync::OnceLock::new();
+        let backing = BACKING.get_or_init(|| ToggleLockMapping::new(PAGE_SIZE, true));
+        let reference = GuestMemory::new("flag-reference", backing);
+        for kernel in [false, true] {
+            drop(
+                reference
+                    .lock_gpns(crate::AccessType::Read, kernel, &[0])
+                    .unwrap(),
+            );
+        }
+        assert_eq!(*backing.lock_modes.lock(), [false, true]);
+    }
+
+    #[cfg(feature = "bitmap")]
+    #[test]
+    fn bitmap_denial_rolls_back_and_read_ranges_use_read_permissions() {
+        struct IgnoreRanges;
+        impl<'a> crate::LockedRange<'a> for IgnoreRanges {
+            fn push_sub_range(&mut self, _range: &'a [std::sync::atomic::AtomicU8]) {}
+        }
+        let mut backing = ToggleLockMapping::new(2 * PAGE_SIZE, true);
+        backing.lock_bitmaps = Some([vec![0b01], vec![0b00]]);
+        let backing = Arc::new(backing);
+        let gm = GuestMemory::new("bitmap-loan", backing.clone());
+        assert!(gm.lock_user_gpns(crate::AccessType::Read, &[0, 1]).is_err());
+        assert_eq!(
+            *backing.events.lock(),
+            [
+                ("lock", vec![0, 1]),
+                ("probe", vec![]),
+                ("unlock", vec![0, 1]),
+            ]
+        );
+        backing.events.lock().clear();
+        let loan = gm
+            .lock_range(
+                crate::AccessType::Read,
+                crate::ranges::PagedRange::new(0, PAGE_SIZE, &[0]).unwrap(),
+                IgnoreRanges,
+            )
+            .unwrap();
+        assert_eq!(
+            *backing.events.lock(),
+            [("lock", vec![0]), ("expose", vec![])]
+        );
+        drop(loan);
+        assert_eq!(backing.unlocks.load(Ordering::Relaxed), 2);
     }
 }

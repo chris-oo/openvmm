@@ -3057,6 +3057,7 @@ impl InitializedVm {
                     device,
                     VirtioResolveInput {
                         driver_source: &driver_source,
+                        guest_memory: Some(&gm),
                     },
                 )
                 .await?;

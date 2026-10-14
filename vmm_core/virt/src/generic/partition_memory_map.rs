@@ -86,6 +86,19 @@ pub trait PartitionHostAccess: Send + Sync {
         false
     }
 
+    /// Attaches the backing's CPU-loan tracker before exposing any locks.
+    fn install_user_locks(
+        &self,
+        _locks: std::sync::Arc<guestmem::GuestMemoryUserLocks>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Whether runtime CPU-only loans can be acquired from this partition.
+    fn supports_user_locks(&self) -> bool {
+        false
+    }
+
     /// Acquires host access without changing guest visibility.
     ///
     /// Called on a contained mapping fault. Confirmed grants remain until a

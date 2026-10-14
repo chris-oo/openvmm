@@ -2,6 +2,27 @@
 
 ## Status and scope
 
+Kernel and CPU-only locking are now distinct capabilities. Device staging
+uses the actual guest memory's kernel-lock capability, with explicit bounce
+flags remaining force overrides. Real CPU loans reserve pages before probing
+and keep mapping/permission changes excluded until unlock. A conflicting
+guest request follows the existing TripleFault path without releasing locked
+permissions. These loans do not restore per-copy cancellation or the removed
+control-page ledger.
+
+The locking implementation passed 693 combined package tests, guestmem
+bitmap tests, package clippy and rustdoc, repository formatting, and the ARM
+MSHV check. Formal and rubber-duck reviews have no remaining blockers in
+their reviewed scopes. Mapping tests cover shared admission, failed removal,
+deferred disposal, and cancelled teardown.
+
+The new static candidate is in `target/protected-user-loans-hardware/`.
+Fresh hardware validation is blocked: SSH timed out before deployment or
+guest launch, and a bounded retry plus a Windows-side TCP check also failed.
+The earlier host preflight was idle. Earlier successful hardware results
+below do not validate this candidate or an explicit CPU-loan conflict with a
+real guest transition.
+
 MSHV SNP now always uses copy-only guest memory and owned bounce buffers for
 supported device I/O. The host-access opt-in and legacy unconditional RW
 acquisition branch are removed. CLI virtio block, software networking, and

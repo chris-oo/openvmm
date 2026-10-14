@@ -170,6 +170,13 @@ impl VirtioDevice for VirtioVsockDevice {
         features: &VirtioDeviceFeatures,
         initial_state: Option<virtio::queue::QueueState>,
     ) -> anyhow::Result<()> {
+        if resources.guest_memory.requires_owned_io() {
+            anyhow::ensure!(
+                self.bounce_io || self.started_queues.iter().all(Option::is_none),
+                "cannot change vsock memory policy with active queues"
+            );
+            self.bounce_io = true;
+        }
         anyhow::ensure!(
             !self.worker.has_state(),
             "virtio-vsock worker already started"
@@ -702,7 +709,7 @@ fn lock_payload_data<'a, T: LockedRange<'a>>(
             && (!require_exact_len || capacity - VSOCK_HEADER_SIZE as u64 >= data_len),
         "data length mismatch in vsock packet"
     );
-    if !mem.supports_locking() {
+    if !mem.supports_kernel_lock() {
         // Copy-only memory and emulated IOMMUs use read_at/write_at.
         return Ok(None);
     }

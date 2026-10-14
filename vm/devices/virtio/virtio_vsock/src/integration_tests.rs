@@ -30,6 +30,7 @@ use std::net::Shutdown;
 use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -105,6 +106,7 @@ struct MemoryFault {
     write: AtomicU64,
     preemptive_locks: AtomicUsize,
     exports: AtomicUsize,
+    requires_owned: AtomicBool,
 }
 
 struct FaultMemory {
@@ -121,6 +123,10 @@ unsafe impl GuestMemoryAccess for FaultMemory {
 
     fn max_address(&self) -> u64 {
         TOTAL_MEM_SIZE as u64
+    }
+
+    fn requires_owned_io(&self) -> bool {
+        self.fault.requires_owned.load(Ordering::SeqCst)
     }
 
     fn subrange(
@@ -178,7 +184,11 @@ unsafe impl GuestMemoryAccess for FaultMemory {
         panic!("copy-only vsock must not export guest virtual addresses")
     }
 
-    fn lock_gpns(&self, _gpns: &[u64]) -> Result<bool, GuestMemoryBackingError> {
+    fn lock_gpns(
+        &self,
+        _gpns: &[u64],
+        _with_kernel_access: bool,
+    ) -> Result<bool, GuestMemoryBackingError> {
         self.fault.exports.fetch_add(1, Ordering::SeqCst);
         panic!("copy-only vsock must not lock guest pages")
     }
@@ -213,9 +223,15 @@ struct TestHarness {
 
 impl TestHarness {
     fn with_fault_memory(mut self) -> (Self, Arc<MemoryFault>) {
+        self.device = self.device.with_bounce_io();
+        self.with_kernel_denied_memory()
+    }
+
+    fn with_kernel_denied_memory(mut self) -> (Self, Arc<MemoryFault>) {
         let fault = Arc::new(MemoryFault {
             read: AtomicU64::new(u64::MAX),
             write: AtomicU64::new(u64::MAX),
+            requires_owned: AtomicBool::new(true),
             ..Default::default()
         });
         self.mem = GuestMemory::new(
@@ -225,8 +241,13 @@ impl TestHarness {
                 fault: fault.clone(),
             },
         );
-        self.device = self.device.with_bounce_io();
         (self, fault)
+    }
+
+    fn with_safe_fallback_memory(self) -> (Self, Arc<MemoryFault>) {
+        let (harness, fault) = self.with_kernel_denied_memory();
+        fault.requires_owned.store(false, Ordering::SeqCst);
+        (harness, fault)
     }
 
     async fn assert_retired(&mut self) -> [virtio::queue::QueueState; 3] {
@@ -738,13 +759,91 @@ async fn normal_stop_resume_preserves_queue_cursors_without_replay(driver: Defau
 
 #[async_test]
 async fn copy_only_rejects_restored_state_even_without_queue_failure(driver: DefaultDriver) {
-    let mut harness = TestHarness::new(&driver, tempfile::tempdir().unwrap());
-    harness.device = harness.device.with_bounce_io();
+    rejects_restored_state_without_queue_failure(driver, true).await;
+}
+
+#[async_test]
+async fn owned_policy_distinguishes_safe_fallback_from_explicit_denial(driver: DefaultDriver) {
+    let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone()));
+    for backing_denied in [false, true] {
+        for policy in [
+            guestmem::GuestMemoryIoPolicy::Direct,
+            guestmem::GuestMemoryIoPolicy::CopyOnly,
+        ] {
+            let (mut harness, fault) =
+                TestHarness::new(&driver, tempfile::tempdir_in(".").unwrap())
+                    .with_safe_fallback_memory();
+            fault.requires_owned.store(backing_denied, Ordering::SeqCst);
+            harness.mem = harness.mem.with_io_policy(policy);
+            let requires_owned =
+                backing_denied || policy == guestmem::GuestMemoryIoPolicy::CopyOnly;
+            assert!(!harness.mem.supports_kernel_lock());
+            assert_eq!(harness.mem.requires_owned_io(), requires_owned);
+            let input = virtio::resolve::VirtioResolveInput {
+                driver_source: &driver_source,
+                guest_memory: Some(&harness.mem),
+            };
+            assert_eq!(input.bounce_io(false), requires_owned);
+            assert!(input.bounce_io(true));
+            assert!(!harness.device.bounce_io);
+            harness.enable().await;
+            assert_eq!(harness.device.bounce_io, requires_owned);
+            assert_eq!(harness.device.supports_save_restore(), !requires_owned);
+            for index in 0..3 {
+                harness.device.stop_queue(index).await.unwrap();
+            }
+            assert_eq!(fault.exports.load(Ordering::SeqCst), 0);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[async_test]
+async fn safe_fallback_does_not_admit_kernel_vhost(driver: DefaultDriver) {
+    let (harness, _fault) =
+        TestHarness::new(&driver, tempfile::tempdir_in(".").unwrap()).with_safe_fallback_memory();
+    assert!(!harness.mem.supports_kernel_lock());
+    assert!(!harness.mem.requires_owned_io());
+    let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver));
+    let error = vm_resource::ResolveResource::resolve(
+        &crate::resolver::VirtioVsockVhostResolver,
+        virtio_resources::vsock::VirtioVsockVhostHandle {
+            vhost: std::fs::File::open("Cargo.toml").unwrap().into(),
+            guest_cid: 3,
+        },
+        virtio::resolve::VirtioResolveInput {
+            driver_source: &driver_source,
+            guest_memory: Some(&harness.mem),
+        },
+    )
+    .err()
+    .unwrap();
+    assert_eq!(
+        error.to_string(),
+        "vhost-vsock requires kernel-lockable guest memory"
+    );
+}
+
+#[async_test]
+async fn automatic_bounce_rejects_restored_state_without_queue_failure(driver: DefaultDriver) {
+    rejects_restored_state_without_queue_failure(driver, false).await;
+}
+
+async fn rejects_restored_state_without_queue_failure(driver: DefaultDriver, force: bool) {
+    let mut harness = TestHarness::new(&driver, tempfile::tempdir_in(".").unwrap());
+    if force {
+        harness.device = harness.device.with_bounce_io();
+    } else {
+        harness = harness.with_kernel_denied_memory().0;
+        assert!(!harness.mem.supports_kernel_lock());
+        assert!(!harness.device.bounce_io);
+    }
     let state = virtio::queue::QueueState {
         avail_index: 0,
         used_index: 0,
     };
     assert!(harness.start_queue(0, Some(state)).await.is_err());
+    assert!(!harness.device.supports_save_restore());
     harness.enable().await;
     let mut states = Vec::new();
     states.push(harness.device.stop_queue(0).await.unwrap());
@@ -774,7 +873,7 @@ async fn copy_only_tx_publication_fault_does_not_replay_stream_bytes(driver: Def
 }
 
 #[async_test]
-async fn normal_tx_publication_fault_allows_fresh_guest_reset(driver: DefaultDriver) {
+async fn automatic_tx_publication_fault_allows_fresh_guest_reset(driver: DefaultDriver) {
     tx_publication_fault_does_not_replay_stream_bytes(driver, false).await;
 }
 
@@ -785,8 +884,10 @@ async fn tx_publication_fault_does_not_replay_stream_bytes(driver: DefaultDriver
         let (mut harness, fault) =
             TestHarness::new(&driver, tempfile::tempdir().unwrap()).with_fault_memory();
         harness.device.bounce_io = bounce_io;
+        assert!(!harness.mem.supports_kernel_lock());
         let mut listener = harness.create_port_listener(5200);
         harness.enable().await;
+        assert!(harness.device.bounce_io);
         let stream = harness
             .connect_guest_to_host(&mut listener, 1024, 5200)
             .await;
@@ -819,9 +920,7 @@ async fn tx_publication_fault_does_not_replay_stream_bytes(driver: DefaultDriver
             virtio::test_helpers::read_used_idx(&harness.mem, TX_USED_ADDR),
             if after_marker { 2 } else { 1 }
         );
-        if bounce_io {
-            assert_eq!(fault.preemptive_locks.load(Ordering::SeqCst), 0);
-        }
+        assert_eq!(fault.preemptive_locks.load(Ordering::SeqCst), 0);
         assert_eq!(fault.exports.load(Ordering::SeqCst), 0);
         fault.read.store(u64::MAX, Ordering::SeqCst);
         fault.write.store(u64::MAX, Ordering::SeqCst);
@@ -1728,23 +1827,67 @@ async fn host_connect_two_connections_get_different_ports(driver: DefaultDriver)
 #[async_test]
 #[cfg_attr(windows, ignore)]
 async fn guest_send_exercises_ring_buffer(driver: DefaultDriver) {
-    guest_send_exercises_ring_buffer_inner(driver, false).await;
+    guest_send_exercises_ring_buffer_inner(driver, false, TestMemoryMode::Mapped).await;
 }
 
 #[async_test]
 #[cfg_attr(windows, ignore)]
 async fn copy_only_tx_snapshot_survives_backpressure(driver: DefaultDriver) {
-    guest_send_exercises_ring_buffer_inner(driver, true).await;
+    guest_send_exercises_ring_buffer_inner(driver, true, TestMemoryMode::Mapped).await;
 }
 
-async fn guest_send_exercises_ring_buffer_inner(driver: DefaultDriver, bounce_io: bool) {
-    let tmp_dir = tempfile::tempdir().unwrap();
+#[async_test]
+#[cfg_attr(windows, ignore)]
+async fn automatic_tx_snapshot_survives_backpressure_without_mapping(driver: DefaultDriver) {
+    guest_send_exercises_ring_buffer_inner(driver, false, TestMemoryMode::KernelDenied).await;
+}
+
+#[async_test]
+#[cfg_attr(windows, ignore)]
+async fn safe_fallback_tx_keeps_direct_mode_without_raw_locks(driver: DefaultDriver) {
+    guest_send_exercises_ring_buffer_inner(driver, false, TestMemoryMode::SafeFallback).await;
+}
+
+#[derive(Clone, Copy)]
+enum TestMemoryMode {
+    Mapped,
+    KernelDenied,
+    SafeFallback,
+}
+
+async fn guest_send_exercises_ring_buffer_inner(
+    driver: DefaultDriver,
+    bounce_io: bool,
+    memory_mode: TestMemoryMode,
+) {
+    let tmp_dir = tempfile::tempdir_in(".").unwrap();
     let mut harness = TestHarness::new(&driver, tmp_dir);
+    match memory_mode {
+        TestMemoryMode::Mapped => {}
+        TestMemoryMode::KernelDenied => harness = harness.with_kernel_denied_memory().0,
+        TestMemoryMode::SafeFallback => harness = harness.with_safe_fallback_memory().0,
+    }
+    if !matches!(memory_mode, TestMemoryMode::Mapped) {
+        assert!(!harness.device.bounce_io);
+        assert!(!harness.mem.supports_kernel_lock());
+        assert_eq!(
+            harness.mem.io_policy(),
+            guestmem::GuestMemoryIoPolicy::Direct
+        );
+        assert_eq!(
+            harness.mem.requires_owned_io(),
+            matches!(memory_mode, TestMemoryMode::KernelDenied)
+        );
+    }
     if bounce_io {
         harness.device = harness.device.with_bounce_io();
     }
     let mut listener = harness.create_port_listener(5050);
     harness.enable().await;
+    assert_eq!(
+        harness.device.bounce_io,
+        bounce_io || matches!(memory_mode, TestMemoryMode::KernelDenied)
+    );
 
     let stream = harness
         .connect_guest_to_host(&mut listener, 1024, 5050)
@@ -1771,7 +1914,7 @@ async fn guest_send_exercises_ring_buffer_inner(driver: DefaultDriver, bounce_io
         // Wait for the tx descriptor to be consumed so the device processes
         // each packet before we queue the next.
         harness.wait_for_tx_used().await;
-        if bounce_io {
+        if harness.device.bounce_io {
             harness
                 .mem
                 .write_at(DATA_BASE + u64::from(HDR_SIZE), &[0xff; CHUNK_SIZE])
@@ -1841,22 +1984,53 @@ async fn guest_send_exercises_ring_buffer_inner(driver: DefaultDriver, bounce_io
 /// Host sends data to the guest through an established connection.
 #[async_test]
 async fn host_send_respects_credit(driver: DefaultDriver) {
-    host_send_respects_credit_inner(driver, false).await;
+    host_send_respects_credit_inner(driver, false, TestMemoryMode::Mapped).await;
 }
 
 #[async_test]
 async fn copy_only_host_send_respects_credit(driver: DefaultDriver) {
-    host_send_respects_credit_inner(driver, true).await;
+    host_send_respects_credit_inner(driver, true, TestMemoryMode::Mapped).await;
 }
 
-async fn host_send_respects_credit_inner(driver: DefaultDriver, bounce_io: bool) {
-    let tmp_dir = tempfile::tempdir().unwrap();
+#[async_test]
+async fn automatic_host_send_respects_credit_without_mapping(driver: DefaultDriver) {
+    host_send_respects_credit_inner(driver, false, TestMemoryMode::KernelDenied).await;
+}
+
+#[async_test]
+async fn safe_fallback_rx_keeps_direct_mode_without_raw_locks(driver: DefaultDriver) {
+    host_send_respects_credit_inner(driver, false, TestMemoryMode::SafeFallback).await;
+}
+
+async fn host_send_respects_credit_inner(
+    driver: DefaultDriver,
+    bounce_io: bool,
+    memory_mode: TestMemoryMode,
+) {
+    let tmp_dir = tempfile::tempdir_in(".").unwrap();
     let mut harness = TestHarness::new(&driver, tmp_dir);
+    match memory_mode {
+        TestMemoryMode::Mapped => {}
+        TestMemoryMode::KernelDenied => harness = harness.with_kernel_denied_memory().0,
+        TestMemoryMode::SafeFallback => harness = harness.with_safe_fallback_memory().0,
+    }
+    if !matches!(memory_mode, TestMemoryMode::Mapped) {
+        assert!(!harness.device.bounce_io);
+        assert!(!harness.mem.supports_kernel_lock());
+        assert_eq!(
+            harness.mem.requires_owned_io(),
+            matches!(memory_mode, TestMemoryMode::KernelDenied)
+        );
+    }
     if bounce_io {
         harness.device = harness.device.with_bounce_io();
     }
     let mut listener = harness.create_port_listener(5002);
     harness.enable().await;
+    assert_eq!(
+        harness.device.bounce_io,
+        bounce_io || matches!(memory_mode, TestMemoryMode::KernelDenied)
+    );
 
     let stream = harness
         .connect_guest_to_host(&mut listener, 1024, 5002)

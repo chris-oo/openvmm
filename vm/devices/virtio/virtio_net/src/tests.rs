@@ -448,6 +448,7 @@ struct MockEndpoint {
     queue_tx: mesh::Sender<MockQueueHandle>,
     is_ordered: bool,
     guest_origin: Option<usize>,
+    endpoint_type: &'static str,
 }
 
 impl InspectMut for MockEndpoint {
@@ -459,7 +460,7 @@ impl InspectMut for MockEndpoint {
 #[async_trait]
 impl Endpoint for MockEndpoint {
     fn endpoint_type(&self) -> &'static str {
-        "mock"
+        self.endpoint_type
     }
 
     async fn get_queues(
@@ -633,6 +634,7 @@ impl TestHarness {
             queue_tx,
             is_ordered: true,
             guest_origin: bounce.then(|| mem.full_mapping().unwrap().0 as usize),
+            endpoint_type: "mock",
         };
 
         let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone()));
@@ -989,14 +991,22 @@ fn post_owned_rx(mem: &GuestMemory, idx: u16, gpa: u64, avail: &mut u16, size: u
 
 #[async_test]
 async fn backend_namespace_and_delayed_consumption(driver: DefaultDriver) {
-    for bounce in [false, true] {
-        let mut harness = TestHarness::new_with_bounce(&driver, bounce);
+    for (force_bounce, automatic) in [(false, false), (true, false), (false, true)] {
+        let bounce = force_bounce || automatic;
+        let mut harness = TestHarness::new_with_bounce(&driver, force_bounce);
+        let origin = harness.mem.full_mapping().unwrap().0;
+        if automatic {
+            harness.mem = harness
+                .mem
+                .with_io_policy(guestmem::GuestMemoryIoPolicy::CopyOnly);
+            assert!(!harness.mem.supports_kernel_lock());
+            assert!(!harness.device.adapter.bounce_io());
+        }
         let mut handle = harness.enable_and_get_handle().await;
         handle.tx_avail_behavior.lock().sync = false;
         harness.post_tx_and_signal(0, 64);
         handle.wait_for_tx_avail().await;
         let probe_mem = handle.probe.lock().memory.clone().unwrap();
-        let origin = harness.mem.full_mapping().unwrap().0;
         assert_eq!(probe_mem.full_mapping().unwrap().0 == origin, !bounce);
         assert_eq!(probe_mem.io_policy(), guestmem::GuestMemoryIoPolicy::Direct);
         assert!(harness.try_read_tx_used().is_none());
@@ -1011,8 +1021,73 @@ async fn backend_namespace_and_delayed_consumption(driver: DefaultDriver) {
             vec![vec![if bounce { 0xAB } else { 0xCD }; 64]]
         );
         assert_eq!(harness.device.supports_save_restore(), !bounce);
+        let rx_gpa = harness.post_rx_buffer_and_signal(0, 1500);
+        handle.wait_for_rx_pending().await;
+        let packet = b"automatic RX staging";
+        handle.inject_rx_packet(packet);
+        assert_eq!(
+            harness.wait_for_rx_used().await,
+            (0, NET_HEADER_SIZE + packet.len() as u32)
+        );
+        let mut received = vec![0; packet.len()];
+        harness
+            .mem
+            .read_at(rx_gpa + u64::from(NET_HEADER_SIZE), &mut received)
+            .unwrap();
+        assert_eq!(received.as_slice(), packet);
         harness.disable().await;
     }
+}
+
+#[async_test]
+async fn automatic_staging_rejects_unsupported_endpoint_before_queue_exposure(
+    driver: DefaultDriver,
+) {
+    let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver));
+    let (queue_tx, _queue_rx) = mesh::channel();
+    let endpoint = MockEndpoint {
+        queue_tx,
+        is_ordered: true,
+        guest_origin: None,
+        endpoint_type: "assigned",
+    };
+    let mut device = Device::builder()
+        .build(
+            &driver_source,
+            Box::new(endpoint),
+            MacAddress::new([0x00, 0x15, 0x5d, 0xaa, 0xbb, 0xcc]),
+        )
+        .unwrap();
+    assert!(!device.adapter.bounce_io());
+    let memory = test_memory().with_io_policy(guestmem::GuestMemoryIoPolicy::CopyOnly);
+    let error = device
+        .start_queue(
+            0,
+            QueueResources {
+                params: QueueParams {
+                    size: QUEUE_SIZE,
+                    enable: true,
+                    desc_addr: RX_DESC_ADDR,
+                    avail_addr: RX_AVAIL_ADDR,
+                    used_addr: RX_USED_ADDR,
+                },
+                notify: Interrupt::from_event(Event::new()),
+                event: Event::new(),
+                guest_memory: memory,
+            },
+            &VirtioDeviceFeatures::new(),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("requires a software endpoint"));
+    assert!(
+        device
+            .pairs
+            .iter()
+            .all(|pair| matches!(pair, crate::QueuePairState::Empty))
+    );
+    assert!(!device.coordinator.has_state());
 }
 
 #[async_test]
@@ -1792,7 +1867,6 @@ async fn owned_endpoint_restart_quiesces_old_consumers_and_recovers_slots(driver
         let (queue_tx, mut queue_rx) = mesh::channel();
         let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone()));
         let mut device = Device::builder()
-            .bounce_io(true)
             .build(
                 &driver_source,
                 Box::new(RestartEndpoint {
@@ -1804,6 +1878,28 @@ async fn owned_endpoint_restart_quiesces_old_consumers_and_recovers_slots(driver
                 MacAddress::new([0x00, 0x15, 0x5d, 0xaa, 0xbb, 0xcc]),
             )
             .unwrap();
+        assert!(!device.adapter.bounce_io());
+        device
+            .start_queue(
+                0,
+                QueueResources {
+                    params: QueueParams {
+                        size: SIZE,
+                        enable: true,
+                        desc_addr: RX_DESC_ADDR,
+                        avail_addr: RX_AVAIL_ADDR,
+                        used_addr: RX_USED_ADDR,
+                    },
+                    notify: Interrupt::from_event(Event::new()),
+                    event: Event::new(),
+                    guest_memory: mem.with_io_policy(guestmem::GuestMemoryIoPolicy::CopyOnly),
+                },
+                &VirtioDeviceFeatures::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(device.adapter.bounce_io());
         let mut task = task_control::TaskControl::new(crate::NetQueue {
             state: Some(old_endpoint_queue),
         });
@@ -2095,6 +2191,7 @@ async fn unordered_backend_rejected(driver: DefaultDriver) {
         queue_tx,
         is_ordered: false,
         guest_origin: None,
+        endpoint_type: "mock",
     };
 
     let err = Device::builder()

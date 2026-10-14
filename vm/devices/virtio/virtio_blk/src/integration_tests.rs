@@ -124,6 +124,14 @@ impl TestHarness {
     }
 
     async fn try_enable(&mut self) -> anyhow::Result<()> {
+        self.try_enable_with_features(&VirtioDeviceFeatures::new())
+            .await
+    }
+
+    async fn try_enable_with_features(
+        &mut self,
+        features: &VirtioDeviceFeatures,
+    ) -> anyhow::Result<()> {
         let interrupt = Interrupt::from_event(self.interrupt_event.clone());
 
         self.device
@@ -141,7 +149,7 @@ impl TestHarness {
                     event: self.queue_event.clone(),
                     guest_memory: self.mem.clone(),
                 },
-                &VirtioDeviceFeatures::new(),
+                features,
                 None,
             )
             .await
@@ -1061,6 +1069,144 @@ async fn copy_only_aligned_io_uses_owned_buffers(driver: DefaultDriver) {
     assert_eq!(probe.write_ops.load(Ordering::SeqCst), 1);
     assert_eq!(probe.read_ops.load(Ordering::SeqCst), 1);
     harness.device.stop_queue(0).await;
+}
+
+#[async_test]
+async fn automatic_bounce_without_force_uses_owned_buffers(driver: DefaultDriver) {
+    let probe = Arc::new(IoProbe::default());
+    let disk = Disk::new(TestDisk4K::new(64 * 1024, 512).with_io_probe(probe.clone())).unwrap();
+    let mut harness = TestHarness::new(&driver, disk, false);
+    harness.device = harness.device.with_bounce_support();
+    assert!(!harness.device.bounce_io);
+    probe.guest_base.store(
+        harness.mem.full_mapping().unwrap().0 as usize,
+        Ordering::SeqCst,
+    );
+    harness.mem = harness
+        .mem
+        .with_io_policy(guestmem::GuestMemoryIoPolicy::CopyOnly);
+    assert!(!harness.mem.supports_kernel_lock());
+    let features = VirtioDeviceFeatures::new()
+        .with_device_specific_low(VIRTIO_BLK_F_SIZE_MAX | VIRTIO_BLK_F_SEG_MAX);
+    harness.try_enable_with_features(&features).await.unwrap();
+    assert!(harness.device.bounce_io);
+    assert!(!harness.device.supports_save_restore());
+    let pattern = vec![0x5a; 512];
+    harness.post_write_request(0, 0, &pattern);
+    assert_eq!(harness.wait_for_used().await.1, 1);
+    let read_gpa = harness.post_read_request(3, 0, pattern.len() as u32);
+    assert_eq!(harness.wait_for_used().await.1, 513);
+    let mut read = vec![0; pattern.len()];
+    harness.mem.read_at(read_gpa, &mut read).unwrap();
+    assert_eq!(read, pattern);
+    harness.device.stop_queue(0).await;
+    assert_eq!(probe.write_ops.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.read_ops.load(Ordering::SeqCst), 1);
+}
+
+#[async_test]
+async fn automatic_bounce_rejects_unreviewed_disk_at_activation(driver: DefaultDriver) {
+    let disk = Disk::new(TestDisk4K::new(64 * 1024, 512)).unwrap();
+    let mut harness = TestHarness::new(&driver, disk, false);
+    harness.mem = harness
+        .mem
+        .with_io_policy(guestmem::GuestMemoryIoPolicy::CopyOnly);
+    assert!(!harness.device.bounce_io);
+    let error = harness.try_enable().await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("requires reviewed bounce disk admission")
+    );
+    assert!(!harness.device.worker.has_state());
+}
+
+#[async_test]
+async fn deferred_bounce_contract_is_advertised_before_negotiation(driver: DefaultDriver) {
+    let disk = Disk::new(TestDisk4K::new(64 * 1024, 512)).unwrap();
+    let mut harness = TestHarness::new(&driver, disk, false);
+    harness.device = harness.device.with_bounce_support();
+    let advertised = harness.device.traits().device_features;
+    let required = VIRTIO_BLK_F_SIZE_MAX | VIRTIO_BLK_F_SEG_MAX;
+    assert_eq!(advertised.bank(0) & required, required);
+    let features = VirtioDeviceFeatures::new().with_device_specific_low(required);
+    let limits = (
+        harness.device.config.size_max,
+        harness.device.config.seg_max,
+    );
+    assert!(limits.0 != 0);
+    assert!(u64::from(limits.0) * u64::from(limits.1) <= scsi_buffers::MAX_BOUNCE_IO_SIZE as u64);
+    harness.try_enable_with_features(&features).await.unwrap();
+    assert!(!harness.device.bounce_io);
+    harness.device.stop_queue(0).await;
+
+    harness.mem = harness
+        .mem
+        .with_io_policy(guestmem::GuestMemoryIoPolicy::CopyOnly);
+    let error = harness.try_enable().await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("requires negotiated SIZE_MAX and SEG_MAX")
+    );
+    assert!(!harness.device.bounce_io);
+    assert!(!harness.device.worker.has_state());
+    harness.try_enable_with_features(&features).await.unwrap();
+    assert!(harness.device.bounce_io);
+    assert_eq!(
+        (
+            harness.device.config.size_max,
+            harness.device.config.seg_max
+        ),
+        limits
+    );
+    assert_eq!(
+        harness.device.traits().device_features.bank(0),
+        advertised.bank(0)
+    );
+    harness.device.stop_queue(0).await;
+}
+
+#[async_test]
+async fn known_direct_contract_rejects_late_kernel_denial_without_changing_limits(
+    driver: DefaultDriver,
+) {
+    let disk = Disk::new(TestDisk4K::new(64 * 1024, 512)).unwrap();
+    let mut harness = TestHarness::new(&driver, disk, false);
+    let features = harness.device.traits().device_features;
+    assert_eq!(features.bank(0) & VIRTIO_BLK_F_SIZE_MAX, 0);
+    let limits = (
+        harness.device.config.size_max,
+        harness.device.config.seg_max,
+    );
+    assert_eq!(limits, (0, crate::DEFAULT_SEG_MAX));
+    harness.try_enable_with_features(&features).await.unwrap();
+    harness.device.stop_queue(0).await;
+    harness.mem = harness
+        .mem
+        .with_io_policy(guestmem::GuestMemoryIoPolicy::CopyOnly);
+    let error = harness
+        .try_enable_with_features(&features)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("requires reviewed bounce disk admission")
+    );
+    assert!(!harness.device.worker.has_state());
+    assert!(!harness.device.bounce_io);
+    assert_eq!(
+        (
+            harness.device.config.size_max,
+            harness.device.config.seg_max
+        ),
+        limits
+    );
+    assert_eq!(
+        harness.device.traits().device_features.bank(0),
+        features.bank(0)
+    );
 }
 
 #[async_test]

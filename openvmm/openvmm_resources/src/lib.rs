@@ -175,6 +175,7 @@ mod tests {
                 .into_resource(),
                 VirtioResolveInput {
                     driver_source: &driver_source,
+                    guest_memory: None,
                 },
             )
             .await;

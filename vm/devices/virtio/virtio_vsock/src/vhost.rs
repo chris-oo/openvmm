@@ -627,6 +627,11 @@ impl VirtioDevice for VhostVsockDevice {
         initial_state: Option<QueueState>,
     ) -> anyhow::Result<()> {
         let queue_index = usize::from(index);
+        anyhow::ensure!(
+            resources.guest_memory.supports_kernel_lock()
+                && !resources.guest_memory.requires_owned_io(),
+            "vhost-vsock requires kernel-lockable guest memory"
+        );
         anyhow::ensure!(queue_index < QUEUE_COUNT, "invalid queue index {index}");
         anyhow::ensure!(
             self.queues[queue_index].is_none(),
