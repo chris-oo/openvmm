@@ -48,6 +48,7 @@ pub use guestmem_core::PageFaultError;
 use guestmem_core::gpn_to_gpa;
 
 const PAGE_SIZE64: u64 = 4096;
+const MAX_NONPROGRESS_FAULT_RETRIES: u8 = 8;
 
 /// Controls whether a guest memory view can export its backing for IO.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -78,6 +79,12 @@ struct NotMapped;
 #[derive(Debug, Error)]
 #[error("page inaccessible in bitmap")]
 struct BitmapFailure;
+
+#[derive(Debug, Error)]
+#[error(
+    "mapping fault did not advance after {MAX_NONPROGRESS_FAULT_RETRIES} successful fault resolutions"
+)]
+struct RepeatedMappingFault;
 
 /// A trait for a guest memory backing that is fully available via a virtual
 /// address mapping, as opposed to the fallback functions such as
@@ -321,20 +328,6 @@ impl<T: ProvideShareableRegions> DynProvideShareableRegions for T {
 ///
 /// The implementor must follow the contract for each method.
 pub unsafe trait GuestMemoryAccess: 'static + Send + Sync {
-    /// Acquires permission for one synchronous mapped access.
-    ///
-    /// Called only after range validation, and not for fallback-only backings
-    /// or empty accesses. The guard covers retries, but not fallback calls.
-    fn acquire_access(
-        &self,
-        address: u64,
-        len: usize,
-        write: bool,
-    ) -> Result<Option<Box<dyn GuestMemoryAccessGuard + '_>>, GuestMemoryBackingError> {
-        let _ = (address, len, write);
-        Ok(None)
-    }
-
     /// Returns the minimum IO restriction for views of this backing.
     fn io_policy(&self) -> GuestMemoryIoPolicy {
         GuestMemoryIoPolicy::Direct
@@ -541,24 +534,8 @@ pub unsafe trait GuestMemoryAccess: 'static + Send + Sync {
     }
 }
 
-/// Permission for one synchronous mapped guest-memory access.
-///
-/// Implementations should provide a non-panicking drop backstop, but callers
-/// must use `finish` to observe release failures.
-pub trait GuestMemoryAccessGuard {
-    /// Releases permission. A release failure takes precedence over copy errors.
-    fn finish(self: Box<Self>) -> Result<(), GuestMemoryBackingError>;
-}
-
 trait DynGuestMemoryAccess: 'static + Send + Sync + Any {
     fn io_policy(&self) -> GuestMemoryIoPolicy;
-
-    fn acquire_access(
-        &self,
-        address: u64,
-        len: usize,
-        write: bool,
-    ) -> Result<Option<Box<dyn GuestMemoryAccessGuard + '_>>, GuestMemoryBackingError>;
 
     fn subrange(
         &self,
@@ -614,15 +591,6 @@ trait DynGuestMemoryAccess: 'static + Send + Sync + Any {
 impl<T: GuestMemoryAccess> DynGuestMemoryAccess for T {
     fn io_policy(&self) -> GuestMemoryIoPolicy {
         GuestMemoryAccess::io_policy(self)
-    }
-
-    fn acquire_access(
-        &self,
-        address: u64,
-        len: usize,
-        write: bool,
-    ) -> Result<Option<Box<dyn GuestMemoryAccessGuard + '_>>, GuestMemoryBackingError> {
-        GuestMemoryAccess::acquire_access(self, address, len, write)
     }
 
     fn subrange(
@@ -721,15 +689,6 @@ pub struct BitmapInfo {
 
 // SAFETY: passing through guarantees from `T`.
 unsafe impl<T: GuestMemoryAccess> GuestMemoryAccess for Arc<T> {
-    fn acquire_access(
-        &self,
-        address: u64,
-        len: usize,
-        write: bool,
-    ) -> Result<Option<Box<dyn GuestMemoryAccessGuard + '_>>, GuestMemoryBackingError> {
-        self.as_ref().acquire_access(address, len, write)
-    }
-
     fn io_policy(&self) -> GuestMemoryIoPolicy {
         self.as_ref().io_policy()
     }
@@ -861,16 +820,6 @@ impl GuestMemoryAccessRange {
 
 // SAFETY: `mapping()` is guaranteed to be valid for the lifetime of the object.
 unsafe impl GuestMemoryAccess for GuestMemoryAccessRange {
-    fn acquire_access(
-        &self,
-        address: u64,
-        len: usize,
-        write: bool,
-    ) -> Result<Option<Box<dyn GuestMemoryAccessGuard + '_>>, GuestMemoryBackingError> {
-        let address = self.adjust_range(address, len as u64)?;
-        self.base.imp.acquire_access(address, len, write)
-    }
-
     fn io_policy(&self) -> GuestMemoryIoPolicy {
         if self.io_policy == GuestMemoryIoPolicy::CopyOnly {
             self.io_policy
@@ -1062,16 +1011,6 @@ impl<T: GuestMemoryAccess> DynGuestMemoryAccess for MultiRegionGuestMemoryAccess
         } else {
             GuestMemoryIoPolicy::Direct
         }
-    }
-
-    fn acquire_access(
-        &self,
-        address: u64,
-        len: usize,
-        write: bool,
-    ) -> Result<Option<Box<dyn GuestMemoryAccessGuard + '_>>, GuestMemoryBackingError> {
-        let (imp, offset) = self.region(address, len as u64)?;
-        imp.acquire_access(offset, len, write)
     }
 
     fn subrange(
@@ -1781,51 +1720,59 @@ impl GuestMemory {
         fallback: impl FnOnce(&mut P) -> Result<T, GuestMemoryBackingError>,
     ) -> Result<T, GuestMemoryBackingError> {
         let op = || {
-            let (region, _, _) = self.inner.region(gpa, len as u64)?;
-            let guard = if len != 0 && region.mapping.is_some() {
-                self.inner
-                    .imp
-                    .acquire_access(gpa, len, access_type == AccessType::Write)?
-            } else {
-                None
+            let Some(mapping) = self.mapping_range(access_type, gpa, len)? else {
+                return fallback(&mut param);
             };
-            let result = (|| {
-                let Some(mapping) = self.mapping_range(access_type, gpa, len)? else {
-                    return Ok(None);
-                };
 
-                // Retries stay within the same permission scope.
-                loop {
-                    match f(&mut param, mapping) {
-                        Ok(t) => return Ok(Some(t)),
-                        Err(fault) => {
-                            match self.inner.imp.page_fault(
-                                gpa + fault.offset() as u64,
-                                len - fault.offset(),
-                                access_type == AccessType::Write,
-                                false,
-                            ) {
-                                PageFaultAction::Fail(err) => {
-                                    return Err(GuestMemoryBackingError::new(
-                                        err.kind,
-                                        gpa + fault.offset() as u64,
-                                        err.err,
-                                    ));
-                                }
-                                PageFaultAction::Retry => {}
-                                PageFaultAction::Fallback => return Ok(None),
+            // A fault can follow a partial copy. Retry the full operation
+            // after the backing resolves it.
+            let mut furthest_fault = None;
+            let mut nonprogress_retries = 0;
+            loop {
+                match f(&mut param, mapping) {
+                    Ok(t) => return Ok(t),
+                    Err(fault) => {
+                        let offset = fault.offset();
+                        let advances = furthest_fault.is_none_or(|furthest| offset > furthest);
+                        if !advances && nonprogress_retries == MAX_NONPROGRESS_FAULT_RETRIES {
+                            tracelimit::warn_ratelimited!(
+                                gpa = gpa + offset as u64,
+                                len,
+                                write = access_type == AccessType::Write,
+                                "guest-memory mapping fault did not resolve"
+                            );
+                            return Err(GuestMemoryBackingError::other(
+                                gpa + offset as u64,
+                                RepeatedMappingFault,
+                            ));
+                        }
+                        match self.inner.imp.page_fault(
+                            gpa + fault.offset() as u64,
+                            len - fault.offset(),
+                            access_type == AccessType::Write,
+                            false,
+                        ) {
+                            PageFaultAction::Fail(err) => {
+                                return Err(GuestMemoryBackingError::new(
+                                    err.kind,
+                                    gpa + fault.offset() as u64,
+                                    err.err,
+                                ));
                             }
+                            PageFaultAction::Retry => {
+                                if advances {
+                                    furthest_fault = Some(offset);
+                                    nonprogress_retries = 1;
+                                } else {
+                                    nonprogress_retries += 1;
+                                }
+                            }
+                            PageFaultAction::Fallback => break,
                         }
                     }
                 }
-            })();
-            if let Some(guard) = guard {
-                guard.finish()?;
             }
-            match result? {
-                Some(t) => Ok(t),
-                None => fallback(&mut param),
-            }
+            fallback(&mut param)
         };
         // If the `bitmap` feature is enabled, run the function in an RCU
         // critical section. This will allow callers to flush concurrent
@@ -2647,8 +2594,6 @@ mod tests {
 
     #[derive(Debug, PartialEq, Eq)]
     enum AccessEvent {
-        Acquire(u64, usize, bool),
-        Finish,
         Fault,
         Fallback,
     }
@@ -2656,6 +2601,9 @@ mod tests {
     #[derive(Clone, Copy)]
     enum ScopedFault {
         Retry,
+        RetryUnresolved,
+        RetryOnePage,
+        RetryAlternating,
         Fail,
         Fallback,
     }
@@ -2663,9 +2611,7 @@ mod tests {
     struct ScopedMapping {
         mapping: SparseMapping,
         events: Arc<parking_lot::Mutex<Vec<AccessEvent>>>,
-        active: Arc<std::sync::atomic::AtomicBool>,
         copy_only: std::sync::atomic::AtomicBool,
-        release_fail: std::sync::atomic::AtomicBool,
         fault: ScopedFault,
         fallback: Option<GuestMemory>,
         mapped: bool,
@@ -2680,9 +2626,7 @@ mod tests {
             Self {
                 mapping,
                 events: Arc::new(parking_lot::Mutex::new(Vec::new())),
-                active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 copy_only: std::sync::atomic::AtomicBool::new(false),
-                release_fail: std::sync::atomic::AtomicBool::new(false),
                 fault,
                 fallback: None,
                 mapped: true,
@@ -2691,34 +2635,6 @@ mod tests {
 
         fn take_events(&self) -> Vec<AccessEvent> {
             std::mem::take(&mut *self.events.lock())
-        }
-    }
-
-    struct ScopedGuard {
-        events: Arc<parking_lot::Mutex<Vec<AccessEvent>>>,
-        active: Arc<std::sync::atomic::AtomicBool>,
-        release_fail: bool,
-        address: u64,
-    }
-
-    impl crate::GuestMemoryAccessGuard for ScopedGuard {
-        fn finish(self: Box<Self>) -> Result<(), crate::GuestMemoryBackingError> {
-            assert!(self.active.swap(false, Ordering::Relaxed));
-            self.events.lock().push(AccessEvent::Finish);
-            if self.release_fail {
-                Err(crate::GuestMemoryBackingError::other(
-                    self.address,
-                    crate::NoFallback,
-                ))
-            } else {
-                Ok(())
-            }
-        }
-    }
-
-    impl Drop for ScopedGuard {
-        fn drop(&mut self) {
-            self.active.store(false, Ordering::Relaxed);
         }
     }
 
@@ -2741,39 +2657,32 @@ mod tests {
             }
         }
 
-        fn acquire_access(
-            &self,
-            address: u64,
-            len: usize,
-            write: bool,
-        ) -> Result<
-            Option<Box<dyn crate::GuestMemoryAccessGuard + '_>>,
-            crate::GuestMemoryBackingError,
-        > {
-            assert!(!self.active.swap(true, Ordering::Relaxed));
-            self.events
-                .lock()
-                .push(AccessEvent::Acquire(address, len, write));
-            Ok(Some(Box::new(ScopedGuard {
-                events: self.events.clone(),
-                active: self.active.clone(),
-                release_fail: self.release_fail.load(Ordering::Relaxed),
-                address,
-            })))
-        }
-
         fn page_fault(
             &self,
-            _address: u64,
+            address: u64,
             _len: usize,
             _write: bool,
             _bitmap: bool,
         ) -> PageFaultAction {
-            assert!(self.active.load(Ordering::Relaxed));
             self.events.lock().push(AccessEvent::Fault);
             match self.fault {
                 ScopedFault::Retry => {
                     self.mapping.alloc(0, self.mapping.len()).unwrap();
+                    PageFaultAction::Retry
+                }
+                ScopedFault::RetryUnresolved => PageFaultAction::Retry,
+                ScopedFault::RetryOnePage => {
+                    self.mapping
+                        .alloc(address as usize & !(PAGE_SIZE - 1), PAGE_SIZE)
+                        .unwrap();
+                    PageFaultAction::Retry
+                }
+                ScopedFault::RetryAlternating => {
+                    let page = address as usize & !(PAGE_SIZE - 1);
+                    self.mapping.alloc(page, PAGE_SIZE).unwrap();
+                    self.mapping
+                        .unmap(if page == 0 { PAGE_SIZE } else { 0 }, PAGE_SIZE)
+                        .unwrap();
                     PageFaultAction::Retry
                 }
                 ScopedFault::Fail => {
@@ -2789,7 +2698,6 @@ mod tests {
             dest: *mut u8,
             len: usize,
         ) -> Result<(), crate::GuestMemoryBackingError> {
-            assert!(!self.active.load(Ordering::Relaxed));
             self.events.lock().push(AccessEvent::Fallback);
             let fallback = self.fallback.as_ref().unwrap();
             // SAFETY: forwarded from the caller.
@@ -2798,7 +2706,7 @@ mod tests {
     }
 
     #[test]
-    fn scoped_mapped_operations_and_empty_bounds() {
+    fn mapped_operations_and_empty_bounds_need_no_grants() {
         let backing = Arc::new(ScopedMapping::new(true, ScopedFault::Fail));
         let gm = GuestMemory::new("scoped", backing.clone());
         gm.write_at(PAGE_SIZE64 - 1, &[1, 2]).unwrap();
@@ -2810,28 +2718,7 @@ mod tests {
         gm.probe_gpa_readable(16).unwrap();
         gm.probe_gpa_writable(16).unwrap();
         gm.probe_gpns(&[0]).unwrap();
-        let expected = [
-            (PAGE_SIZE64 - 1, 2, true),
-            (PAGE_SIZE64 - 1, 2, false),
-            (16, 8, true),
-            (16, 8, true),
-            (16, 8, false),
-            (16, 8, true),
-            (16, 1, false),
-            (16, 1, true),
-            (0, 1, false),
-        ];
-        let events = backing.take_events();
-        assert_eq!(events.len(), expected.len() * 2);
-        for (events, (address, len, write)) in events.chunks_exact(2).zip(expected) {
-            assert_eq!(
-                events,
-                [
-                    AccessEvent::Acquire(address, len, write),
-                    AccessEvent::Finish
-                ]
-            );
-        }
+        assert!(backing.take_events().is_empty());
         gm.read_plain::<()>(0).unwrap();
         gm.write_plain(0, &()).unwrap();
         gm.read_at(0, &mut []).unwrap();
@@ -2843,7 +2730,7 @@ mod tests {
     }
 
     #[test]
-    fn scoped_ranges_multi_region_and_arc() {
+    fn mapped_ranges_multi_region_and_arc_need_no_grants() {
         let first = Arc::new(ScopedMapping::new(true, ScopedFault::Fail));
         let second = Arc::new(ScopedMapping::new(true, ScopedFault::Fail));
         let region_size = 8 * PAGE_SIZE64;
@@ -2862,56 +2749,79 @@ mod tests {
         range.read_plain::<u8>(32).unwrap_err();
         gm.read_plain::<u8>(region_size).unwrap_err();
         assert!(first.take_events().is_empty());
-        assert_eq!(
-            second.take_events(),
-            [AccessEvent::Acquire(27, 2, true), AccessEvent::Finish]
-        );
+        assert!(second.take_events().is_empty());
     }
 
     #[test]
-    fn scoped_retry_and_error_release_precedence() {
+    fn mapping_fault_retries_and_failures() {
         let retry = Arc::new(ScopedMapping::new(false, ScopedFault::Retry));
         GuestMemory::new("scoped", retry.clone())
             .read_plain::<u8>(8)
             .unwrap();
-        assert_eq!(
-            retry.take_events(),
-            [
-                AccessEvent::Acquire(8, 1, false),
-                AccessEvent::Fault,
-                AccessEvent::Finish
-            ]
-        );
+        assert_eq!(retry.take_events(), [AccessEvent::Fault]);
         let fail = Arc::new(ScopedMapping::new(false, ScopedFault::Fail));
         let gm = GuestMemory::new("scoped", fail.clone());
         assert_eq!(
             gm.read_plain::<u8>(8).unwrap_err().kind(),
             crate::GuestMemoryErrorKind::Other
         );
-        assert_eq!(
-            fail.take_events(),
-            [
-                AccessEvent::Acquire(8, 1, false),
-                AccessEvent::Fault,
-                AccessEvent::Finish
-            ]
-        );
-        fail.release_fail.store(true, Ordering::Relaxed);
+        assert_eq!(fail.take_events(), [AccessEvent::Fault]);
         let err = gm.read_plain_inner::<u8>(8).unwrap_err();
         assert_eq!(err.gpa, 8);
-        assert!(err.err.downcast_ref::<crate::NoFallback>().is_some());
-        assert_eq!(
-            fail.take_events(),
-            [
-                AccessEvent::Acquire(8, 1, false),
-                AccessEvent::Fault,
-                AccessEvent::Finish
-            ]
-        );
+        assert!(err.err.downcast_ref::<crate::OutOfRange>().is_some());
+        assert_eq!(fail.take_events(), [AccessEvent::Fault]);
     }
 
     #[test]
-    fn scoped_fallback_releases_outer_guard_and_skips_unmapped_hook() {
+    fn repeated_unresolved_mapping_fault_returns_io_error() {
+        let backing = Arc::new(ScopedMapping::new(false, ScopedFault::RetryUnresolved));
+        let gm = GuestMemory::new("unresolved", backing.clone());
+        let error = gm.read_plain_inner::<u64>(0).unwrap_err();
+        assert_eq!(error.gpa, 0);
+        assert!(
+            error
+                .err
+                .downcast_ref::<crate::RepeatedMappingFault>()
+                .is_some()
+        );
+        assert_eq!(
+            backing.take_events().len(),
+            usize::from(crate::MAX_NONPROGRESS_FAULT_RETRIES)
+        );
+        backing.mapping.alloc(0, PAGE_SIZE).unwrap();
+        assert_eq!(gm.read_plain::<u64>(0).unwrap(), 0);
+    }
+
+    #[test]
+    fn sequential_first_touch_faults_advance_the_retry_frontier() {
+        let mut backing = ScopedMapping::new(false, ScopedFault::RetryOnePage);
+        let pages = usize::from(crate::MAX_NONPROGRESS_FAULT_RETRIES) + 3;
+        backing.mapping = SparseMapping::new(pages * PAGE_SIZE).unwrap();
+        let backing = Arc::new(backing);
+        let gm = GuestMemory::new("first-touch", backing.clone());
+        let mut bytes = vec![0xff; pages * PAGE_SIZE];
+        gm.read_at(0, &mut bytes).unwrap();
+        assert!(bytes.iter().all(|byte| *byte == 0));
+        assert_eq!(backing.take_events().len(), pages);
+    }
+
+    #[test]
+    fn alternating_mapping_faults_without_forward_progress_return_io_error() {
+        let backing = Arc::new(ScopedMapping::new(false, ScopedFault::RetryAlternating));
+        let gm = GuestMemory::new("alternating", backing.clone());
+        let mut bytes = vec![0; 2 * PAGE_SIZE];
+        let error = gm.read_at(0, &mut bytes).unwrap_err();
+        assert_eq!(error.kind(), crate::GuestMemoryErrorKind::Other);
+        assert_eq!(
+            backing.take_events().len(),
+            usize::from(crate::MAX_NONPROGRESS_FAULT_RETRIES) + 1
+        );
+        backing.mapping.alloc(0, 2 * PAGE_SIZE).unwrap();
+        gm.read_at(0, &mut bytes).unwrap();
+    }
+
+    #[test]
+    fn mapping_fault_and_unmapped_fallback() {
         let inner = Arc::new(ScopedMapping::new(true, ScopedFault::Fail));
         let mut outer = ScopedMapping::new(false, ScopedFault::Fallback);
         outer.fallback = Some(GuestMemory::new("inner", inner.clone()));
@@ -2921,17 +2831,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             outer.take_events(),
-            [
-                AccessEvent::Acquire(8, 1, false),
-                AccessEvent::Fault,
-                AccessEvent::Finish,
-                AccessEvent::Fallback
-            ]
+            [AccessEvent::Fault, AccessEvent::Fallback]
         );
-        assert_eq!(
-            inner.take_events(),
-            [AccessEvent::Acquire(8, 1, false), AccessEvent::Finish]
-        );
+        assert!(inner.take_events().is_empty());
         let mut adapter = ScopedMapping::new(false, ScopedFault::Fail);
         adapter.mapped = false;
         adapter.fallback = Some(GuestMemory::new("inner", inner.clone()));
@@ -2940,14 +2842,11 @@ mod tests {
             .read_plain::<u8>(8)
             .unwrap();
         assert_eq!(adapter.take_events(), [AccessEvent::Fallback]);
-        assert_eq!(
-            inner.take_events(),
-            [AccessEvent::Acquire(8, 1, false), AccessEvent::Finish]
-        );
+        assert!(inner.take_events().is_empty());
     }
 
     #[test]
-    fn scoped_dynamic_copy_policy_strengthens_existing_views() {
+    fn dynamic_copy_policy_strengthens_existing_views() {
         let backing = Arc::new(ScopedMapping::new(true, ScopedFault::Fail));
         let gm = GuestMemory::new("scoped", backing.clone());
         let range = gm.subrange(8, 64, false).unwrap();
@@ -2984,10 +2883,7 @@ mod tests {
         assert_eq!(gm.io_policy(), crate::GuestMemoryIoPolicy::CopyOnly);
         assert_eq!(range.io_policy(), crate::GuestMemoryIoPolicy::CopyOnly);
         gm.read_plain::<u8>(0).unwrap();
-        assert_eq!(
-            backing.take_events(),
-            [AccessEvent::Acquire(0, 1, false), AccessEvent::Finish]
-        );
+        assert!(backing.take_events().is_empty());
     }
 
     /// An implementation of a GuestMemoryAccess trait that expects all of

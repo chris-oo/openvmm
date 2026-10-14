@@ -128,7 +128,10 @@ impl LinuxMshv {
         self
     }
 
-    /// Configures opt-in scoped host access for SNP partitions.
+    /// Configures opt-in copy-only host access for SNP partitions.
+    ///
+    /// The experimental option keeps its name for compatibility; ordinary
+    /// grants are fault-driven and retained, not scoped to each copy.
     pub fn with_snp_scoped_host_access(mut self, enabled: bool) -> Self {
         self.snp_scoped_host_access = enabled;
         self
@@ -418,11 +421,17 @@ struct MshvVpInner {
 
 struct MshvVpInnerCleaner<'a> {
     vpinner: &'a MshvVpInner,
+    #[cfg(guest_arch = "x86_64")]
+    snp: Option<&'a arch::SnpPartitionState>,
 }
 
 impl Drop for MshvVpInnerCleaner<'_> {
     fn drop(&mut self) {
         self.vpinner.thread.write().take();
+        #[cfg(guest_arch = "x86_64")]
+        if let Some(snp) = self.snp {
+            snp.log_host_access_counts("VP stop");
+        }
     }
 }
 
@@ -466,41 +475,6 @@ impl virt::PartitionTimeControl for MshvPartition {
 }
 
 impl MshvPartitionInner {
-    #[cfg(guest_arch = "x86_64")]
-    fn kick_host_access_vps(&self) {
-        for vp in &self.vps {
-            vp.needs_yield.request_yield();
-            if let Some(waker) = vp.waker.read().clone() {
-                waker.wake();
-            }
-            let thread = *vp.thread.read();
-            if let Some(thread) = thread {
-                if thread != Pthread::current() {
-                    if let Err(error) = thread.signal(libc::SIGRTMIN()) {
-                        tracelimit::error_ratelimited!(
-                            error = &error as &dyn std::error::Error,
-                            "failed to interrupt poisoned SNP VP"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    fn check_host_access_run(&self) -> Result<(), VpHaltReason> {
-        #[cfg(guest_arch = "x86_64")]
-        if let Some(snp) = self.isolation.snp() {
-            snp.check_host_access_run().map_err(|error| {
-                tracelimit::error_ratelimited!(
-                    error = &*error,
-                    "stopping VP after uncertain SNP host access"
-                );
-                VpHaltReason::TripleFault { vtl: Vtl::Vtl0 }
-            })?;
-        }
-        Ok(())
-    }
-
     fn vp(&self, vp_index: VpIndex) -> &MshvVpInner {
         &self.vps[vp_index.index() as usize]
     }
@@ -724,7 +698,11 @@ impl virt::Processor for MshvProcessor<'_> {
         dev: &impl CpuIo,
     ) -> Result<Infallible, VpHaltReason> {
         let vpinner = self.inner;
-        let _cleaner = MshvVpInnerCleaner { vpinner };
+        let _cleaner = MshvVpInnerCleaner {
+            vpinner,
+            #[cfg(guest_arch = "x86_64")]
+            snp: self.partition.isolation.snp(),
+        };
 
         assert!(vpinner.thread.write().replace(Pthread::current()).is_none());
 
@@ -737,6 +715,10 @@ impl virt::Processor for MshvProcessor<'_> {
         }
 
         let mut last_waker: Option<Waker> = None;
+        // Telemetry only: count a successful RUN following an accepted
+        // attribute intercept. An interrupted RUN leaves this observation pending.
+        #[cfg(guest_arch = "x86_64")]
+        let mut attribute_resume_pending = false;
 
         loop {
             vpinner.needs_yield.maybe_yield().await;
@@ -763,12 +745,21 @@ impl virt::Processor for MshvProcessor<'_> {
                 }
             }
 
-            self.partition.check_host_access_run()?;
             let exit = self.runner.run();
-            self.partition.check_host_access_run()?;
             match exit {
                 Ok(exit) => {
+                    #[cfg(guest_arch = "x86_64")]
+                    if attribute_resume_pending {
+                        if let Some(snp) = self.partition.isolation.snp() {
+                            snp.record_attribute_resume_run(self.vpindex);
+                        }
+                    }
                     self.handle_exit(&exit, dev).await?;
+                    #[cfg(guest_arch = "x86_64")]
+                    {
+                        attribute_resume_pending =
+                            exit.header.typ == HvMessageType::HvMessageTypeGpaAttributeIntercept;
+                    }
                 }
                 Err(e) => match e.errno() {
                     libc::EAGAIN | libc::EINTR => {}
@@ -1046,25 +1037,10 @@ impl virt::PartitionHostAccess for MshvPartitionInner {
         false
     }
 
-    fn acquire_host_access_scoped(
-        &self,
-        addr: u64,
-        size: u64,
-        write: bool,
-    ) -> anyhow::Result<Option<Box<dyn virt::PartitionHostAccessGuard>>> {
-        #[cfg(guest_arch = "x86_64")]
-        if let Some(snp) = self.isolation.snp() {
-            return snp.acquire_host_access_scoped(self, addr, size, write);
-        }
-        let _ = (addr, size, write);
-        Ok(None)
-    }
-
     fn acquire_host_access(&self, _addr: u64, _size: u64, _write: bool) -> anyhow::Result<()> {
         #[cfg(guest_arch = "x86_64")]
         if let Some(snp) = self.isolation.snp() {
-            snp.check_legacy_host_access()?;
-            return arch::acquire_snp_host_access(self, _addr, _size);
+            return snp.acquire_host_access(self, _addr, _size, _write);
         }
         anyhow::bail!("acquiring host access is not supported")
     }

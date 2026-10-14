@@ -3249,6 +3249,7 @@ dependencies = [
  "sparse_mmap",
  "test_with_tracing",
  "thiserror 2.0.16",
+ "tracelimit",
  "trycopy",
  "zerocopy",
 ]
@@ -8921,7 +8922,6 @@ version = "0.0.0"
 dependencies = [
  "criterion",
  "libc",
- "test_with_tracing",
  "thiserror 2.0.16",
  "windows-sys 0.61.0",
  "zerocopy",
@@ -9857,7 +9857,6 @@ dependencies = [
  "thiserror 2.0.16",
  "tracelimit",
  "tracing",
- "trycopy",
  "virt",
  "virt_support_x86emu",
  "vm_topology",
@@ -10075,7 +10074,6 @@ dependencies = [
  "task_control",
  "test_with_tracing",
  "tracelimit",
- "trycopy",
  "unicycle",
  "virtio",
  "virtio_resources",

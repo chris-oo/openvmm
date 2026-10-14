@@ -1048,7 +1048,7 @@ flags:
     ///
     /// MSHV parameters (default: false):
     ///   snp_disable_cpuid_offload - forward SNP GHCB CPUID requests to OpenVMM
-    ///   snp_scoped_host_access - opt in to scoped SNP host access; requires
+    ///   snp_scoped_host_access - opt in to copy-only SNP host access; requires
     ///                           explicit per-device bounce I/O
     ///
     /// Examples:

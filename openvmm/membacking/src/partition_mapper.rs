@@ -303,7 +303,7 @@ mod tests {
         assert!(backing_weak.upgrade().is_some());
         assert!(events.lock().is_empty());
         assert_eq!(gm.read_plain::<u64>(0).unwrap(), 42);
-        // This is the last owner held by a copy guard, not the partition.
+        // A retained kernel fd can outlive the partition.
         drop(owner);
         assert!(backing_weak.upgrade().is_none());
         assert_eq!(*events.lock(), ["kernel closed", "backing released"]);

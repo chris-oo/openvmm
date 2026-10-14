@@ -3,18 +3,20 @@
 
 //! AMD SEV-SNP support for the x86_64 MSHV backend.
 
-use super::snp_host_access::HostAccessBackend;
-use super::snp_host_access::HostAccessCoordinator;
+use super::snp_host_access::ControlBinding;
+use super::snp_host_access::ControlPageRegistry;
 use super::snp_host_access::HostAccessError;
 use super::snp_host_access::PageRange;
 use super::snp_host_access::RootAccessGuard;
-use super::snp_host_access::attribute_ranges;
+use super::snp_host_access::revoke_attribute_access;
 use super::snp_host_access::validate_ram;
 use super::*;
 use crate::KernelError;
 use mshv_bindings::MSHV_SET_MEM_BIT_WRITABLE;
 use mshv_ioctls::VmFd;
 use std::io;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 pub(super) const SNP_IMPORT_CHUNK_PAGES: usize = 256;
 
@@ -180,9 +182,21 @@ pub(crate) struct SnpPartitionState {
     pub(super) cpuid_offloads_enabled: bool,
     pub(crate) scoped_host_access: bool,
     #[inspect(skip)]
-    host_access: Arc<HostAccessCoordinator>,
+    control_pages: Arc<ControlPageRegistry>,
     #[inspect(skip)]
     control_ranges: Mutex<Vec<PageRange>>,
+    #[inspect(skip)]
+    ghcb_controls: Mutex<Vec<(VpIndex, RootAccessGuard)>>,
+    #[inspect(skip)]
+    attribute_releases: AtomicU64,
+    #[inspect(skip)]
+    attribute_released_pages: AtomicU64,
+    #[inspect(skip)]
+    host_read_acquires: AtomicU64,
+    #[inspect(skip)]
+    host_write_acquires: AtomicU64,
+    #[inspect(skip)]
+    attribute_resume_runs: AtomicU64,
     config: Option<Box<MshvSnpConfig>>,
 }
 
@@ -193,8 +207,14 @@ impl SnpPartitionState {
             sev_features: Mutex::new(None),
             cpuid_offloads_enabled: !disable_cpuid_offload,
             scoped_host_access: false,
-            host_access: Arc::new(HostAccessCoordinator::default()),
+            control_pages: Arc::new(ControlPageRegistry::default()),
             control_ranges: Mutex::new(Vec::new()),
+            ghcb_controls: Mutex::new(Vec::new()),
+            attribute_releases: AtomicU64::new(0),
+            attribute_released_pages: AtomicU64::new(0),
+            host_read_acquires: AtomicU64::new(0),
+            host_write_acquires: AtomicU64::new(0),
+            attribute_resume_runs: AtomicU64::new(0),
             config: None,
         }
     }
@@ -210,32 +230,12 @@ impl SnpPartitionState {
         state
     }
 
-    pub(crate) fn install_host_access_kick(&self, partition: &Arc<MshvPartitionInner>) {
-        let partition = Arc::downgrade(partition);
-        self.host_access.set_kick(Arc::new(move || {
-            if let Some(partition) = partition.upgrade() {
-                partition.kick_host_access_vps();
-            }
-        }));
-    }
-
-    pub(crate) fn check_host_access_run(&self) -> anyhow::Result<()> {
-        self.host_access.check_run()?;
-        Ok(())
-    }
-
-    pub(crate) fn check_legacy_host_access(&self) -> anyhow::Result<()> {
-        if self.scoped_host_access {
-            return Err(HostAccessError::LegacyAcquisition.into());
-        }
-        Ok(())
-    }
-
     pub(crate) fn reserve_root_operation(
         &self,
         partition: &MshvPartitionInner,
         addresses: &[u64],
         operation: &'static str,
+        binding: Option<ControlBinding>,
     ) -> anyhow::Result<Option<RootAccessGuard>> {
         if !self.scopes_active()? {
             return Ok(None);
@@ -244,9 +244,9 @@ impl SnpPartitionState {
             .iter()
             .map(|addr| PageRange::new(*addr, hvdef::HV_PAGE_SIZE))
             .collect::<Result<Vec<_>, _>>()?;
-        // Reserve before validation so admission waits cannot block the
-        // mapping lock used by a fault/intercept handler.
-        let guard = self.host_access.reserve_root(ranges.clone(), operation)?;
+        let guard = self
+            .control_pages
+            .reserve_root(ranges.clone(), operation, binding)?;
         {
             let memory = partition.memory.lock();
             let (ram, mappings) = host_access_ram(partition, &memory)?;
@@ -254,13 +254,29 @@ impl SnpPartitionState {
             for range in &ranges {
                 validate_ram(*range, true, &ram, &mappings, &controls)?;
             }
+            // Control references require HostClosed. The reservation prevents
+            // concurrent ordinary fault reacquisition while we close grants.
+            for (index, range) in ranges.iter().enumerate() {
+                modify_snp_host_access(
+                    &partition.vmfd,
+                    range.start,
+                    range.end - range.start,
+                    false,
+                    false,
+                )
+                .map_err(|error| {
+                    error.context(format!(
+                        "{operation}: host release failed after {index} completed control ranges"
+                    ))
+                })?;
+            }
         }
         Ok(Some(guard))
     }
 
     pub(crate) fn check_mapping_change(&self, addr: u64, size: u64) -> anyhow::Result<()> {
         if self.scoped_host_access {
-            self.host_access
+            self.control_pages
                 .check_change(&[PageRange::new(addr, size)?])?;
         }
         Ok(())
@@ -277,54 +293,124 @@ impl SnpPartitionState {
         }
     }
 
-    pub(crate) fn acquire_host_access_scoped(
+    pub(crate) fn acquire_host_access(
         &self,
         partition: &MshvPartitionInner,
         addr: u64,
         size: u64,
         write: bool,
-    ) -> anyhow::Result<Option<Box<dyn virt::PartitionHostAccessGuard>>> {
-        if !self.scopes_active()? {
-            return Ok(None);
+    ) -> anyhow::Result<()> {
+        let write = self.host_access_write(write);
+        if !self.scoped_host_access {
+            // Legacy views can export raw pointers. Keep their original RW
+            // grant and admission behavior, even when a read caused the fault.
+            return modify_snp_host_access(&partition.vmfd, addr, size, true, write);
+        }
+        if *self.launch_state.lock() == SnpLaunchState::Failed {
+            return Err(SnpError::LaunchFailed.into());
         }
         let range = PageRange::new(addr, size)?;
-        let mut guard = self.host_access.reserve(
-            range,
-            0,
+        let memory = partition.memory.lock();
+        let (ram, mappings) = host_access_ram(partition, &memory)?;
+        validate_ram(range, write, &ram, &mappings, &self.control_ranges.lock())?;
+        self.control_pages.with_access(&[range], || {
+            modify_snp_host_access(
+                &partition.vmfd,
+                range.start,
+                range.end - range.start,
+                true,
+                write,
+            )
+        })?;
+        let count = if write {
+            &self.host_write_acquires
+        } else {
+            &self.host_read_acquires
+        };
+        count.fetch_add(1, Ordering::Relaxed);
+        tracelimit::info_ratelimited!(
+            addr,
+            size,
             write,
-            Arc::new(MshvHostAccessBackend {
-                vmfd: partition.vmfd.clone(),
-                _memory: partition.gm.clone(),
-            }),
-        )?;
-        {
-            let memory = partition.memory.lock();
-            let (ram, mappings) = host_access_ram(partition, &memory)?;
-            let backing = validate_ram(range, write, &ram, &mappings, &self.control_ranges.lock())?;
-            guard.set_backing(backing);
-        }
-        // No mapping or ledger mutex is held across the ioctl or the copy.
-        Ok(Some(Box::new(guard.acquire()?)))
+            "acquired SNP host access after mapping fault"
+        );
+        Ok(())
     }
 
-    fn check_gpa_attribute_change(
+    pub(crate) fn record_attribute_resume_run(&self, vp_index: VpIndex) {
+        self.attribute_resume_runs.fetch_add(1, Ordering::Relaxed);
+        tracelimit::info_ratelimited!(
+            vp_index = vp_index.index(),
+            "MSHV RUN returned after SNP host-access release"
+        );
+    }
+
+    pub(crate) fn log_host_access_counts(&self, phase: &'static str) {
+        if self.scoped_host_access {
+            tracing::info!(
+                phase,
+                attribute_releases = self.attribute_releases.load(Ordering::Relaxed),
+                attribute_released_pages = self.attribute_released_pages.load(Ordering::Relaxed),
+                host_read_acquires = self.host_read_acquires.load(Ordering::Relaxed),
+                host_write_acquires = self.host_write_acquires.load(Ordering::Relaxed),
+                attribute_resume_runs = self.attribute_resume_runs.load(Ordering::Relaxed),
+                "SNP host-access counts"
+            );
+        }
+    }
+
+    fn host_access_write(&self, write: bool) -> bool {
+        !self.scoped_host_access || write
+    }
+
+    fn revoke_gpa_attribute_access(
         &self,
         partition: &MshvPartitionInner,
         message: &hvdef::HvX64GpaAttributeInterceptMessage,
     ) -> anyhow::Result<()> {
-        let ranges = attribute_ranges(message)?;
         let memory = partition.memory.lock();
         let (ram, mappings) = host_access_ram(partition, &memory)?;
         let controls = self.control_ranges.lock();
-        // Validate every range before checking the whole request against the
-        // partition ledger. A second VP shares this same admission state.
-        for range in &ranges {
-            validate_ram(*range, false, &ram, &mappings, &controls)?;
-        }
-        self.host_access.check_change(&ranges)?;
-        // Do not reserve or resume an intercept without a proven completion
-        // contract. CompletePartitionIntercept's value encoding is unresolved.
+        let ranges = revoke_attribute_access(
+            self.scoped_host_access,
+            message,
+            &ram,
+            &mappings,
+            &controls,
+            &self.control_pages,
+            |range| {
+                modify_snp_host_access(
+                    &partition.vmfd,
+                    range.start,
+                    range.end - range.start,
+                    false,
+                    false,
+                )
+            },
+        )?;
+        self.attribute_releases.fetch_add(1, Ordering::Relaxed);
+        self.attribute_released_pages.fetch_add(
+            ranges
+                .iter()
+                .map(|range| (range.end - range.start) / hvdef::HV_PAGE_SIZE)
+                .sum(),
+            Ordering::Relaxed,
+        );
+        tracelimit::info_ratelimited!(
+            vp_index = message.vp_index,
+            adjust = message.flags.adjust(),
+            host_visibility = message.flags.host_visibility(),
+            memory_type = message.flags.memory_type(),
+            ?ranges,
+            "released SNP host access; retrying guest GPA attribute operation"
+        );
         Ok(())
+    }
+}
+
+impl Drop for SnpPartitionState {
+    fn drop(&mut self) {
+        self.log_host_access_counts("partition drop");
     }
 }
 
@@ -362,25 +448,6 @@ fn host_access_ram(
         })
         .collect::<Result<_, HostAccessError>>()?;
     Ok((ram, mappings))
-}
-
-struct MshvHostAccessBackend {
-    vmfd: Arc<crate::MshvMemoryOwner>,
-    // Keep the registered RAM backing alive even if the weak host callback
-    // was the last partition reference.
-    _memory: GuestMemory,
-}
-
-impl HostAccessBackend for MshvHostAccessBackend {
-    fn modify(&self, range: PageRange, acquire: bool, write: bool) -> anyhow::Result<()> {
-        modify_snp_host_access(
-            &self.vmfd,
-            range.start,
-            range.end - range.start,
-            acquire,
-            write,
-        )
-    }
 }
 
 pub(crate) struct SnpVpState {
@@ -610,15 +677,6 @@ pub(super) fn vp_index_for_apic_id(
         .find_map(|(vp_index, candidate)| (candidate == apic_id).then_some(vp_index))
 }
 
-pub(crate) fn acquire_snp_host_access(
-    partition: &MshvPartitionInner,
-    addr: u64,
-    size: u64,
-) -> anyhow::Result<()> {
-    // Legacy single-threaded bring-up intentionally retains its RW grant.
-    modify_snp_host_access(&partition.vmfd, addr, size, true, true)
-}
-
 fn modify_snp_host_access(
     vmfd: &VmFd,
     addr: u64,
@@ -669,345 +727,6 @@ fn host_access_flags(acquire: bool, write: bool) -> u8 {
         } else {
             0
         }
-}
-
-/// Test-only legacy shared-DMA probe. Never used by scoped or fd-backed RAM.
-// xtask-fmt allow-target-arch dependency
-#[cfg(all(feature = "revocation-experiment", target_arch = "x86_64"))]
-pub(super) fn install_revocation_experiment(
-    partition: &Arc<MshvPartitionInner>,
-) -> anyhow::Result<()> {
-    use std::sync::atomic::AtomicBool;
-    use std::sync::atomic::Ordering;
-    use trycopy::experiment::Width;
-
-    let Some(setting) = std::env::var_os("OPENVMM_SHARED_REVOKE_EXPERIMENT") else {
-        return Ok(());
-    };
-    let setting = setting
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("experiment setting is not UTF-8"))?;
-    let (direction, width) = setting
-        .split_once(':')
-        .ok_or_else(|| anyhow::anyhow!("expected read|write:u8|u64|simd|rep"))?;
-    let write = match direction {
-        "read" => false,
-        "write" => true,
-        _ => anyhow::bail!("invalid experiment direction"),
-    };
-    let width = match width {
-        "u8" => Width::Byte,
-        "u64" => Width::Word,
-        "simd" => Width::Simd,
-        "rep" => Width::Rep,
-        _ => anyhow::bail!("invalid experiment width"),
-    };
-    anyhow::ensure!(
-        partition
-            .isolation
-            .snp()
-            .is_some_and(|snp| !snp.scoped_host_access),
-        "experiment requires legacy SNP access, not scoped grants"
-    );
-    let partition = Arc::downgrade(partition);
-    let fired = AtomicBool::new(false);
-    trycopy::experiment::install_dma_probe(move |lease, owned, dma_write| {
-        // This fixture marker is carried by a real pending virtio-blk request,
-        // not by arbitrary RAM scanning or MAP_SHARED ownership inference.
-        if dma_write != write
-            || !owned.starts_with(b"MSHV-SHARED-REVOKE-v1")
-            || owned.len() < 4096
-            || !lease.payload_gpa.is_multiple_of(4096)
-            || fired.swap(true, Ordering::AcqRel)
-        {
-            return Ok(());
-        }
-        let partition = partition
-            .upgrade()
-            .ok_or_else(|| "experiment partition retired".to_owned())?;
-        run_shared_revocation_probe(&partition, lease, owned, write, width)
-            .map_err(|error| format!("{error:#}"))
-    })
-    .map_err(anyhow::Error::msg)?;
-    eprintln!("MSHV_REVOKE_EXPERIMENT_ARMED direction={direction} width={width:?} legacy=true");
-    Ok(())
-}
-
-// xtask-fmt allow-target-arch dependency
-#[cfg(all(feature = "revocation-experiment", target_arch = "x86_64"))]
-fn run_shared_revocation_probe(
-    partition: &Arc<MshvPartitionInner>,
-    lease: trycopy::experiment::DmaLease,
-    owned: &mut [u8],
-    write: bool,
-    width: trycopy::experiment::Width,
-) -> anyhow::Result<()> {
-    use std::sync::atomic::AtomicU8;
-    use std::sync::atomic::Ordering;
-    use std::sync::mpsc;
-    use std::time::Duration;
-    use trycopy::experiment::CopyError;
-    use trycopy::experiment::Rendezvous;
-
-    const GUARD: usize = 64;
-    const PREFIX: usize = 64;
-    let gpa = lease.payload_gpa;
-    let page_range = PageRange::new(gpa, owned.len() as u64)?;
-    anyhow::ensure!(owned.len() <= 65536, "experiment payload exceeds 64 KiB");
-    let pointer = {
-        let memory = partition.memory.lock();
-        let (ram, mappings) = host_access_ram(partition, &memory)?;
-        let snp = partition
-            .isolation
-            .snp()
-            .ok_or_else(|| anyhow::anyhow!("experiment requires SNP isolation"))?;
-        validate_ram(
-            page_range,
-            true,
-            &ram,
-            &mappings,
-            &snp.control_ranges.lock(),
-        )?;
-        let mapping = memory
-            .ranges
-            .iter()
-            .flatten()
-            .find(|mapping| {
-                let start = mapping.region.guest_pfn * hvdef::HV_PAGE_SIZE;
-                mapping.mapped && start <= gpa && page_range.end <= start + mapping.region.size
-            })
-            .ok_or_else(|| anyhow::anyhow!("experiment DMA backing not found"))?;
-        mapping.region.userspace_addr + (gpa - mapping.region.guest_pfn * hvdef::HV_PAGE_SIZE)
-    };
-    let guest = pointer as *mut u8;
-    // Successful RW acquisition checks the guest's maximum access. Together
-    // with the pending SNP virtio DMA request, this is the shared-page evidence.
-    modify_snp_host_access(
-        &partition.vmfd,
-        page_range.start,
-        page_range.end - page_range.start,
-        true,
-        true,
-    )?;
-    eprintln!(
-        "MSHV_REVOKE_LEASE payload_gpa={gpa:#x} bytes={} head={} sector={} header_gpa={:#x} status_gpa={:#x} request_uncompleted=true rw_acquire=true guest_shared_dma=true",
-        owned.len(),
-        lease.descriptor_index,
-        lease.sector,
-        lease.header_gpa,
-        lease.status_gpa,
-    );
-    let mut before = vec![0u8; owned.len()];
-    // SAFETY: validated registered backing stays owned by the partition; the
-    // cooperative guest retains the pending DMA request and does not reset it.
-    unsafe { trycopy::try_copy(guest.cast_const(), before.as_mut_ptr(), before.len())? };
-    let mut offset = GUARD + (32 - (pointer as usize + GUARD) % 32) % 32;
-    let mut copy_gpa = gpa + offset as u64;
-    if 4096 - copy_gpa % 4096 <= PREFIX as u64 {
-        offset += (4096 - copy_gpa % 4096) as usize + GUARD;
-        copy_gpa = gpa + offset as u64;
-    }
-    let len = owned
-        .len()
-        .checked_sub(offset + GUARD)
-        .ok_or_else(|| anyhow::anyhow!("experiment guards exceed payload"))?
-        & !31;
-    let next_page = (copy_gpa & !4095) + 4096;
-    let cross_page = copy_gpa + (PREFIX as u64) < next_page && next_page < copy_gpa + len as u64;
-    let revoke_gpa = if cross_page {
-        next_page
-    } else {
-        copy_gpa & !4095
-    };
-    let expected_copied = if cross_page {
-        (revoke_gpa - copy_gpa) as usize
-    } else {
-        PREFIX
-    };
-    anyhow::ensure!(
-        revoke_gpa >= gpa && revoke_gpa + 4096 <= gpa + owned.len() as u64,
-        "experiment must revoke a complete page inside the leased payload"
-    );
-    eprintln!("MSHV_REVOKE_PAGE revoke_page_within_payload=true");
-    anyhow::ensure!(
-        len > PREFIX,
-        "experiment requires a copied prefix and an uncopied tail"
-    );
-    let expected = if write {
-        before[offset..offset + len]
-            .iter()
-            .map(|byte| byte ^ 0xa5)
-            .collect::<Vec<_>>()
-    } else {
-        before[offset..offset + len].to_vec()
-    };
-    let staging: Arc<[AtomicU8]> = (0..len + 2 * GUARD)
-        .map(|i| {
-            let byte = if (GUARD..GUARD + len).contains(&i) {
-                expected[i - GUARD] ^ if write { 0 } else { 0xa5 }
-            } else {
-                0xd3
-            };
-            AtomicU8::new(byte)
-        })
-        .collect();
-    // SAFETY: offset and length were checked within the retained DMA payload.
-    let guest_copy = unsafe { guest.add(offset) };
-    let (src, dest) = if write {
-        (
-            staging.as_ptr().cast::<u8>().wrapping_add(GUARD),
-            guest_copy,
-        )
-    } else {
-        (
-            guest_copy.cast_const(),
-            staging.as_ptr().cast::<u8>().cast_mut().wrapping_add(GUARD),
-        )
-    };
-    let rendezvous = Arc::new(Rendezvous::default());
-    let revoker_control = rendezvous.clone();
-    let vmfd = partition.vmfd.clone();
-    let memory = partition.gm.clone();
-    let staging_owner = staging.clone();
-    let prefix_address = dest.addr();
-    let expected_prefix = expected[..PREFIX].to_vec();
-    let (result_tx, result_rx) = mpsc::sync_channel(1);
-    let revoker = std::thread::spawn(move || {
-        // Retain backing even if a failed/hung ioctl outlives the probe.
-        let _memory = memory;
-        let _staging = staging_owner;
-        let result = (|| {
-            let progress = revoker_control.wait_for_prefix(Duration::from_secs(2))?;
-            anyhow::ensure!(progress == PREFIX, "unexpected copy progress");
-            let mut observed_prefix = vec![0u8; PREFIX];
-            // SAFETY: published progress means assembly finished its stores
-            // and is paused. The retained, acquired destination and the owned
-            // staging buffer remain live until this thread resumes the tail.
-            unsafe {
-                trycopy::try_copy(
-                    prefix_address as *const u8,
-                    observed_prefix.as_mut_ptr(),
-                    PREFIX,
-                )?;
-            }
-            anyhow::ensure!(
-                observed_prefix == expected_prefix,
-                "prefix is not observable"
-            );
-            eprintln!(
-                "MSHV_REVOKE_PREFIX bytes={progress} verified=true revoke_gpa={revoke_gpa:#x}"
-            );
-            modify_snp_host_access(&vmfd, revoke_gpa, 4096, false, false)?;
-            eprintln!("MSHV_REVOKE_RETURN flags=0 pages=1 success=true");
-            Ok::<_, anyhow::Error>(())
-        })();
-        let success = result.is_ok();
-        let _ = result_tx.send(result);
-        if success {
-            revoker_control.resume();
-        } else {
-            revoker_control.cancel();
-        }
-    });
-    let (done_tx, done_rx) = mpsc::channel::<()>();
-    let watchdog_control = rendezvous.clone();
-    let watchdog = std::thread::spawn(move || {
-        if done_rx.recv_timeout(Duration::from_secs(5)).is_err() {
-            watchdog_control.cancel();
-        }
-    });
-    // SAFETY: disjoint guest and owned staging ranges stay live; the owned
-    // controls and independent watchdog bound the annotated mid-copy pause.
-    let fault = unsafe { trycopy::experiment::copy(src, dest, len, PREFIX, width, &rendezvous) };
-    let _ = done_tx.send(());
-    let _ = watchdog.join();
-    let release = result_rx
-        .recv_timeout(Duration::from_secs(1))
-        .map_err(|_| anyhow::anyhow!("revoker did not return; retain backing and stop VM"))?;
-    let _ = revoker.join();
-    release?;
-    eprintln!("MSHV_REVOKE_FAULT direction_write={write} width={width:?} result={fault:?}");
-    eprintln!(
-        "MSHV_REVOKE_FAULT_NOTE gp_address_and_offset_may_be_zero=true copied_bytes_measured=true linux_mprotect=false fd_pte_zap_variant=false"
-    );
-    // This is a known completed release, not an uncertain scoped guard. Keep
-    // the device request pending while explicitly reacquiring shared access.
-    modify_snp_host_access(&partition.vmfd, revoke_gpa, 4096, true, true)?;
-    eprintln!("MSHV_REVOKE_REACQUIRE success=true guest_request_uncompleted=true");
-    let mut after = before.clone();
-    if write {
-        // SAFETY: RW acquisition returned; the same DMA lease is still held.
-        unsafe { trycopy::try_copy(guest.cast_const(), after.as_mut_ptr(), after.len())? };
-    } else {
-        for (dest, source) in after[offset..offset + len]
-            .iter_mut()
-            .zip(&staging[GUARD..GUARD + len])
-        {
-            *dest = source.load(Ordering::Relaxed);
-        }
-    }
-    let actual = &after[offset..offset + len];
-    let copied = actual
-        .iter()
-        .zip(&expected)
-        .take_while(|(a, b)| a == b)
-        .count();
-    let baseline_tail = if write {
-        &before[offset + copied..offset + len]
-    } else {
-        // The read destination was initialized to the complement of source.
-        &[]
-    };
-    let tail_unchanged = if write {
-        &actual[copied..] == baseline_tail
-    } else {
-        actual[copied..]
-            .iter()
-            .zip(&expected[copied..])
-            .all(|(a, b)| *a == (*b ^ 0xa5))
-    };
-    let guards_ok = staging[..GUARD]
-        .iter()
-        .chain(&staging[GUARD + len..])
-        .all(|b| b.load(Ordering::Relaxed) == 0xd3)
-        && after[..offset] == before[..offset]
-        && after[offset + len..] == before[offset + len..];
-    eprintln!(
-        "MSHV_REVOKE_PARTIAL copy_gpa={copy_gpa:#x} copy_bytes={len} copied_bytes={copied} expected_copied={expected_copied} cross_page={cross_page} guards_ok={guards_ok} tail_unchanged={tail_unchanged}",
-    );
-    anyhow::ensure!(
-        matches!(fault, Err(CopyError::Fault(_)))
-            && copied == expected_copied
-            && guards_ok
-            && tail_unchanged,
-        "unexpected revoke/copy outcome; stop further experiments"
-    );
-    let retry = Rendezvous::default();
-    retry.resume();
-    // SAFETY: unchanged buffers, successful reacquire, checkpoint pre-resumed
-    // for this one-shot full-primitive retry, without recursive lazy faults.
-    unsafe { trycopy::experiment::copy(src, dest, len, PREFIX, width, &retry)? };
-    if write {
-        let mut retried = vec![0u8; len];
-        // SAFETY: acquisition and the pending DMA lease remain valid.
-        unsafe { trycopy::try_copy(guest_copy.cast_const(), retried.as_mut_ptr(), len)? };
-        anyhow::ensure!(retried == expected, "write retry differs from owned source");
-        // SAFETY: same valid lease. Restore the probe's XOR data before normal
-        // disk completion copies its original owned data into the guest.
-        unsafe {
-            trycopy::try_copy(before.as_ptr().add(offset), guest_copy, len)?;
-        }
-    } else {
-        anyhow::ensure!(
-            staging[GUARD..GUARD + len]
-                .iter()
-                .zip(&expected)
-                .all(|(a, b)| a.load(Ordering::Relaxed) == *b),
-            "read retry differs from shared source"
-        );
-    }
-    eprintln!("MSHV_REVOKE_EXPERIMENT_PASS retry=true request_still_uncompleted=true");
-    Ok(())
 }
 
 pub(super) fn sanitize_snp_cpuid(
@@ -1700,7 +1419,14 @@ impl MshvProcessor<'_> {
             HvMessageType::HvMessageTypeGpaAttributeIntercept => {
                 if let Some(snp) = self.partition.isolation.snp() {
                     let info = exit.as_message::<hvdef::HvX64GpaAttributeInterceptMessage>();
-                    if let Err(error) = snp.check_gpa_attribute_change(self.partition, info) {
+                    if info.vp_index != self.vpindex.index() {
+                        tracelimit::warn_ratelimited!(
+                            vp_index = info.vp_index,
+                            "SNP GPA attribute request targets another VP"
+                        );
+                        return Err(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 });
+                    }
+                    if let Err(error) = snp.revoke_gpa_attribute_access(self.partition, info) {
                         tracelimit::warn_ratelimited!(
                             error = &*error,
                             vp_index = info.vp_index,
@@ -1709,7 +1435,9 @@ impl MshvProcessor<'_> {
                         return Err(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 });
                     }
                 }
-                Self::handle_snp_gpa_attribute_intercept(exit)
+                // MSHV_RUN_VP clears intercept suspend and retries the existing
+                // guest operation. No completion-register encoding is needed.
+                Ok(())
             }
             HvMessageType::HvMessageTypeHypercallIntercept => {
                 tracing::trace!("HYPERCALL_INTERCEPT");
@@ -1775,25 +1503,6 @@ impl MshvProcessor<'_> {
         Ok(())
     }
 
-    pub(super) fn handle_snp_gpa_attribute_intercept(
-        message: &HvMessage,
-    ) -> Result<(), VpHaltReason> {
-        let info = message.as_message::<hvdef::HvX64GpaAttributeInterceptMessage>();
-        let range_count = info.flags.range_count() as usize;
-        // Admission alone cannot resume the VP. The kernel's
-        // CompletePartitionIntercept value encoding is not yet established.
-        tracelimit::warn_ratelimited!(
-            vp_index = info.vp_index,
-            adjust = info.flags.adjust(),
-            host_visibility = info.flags.host_visibility(),
-            memory_type = info.flags.memory_type(),
-            range_count,
-            ranges = ?info.ranges.get(..range_count),
-            "SNP GPA attribute completion is unresolved; halting VP"
-        );
-        Err(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 })
-    }
-
     pub(super) fn sev_set_reg(
         &self,
         name: HvX64RegisterName,
@@ -1801,14 +1510,20 @@ impl MshvProcessor<'_> {
     ) -> Result<(), VpHaltReason> {
         let mut control = if name == HvX64RegisterName::SevDoorbellGpa {
             if let Some(snp) = self.partition.isolation.snp() {
-                snp.reserve_root_operation(self.partition, &[value & !1], "SNP doorbell")
-                    .map_err(|error| {
-                        tracelimit::warn_ratelimited!(
-                            error = &*error,
-                            "SNP doorbell admission failed"
-                        );
-                        VpHaltReason::TripleFault { vtl: Vtl::Vtl0 }
-                    })?
+                if snp.scoped_host_access && value & 1 == 0 {
+                    tracelimit::warn_ratelimited!("SNP doorbell disable is not supported");
+                    return Err(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 });
+                }
+                snp.reserve_root_operation(
+                    self.partition,
+                    &[value & !1],
+                    "SNP doorbell",
+                    Some(ControlBinding::Doorbell(self.vpindex)),
+                )
+                .map_err(|error| {
+                    tracelimit::warn_ratelimited!(error = &*error, "SNP doorbell admission failed");
+                    VpHaltReason::TripleFault { vtl: Vtl::Vtl0 }
+                })?
             } else {
                 None
             }
@@ -1936,8 +1651,45 @@ impl MshvProcessor<'_> {
                 let previous = self.sev_get_reg(HvX64RegisterName::SevGhcbGpa)?;
                 let page_number = ghcb_data;
                 let ghcb_gpa = page_number << GHCB_INFO_BIT_WIDTH;
+                let snp = self
+                    .partition
+                    .isolation
+                    .snp()
+                    .ok_or(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 })?;
+                if snp.scoped_host_access && previous & 1 != 0 && previous & !0xfff == ghcb_gpa {
+                    return self.sev_set_reg(
+                        HvX64RegisterName::Ghcb,
+                        GHCB_INFO_REGISTER_RESPONSE as u64 | page_number << GHCB_INFO_BIT_WIDTH,
+                    );
+                }
+                let mut control = snp
+                    .reserve_root_operation(self.partition, &[ghcb_gpa], "GHCB registration", None)
+                    .map_err(|error| {
+                        tracelimit::warn_ratelimited!(error = &*error, "SNP GHCB admission failed");
+                        VpHaltReason::TripleFault { vtl: Vtl::Vtl0 }
+                    })?;
+                let mut controls = snp.ghcb_controls.lock();
+                if control.is_some() {
+                    controls.try_reserve(1).map_err(|error| {
+                        tracelimit::warn_ratelimited!(
+                            error = &error as &dyn std::error::Error,
+                            "SNP GHCB reference allocation failed"
+                        );
+                        VpHaltReason::TripleFault { vtl: Vtl::Vtl0 }
+                    })?;
+                }
                 self.sev_set_reg(HvX64RegisterName::SevGhcbGpa, previous & !1)?;
+                if let Some(index) = controls.iter().position(|(vp, _)| *vp == self.vpindex) {
+                    controls.swap_remove(index).1.complete();
+                }
+                if let Some(control) = &mut control {
+                    control.start();
+                }
                 self.sev_set_reg(HvX64RegisterName::SevGhcbGpa, ghcb_gpa | 1)?;
+                if let Some(mut control) = control {
+                    control.mark_granted();
+                    controls.push((self.vpindex, control));
+                }
                 self.sev_set_reg(
                     HvX64RegisterName::Ghcb,
                     GHCB_INFO_REGISTER_RESPONSE as u64 | page_number << GHCB_INFO_BIT_WIDTH,
@@ -1961,6 +1713,14 @@ impl MshvProcessor<'_> {
                                     return Ok(0);
                                 }
                                 self.sev_set_reg(HvX64RegisterName::SevGhcbGpa, registered & !1)?;
+                                if let Some(snp) = self.partition.isolation.snp() {
+                                    let mut controls = snp.ghcb_controls.lock();
+                                    if let Some(index) =
+                                        controls.iter().position(|(vp, _)| *vp == self.vpindex)
+                                    {
+                                        controls.swap_remove(index).1.complete();
+                                    }
+                                }
                                 Ok(registered >> GHCB_INFO_BIT_WIDTH)
                             });
                     // Register access failures are logged by sev_get/set_reg.
@@ -2303,6 +2063,7 @@ impl MshvProcessor<'_> {
                 self.partition,
                 &[request.req_gpa, request.rsp_gpa],
                 "PSP guest request",
+                None,
             )
             .map_err(|error| {
                 tracelimit::warn_ratelimited!(error = &*error, "SNP PSP admission failed");
@@ -2423,7 +2184,12 @@ impl MshvProcessor<'_> {
             vmsa_gpa: request.vmsa_gpa,
         };
         let mut control = snp
-            .reserve_root_operation(self.partition, &[request.vmsa_gpa], "AP VMSA")
+            .reserve_root_operation(
+                self.partition,
+                &[request.vmsa_gpa],
+                "AP VMSA",
+                Some(ControlBinding::Ap(target_vp)),
+            )
             .map_err(|error| {
                 tracelimit::warn_ratelimited!(error = &*error, "SNP AP VMSA admission failed");
                 VpHaltReason::TripleFault { vtl: Vtl::Vtl0 }
@@ -2461,20 +2227,19 @@ impl MshvProcessor<'_> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::snp_host_access::attribute_ranges;
     use super::*;
     use test_with_tracing::test;
 
     #[test]
-    fn scoped_host_access_starts_only_after_launch() {
+    fn control_page_tracking_starts_only_after_launch() {
         let scoped = SnpPartitionState::with_config(false, None, true);
         for state in [SnpLaunchState::NotStarted, SnpLaunchState::Started] {
             *scoped.launch_state.lock() = state;
             assert!(!scoped.scopes_active().expect("boot loading"));
-            assert!(scoped.host_access.ledger_for_test_is_empty());
         }
         *scoped.launch_state.lock() = SnpLaunchState::Finished;
         assert!(scoped.scopes_active().expect("finished"));
-        assert!(scoped.check_legacy_host_access().is_err());
         *scoped.launch_state.lock() = SnpLaunchState::Failed;
         assert!(scoped.scopes_active().is_err());
 
@@ -2482,11 +2247,10 @@ mod tests {
         *legacy.launch_state.lock() = SnpLaunchState::Finished;
         assert!(!legacy.scoped_host_access);
         assert!(!legacy.scopes_active().expect("legacy"));
-        assert!(legacy.check_legacy_host_access().is_ok());
     }
 
     #[test]
-    fn scoped_host_access_flags_keep_guest_ownership_and_release_all_permissions() {
+    fn host_access_flags_keep_guest_ownership_and_release_all_permissions() {
         let acquire = 1 << mshv_bindings::MSHV_GPA_HOST_ACCESS_BIT_ACQUIRE;
         let readable = 1 << mshv_bindings::MSHV_GPA_HOST_ACCESS_BIT_READABLE;
         let writable = 1 << mshv_bindings::MSHV_GPA_HOST_ACCESS_BIT_WRITABLE;
@@ -2494,6 +2258,21 @@ mod tests {
         assert_eq!(host_access_flags(true, true), acquire | readable | writable);
         assert_eq!(host_access_flags(false, false), 0);
         assert_eq!(host_access_flags(false, true), 0);
+    }
+
+    #[test]
+    fn legacy_faults_keep_rw_grants_and_copy_only_faults_use_the_requested_direction() {
+        let legacy = SnpPartitionState::new(false);
+        let copy_only = SnpPartitionState::with_config(false, None, true);
+        let rw = host_access_flags(true, true);
+        for write in [false, true] {
+            assert_eq!(host_access_flags(true, legacy.host_access_write(write)), rw);
+            assert_eq!(copy_only.host_access_write(write), write);
+        }
+        assert_eq!(
+            host_access_flags(true, copy_only.host_access_write(false)),
+            host_access_flags(true, false)
+        );
     }
 
     fn snp_config(features: x86defs::snp::SevFeatures) -> virt::SnpConfig {
@@ -3106,7 +2885,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_snp_gpa_attribute_intercepts() {
+    fn validates_snp_gpa_attribute_range_count_independent_of_attributes() {
         for adjust in [false, true] {
             for memory_type in [0, 1] {
                 for host_visibility in 0..4 {
@@ -3117,15 +2896,10 @@ mod tests {
                             .with_memory_type(memory_type)
                             .with_host_visibility(host_visibility)
                             .with_range_count(range_count);
-                        let message = HvMessage::new(
-                            HvMessageType::HvMessageTypeGpaAttributeIntercept,
-                            0,
-                            info.as_bytes(),
+                        assert_eq!(
+                            attribute_ranges(&info).is_ok(),
+                            range_count == 1 || range_count == 29
                         );
-                        assert!(matches!(
-                            MshvProcessor::handle_snp_gpa_attribute_intercept(&message),
-                            Err(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 })
-                        ));
                     }
                 }
             }

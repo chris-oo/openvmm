@@ -6,9 +6,6 @@ name = "virtio_blk"
 edition.workspace = true
 rust-version.workspace = true
 
-[features]
-revocation-experiment = ["dep:trycopy", "trycopy/revocation-experiment"]
-
 [dependencies]
 vm_resource.workspace = true
 
@@ -30,7 +27,6 @@ async-trait.workspace = true
 futures.workspace = true
 unicycle.workspace = true
 zerocopy.workspace = true
-trycopy = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { workspace = true, features = ["fs"] }

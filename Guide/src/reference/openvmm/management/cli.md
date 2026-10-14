@@ -120,7 +120,7 @@ describes the source definitions.
   offloading enabled. This diagnostic parameter is meaningful only with
   `--isolation snp`.
 * `--hypervisor mshv:snp_scoped_host_access=true`: Opt in to experimental
-  scoped host access for SNP. The default is `false`; ordinary SNP bring-up
+  copy-only host access for SNP. The default is `false`; ordinary SNP bring-up
   does not change. This parameter requires `--isolation snp` and MSHV.
   It can be combined with `snp_disable_cpuid_offload=false` or `true`.
   Base-page backing is required: pass `--memory size=<SIZE>,thp=off`.
@@ -143,20 +143,33 @@ describes the source definitions.
   RNG, and virtio console. With `--hv`, also pass `--no-vmbus`.
   Snapshot restore, guest memory dumps, and the debugger are not supported.
 
-  This experimental mode uses existing MSHV calls. It does not add a Hyper-V
-  ABI, kernel memory-management enforcement, or large-page support. Hardware
-  tests must still verify clean denial of intercept access and private-page
-  access cycles. Do not treat this option as a completed isolation feature.
-  GPA-attribute intercepts currently halt the guest rather than complete the
-  request. Race-free VP-entry cancellation and explicit private/shared/private
-  acceptance also remain unfinished.
+  The parameter keeps its original experimental name for compatibility.
+  It no longer takes per-copy permission leases or cancels VPs. Host copies
+  use fault-contained `GuestMemory` operations. A mapping fault requests host
+  permission and retries the full operation. Confirmed grants remain until
+  a guest GPA-attribute conflict or a control operation requires release.
+  Grant denial returns a guest-memory I/O error, not partition-wide poison.
+  Eight successful fault resolutions without advancing the furthest fault
+  offset end with an I/O error. The budget resets only when that offset
+  increases, so sequential first-touch faults on different pages can continue.
+  GPA-attribute conflicts release host access and let the next VP run retry
+  the existing guest operation. Valid repeated requests remain supported.
+  The default legacy mode still acquires RW access and halts on GPA-attribute
+  intercepts; it can export raw guest pointers and cannot safely revoke them.
+
+  This mode uses existing MSHV calls. It does not add a Hyper-V ABI, kernel
+  memory-management enforcement, or large-page support. Do not treat it as
+  a completed isolation feature. Private-page handoff race tests remain an
+  acceptance requirement.
 
   Control-page reservations remain until partition teardown. AP recreation
   and SNP doorbell disable/rebind are not supported. Reusing a reserved page
-  can halt the guest. The coordinator allows at most 4,096 root-operation
+  can halt the guest. The control registry allows at most 4,096 root-operation
   reservations; exhausting this limit also prevents PSP guest requests.
-  A failed root-operation ioctl stops the partition when its result is
-  uncertain, even if an AP-start error was returned to the guest.
+  GHCB pages keep a separate control reference until confirmed unregister.
+  GHCB replacement closes the old binding before it sets the new binding.
+  A failed root-operation ioctl retains its pages when the result is uncertain.
+  This ownership rule is separate from ordinary host permission grants.
   For guest-driver tests with the published `0.3.0-155` image, the driver is
   built in: use device unbind/rebind, not `rmmod`.
 * `--nested-virt`: Expose hardware virtualization (VMX/SVM) to the guest so it

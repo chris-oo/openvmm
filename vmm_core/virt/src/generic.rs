@@ -4,7 +4,6 @@
 mod partition_memory_map;
 
 pub use partition_memory_map::PartitionHostAccess;
-pub use partition_memory_map::PartitionHostAccessGuard;
 pub use partition_memory_map::PartitionMemoryMap;
 pub use vm_topology::processor::VpIndex;
 

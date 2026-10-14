@@ -10,7 +10,7 @@ pub trait PartitionMemoryMap: Send + Sync {
     ///
     /// Returning `true` transfers teardown responsibility to the partition:
     /// the caller must not unmap any region on mapper drop, and the partition must retain
-    /// `backing` until all kernel partition references and copy guards are gone.
+    /// `backing` until all kernel partition references are gone.
     /// Explicit runtime unmaps still use `unmap_range`.
     fn retain_memory_backing(&self, _backing: std::sync::Arc<dyn Send + Sync>) -> bool {
         false
@@ -86,31 +86,13 @@ pub trait PartitionHostAccess: Send + Sync {
         false
     }
 
-    /// Acquires permission for one synchronous host copy.
-    ///
-    /// Called only when `requires_copy_only()` is true.
-    /// The guard owns its release state so that weak callback adapters can
-    /// return it without retaining the partition.
-    fn acquire_host_access_scoped(
-        &self,
-        addr: u64,
-        size: u64,
-        write: bool,
-    ) -> anyhow::Result<Option<Box<dyn PartitionHostAccessGuard>>> {
-        let _ = (addr, size, write);
-        Ok(None)
-    }
-
     /// Acquires host access without changing guest visibility.
     ///
-    /// Legacy fault recovery for backings without scoped copy permission.
-    fn acquire_host_access(&self, addr: u64, size: u64, write: bool) -> anyhow::Result<()>;
-}
-
-/// Owned permission for a synchronous host copy.
-pub trait PartitionHostAccessGuard {
-    /// Releases permission and reports release failures.
+    /// Called on a contained mapping fault. Confirmed grants remain until a
+    /// guest attribute conflict or a control operation requires their release.
+    /// Repeated acquisition and read-to-write upgrades must be supported.
     ///
-    /// Implementations should also provide a non-panicking drop backstop.
-    fn finish(self: Box<Self>) -> anyhow::Result<()>;
+    /// An error does not promise that no page in the range was granted.
+    /// The backend owns permission-state recovery and backing lifetime on failure.
+    fn acquire_host_access(&self, addr: u64, size: u64, write: bool) -> anyhow::Result<()>;
 }

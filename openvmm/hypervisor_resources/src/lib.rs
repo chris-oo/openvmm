@@ -48,7 +48,8 @@ pub struct MshvHandle {
     pub mshv: std::fs::File,
     /// Disable MSHV handling of SNP GHCB CPUID requests.
     pub snp_disable_cpuid_offload: bool,
-    /// Restrict SNP host access to explicit, temporary access scopes.
+    /// Require copy-only SNP I/O with retained, fault-driven host grants.
+    /// The experimental field name is retained for compatibility.
     pub scoped_host_access: bool,
 }
 
@@ -61,7 +62,8 @@ impl ResourceId<HypervisorKind> for MshvHandle {
 pub struct MshvConfig {
     /// Disable MSHV handling of SNP GHCB CPUID requests.
     pub snp_disable_cpuid_offload: bool,
-    /// Restrict SNP host access to explicit, temporary access scopes.
+    /// Require copy-only SNP I/O with retained, fault-driven host grants.
+    /// The experimental field name is retained for compatibility.
     pub scoped_host_access: bool,
 }
 

@@ -75,7 +75,6 @@ pub(super) use snp::SnpError;
 pub(crate) use snp::SnpLaunchState;
 pub(crate) use snp::SnpPartitionState;
 pub(crate) use snp::SnpVpState;
-pub(crate) use snp::acquire_snp_host_access;
 use snp::prepare_snp_config;
 use snp::snp_cpuid_overrides;
 use snp::snp_hv_cpuid_overrides;
@@ -608,13 +607,6 @@ impl ProtoPartition for MshvProtoPartition<'_> {
             isolation,
             time_frozen: Mutex::new(true),
         });
-        if let Some(snp) = inner.isolation.snp() {
-            snp.install_host_access_kick(&inner);
-            // xtask-fmt allow-target-arch dependency
-            #[cfg(all(feature = "revocation-experiment", target_arch = "x86_64"))]
-            snp::install_revocation_experiment(&inner)
-                .map_err(|_| ErrorInner::InvalidConfiguration("invalid revocation experiment"))?;
-        }
         inner.add_snp_vmsa_mapping()?;
 
         let partition = MshvPartition {
@@ -1401,7 +1393,12 @@ impl hv1_hypercall::StartVirtualProcessor<hvdef::hypercall::InitialVpContextX64>
             .isolation
             .snp()
             .ok_or(hvdef::HvError::InvalidPartitionId)?
-            .reserve_root_operation(self.partition, &[vmsa_gpa], "StartVirtualProcessor VMSA")
+            .reserve_root_operation(
+                self.partition,
+                &[vmsa_gpa],
+                "StartVirtualProcessor VMSA",
+                Some(snp_host_access::ControlBinding::Ap(target_vp)),
+            )
             .map_err(|error| {
                 tracelimit::warn_ratelimited!(
                     error = &*error,

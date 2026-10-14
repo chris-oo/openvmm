@@ -51,7 +51,7 @@ impl<'a> HypervisorParamRoot<'a> {
         Ok(Self { name, params })
     }
 
-    /// Returns the opt-in scoped host access setting, with MSHV parameters
+    /// Returns the opt-in copy-only host access setting, with MSHV parameters
     /// validated by the same parser as the backend probe.
     pub fn scoped_host_access(&self) -> anyhow::Result<bool> {
         if self.name == "mshv" {
