@@ -51,21 +51,12 @@ impl<'a> HypervisorParamRoot<'a> {
         Ok(Self { name, params })
     }
 
-    /// Returns the opt-in copy-only host access setting, with MSHV parameters
-    /// validated by the same parser as the backend probe.
-    pub fn scoped_host_access(&self) -> anyhow::Result<bool> {
+    /// Validates MSHV parameters before any backend device is opened.
+    pub fn validate_mshv_params(&self) -> anyhow::Result<()> {
         if self.name == "mshv" {
-            Ok(MshvConfig::parse(&self.params)?.scoped_host_access)
-        } else {
-            anyhow::ensure!(
-                !self
-                    .params
-                    .iter()
-                    .any(|(key, _)| *key == "snp_scoped_host_access"),
-                "snp_scoped_host_access requires --hypervisor mshv"
-            );
-            Ok(false)
+            MshvConfig::parse(&self.params)?;
         }
+        Ok(())
     }
 }
 

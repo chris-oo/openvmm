@@ -110,7 +110,7 @@ describes the source definitions.
   openvmm --hypervisor mshv --isolation snp \
     --igvm firmware=path/to/snp-linux-direct.bin,personality=linux-direct \
     --com1 console \
-    --hv --no-vmbus -m 160MB -p 1
+    --hv --no-vmbus --memory size=160MB,thp=off -p 1
   ```
 * `--snp-restricted-injection`: Enable restricted interrupt injection in the
   MSHV partition and loader-generated SNP VMSA. This is only supported on mshv
@@ -119,22 +119,23 @@ describes the source definitions.
   SNP GHCB CPUID requests so they are forwarded to OpenVMM. The default is
   offloading enabled. This diagnostic parameter is meaningful only with
   `--isolation snp`.
-* `--hypervisor mshv:snp_scoped_host_access=true`: Opt in to experimental
-  copy-only host access for SNP. The default is `false`; ordinary SNP bring-up
-  does not change. This parameter requires `--isolation snp` and MSHV.
-  It can be combined with `snp_disable_cpuid_offload=false` or `true`.
+* MSHV SNP always uses copy-only host access and owned bounce buffers.
+  There is no direct-access mode or host-access opt-in. The former
+  `snp_scoped_host_access` parameter is no longer accepted. Non-isolated MSHV
+  guests retain their existing device and guest-memory behavior.
   Base-page backing is required: pass `--memory size=<SIZE>,thp=off`.
   Transparent huge pages and explicit huge pages are not supported in this
   mode. For NUMA configurations, pass `thp=off` on every `--numa` node instead
   of using `--memory`. Existing guest-memory backing files are not supported.
 
-  Each virtio block device must explicitly select `bounce`. Each virtio
-  network device must explicitly select `bounce:` with Consomme, Linux TAP,
-  or `none`. In-process vsock requires `--virtio-vsock-bounce`. Block
+  Bouncing is enabled automatically for virtio block, virtio network with
+  Consomme, Linux TAP, or `none`, and in-process vsock. Per-device `bounce`,
+  `bounce:`, and `--virtio-vsock-bounce` options remain valid but are not
+  needed for MSHV SNP. Block
   backends are limited to plain buffered regular files and RAM disks.
   See [block bounce I/O](#per-device-block-bounce-io) and
   [network and vsock bounce I/O](#per-device-network-and-vsock-bounce-io)
-  for syntax and limits. The option does not enable bounce I/O implicitly.
+  for syntax and limits.
 
   The initial device allowlist contains these three bounced virtio devices,
   serial ports, and the minimal chipset. Other devices are rejected before
@@ -142,9 +143,12 @@ describes the source definitions.
   devices, remote PCIe devices, CXL, persistent memory, filesystem devices,
   RNG, and virtio console. With `--hv`, also pass `--no-vmbus`.
   Snapshot restore, guest memory dumps, and the debugger are not supported.
+  The VM-service currently supports only the minimal chipset and serial for
+  MSHV SNP; disable VMBus and omit device configurations. It selects base-page
+  backing by default and rejects explicit NUMA huge-page settings. Use the
+  CLI for bounced virtio devices.
 
-  The parameter keeps its original experimental name for compatibility.
-  It no longer takes per-copy permission leases or cancels VPs. Host copies
+  Host access does not take per-copy permission leases or cancel VPs. Copies
   use fault-contained `GuestMemory` operations. A mapping fault requests host
   permission and retries the full operation. Confirmed grants remain until
   a guest GPA-attribute conflict or a control operation requires release.
@@ -154,8 +158,6 @@ describes the source definitions.
   increases, so sequential first-touch faults on different pages can continue.
   GPA-attribute conflicts release host access and let the next VP run retry
   the existing guest operation. Valid repeated requests remain supported.
-  The default legacy mode still acquires RW access and halts on GPA-attribute
-  intercepts; it can export raw guest pointers and cannot safely revoke them.
 
   This mode uses existing MSHV calls. It does not add a Hyper-V ABI, kernel
   memory-management enforcement, or large-page support. Do not treat it as

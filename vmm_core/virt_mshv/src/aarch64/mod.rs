@@ -68,7 +68,7 @@ impl virt::Hypervisor for LinuxMshv {
         &mut self,
         config: ProtoPartitionConfig<'a>,
     ) -> Result<MshvProtoPartition<'a>, Self::Error> {
-        if self.snp_disable_cpuid_offload || self.snp_scoped_host_access {
+        if self.snp_disable_cpuid_offload {
             return Err(ErrorInner::IsolationNotSupported.into());
         }
         if config.isolation.is_isolated() {

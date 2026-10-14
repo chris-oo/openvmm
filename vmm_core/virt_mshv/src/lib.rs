@@ -112,7 +112,6 @@ impl VcpuFdExt for VcpuFd {
 pub struct LinuxMshv {
     mshv: Mshv,
     snp_disable_cpuid_offload: bool,
-    snp_scoped_host_access: bool,
 }
 
 impl LinuxMshv {
@@ -127,15 +126,6 @@ impl LinuxMshv {
         self.snp_disable_cpuid_offload = disabled;
         self
     }
-
-    /// Configures opt-in copy-only host access for SNP partitions.
-    ///
-    /// The experimental option keeps its name for compatibility; ordinary
-    /// grants are fault-driven and retained, not scoped to each copy.
-    pub fn with_snp_scoped_host_access(mut self, enabled: bool) -> Self {
-        self.snp_scoped_host_access = enabled;
-        self
-    }
 }
 
 impl From<std::fs::File> for LinuxMshv {
@@ -145,7 +135,6 @@ impl From<std::fs::File> for LinuxMshv {
             // TODO: fix mshv_bindings to not need this unsafe code.
             mshv: unsafe { Mshv::new_with_fd_number(file.into_raw_fd()) },
             snp_disable_cpuid_offload: false,
-            snp_scoped_host_access: false,
         }
     }
 }
@@ -1031,10 +1020,13 @@ impl virt::PartitionMemoryMapper for MshvPartition {
 impl virt::PartitionHostAccess for MshvPartitionInner {
     fn requires_copy_only(&self) -> bool {
         #[cfg(guest_arch = "x86_64")]
-        if let Some(snp) = self.isolation.snp() {
-            return snp.scoped_host_access;
+        {
+            self.isolation.snp().is_some()
         }
-        false
+        #[cfg(not(guest_arch = "x86_64"))]
+        {
+            false
+        }
     }
 
     fn acquire_host_access(&self, _addr: u64, _size: u64, _write: bool) -> anyhow::Result<()> {
@@ -1049,11 +1041,7 @@ impl virt::PartitionHostAccess for MshvPartitionInner {
 impl virt::PartitionMemoryMap for MshvPartitionInner {
     fn retain_memory_backing(&self, backing: Arc<dyn Send + Sync>) -> bool {
         #[cfg(guest_arch = "x86_64")]
-        if self
-            .isolation
-            .snp()
-            .is_some_and(|snp| snp.scoped_host_access)
-        {
+        if self.isolation.snp().is_some() {
             self.vmfd.backing.lock().push(backing);
             return true;
         }

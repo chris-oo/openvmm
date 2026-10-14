@@ -93,7 +93,6 @@ pub(crate) enum MshvProtoPartitionIsolation {
     Snp {
         config: Option<Box<MshvSnpConfig>>,
         disable_cpuid_offload: bool,
-        scoped_host_access: bool,
     },
 }
 
@@ -118,7 +117,6 @@ impl virt::Hypervisor for LinuxMshv {
         };
         let isolation = config.isolation.isolation_type();
         validate_snp_cpuid_offload_config(isolation, self.snp_disable_cpuid_offload)?;
-        validate_snp_scoped_host_access_config(isolation, self.snp_scoped_host_access)?;
         let snp = isolation == virt::IsolationType::Snp;
         let x2apic = matches!(
             config.processor_topology.apic_mode(),
@@ -213,7 +211,6 @@ impl virt::Hypervisor for LinuxMshv {
             MshvProtoPartitionIsolation::Snp {
                 config: snp_config,
                 disable_cpuid_offload: self.snp_disable_cpuid_offload,
-                scoped_host_access: self.snp_scoped_host_access,
             }
         } else {
             MshvProtoPartitionIsolation::None
@@ -324,19 +321,6 @@ fn hv1_reference_tsc_page_supported(
     // when a newer guest kernel with fixed shared reference-TSC-page handling
     // is available.
     hv1_enabled && isolation != virt::IsolationType::Snp && advertised
-}
-
-fn validate_snp_scoped_host_access_config(
-    isolation: virt::IsolationType,
-    enabled: bool,
-) -> Result<(), Error> {
-    if enabled && isolation != virt::IsolationType::Snp {
-        return Err(ErrorInner::InvalidConfiguration(
-            "snp_scoped_host_access requires SNP isolation",
-        )
-        .into());
-    }
-    Ok(())
 }
 
 fn validate_snp_cpuid_offload_config(
@@ -583,11 +567,9 @@ impl ProtoPartition for MshvProtoPartition<'_> {
             MshvProtoPartitionIsolation::Snp {
                 config,
                 disable_cpuid_offload,
-                scoped_host_access,
             } => MshvIsolationState::Snp(SnpPartitionState::with_config(
                 disable_cpuid_offload,
                 config,
-                scoped_host_access,
             )),
         };
         let inner = Arc::new(MshvPartitionInner {
@@ -1609,13 +1591,6 @@ fn supported_xsave_features() -> hvdef::HvX64PartitionProcessorXsaveFeatures {
 mod tests {
     use super::*;
     use test_with_tracing::test;
-
-    #[test]
-    fn scoped_host_access_requires_snp() {
-        assert!(validate_snp_scoped_host_access_config(virt::IsolationType::Snp, true).is_ok());
-        assert!(validate_snp_scoped_host_access_config(virt::IsolationType::None, true).is_err());
-        assert!(validate_snp_scoped_host_access_config(virt::IsolationType::None, false).is_ok());
-    }
 
     #[test]
     fn can_disable_snp_cpuid_offloads() {

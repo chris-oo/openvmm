@@ -33,7 +33,6 @@ impl hypervisor_resources::HypervisorProbe for MshvProbe {
             MshvHandle {
                 mshv: mshv.into(),
                 snp_disable_cpuid_offload: false,
-                scoped_host_access: false,
             }
             .into_resource(),
         ))
@@ -45,7 +44,6 @@ impl hypervisor_resources::HypervisorProbe for MshvProbe {
         Ok(Resource::new(MshvHandle {
             mshv: fs_err::File::open("/dev/mshv")?.into(),
             snp_disable_cpuid_offload: config.snp_disable_cpuid_offload,
-            scoped_host_access: config.scoped_host_access,
         }))
     }
 }
@@ -72,21 +70,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_scoped_host_access_parameter() {
-        assert!(!parse_mshv_params(&[]).unwrap().scoped_host_access);
-        let config = parse_mshv_params(&[
-            ("snp_scoped_host_access", "true"),
-            ("snp_disable_cpuid_offload", "false"),
-        ])
-        .unwrap();
-        assert!(config.scoped_host_access);
-        assert!(!config.snp_disable_cpuid_offload);
-        assert!(
-            !parse_mshv_params(&[("snp_scoped_host_access", "false")])
-                .unwrap()
-                .scoped_host_access
-        );
-        assert!(parse_mshv_params(&[("snp_scoped_host_access", "invalid")]).is_err());
+    fn rejects_removed_host_access_parameter() {
+        for value in ["true", "false", "invalid"] {
+            assert!(parse_mshv_params(&[("snp_scoped_host_access", value)]).is_err());
+        }
         assert!(parse_mshv_params(&[("scoped_host_access", "true")]).is_err());
     }
 }

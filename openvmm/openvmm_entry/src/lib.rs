@@ -754,7 +754,7 @@ async fn vm_config_from_command_line(
                 storage_builder::DiskLocation::VirtioBlk {
                     pcie_port: pcie_port.clone(),
                     serial: serial.clone(),
-                    bounce_io,
+                    bounce_io: bounce_io || opt.requires_snp_bounce(),
                 },
                 kind,
                 is_dvd,
@@ -1891,7 +1891,7 @@ async fn vm_config_from_command_line(
             max_queues: vport.max_queues,
             mac_address: vport.mac_address,
             endpoint: vport.endpoint,
-            bounce_io: cli_cfg.bounce_io,
+            bounce_io: cli_cfg.bounce_io || opt.requires_snp_bounce(),
         }
         .into_resource();
         if let Some(pcie_port) = &cli_cfg.pcie_port {
@@ -2062,7 +2062,7 @@ async fn vm_config_from_command_line(
             guest_cid: 0x3,
             base_path: vsock_path.clone(),
             listener,
-            bounce_io: opt.virtio_vsock_bounce,
+            bounce_io: opt.virtio_vsock_bounce || opt.requires_snp_bounce(),
         }
         .into_resource();
         add_virtio_device(virtio_vsock_bus.clone(), resource, &mut pcie_devices);
@@ -2826,8 +2826,18 @@ async fn run_control(driver: &DefaultDriver, opt: Options) -> anyhow::Result<i32
 async fn run_control_inner(
     driver: &DefaultDriver,
     mesh_slot: &mut Option<VmmMesh>,
-    opt: Options,
+    mut opt: Options,
 ) -> anyhow::Result<i32> {
+    let hypervisor = match &opt.hypervisor {
+        Some(name) => openvmm_helpers::hypervisor::hypervisor_resource(name)?,
+        None => {
+            let hypervisor = openvmm_helpers::hypervisor::choose_hypervisor()?;
+            // Apply backend-specific device admission and bounce defaults
+            // before opening any device resources.
+            opt.hypervisor = Some(hypervisor.id().to_owned());
+            hypervisor
+        }
+    };
     let mesh = mesh_slot.as_ref().unwrap();
     let (mut vm_config, mut resources) = vm_config_from_command_line(driver, mesh, &opt).await?;
 
@@ -2970,10 +2980,7 @@ async fn run_control_inner(
         };
 
         let params = VmWorkerParameters {
-            hypervisor: match &opt.hypervisor {
-                Some(name) => openvmm_helpers::hypervisor::hypervisor_resource(name)?,
-                None => openvmm_helpers::hypervisor::choose_hypervisor()?,
-            },
+            hypervisor,
             cfg: vm_config,
             saved_state,
             shared_memory,

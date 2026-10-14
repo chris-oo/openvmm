@@ -180,7 +180,6 @@ pub(crate) struct SnpPartitionState {
     /// feature set for subsequent requests.
     pub(super) sev_features: Mutex<Option<u64>>,
     pub(super) cpuid_offloads_enabled: bool,
-    pub(crate) scoped_host_access: bool,
     #[inspect(skip)]
     control_pages: Arc<ControlPageRegistry>,
     #[inspect(skip)]
@@ -206,7 +205,6 @@ impl SnpPartitionState {
             launch_state: Mutex::new(SnpLaunchState::NotStarted),
             sev_features: Mutex::new(None),
             cpuid_offloads_enabled: !disable_cpuid_offload,
-            scoped_host_access: false,
             control_pages: Arc::new(ControlPageRegistry::default()),
             control_ranges: Mutex::new(Vec::new()),
             ghcb_controls: Mutex::new(Vec::new()),
@@ -222,11 +220,9 @@ impl SnpPartitionState {
     pub(super) fn with_config(
         disable_cpuid_offload: bool,
         config: Option<Box<MshvSnpConfig>>,
-        scoped_host_access: bool,
     ) -> Self {
         let mut state = Self::new(disable_cpuid_offload);
         state.config = config;
-        state.scoped_host_access = scoped_host_access;
         state
     }
 
@@ -237,7 +233,7 @@ impl SnpPartitionState {
         operation: &'static str,
         binding: Option<ControlBinding>,
     ) -> anyhow::Result<Option<RootAccessGuard>> {
-        if !self.scopes_active()? {
+        if !self.control_tracking_active()? {
             return Ok(None);
         }
         let ranges = addresses
@@ -275,17 +271,12 @@ impl SnpPartitionState {
     }
 
     pub(crate) fn check_mapping_change(&self, addr: u64, size: u64) -> anyhow::Result<()> {
-        if self.scoped_host_access {
-            self.control_pages
-                .check_change(&[PageRange::new(addr, size)?])?;
-        }
+        self.control_pages
+            .check_change(&[PageRange::new(addr, size)?])?;
         Ok(())
     }
 
-    fn scopes_active(&self) -> Result<bool, SnpError> {
-        if !self.scoped_host_access {
-            return Ok(false);
-        }
+    fn control_tracking_active(&self) -> Result<bool, SnpError> {
         match *self.launch_state.lock() {
             SnpLaunchState::Finished => Ok(true),
             SnpLaunchState::NotStarted | SnpLaunchState::Started => Ok(false),
@@ -300,12 +291,6 @@ impl SnpPartitionState {
         size: u64,
         write: bool,
     ) -> anyhow::Result<()> {
-        let write = self.host_access_write(write);
-        if !self.scoped_host_access {
-            // Legacy views can export raw pointers. Keep their original RW
-            // grant and admission behavior, even when a read caused the fault.
-            return modify_snp_host_access(&partition.vmfd, addr, size, true, write);
-        }
         if *self.launch_state.lock() == SnpLaunchState::Failed {
             return Err(SnpError::LaunchFailed.into());
         }
@@ -346,21 +331,15 @@ impl SnpPartitionState {
     }
 
     pub(crate) fn log_host_access_counts(&self, phase: &'static str) {
-        if self.scoped_host_access {
-            tracing::info!(
-                phase,
-                attribute_releases = self.attribute_releases.load(Ordering::Relaxed),
-                attribute_released_pages = self.attribute_released_pages.load(Ordering::Relaxed),
-                host_read_acquires = self.host_read_acquires.load(Ordering::Relaxed),
-                host_write_acquires = self.host_write_acquires.load(Ordering::Relaxed),
-                attribute_resume_runs = self.attribute_resume_runs.load(Ordering::Relaxed),
-                "SNP host-access counts"
-            );
-        }
-    }
-
-    fn host_access_write(&self, write: bool) -> bool {
-        !self.scoped_host_access || write
+        tracing::info!(
+            phase,
+            attribute_releases = self.attribute_releases.load(Ordering::Relaxed),
+            attribute_released_pages = self.attribute_released_pages.load(Ordering::Relaxed),
+            host_read_acquires = self.host_read_acquires.load(Ordering::Relaxed),
+            host_write_acquires = self.host_write_acquires.load(Ordering::Relaxed),
+            attribute_resume_runs = self.attribute_resume_runs.load(Ordering::Relaxed),
+            "SNP host-access counts"
+        );
     }
 
     fn revoke_gpa_attribute_access(
@@ -372,7 +351,6 @@ impl SnpPartitionState {
         let (ram, mappings) = host_access_ram(partition, &memory)?;
         let controls = self.control_ranges.lock();
         let ranges = revoke_attribute_access(
-            self.scoped_host_access,
             message,
             &ram,
             &mappings,
@@ -885,16 +863,10 @@ impl MshvPartitionInner {
         let Some(vmsa_bytes) = config.vmsa_memory.inner_buf() else {
             return Err(ErrorInner::InvalidSnpVmsaBacking.into());
         };
-        if self
-            .isolation
-            .snp()
-            .is_some_and(|snp| snp.scoped_host_access)
-        {
-            self.vmfd
-                .backing
-                .lock()
-                .push(Arc::new(config.vmsa_memory.clone()));
-        }
+        self.vmfd
+            .backing
+            .lock()
+            .push(Arc::new(config.vmsa_memory.clone()));
         let flags =
             (1 << MSHV_SET_MEM_BIT_WRITABLE) | (1 << mshv_bindings::MSHV_SET_MEM_BIT_EXECUTABLE);
         let region = mshv_bindings::mshv_user_mem_region {
@@ -1510,7 +1482,7 @@ impl MshvProcessor<'_> {
     ) -> Result<(), VpHaltReason> {
         let mut control = if name == HvX64RegisterName::SevDoorbellGpa {
             if let Some(snp) = self.partition.isolation.snp() {
-                if snp.scoped_host_access && value & 1 == 0 {
+                if value & 1 == 0 {
                     tracelimit::warn_ratelimited!("SNP doorbell disable is not supported");
                     return Err(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 });
                 }
@@ -1656,7 +1628,7 @@ impl MshvProcessor<'_> {
                     .isolation
                     .snp()
                     .ok_or(VpHaltReason::TripleFault { vtl: Vtl::Vtl0 })?;
-                if snp.scoped_host_access && previous & 1 != 0 && previous & !0xfff == ghcb_gpa {
+                if previous & 1 != 0 && previous & !0xfff == ghcb_gpa {
                     return self.sev_set_reg(
                         HvX64RegisterName::Ghcb,
                         GHCB_INFO_REGISTER_RESPONSE as u64 | page_number << GHCB_INFO_BIT_WIDTH,
@@ -2233,20 +2205,15 @@ mod tests {
 
     #[test]
     fn control_page_tracking_starts_only_after_launch() {
-        let scoped = SnpPartitionState::with_config(false, None, true);
+        let snp = SnpPartitionState::new(false);
         for state in [SnpLaunchState::NotStarted, SnpLaunchState::Started] {
-            *scoped.launch_state.lock() = state;
-            assert!(!scoped.scopes_active().expect("boot loading"));
+            *snp.launch_state.lock() = state;
+            assert!(!snp.control_tracking_active().expect("boot loading"));
         }
-        *scoped.launch_state.lock() = SnpLaunchState::Finished;
-        assert!(scoped.scopes_active().expect("finished"));
-        *scoped.launch_state.lock() = SnpLaunchState::Failed;
-        assert!(scoped.scopes_active().is_err());
-
-        let legacy = SnpPartitionState::new(false);
-        *legacy.launch_state.lock() = SnpLaunchState::Finished;
-        assert!(!legacy.scoped_host_access);
-        assert!(!legacy.scopes_active().expect("legacy"));
+        *snp.launch_state.lock() = SnpLaunchState::Finished;
+        assert!(snp.control_tracking_active().expect("finished"));
+        *snp.launch_state.lock() = SnpLaunchState::Failed;
+        assert!(snp.control_tracking_active().is_err());
     }
 
     #[test]
@@ -2258,21 +2225,6 @@ mod tests {
         assert_eq!(host_access_flags(true, true), acquire | readable | writable);
         assert_eq!(host_access_flags(false, false), 0);
         assert_eq!(host_access_flags(false, true), 0);
-    }
-
-    #[test]
-    fn legacy_faults_keep_rw_grants_and_copy_only_faults_use_the_requested_direction() {
-        let legacy = SnpPartitionState::new(false);
-        let copy_only = SnpPartitionState::with_config(false, None, true);
-        let rw = host_access_flags(true, true);
-        for write in [false, true] {
-            assert_eq!(host_access_flags(true, legacy.host_access_write(write)), rw);
-            assert_eq!(copy_only.host_access_write(write), write);
-        }
-        assert_eq!(
-            host_access_flags(true, copy_only.host_access_write(false)),
-            host_access_flags(true, false)
-        );
     }
 
     fn snp_config(features: x86defs::snp::SevFeatures) -> virt::SnpConfig {

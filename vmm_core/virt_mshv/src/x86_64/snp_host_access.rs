@@ -24,8 +24,6 @@ pub(super) enum HostAccessError {
     Allocation(#[source] std::collections::TryReserveError),
     #[error("SNP control binding cannot be replaced: {0}")]
     ControlBinding(&'static str),
-    #[error("SNP GPA attribute retry requires copy-only host access")]
-    AttributeRetryRequiresCopyOnly,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -271,7 +269,6 @@ pub(super) fn attribute_ranges(
 }
 
 pub(super) fn revoke_attribute_access(
-    copy_only: bool,
     message: &hvdef::HvX64GpaAttributeInterceptMessage,
     ram: &[PageRange],
     mappings: &[(PageRange, u64, bool)],
@@ -279,9 +276,6 @@ pub(super) fn revoke_attribute_access(
     registry: &ControlPageRegistry,
     mut release: impl FnMut(PageRange) -> anyhow::Result<()>,
 ) -> anyhow::Result<Vec<PageRange>> {
-    if !copy_only {
-        return Err(HostAccessError::AttributeRetryRequiresCopyOnly.into());
-    }
     let ranges = attribute_ranges(message)?;
     for range in &ranges {
         validate_ram(*range, false, ram, mappings, controls)?;
@@ -498,7 +492,6 @@ mod tests {
         for (ram, controls) in [(&[page(0)][..], &[][..]), (&[range][..], &[page(4096)][..])] {
             assert!(
                 revoke_attribute_access(
-                    true,
                     &message,
                     ram,
                     &[(range, 0, true)],
@@ -518,7 +511,6 @@ mod tests {
             .unwrap();
         assert!(
             revoke_attribute_access(
-                true,
                 &message,
                 &[range],
                 &[(range, 0, true)],
@@ -534,7 +526,6 @@ mod tests {
         assert!(released.is_empty());
         control.complete();
         let error = revoke_attribute_access(
-            true,
             &message,
             &[range],
             &[(range, 0, true)],
@@ -554,7 +545,6 @@ mod tests {
         released.clear();
         assert_eq!(
             revoke_attribute_access(
-                true,
                 &message,
                 &[range],
                 &[(range, 0, true)],
@@ -572,7 +562,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_attribute_gate_and_malformed_whole_batches_have_no_effects() {
+    fn malformed_whole_batches_have_no_effects() {
         use hvdef::hypercall::HvGpaRange;
         use hvdef::hypercall::HvGpaRangeExtended;
 
@@ -581,29 +571,10 @@ mod tests {
         let mut message = hvdef::HvX64GpaAttributeInterceptMessage::new_zeroed();
         message.flags.set_range_count(1);
         let mut releases = 0;
-        let error = revoke_attribute_access(
-            false,
-            &message,
-            &[range],
-            &[(range, 0, true)],
-            &[],
-            &registry,
-            |_| {
-                releases += 1;
-                Ok(())
-            },
-        )
-        .unwrap_err();
-        assert!(matches!(
-            error.downcast_ref::<HostAccessError>(),
-            Some(HostAccessError::AttributeRetryRequiresCopyOnly)
-        ));
-        assert_eq!(releases, 0);
         for count in [0, 30, 31] {
             message.flags.set_range_count(count);
             assert!(
                 revoke_attribute_access(
-                    true,
                     &message,
                     &[range],
                     &[(range, 0, true)],
@@ -630,7 +601,6 @@ mod tests {
             message.ranges[1] = malformed;
             assert!(
                 revoke_attribute_access(
-                    true,
                     &message,
                     &[range],
                     &[(range, 0, true)],
@@ -648,7 +618,6 @@ mod tests {
         message.flags = hvdef::HvX64GpaAttributeInterceptMessageFlags::from_bits(1 | (1 << 14));
         assert!(
             revoke_attribute_access(
-                true,
                 &message,
                 &[range],
                 &[(range, 0, true)],
@@ -673,7 +642,6 @@ mod tests {
         let mut releases = 0;
         for _ in 0..16 {
             revoke_attribute_access(
-                true,
                 &message,
                 &[range],
                 &[(range, 0, true)],

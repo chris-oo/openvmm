@@ -2,6 +2,40 @@
 
 ## Status and scope
 
+MSHV SNP now always uses copy-only guest memory and owned bounce buffers for
+supported device I/O. The host-access opt-in and legacy unconditional RW
+acquisition branch are removed. CLI virtio block, software networking, and
+in-process vsock select bouncing automatically. Non-isolated MSHV and KVM
+retain their existing behavior.
+
+The CLI rejects unsupported devices and backing configurations. VM-service
+MSHV SNP admits only the minimal chipset and serial, selects base pages by
+default, and rejects explicit NUMA huge pages or devices without bounce
+admission. Use the CLI for bounced virtio devices.
+
+Host grants remain fault-driven and retained until a guest ownership conflict
+or control operation releases them. Ordinary-copy cancellation and a new
+completion ABI are not prerequisites. Separate control references, backing
+retention, and CopyOnly export/pin restrictions remain.
+
+A real two-CPU SNP lifecycle passed with plain `--hypervisor mshv` and no
+per-device bounce options: block, TCP, vsock, all three driver cycles, 13
+conflict releases and subsequent RUN returns, normal shutdown, and unchanged
+host kernel logs. Evidence is in `target/mandatory-snp-bounce-hardware/`.
+This uses legacy RAM backing, not the lite fd path.
+
+The next design investigation will compare device admission, owned-memory
+I/O boundaries, and an API that limits host-access acquisition to bounce
+copies. That investigation is options-only; no such API is implemented.
+Identified-page ownership and failure-injection coverage remain separate
+follow-ups.
+
+## Historical scoped-model status
+
+The sections below describe the superseded opt-in scoped-copy design.
+Their cancellation and completion-ABI blockers do not apply to the current
+retained-grant implementation. Preserve these sections as historical evidence.
+
 Phase 1b remains a default-off experimental feature. Bounced block, software
 networking, and in-process vsock work on the published SNP guest. Both guest
 CPUs were online in the last acceptance run. All three drivers passed
