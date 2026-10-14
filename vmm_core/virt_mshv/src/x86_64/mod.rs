@@ -68,7 +68,6 @@ use zerocopy::FromZeros;
 use zerocopy::IntoBytes;
 
 mod snp;
-mod snp_host_access;
 
 pub(crate) use snp::MshvSnpConfig;
 pub(super) use snp::SnpError;
@@ -1370,17 +1369,11 @@ impl hv1_hypercall::StartVirtualProcessor<hvdef::hypercall::InitialVpContextX64>
             vp_id: u64::from(target_vp.index()),
             vmsa_gpa,
         };
-        let mut control = self
-            .partition
+        self.partition
             .isolation
             .snp()
             .ok_or(hvdef::HvError::InvalidPartitionId)?
-            .reserve_root_operation(
-                self.partition,
-                &[vmsa_gpa],
-                "StartVirtualProcessor VMSA",
-                Some(snp_host_access::ControlBinding::Ap(target_vp)),
-            )
+            .release_control_host_access(self.partition, &[vmsa_gpa], "StartVirtualProcessor VMSA")
             .map_err(|error| {
                 tracelimit::warn_ratelimited!(
                     error = &*error,
@@ -1388,9 +1381,6 @@ impl hv1_hypercall::StartVirtualProcessor<hvdef::hypercall::InitialVpContextX64>
                 );
                 hvdef::HvError::InvalidVpState
             })?;
-        if let Some(control) = &mut control {
-            control.start();
-        }
         self.partition
             .vmfd
             .sev_snp_ap_create(&request)
@@ -1403,9 +1393,6 @@ impl hv1_hypercall::StartVirtualProcessor<hvdef::hypercall::InitialVpContextX64>
                 );
                 hvdef::HvError::InvalidVpState
             })?;
-        if let Some(control) = control {
-            control.retain();
-        }
         Ok(())
     }
 }

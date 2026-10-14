@@ -164,14 +164,14 @@ describes the source definitions.
   a completed isolation feature. Private-page handoff race tests remain an
   acceptance requirement.
 
-  Control-page reservations remain until partition teardown. AP recreation
-  and SNP doorbell disable/rebind are not supported. Reusing a reserved page
-  can halt the guest. The control registry allows at most 4,096 root-operation
-  reservations; exhausting this limit also prevents PSP guest requests.
-  GHCB pages keep a separate control reference until confirmed unregister.
-  GHCB replacement closes the old binding before it sets the new binding.
-  A failed root-operation ioctl retains its pages when the result is uncertain.
-  This ownership rule is separate from ordinary host permission grants.
+  OpenVMM closes cached host grants before submitting SNP control operations,
+  but does not maintain a separate control-page reservation table. The kernel
+  and hypervisor enforce their control-page and permission contracts.
+  GHCB replacement still clears the old registration before setting the new
+  one, and unregister waits for a successful clear before acknowledgement.
+  Control-operation failures remain explicit; supported replacement and
+  disable operations depend on the backend. RAM backing remains retained
+  through kernel partition teardown.
   For guest-driver tests with the published `0.3.0-155` image, the driver is
   built in: use device unbind/rebind, not `rmmod`.
 * `--nested-virt`: Expose hardware virtualization (VMX/SVM) to the guest so it

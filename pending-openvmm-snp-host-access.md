@@ -15,8 +15,11 @@ admission. Use the CLI for bounced virtio devices.
 
 Host grants remain fault-driven and retained until a guest ownership conflict
 or control operation releases them. Ordinary-copy cancellation and a new
-completion ABI are not prerequisites. Separate control references, backing
-retention, and CopyOnly export/pin restrictions remain.
+completion ABI are not prerequisites. The userspace control-page reservation
+ledger and `snp_host_access` module have now been removed after checking the
+backend contracts. Required control-operation permission releases, checked
+RAM/range validation, backing retention, and CopyOnly export/pin restrictions
+remain. The kernel and hypervisor retain their own control/lifetime enforcement.
 
 A real two-CPU SNP lifecycle passed with plain `--hypervisor mshv` and no
 per-device bounce options: block, TCP, vsock, all three driver cycles, 13
@@ -24,17 +27,20 @@ conflict releases and subsequent RUN returns, normal shutdown, and unchanged
 host kernel logs. Evidence is in `target/mandatory-snp-bounce-hardware/`.
 This uses legacy RAM backing, not the lite fd path.
 
-The next design investigation will compare device admission, owned-memory
-I/O boundaries, and an API that limits host-access acquisition to bounce
-copies. That investigation is options-only; no such API is implemented.
+The device-admission and branch-scope investigations are recorded in
+`report-mshv-bounce-scope-and-io-enforcement.md`. They remain options-only;
+no dedicated bounce-copy capability is implemented.
 Identified-page ownership and failure-injection coverage remain separate
 follow-ups.
 
-## Historical scoped-model status
+## Historical scoped-model status (all remaining sections)
 
 The sections below describe the superseded opt-in scoped-copy design.
 Their cancellation and completion-ABI blockers do not apply to the current
 retained-grant implementation. Preserve these sections as historical evidence.
+Source citations below refer to the earlier implementation, including the
+now-deleted `snp_host_access.rs`; they are not links to the current source.
+That earlier source is retained in change ID `xzrmxqqp`.
 
 Phase 1b remains a default-off experimental feature. Bounced block, software
 networking, and in-process vsock work on the published SNP guest. Both guest
@@ -57,7 +63,7 @@ This document tracks the remaining work, not completed isolation support.
 | Identified-page transition acceptance | Not run | Full acceptance needs the first three contracts |
 | Restricted-injection guest boot | Separate failure | GHCB boot-path diagnosis |
 
-## 1. Persistent cancellation after uncertain host access
+## 1. Persistent cancellation after uncertain host access (historical)
 
 An unsuccessful acquire or release may leave a range's permissions uncertain.
 The coordinator retains its exclusion, refuses new copies, and kicks VPs.
@@ -87,7 +93,7 @@ uncertain backing.
 Evidence: `vmm_core/virt_mshv/src/lib.rs:470-486,766-768`;
 `vmm_core/virt_mshv/src/x86_64/snp_host_access.rs:307-329`.
 
-## 2. GPA-attribute completion and whole-request exclusion
+## 2. GPA-attribute completion and whole-request exclusion (historical)
 
 The existing message definition and dispatch are already present. The handler
 validates ranges and checks overlap against copy/control reservations.
@@ -115,7 +121,7 @@ result, not just absence of a host error.
 Evidence: `vmm_core/virt_mshv/src/x86_64/snp.rs:310-329,1361-1373,1439-1455`;
 `vm/hv1/hvdef/src/lib.rs:4351-4355`.
 
-## 3. Control-page lifetime, replacement, and failure semantics
+## 3. Control-page lifetime, replacement, and failure semantics (historical)
 
 PSP request/response reservations are transient and retire after success.
 AP VMSA and SNP doorbell reservations remain until partition teardown.

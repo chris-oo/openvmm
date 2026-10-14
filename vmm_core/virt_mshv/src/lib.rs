@@ -1058,19 +1058,6 @@ impl virt::PartitionMemoryMap for MshvPartitionInner {
         exec: bool,
     ) -> anyhow::Result<()> {
         let mut state = self.memory.lock();
-        #[cfg(guest_arch = "x86_64")]
-        if let Some(snp) = self.isolation.snp() {
-            snp.check_mapping_change(addr, size as u64)?;
-            // Moving an existing backing also changes its old GPA identity.
-            for range in state.ranges.iter().flatten() {
-                if range.region.userspace_addr == data as u64 {
-                    snp.check_mapping_change(
-                        range.region.guest_pfn << HV_PAGE_SHIFT,
-                        range.region.size,
-                    )?;
-                }
-            }
-        }
 
         // Memory slots cannot be resized but can be moved within the guest
         // address space. Find the existing slot if there is one.
@@ -1129,10 +1116,6 @@ impl virt::PartitionMemoryMap for MshvPartitionInner {
             .ok_or_else(|| anyhow::anyhow!("unmap range overflows the guest address space"))?
             >> HV_PAGE_SHIFT;
         let mut state = self.memory.lock();
-        #[cfg(guest_arch = "x86_64")]
-        if let Some(snp) = self.isolation.snp() {
-            snp.check_mapping_change(addr, size)?;
-        }
         for range in state.ranges.iter().flatten() {
             let region_start = range.region.guest_pfn;
             let region_end = region_start
