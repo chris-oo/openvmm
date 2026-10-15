@@ -105,6 +105,36 @@ impl<K: ResourceKind> Resource<K> {
     pub fn id(&self) -> &str {
         &self.id
     }
+
+    /// Decodes a resource for admission checks before invoking its resolver.
+    /// The resource ID must match the requested payload type.
+    pub fn into_inner<T: 'static + MeshPayload + ResourceId<K> + Send>(
+        self,
+    ) -> Result<T, ResourceDecodeError> {
+        if self.id != T::ID {
+            return Err(ResourceDecodeError::WrongType {
+                expected: T::ID,
+                actual: self.id.into_owned(),
+            });
+        }
+        self.message.parse().map_err(ResourceDecodeError::Payload)
+    }
+}
+
+/// Failure to decode a typed resource before resolution.
+#[derive(Debug, thiserror::Error)]
+pub enum ResourceDecodeError {
+    /// The opaque resource carries a different payload type.
+    #[error("expected resource {expected}, got {actual}")]
+    WrongType {
+        /// Requested resource ID.
+        expected: &'static str,
+        /// Received resource ID.
+        actual: String,
+    },
+    /// The mesh payload is invalid.
+    #[error("invalid resource payload")]
+    Payload(#[source] mesh::payload::Error),
 }
 
 impl<K: ResourceKind> std::fmt::Debug for Resource<K> {
@@ -639,6 +669,7 @@ mod tests {
     use mesh::payload::Protobuf;
     use pal_async::async_test;
     use std::convert::Infallible;
+    use test_with_tracing::test;
 
     enum TestConfigKind {}
 
@@ -667,6 +698,24 @@ mod tests {
 
     impl ResourceId<TestConfigKind> for TestConfig {
         const ID: &'static str = "foo";
+    }
+
+    #[derive(Protobuf)]
+    struct OtherConfig {}
+
+    impl ResourceId<TestConfigKind> for OtherConfig {
+        const ID: &'static str = "other";
+    }
+
+    #[test]
+    fn typed_resource_admission_checks_id_before_decode() {
+        let resource = Resource::new(TestConfig { value: 42 });
+        assert_eq!(resource.into_inner::<TestConfig>().unwrap().value, 42);
+        let resource = Resource::new(TestConfig { value: 42 });
+        assert!(matches!(
+            resource.into_inner::<OtherConfig>(),
+            Err(super::ResourceDecodeError::WrongType { .. })
+        ));
     }
 
     #[derive(MeshPayload)]

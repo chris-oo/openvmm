@@ -132,6 +132,64 @@ describes the source definitions.
 
   For VM-service configuration, see [MSHV SNP devices](grpc.md#mshv-snp-devices).
 
+* `--hypervisor mshv:guest_memfd_lite=true`: Opt in to experimental,
+  kernel-owned RAM. The default is `false`; ordinary MSHV and SNP backing
+  remain unchanged. This is not KVM guest_memfd.
+
+  This mode requires native x86 Linux MSHV and Linux direct boot. Use
+  `--memory size=256MB,thp=off` for a small VM. The current kernel limit
+  is 1 GiB per backing file. A nonisolated VM uses the shared-only path.
+  SNP also requires `--isolation snp`; bouncing is automatic:
+
+  ```bash
+  --hypervisor mshv:guest_memfd_lite=true \
+    --isolation snp --memory size=256MB,thp=off
+  ```
+
+  The kernel must explicitly enable its matching experimental mode:
+  `lite_shared_memory` for nonisolated RAM, or `lite_snp_memory` for SNP.
+  SNP requires normal interrupt injection; IGVM and restricted injection
+  are not admitted. An unsupported or disabled kernel fails startup;
+  OpenVMM never falls back to userspace-pinned RAM.
+
+  The VM worker creates the file in its own address space. Loader and
+  device access use a copy-only primary memory view. Guest RAM uses
+  direct file-offset-to-GPA registration, not legacy userspace pinning.
+  Nonisolated access does not use SNP host-access ioctls. Usermode loans
+  and kernel locks are not supported. SNP copies acquire host access
+  lazily and retain it. A guest ownership conflict releases the affected
+  permissions before retrying the guest operation; the kernel controls
+  faults and mapping revocation. Malformed requests and conflicts with
+  retained control pages still halt the guest.
+
+  Supported devices are bounced virtio-blk, software virtio-net,
+  in-process virtio-vsock, serial ports, and the minimal chipset.
+  The memory policy selects bouncing automatically.
+  For SNP, place every virtio device on PCIe; the default buses are rejected.
+
+  ```bash
+  --pcie-root-complex rc0 \
+    --pcie-root-port rc0:blk --pcie-root-port rc0:net \
+    --pcie-root-port rc0:vsock \
+    --virtio-blk mem:256MB,pcie_port=blk \
+    --virtio-net pcie_port=net:consomme \
+    --virtio-vsock-path path/to/vsock \
+    --virtio-vsock-bus pcie:vsock
+  ```
+
+  See [PCIe topology](#setting-up-a-pcie-topology) for port configuration.
+
+  With `--hv`, also pass `--no-vmbus`. VMBus, kernel vhost, vhost-user,
+  assigned devices, DMA, unreviewed device resources, NUMA, legacy
+  PAM/VGA, huge pages, and transparent huge pages are not supported.
+  Memory backing files, exports, secondary or cross-process memory
+  views, snapshots, restore, memory dumps, the debugger, and device
+  hotplug are not supported.
+
+  The default-off CREATE/SET ioctl ABI is local and provisional. It is
+  not an upstream MSHV or Hyper-V ABI. Hardware validation is required
+  before you rely on this experimental path.
+
 * `--nested-virt`: Expose hardware virtualization (VMX/SVM) to the guest so it
   can run its own hypervisor (Hyper-V, KVM, etc.). Only supported on `x86_64`,
   and only by backends that support nested virtualization (currently WHP,

@@ -97,6 +97,11 @@ pub enum PartitionAttachError {
 /// Errors creating a [`GuestMemoryManager`].
 #[derive(Error, Debug)]
 pub enum MemoryBuildError {
+    /// A copy-only view cannot support these alternate backing mechanisms.
+    #[error(
+        "copy-only memory forbids private/huge/THP RAM, NUMA binding, pinned mappings, legacy PAM, and aliases"
+    )]
+    CopyOnlyBacking,
     /// RAM too large.
     #[error("ram size {0} is too large")]
     RamTooLarge(MemorySize),
@@ -350,6 +355,7 @@ pub struct GuestMemoryBuilder {
     supports_memory_fault_resolution: bool,
     backing_requests: Vec<RamBackingRequest>,
     io_policy: guestmem::GuestMemoryIoPolicy,
+    single_mapper: bool,
 }
 
 impl GuestMemoryBuilder {
@@ -362,6 +368,7 @@ impl GuestMemoryBuilder {
             supports_memory_fault_resolution: false,
             backing_requests: Vec::new(),
             io_policy: guestmem::GuestMemoryIoPolicy::Direct,
+            single_mapper: false,
         }
     }
 
@@ -419,6 +426,12 @@ impl GuestMemoryBuilder {
         self
     }
 
+    /// Rejects secondary address spaces when required by the backend and mode.
+    pub fn single_mapper(mut self, required: bool) -> Self {
+        self.single_mapper = required;
+        self
+    }
+
     /// Builds the memory backing, allocating one memfd or anonymous region
     /// per backing request.
     ///
@@ -427,6 +440,19 @@ impl GuestMemoryBuilder {
     /// private requests use anonymous pages.
     pub async fn build(self, max_addr: u64) -> Result<GuestMemoryManager, MemoryBuildError> {
         let backing_requests = self.backing_requests;
+        if self.io_policy == guestmem::GuestMemoryIoPolicy::CopyOnly
+            && (self.pin_mappings
+                || self.x86_legacy_support
+                || self.vtl0_alias_map.is_some()
+                || backing_requests.iter().any(|req| {
+                    req.private_memory
+                        || req.transparent_hugepages
+                        || req.hugepages
+                        || req.host_numa_node.is_some()
+                }))
+        {
+            return Err(MemoryBuildError::CopyOnlyBacking);
+        }
 
         // Validate per-request constraints.
         for req in &backing_requests {
@@ -584,6 +610,7 @@ impl GuestMemoryBuilder {
             max_hugepage_size,
             self.supports_memory_fault_resolution,
             self.io_policy,
+            self.single_mapper,
         )
         .await
         .map_err(MemoryBuildError::VaMapper)?;
@@ -948,6 +975,31 @@ mod tests {
     use super::*;
     use pal_async::async_test;
     use std::error::Error as _;
+
+    #[async_test]
+    async fn copy_only_is_installed_before_memory_is_exposed() {
+        let mgr = GuestMemoryBuilder::new()
+            .io_policy(guestmem::GuestMemoryIoPolicy::CopyOnly)
+            .add_backing(RamBackingRequest::new(vec![
+                MemoryRange::new(0..0x2000),
+                MemoryRange::new(0x4000..0x8000),
+            ]))
+            .build(0x8000)
+            .await
+            .unwrap();
+        let gm = mgr.client().guest_memory().await.unwrap();
+        assert_eq!(gm.io_policy(), guestmem::GuestMemoryIoPolicy::CopyOnly);
+        assert!(gm.full_mapping().is_none());
+        assert!(!gm.supports_kernel_lock());
+        assert!(mgr.shared_memory_backing().is_none());
+        gm.write_plain(0x5000, &42u64).unwrap();
+        assert_eq!(gm.read_plain::<u64>(0x5000).unwrap(), 42);
+        assert!(gm.write_at(0x1fff, &[1, 2]).is_err());
+        assert_eq!(
+            gm.copy_only_view().io_policy(),
+            guestmem::GuestMemoryIoPolicy::CopyOnly
+        );
+    }
 
     /// Build a GuestMemoryManager with the given backing range groups,
     /// and return a GuestMemory handle for read/write testing.

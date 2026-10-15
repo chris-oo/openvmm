@@ -117,13 +117,18 @@ impl virt::Hypervisor for LinuxMshv {
         let isolation = config.isolation.isolation_type();
         validate_snp_cpuid_offload_config(isolation, self.snp_disable_cpuid_offload)?;
         validate_nested_virt_config(config.nested_virt, config.hv_config.as_ref())?;
+        let lite_flags = if self.guest_memfd_lite {
+            guest_memfd_lite_creation_flags(&config.isolation)?
+        } else {
+            0
+        };
         let snp = isolation == virt::IsolationType::Snp;
         let x2apic = matches!(
             config.processor_topology.apic_mode(),
             vm_topology::processor::x86::ApicMode::X2ApicSupported
                 | vm_topology::processor::x86::ApicMode::X2ApicEnabled
         );
-        let create_args = partition_create_args(
+        let mut create_args = partition_create_args(
             &config.isolation,
             PartitionCreateOptions {
                 x2apic,
@@ -131,6 +136,7 @@ impl virt::Hypervisor for LinuxMshv {
                 nested: config.nested_virt,
             },
         )?;
+        create_args.pt_flags |= lite_flags;
 
         let vmfd = create_vm_with_retry(&self.mshv, &create_args)?;
 
@@ -235,6 +241,7 @@ impl virt::Hypervisor for LinuxMshv {
         };
         let mut proto = MshvProtoPartition::new(config, vmfd)?;
         proto.isolation = isolation;
+        proto.guest_memfd_lite = self.guest_memfd_lite;
         Ok(proto)
     }
 
@@ -352,6 +359,21 @@ fn hv1_reference_tsc_page_supported(
     // when a newer guest kernel with fixed shared reference-TSC-page handling
     // is available.
     hv1_enabled && isolation != virt::IsolationType::Snp && advertised
+}
+
+fn guest_memfd_lite_creation_flags(
+    isolation: &virt::ProtoPartitionIsolation,
+) -> Result<u64, Error> {
+    match isolation {
+        virt::ProtoPartitionIsolation::None => Ok(0),
+        virt::ProtoPartitionIsolation::Snp(virt::SnpPartitionConfig::DirectBoot {
+            restricted_injection: false,
+        }) => Ok(crate::guest_memfd_lite::MSHV_PT_LITE_SNP),
+        _ => Err(ErrorInner::InvalidConfiguration(
+            "guest_memfd_lite requires nonisolated or normal-injection SNP Linux direct boot",
+        )
+        .into()),
+    }
 }
 
 fn validate_snp_cpuid_offload_config(
@@ -484,10 +506,46 @@ impl ProtoPartition for MshvProtoPartition<'_> {
     }
 
     fn guest_memory_io_policy(&self) -> guestmem::GuestMemoryIoPolicy {
-        match self.isolation {
-            MshvProtoPartitionIsolation::None => guestmem::GuestMemoryIoPolicy::Direct,
-            MshvProtoPartitionIsolation::Snp { .. } => guestmem::GuestMemoryIoPolicy::CopyOnly,
+        if self.guest_memfd_lite
+            || matches!(self.isolation, MshvProtoPartitionIsolation::Snp { .. })
+        {
+            guestmem::GuestMemoryIoPolicy::CopyOnly
+        } else {
+            guestmem::GuestMemoryIoPolicy::Direct
         }
+    }
+
+    fn requires_kernel_memory_backing(&self) -> bool {
+        self.guest_memfd_lite
+    }
+
+    fn create_memory_backing(
+        &mut self,
+        ranges: &[MemoryRange],
+    ) -> Result<Option<std::fs::File>, Self::Error> {
+        if !self.guest_memfd_lite {
+            return Ok(None);
+        }
+        if self.guest_memfd_backing.is_some() {
+            return Err(ErrorInner::InvalidConfiguration(
+                "guest_memfd_lite requires a single RAM backing request",
+            )
+            .into());
+        }
+        let backing = crate::guest_memfd_lite::GuestMemfdBacking::create(&self.vmfd, ranges)
+            .map_err(ErrorInner::GuestMemfdLite)?;
+        let file = backing
+            .file
+            .try_clone()
+            .map_err(crate::guest_memfd_lite::GuestMemfdError::Duplicate)
+            .map_err(ErrorInner::GuestMemfdLite)?;
+        tracing::info!(
+            fd = backing.file.as_raw_fd(),
+            bytes = ranges.iter().map(|r| r.len()).sum::<u64>(),
+            "mshv guest_memfd_lite create success"
+        );
+        self.guest_memfd_backing = Some(backing);
+        Ok(Some(file))
     }
 
     fn build(
@@ -498,6 +556,25 @@ impl ProtoPartition for MshvProtoPartition<'_> {
             self.guest_memory_io_policy(),
             config.guest_memory.io_policy(),
         )?;
+        if self.guest_memfd_lite && self.guest_memfd_backing.is_none() {
+            return Err(ErrorInner::InvalidConfiguration(
+                "guest_memfd_lite requires kernel RAM backing",
+            )
+            .into());
+        }
+        if let Some(backing) = &self.guest_memfd_backing
+            && (!backing.ranges.iter().map(|r| r.range).eq(config
+                .mem_layout
+                .ram()
+                .iter()
+                .map(|r| r.range))
+                || config.vtl0_alias_map.is_some())
+        {
+            return Err(ErrorInner::InvalidConfiguration(
+                "guest_memfd_lite backing must match the complete unaliased RAM layout",
+            )
+            .into());
+        }
         let snp_config = match &self.isolation {
             MshvProtoPartitionIsolation::None => None,
             MshvProtoPartitionIsolation::Snp { config, .. } => config.as_deref(),
@@ -627,7 +704,9 @@ impl ProtoPartition for MshvProtoPartition<'_> {
             )),
         };
         let inner = Arc::new(MshvPartitionInner {
-            vmfd: self.vmfd,
+            vmfd: Arc::new(
+                crate::MshvMemoryOwner::new(self.vmfd).with_guest_memfd(self.guest_memfd_backing),
+            ),
             bsp_vcpufd: self.bsp,
             memory: Default::default(),
             gm: config.guest_memory.clone(),
@@ -1782,6 +1861,49 @@ mod tests {
                 .to_string(),
             "invalid MSHV configuration: nested_virt requires hv_config"
         );
+    }
+
+    #[test]
+    fn lite_snp_mode_is_selected_before_partition_creation() {
+        assert_eq!(
+            guest_memfd_lite_creation_flags(&virt::ProtoPartitionIsolation::None).unwrap(),
+            0
+        );
+        let isolation = virt::ProtoPartitionIsolation::Snp(virt::SnpPartitionConfig::DirectBoot {
+            restricted_injection: false,
+        });
+        let flags = guest_memfd_lite_creation_flags(&isolation).unwrap();
+        assert_eq!(flags, 0x100);
+        let mut args = partition_create_args(
+            &isolation,
+            PartitionCreateOptions {
+                x2apic: true,
+                smt: false,
+                nested: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(args.pt_flags & flags, 0);
+        let legacy_flags = args.pt_flags;
+        args.pt_flags |= flags;
+        assert_eq!(args.pt_flags ^ legacy_flags, flags);
+        let restricted = virt::ProtoPartitionIsolation::Snp(virt::SnpPartitionConfig::DirectBoot {
+            restricted_injection: true,
+        });
+        assert!(guest_memfd_lite_creation_flags(&restricted).is_err());
+        assert!(guest_memfd_lite_creation_flags(&virt::ProtoPartitionIsolation::Vbs).is_err());
+        let igvm = virt::ProtoPartitionIsolation::Snp(virt::SnpPartitionConfig::Igvm(Box::new(
+            virt::SnpConfig {
+                host_data: None,
+                policy: 0,
+                highest_vtl: 0,
+                shared_gpa_boundary: 0,
+                has_relocation: false,
+                vp_contexts: Vec::new(),
+                id_block: None,
+            },
+        )));
+        assert!(guest_memfd_lite_creation_flags(&igvm).is_err());
     }
 
     #[test]

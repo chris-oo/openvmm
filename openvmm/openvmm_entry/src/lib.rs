@@ -2900,7 +2900,9 @@ async fn run_control_inner(
     };
     // Resource creation validates backend parameters once. All admission and
     // device defaults below use the actual selected backend, including auto.
-    opt.hypervisor = Some(hypervisor.id().to_owned());
+    if opt.hypervisor.is_none() {
+        opt.hypervisor = Some(hypervisor.id().to_owned());
+    }
     let mesh = mesh_slot.as_ref().unwrap();
     let (mut vm_config, mut resources) = vm_config_from_command_line(driver, mesh, &opt).await?;
 

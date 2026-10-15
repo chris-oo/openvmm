@@ -5,24 +5,11 @@
 
 #![cfg(all(target_os = "linux", feature = "virt_mshv", guest_is_native))]
 
-use crate::parse_bool_param;
 use hypervisor_resources::HypervisorKind;
+use hypervisor_resources::MshvConfig;
 use hypervisor_resources::MshvHandle;
 use vm_resource::IntoResource;
 use vm_resource::Resource;
-
-fn parse_mshv_params(params: &[(&str, &str)]) -> anyhow::Result<bool> {
-    let mut snp_disable_cpuid_offload = false;
-    for &(key, value) in params {
-        match key {
-            "snp_disable_cpuid_offload" => {
-                snp_disable_cpuid_offload = parse_bool_param(key, value)?;
-            }
-            _ => anyhow::bail!("unknown mshv parameter: {key}"),
-        }
-    }
-    Ok(snp_disable_cpuid_offload)
-}
 
 /// MSHV probe for auto-detection.
 pub struct MshvProbe;
@@ -42,17 +29,19 @@ impl hypervisor_resources::HypervisorProbe for MshvProbe {
             MshvHandle {
                 mshv: mshv.into(),
                 snp_disable_cpuid_offload: false,
+                guest_memfd_lite: false,
             }
             .into_resource(),
         ))
     }
 
     fn new_resource(&self, params: &[(&str, &str)]) -> anyhow::Result<Resource<HypervisorKind>> {
-        let snp_disable_cpuid_offload = parse_mshv_params(params)?;
+        let config = MshvConfig::parse(params)?;
         anyhow::ensure!(virt_mshv::is_available()?, "MSHV is not available");
         Ok(Resource::new(MshvHandle {
             mshv: fs_err::File::open("/dev/mshv")?.into(),
-            snp_disable_cpuid_offload,
+            snp_disable_cpuid_offload: config.snp_disable_cpuid_offload,
+            guest_memfd_lite: config.guest_memfd_lite,
         }))
     }
 }
@@ -64,9 +53,29 @@ mod tests {
 
     #[test]
     fn parses_snp_cpuid_offload_parameter() {
-        assert!(!parse_mshv_params(&[]).unwrap());
-        assert!(parse_mshv_params(&[("snp_disable_cpuid_offload", "true")]).unwrap());
-        assert!(parse_mshv_params(&[("snp_disable_cpuid_offload", "invalid")]).is_err());
-        assert!(parse_mshv_params(&[("unknown", "true")]).is_err());
+        assert!(!MshvConfig::parse(&[]).unwrap().snp_disable_cpuid_offload);
+        assert!(
+            MshvConfig::parse(&[("snp_disable_cpuid_offload", "true")])
+                .unwrap()
+                .snp_disable_cpuid_offload
+        );
+        assert!(MshvConfig::parse(&[("snp_disable_cpuid_offload", "invalid")]).is_err());
+        assert!(MshvConfig::parse(&[("unknown", "true")]).is_err());
+    }
+
+    #[test]
+    fn parses_guest_memfd_lite_parameter() {
+        assert!(!MshvConfig::parse(&[]).unwrap().guest_memfd_lite);
+        assert!(
+            MshvConfig::parse(&[("guest_memfd_lite", "yes")])
+                .unwrap()
+                .guest_memfd_lite
+        );
+        assert!(
+            !MshvConfig::parse(&[("guest_memfd_lite", "false")])
+                .unwrap()
+                .guest_memfd_lite
+        );
+        assert!(MshvConfig::parse(&[("guest_memfd_lite", "invalid")]).is_err());
     }
 }
