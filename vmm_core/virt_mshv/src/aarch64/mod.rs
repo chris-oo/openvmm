@@ -68,7 +68,7 @@ impl virt::Hypervisor for LinuxMshv {
         &mut self,
         config: ProtoPartitionConfig<'a>,
     ) -> Result<MshvProtoPartition<'a>, Self::Error> {
-        if self.snp_disable_cpuid_offload {
+        if self.snp_disable_cpuid_offload || self.guest_memfd_lite {
             return Err(ErrorInner::IsolationNotSupported.into());
         }
         if config.isolation.is_isolated() {
@@ -199,7 +199,7 @@ impl ProtoPartition for MshvProtoPartition<'_> {
         };
 
         let inner = Arc::new(MshvPartitionInner {
-            vmfd: self.vmfd,
+            vmfd: Arc::new(crate::MshvMemoryOwner::new(self.vmfd)),
             bsp_vcpufd: self.bsp,
             memory: Default::default(),
             gm: config.guest_memory.clone(),

@@ -220,6 +220,14 @@ impl SnpPartitionState {
         }
     }
 
+    pub(crate) fn check_lite_mapping_change(&self) -> anyhow::Result<()> {
+        match *self.launch_state.lock() {
+            SnpLaunchState::NotStarted | SnpLaunchState::Finished => Ok(()),
+            SnpLaunchState::Started => Err(SnpError::LaunchInProgress.into()),
+            SnpLaunchState::Failed => Err(SnpError::LaunchFailed.into()),
+        }
+    }
+
     pub(crate) fn acquire_host_access(
         &self,
         partition: &MshvPartitionInner,
@@ -883,6 +891,7 @@ impl MshvPartitionInner {
             rsvd: [0; 7],
         };
         self.memory.lock().ranges.push(Some(crate::MshvMemoryRange {
+            guest_memfd: None,
             region,
             mapped: false,
         }));
@@ -2333,6 +2342,18 @@ mod tests {
         assert_eq!(attribute_ranges(&message).unwrap().len(), 29);
         message.flags = hvdef::HvX64GpaAttributeInterceptMessageFlags::from_bits(1 | (1 << 14));
         assert!(attribute_ranges(&message).is_err());
+    }
+
+    #[test]
+    fn lite_mapping_changes_check_launch_state() {
+        let snp = SnpPartitionState::new(false);
+        snp.check_lite_mapping_change().unwrap();
+        for state in [SnpLaunchState::Started, SnpLaunchState::Failed] {
+            *snp.launch_state.lock() = state;
+            assert!(snp.check_lite_mapping_change().is_err());
+        }
+        *snp.launch_state.lock() = SnpLaunchState::Finished;
+        snp.check_lite_mapping_change().unwrap();
     }
 
     #[test]

@@ -62,8 +62,15 @@ impl MappingManager {
         minimum_va_alignment: Option<usize>,
         supports_memory_fault_resolution: bool,
         io_policy: guestmem::GuestMemoryIoPolicy,
+        single_mapper: bool,
     ) -> Result<(Self, Arc<VaMapper>), VaMapperError> {
-        let this = Self::new_bare(spawn, max_addr, minimum_va_alignment, io_policy);
+        let this = Self::new_bare(
+            spawn,
+            max_addr,
+            minimum_va_alignment,
+            io_policy,
+            single_mapper,
+        );
         // Create the primary mapper as part of construction. Being first, it is
         // the instance the shared cache hands to every later `new_mapper` in
         // this process.
@@ -86,11 +93,14 @@ impl MappingManager {
         max_addr: u64,
         minimum_va_alignment: Option<usize>,
         io_policy: guestmem::GuestMemoryIoPolicy,
+        single_mapper: bool,
     ) -> Self {
         let (req_send, mut req_recv) = mesh::mpsc_channel();
         spawn
             .spawn("mapping_manager", {
                 let mut task = MappingManagerTask::new();
+                task.copy_only = io_policy == guestmem::GuestMemoryIoPolicy::CopyOnly;
+                task.single_mapper = single_mapper;
                 async move {
                     task.run(&mut req_recv).await;
                 }
@@ -121,6 +131,7 @@ impl MappingManager {
             max_addr,
             minimum_va_alignment,
             guestmem::GuestMemoryIoPolicy::Direct,
+            false,
         )
     }
 
@@ -296,7 +307,7 @@ pub enum MappingRequest {
     AddMapping(FailableRpc<MappingParams, ()>),
     RemoveMappings(Rpc<MemoryRange, ()>),
     /// Returns all mappings that have [`MappingType::Ram`] type.
-    GetDmaTargetMappings(Rpc<(), Vec<MappingParams>>),
+    GetDmaTargetMappings(FailableRpc<(), Vec<MappingParams>>),
     Inspect(inspect::Deferred),
 }
 
@@ -306,6 +317,9 @@ struct MappingManagerTask {
     mappings: Vec<Mapping>,
     #[inspect(skip)]
     mappers: Mappers,
+    copy_only: bool,
+    primary_registered: bool,
+    single_mapper: bool,
 }
 
 fn inspect_mappings(mappings: &Vec<Mapping>) -> impl '_ + Inspect {
@@ -499,6 +513,9 @@ impl MappingManagerTask {
                 mappers: Slab::new(),
             },
             mappings: Vec::new(),
+            copy_only: false,
+            primary_registered: false,
+            single_mapper: false,
         }
     }
 
@@ -507,6 +524,14 @@ impl MappingManagerTask {
             match req {
                 MappingRequest::AddMapper(rpc) => {
                     rpc.handle_failable(async |params: AddMapperParams| {
+                        if self.single_mapper && self.primary_registered {
+                            return Err(MappingError::new(
+                                MemoryRange::EMPTY,
+                                std::io::Error::other(
+                                    "selected memory mode forbids secondary mappers",
+                                ),
+                            ));
+                        }
                         // Private memory is anonymous: its storage *is* a single
                         // mapper's address space, with no backing fd to share, so
                         // a second mapper would get its own incoherent copy.
@@ -522,7 +547,9 @@ impl MappingManagerTask {
                                 ),
                             ));
                         }
-                        self.add_mapper(params.send, params.eager).await
+                        let id = self.add_mapper(params.send, params.eager).await?;
+                        self.primary_registered = true;
+                        Ok(id)
                     })
                     .await
                 }
@@ -544,9 +571,15 @@ impl MappingManagerTask {
                     rpc.handle(async |range| self.remove_mappings(range).await)
                         .await
                 }
-                MappingRequest::GetDmaTargetMappings(rpc) => {
-                    rpc.handle_sync(|()| self.get_dma_target_mappings())
-                }
+                MappingRequest::GetDmaTargetMappings(rpc) => rpc.handle_failable_sync(|()| {
+                    if self.copy_only {
+                        Err(std::io::Error::other(
+                            "copy-only memory forbids DMA memory exports",
+                        ))
+                    } else {
+                        Ok(self.get_dma_target_mappings())
+                    }
+                }),
                 MappingRequest::Inspect(deferred) => deferred.inspect(&mut *self),
             }
         }
@@ -849,7 +882,7 @@ impl ProvideShareableRegions for DmaRegionProvider {
         let mappings = self
             .req_send
             .call(MappingRequest::GetDmaTargetMappings, ())
-            .await?;
+            .await??;
 
         Ok(mappings
             .into_iter()
@@ -924,6 +957,98 @@ mod tests {
         assert_eq!(regions[0].guest_address, 0);
         assert_eq!(regions[0].size, 0x100000);
         assert_eq!(regions[0].file_offset, 0);
+    }
+
+    #[pal_async::async_test]
+    async fn nonisolated_copy_only_policy_reaches_supported_secondary_views(spawn: impl Spawn) {
+        let (manager, primary) = MappingManager::new(
+            &spawn,
+            0x10000,
+            None,
+            false,
+            guestmem::GuestMemoryIoPolicy::CopyOnly,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(!guestmem::GuestMemory::new("primary", primary.clone()).supports_user_lock());
+        let foreign = MappingManagerClient {
+            id: ObjectId::new(),
+            ..manager.client().clone()
+        };
+        let secondary = foreign.new_mapper(false).await.unwrap();
+        for mapper in [primary, secondary] {
+            let memory = guestmem::GuestMemory::new("construction policy", mapper);
+            assert_eq!(memory.io_policy(), guestmem::GuestMemoryIoPolicy::CopyOnly);
+            assert!(!memory.supports_kernel_lock());
+            assert!(memory.full_mapping().is_none());
+        }
+    }
+
+    #[pal_async::async_test]
+    async fn single_mapper_rejects_secondary_views_before_host_callback_attachment(
+        spawn: impl Spawn,
+    ) {
+        let (manager, primary) = MappingManager::new(
+            &spawn,
+            0x10000,
+            None,
+            false,
+            guestmem::GuestMemoryIoPolicy::CopyOnly,
+            true,
+        )
+        .await
+        .unwrap();
+        let memory = guestmem::GuestMemory::new("SNP primary", primary);
+        assert!(!memory.supports_user_lock());
+        let foreign = MappingManagerClient {
+            id: ObjectId::new(),
+            ..manager.client().clone()
+        };
+        assert!(foreign.new_mapper(false).await.is_err());
+        assert!(foreign.new_mapper(true).await.is_err());
+    }
+
+    #[pal_async::async_test]
+    async fn kernel_owned_backing_rejects_an_uncached_secondary_mapper(spawn: impl Spawn) {
+        let (manager, primary) = MappingManager::new(
+            &spawn,
+            0x10000,
+            None,
+            false,
+            guestmem::GuestMemoryIoPolicy::CopyOnly,
+            true,
+        )
+        .await
+        .unwrap();
+        let cached = manager.client().new_mapper(false).await.unwrap();
+        assert!(Arc::ptr_eq(&primary, &cached));
+        let foreign = MappingManagerClient {
+            id: ObjectId::new(),
+            ..manager.client().clone()
+        };
+        assert!(foreign.new_mapper(false).await.is_err());
+        manager
+            .client()
+            .add_mapping(MappingParams {
+                range: MemoryRange::new(0..4096),
+                backing: MappingBacking::File {
+                    mappable: sparse_mmap::alloc_shared_memory(4096, "copy-only-test")
+                        .unwrap()
+                        .into(),
+                    file_offset: 0,
+                },
+                writable: true,
+                mapping_type: MappingType::Ram,
+                policy: MemoryPolicy::none(),
+            })
+            .await
+            .unwrap();
+        let provider = DmaRegionProvider {
+            req_send: manager.client().req_send.clone(),
+        };
+        assert!(matches!(provider.get_regions().await, Err(err)
+            if err.to_string().contains("copy-only memory forbids DMA memory exports")));
     }
 
     #[pal_async::async_test]

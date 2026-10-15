@@ -1063,6 +1063,11 @@ flags:
     ///   user_mode_apic       - use user-mode APIC emulator
     ///   no_enlightenments    - disable in-hypervisor enlightenments
     ///
+    /// MSHV parameters (default: false):
+    ///   snp_disable_cpuid_offload - forward SNP GHCB CPUID requests to OpenVMM
+    ///   guest_memfd_lite     - opt in to kernel-owned RAM; requires x86
+    ///                         Linux direct boot and thp=off
+    ///
     /// Examples:
     ///   --hypervisor whp
     ///   --hypervisor whp:user_mode_apic
@@ -1570,34 +1575,92 @@ impl Options {
                 anyhow::bail!("SNP isolation currently does not support hugetlb memory");
             }
         }
-        if self.requires_snp_bounce() {
-            self.validate_snp_bounce_options()?;
+        let hypervisor = self
+            .hypervisor
+            .as_deref()
+            .map(openvmm_helpers::hypervisor::HypervisorParamRoot::parse)
+            .transpose()?;
+        let snp_bounce = self.requires_snp_bounce();
+        let guest_memfd_lite = hypervisor
+            .as_ref()
+            .map(|value| value.guest_memfd_lite())
+            .transpose()?
+            .unwrap_or(false);
+        if guest_memfd_lite {
+            self.validate_guest_memfd_lite_options()?;
+        }
+        if snp_bounce || guest_memfd_lite {
+            self.validate_copy_only_options(if guest_memfd_lite {
+                "guest_memfd_lite"
+            } else {
+                "MSHV SNP"
+            })?;
         }
         Ok(())
     }
 
-    fn validate_snp_bounce_options(&self) -> anyhow::Result<()> {
+    fn validate_guest_memfd_lite_options(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            cfg!(all(target_os = "linux", guest_arch = "x86_64")),
+            "guest_memfd_lite requires x86 Linux MSHV"
+        );
+        anyhow::ensure!(
+            matches!(self.isolation, None | Some(IsolationCli::Snp)),
+            "guest_memfd_lite only supports nonisolated or SNP guests"
+        );
+        if matches!(self.isolation, Some(IsolationCli::Snp)) {
+            anyhow::ensure!(
+                !self.snp_restricted_injection,
+                "SNP guest_memfd_lite does not support restricted injection"
+            );
+            anyhow::ensure!(
+                self.virtio_blk.iter().all(|disk| disk.pcie_port.is_some())
+                    && self.virtio_net.iter().all(|nic| nic.pcie_port.is_some())
+                    && (self.virtio_vsock_path.is_none()
+                        || matches!(self.virtio_vsock_bus, Some(VirtioBusCli::Pcie(_)))),
+                "SNP guest_memfd_lite requires PCIe placement for every virtio device"
+            );
+        }
+        anyhow::ensure!(
+            self.kernel.0.is_some() && self.uefi.is_none() && !self.pcat && self.igvm.is_none(),
+            "guest_memfd_lite requires Linux direct boot"
+        );
+        anyhow::ensure!(
+            self.numa.is_none()
+                && !self.deprecated_private_memory
+                && self.memory.shared != Some(false)
+                && !self.shared_memory
+                && self.write_saved_state_proto.is_none()
+                && self.vmgs.is_none()
+                && self.pcie_generic_initiator.is_empty()
+                && self.imc.is_none(),
+            "guest_memfd_lite forbids NUMA, anonymous private backing, memory exports, and saved state"
+        );
+        Ok(())
+    }
+
+    fn validate_copy_only_options(&self, feature: &str) -> anyhow::Result<()> {
         if let Some(nodes) = &self.numa {
             anyhow::ensure!(
                 nodes.iter().all(|node| {
                     node.memory.transparent_hugepages == Some(false) && !node.memory.hugepages
                 }),
-                "MSHV SNP requires thp=off on every NUMA node"
+                "{feature} requires thp=off on every NUMA node"
             );
         } else {
             anyhow::ensure!(
                 !self.transparent_hugepages() && !self.memory.hugepages,
-                "MSHV SNP requires base-page backing; pass --memory thp=off"
+                "{feature} requires base-page backing; pass --memory thp=off"
             );
         }
         anyhow::ensure!(
             self.memory_backing_file().is_none(),
-            "MSHV SNP forbids existing guest-memory backing files"
+            "{feature} forbids existing guest-memory backing files"
         );
         for nic in &self.virtio_net {
             nic.validate_copy_only_backend()
                 .map_err(anyhow::Error::msg)
-                .context("MSHV SNP requires a bounce-capable virtio-net backend")?;
+                .context("copy-only guest memory requires a bounce-capable virtio-net backend")?;
         }
         #[cfg(target_os = "linux")]
         anyhow::ensure!(
@@ -1605,17 +1668,17 @@ impl Options {
                 && self.virtio_vsock_vhost_cid.is_none()
                 && self.vfio.is_empty()
                 && self.iommu.is_empty(),
-            "MSHV SNP forbids vhost-user, kernel vhost-vsock, and assigned devices"
+            "{feature} forbids vhost-user, kernel vhost-vsock, and assigned devices"
         );
         #[cfg(windows)]
-        anyhow::ensure!(self.device.is_empty(), "MSHV SNP forbids assigned devices");
+        anyhow::ensure!(self.device.is_empty(), "{feature} forbids assigned devices");
         #[cfg(guest_arch = "x86_64")]
         anyhow::ensure!(
             self.amd_iommu.is_empty() && self.intel_vtd.is_empty(),
-            "MSHV SNP forbids IOMMU devices"
+            "{feature} forbids IOMMU devices"
         );
         #[cfg(guest_arch = "aarch64")]
-        anyhow::ensure!(self.smmu.is_empty(), "MSHV SNP forbids IOMMU devices");
+        anyhow::ensure!(self.smmu.is_empty(), "{feature} forbids IOMMU devices");
         anyhow::ensure!(
             self.disk.is_empty()
                 && self.nvme.is_empty()
@@ -1655,7 +1718,7 @@ impl Options {
                 && self.crash_dump_path.is_none()
                 && self.restore_snapshot.is_none()
                 && !self.hibernation,
-            "MSHV SNP only supports bounced virtio-blk/net/vsock, serial, and the minimal chipset"
+            "{feature} only supports bounced virtio-blk/net/vsock, serial, and the minimal chipset"
         );
         Ok(())
     }
@@ -5866,6 +5929,141 @@ mod tests {
         );
     }
 
+    #[cfg(all(target_os = "linux", guest_arch = "x86_64"))]
+    #[test]
+    fn test_guest_memfd_lite_admission() {
+        let base = [
+            "openvmm",
+            "--hypervisor",
+            "mshv:guest_memfd_lite=true",
+            "--kernel",
+            "kernel.bin",
+            "--memory",
+            "size=256MB,thp=off",
+            "--processors",
+            "2",
+        ];
+        let opt = Options::try_parse_from(base).unwrap();
+        opt.validate_vm_options().unwrap();
+        let opt = Options::try_parse_from(base.into_iter().chain([
+            "--virtio-blk",
+            "mem:1M",
+            "--virtio-net",
+            "consomme",
+            "--virtio-vsock-path",
+            "vsock.sock",
+        ]))
+        .unwrap();
+        opt.validate_vm_options().unwrap();
+        for args in [
+            vec!["--virtio-rng"],
+            vec!["--private-memory"],
+            vec!["--shared-memory"],
+            vec!["--restore-snapshot", "snapshot"],
+            vec!["--gdb", "1234"],
+            vec!["--vhost-user", "vhost.sock,type=blk"],
+            vec!["--virtio-vsock-vhost-cid", "3"],
+        ] {
+            let opt = Options::try_parse_from(base.into_iter().chain(args.clone())).unwrap();
+            assert!(opt.validate_vm_options().is_err(), "{args:?}");
+        }
+
+        for memory in [
+            "size=256MB",
+            "size=256MB,thp=on",
+            "size=256MB,hugepages=on",
+            "size=256MB,thp=off,shared=off",
+            "size=256MB,thp=off,file=ram.bin",
+        ] {
+            let opt = Options::try_parse_from([
+                "openvmm",
+                "--hypervisor",
+                "mshv:guest_memfd_lite=true",
+                "--kernel",
+                "kernel.bin",
+                "--memory",
+                memory,
+            ])
+            .unwrap();
+            assert!(opt.validate_vm_options().is_err(), "{memory}");
+        }
+        for spec in ["mshv:guest_memfd_lite=invalid", "kvm:guest_memfd_lite=true"] {
+            let opt = Options::try_parse_from(["openvmm", "--hypervisor", spec]).unwrap();
+            assert!(opt.validate_vm_options().is_err());
+        }
+        for spec in ["mshv", "mshv:guest_memfd_lite=false"] {
+            let opt = Options::try_parse_from(["openvmm", "--hypervisor", spec]).unwrap();
+            opt.validate_vm_options().unwrap();
+        }
+    }
+
+    #[cfg(all(target_os = "linux", guest_arch = "x86_64"))]
+    #[test]
+    fn test_snp_guest_memfd_lite_admission() {
+        let base = [
+            "openvmm",
+            "--hypervisor",
+            "mshv:guest_memfd_lite=true",
+            "--isolation",
+            "snp",
+            "--kernel",
+            "kernel.bin",
+            "--memory",
+            "size=256MB,thp=off",
+            "--processors",
+            "2",
+        ];
+        Options::try_parse_from(base)
+            .unwrap()
+            .validate_vm_options()
+            .unwrap();
+        for hypervisor in [
+            "mshv:guest_memfd_lite=true,snp_scoped_host_access=true",
+            "mshv:guest_memfd_lite=true,snp_scoped_host_access=false",
+        ] {
+            let mut args = base;
+            args[2] = hypervisor;
+            assert!(
+                Options::try_parse_from(args)
+                    .unwrap()
+                    .validate_vm_options()
+                    .is_err()
+            );
+        }
+        Options::try_parse_from(base.into_iter().chain([
+            "--pcie-root-complex",
+            "rc0",
+            "--pcie-root-port",
+            "rc0:blk",
+            "--pcie-root-port",
+            "rc0:net",
+            "--pcie-root-port",
+            "rc0:vsock",
+            "--virtio-blk",
+            "mem:1M,pcie_port=blk",
+            "--virtio-net",
+            "pcie_port=net:consomme",
+            "--virtio-vsock-path",
+            "vsock.sock",
+            "--virtio-vsock-bus",
+            "pcie:vsock",
+        ]))
+        .unwrap()
+        .validate_vm_options()
+        .unwrap();
+        for args in [
+            vec!["--snp-restricted-injection"],
+            vec!["--virtio-blk", "mem:1M"],
+            vec!["--virtio-net", "consomme"],
+            vec!["--virtio-vsock-path", "vsock.sock"],
+            vec!["--private-memory"],
+            vec!["--restore-snapshot", "snapshot"],
+        ] {
+            let opt = Options::try_parse_from(base.into_iter().chain(args.clone())).unwrap();
+            assert!(opt.validate_vm_options().is_err(), "{args:?}");
+        }
+    }
+
     #[test]
     fn test_hypervisor_syntax_errors() {
         for spec in [":", ":foo", "mshv:=true"] {
@@ -5893,15 +6091,16 @@ mod tests {
             assert!(!opt.requires_snp_bounce());
             opt.validate_vm_options().unwrap();
         }
-        for selection in [
-            vec!["--hypervisor", "mshv"],
-            vec!["--hypervisor", "mshv:snp_disable_cpuid_offload"],
-        ] {
-            let opt = Options::try_parse_from(
-                ["openvmm", "--isolation", "snp", "--memory", "thp=off"]
-                    .into_iter()
-                    .chain(selection),
-            )
+        for spec in ["mshv", "mshv:snp_disable_cpuid_offload"] {
+            let opt = Options::try_parse_from([
+                "openvmm",
+                "--hypervisor",
+                spec,
+                "--isolation",
+                "snp",
+                "--memory",
+                "thp=off",
+            ])
             .unwrap();
             assert!(opt.requires_snp_bounce());
             opt.validate_vm_options().unwrap();
@@ -6137,8 +6336,6 @@ mod tests {
             "--isolation",
             "snp",
             "--snp-restricted-injection",
-            "--memory",
-            "thp=off",
         ])
         .unwrap();
         assert_eq!(

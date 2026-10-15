@@ -783,6 +783,135 @@ mod tests {
         }
     }
 
+    #[cfg(all(target_os = "linux", guest_arch = "x86_64"))]
+    fn minimal_lite_manifest(with_hv: bool) -> Manifest {
+        use vm_manifest_builder::BaseChipsetType;
+        use vm_manifest_builder::MachineArch;
+        use vm_manifest_builder::VmManifestBuilder;
+        let builder = VmManifestBuilder::new(
+            if with_hv {
+                BaseChipsetType::HyperVGen2LinuxDirect
+            } else {
+                BaseChipsetType::UnenlightenedLinuxDirect
+            },
+            MachineArch::X86_64,
+        )
+        .without_vmbus()
+        .with_serial([None, None, None, None]);
+        let layout = builder.layout_config();
+        let chipset = builder.build().unwrap();
+        let (_, input) = mesh::channel();
+        Manifest {
+            load_mode: linux_load_mode(openvmm_defs::config::LinuxIsolationConfig::None),
+            floppy_disks: Vec::new(),
+            ide_disks: Vec::new(),
+            pcie_root_complexes: Vec::new(),
+            pcie_ecam_below_4gb: false,
+            pcie_devices: Vec::new(),
+            pcie_switches: Vec::new(),
+            pcie_generic_initiators: Vec::new(),
+            vpci_devices: Vec::new(),
+            numa: NumaTopology {
+                nodes: vec![openvmm_defs::config::NumaNode {
+                    mem: Some(openvmm_defs::config::MemoryConfig {
+                        mem_size: 256 * 1024 * 1024,
+                        prefetch_memory: false,
+                        private_memory: false,
+                        transparent_hugepages: false,
+                        hugepages: false,
+                        hugepage_size: None,
+                        host_numa_node: None,
+                    }),
+                    vps: openvmm_defs::config::VpAssignment::FromTopology,
+                }],
+                distances: Vec::new(),
+            },
+            processor_topology: ProcessorTopologyConfig {
+                proc_count: 2,
+                vps_per_socket: None,
+                enable_smt: None,
+                arch: None,
+            },
+            hypervisor: HypervisorConfig {
+                with_hv,
+                with_vtl2: None,
+                with_isolation: None,
+                nested_virt: false,
+                force_guest_memory_bounce: false,
+            },
+            chipset: chipset.chipset,
+            input,
+            framebuffer: None,
+            vga_firmware: None,
+            vtl2_gfx: false,
+            virtio_devices: Vec::new(),
+            vmbus: None,
+            vtl2_vmbus: None,
+            vmgs: Some(VmgsResource::Ephemeral),
+            firmware_event_send: None,
+            debugger_rpc: None,
+            vmbus_devices: Vec::new(),
+            chipset_devices: chipset.chipset_devices,
+            pci_chipset_devices: chipset.pci_chipset_devices,
+            isa_dma_controller: chipset.isa_dma_controller,
+            chipset_capabilities: chipset.capabilities,
+            layout,
+            rtc_delta_milliseconds: 0,
+        }
+    }
+
+    #[cfg(all(target_os = "linux", guest_arch = "x86_64"))]
+    #[test]
+    fn lite_admission_accepts_both_actual_direct_boot_chipsets_with_ephemeral_vmgs() {
+        for with_hv in [false, true] {
+            let mut cfg = minimal_lite_manifest(with_hv);
+            validate_kernel_owned_memory_manifest(&mut cfg, false).unwrap();
+            cfg.chipset.with_generic_isa_floppy = true;
+            assert!(validate_kernel_owned_memory_manifest(&mut cfg, false).is_err());
+            let mut cfg = minimal_lite_manifest(with_hv);
+            cfg.vmgs = Some(VmgsResource::Disk(vmgs_resources::VmgsDisk {
+                disk: Resource::new(LiteTestDisk),
+                encryption_policy: GuestStateEncryptionPolicy::None(true),
+            }));
+            assert!(validate_kernel_owned_memory_manifest(&mut cfg, false).is_err());
+        }
+    }
+
+    #[cfg(all(target_os = "linux", guest_arch = "x86_64"))]
+    #[test]
+    fn lite_admission_requires_matching_direct_boot_isolation() {
+        for with_hv in [false, true] {
+            let mut cfg = minimal_lite_manifest(with_hv);
+            cfg.hypervisor.with_isolation =
+                Some(openvmm_defs::config::IsolationType::Snp { host_data: None });
+            assert!(validate_kernel_owned_memory_manifest(&mut cfg, false).is_err());
+            cfg.load_mode = linux_load_mode(openvmm_defs::config::LinuxIsolationConfig::Snp {
+                restricted_injection: false,
+            });
+            validate_kernel_owned_memory_manifest(&mut cfg, false).unwrap();
+            for bus in [VirtioBus::Pci, VirtioBus::Mmio] {
+                cfg.virtio_devices.push((
+                    bus,
+                    Resource::new(virtio_resources::blk::VirtioBlkHandle {
+                        disk: Resource::new(LiteTestDisk),
+                        read_only: false,
+                        serial: None,
+                    }),
+                ));
+                assert!(validate_kernel_owned_memory_manifest(&mut cfg, false).is_err());
+                cfg.virtio_devices.clear();
+            }
+            cfg.load_mode = linux_load_mode(openvmm_defs::config::LinuxIsolationConfig::Snp {
+                restricted_injection: true,
+            });
+            assert!(validate_kernel_owned_memory_manifest(&mut cfg, false).is_err());
+            cfg.hypervisor.with_isolation = None;
+            assert!(validate_kernel_owned_memory_manifest(&mut cfg, false).is_err());
+            cfg.hypervisor.with_isolation = Some(openvmm_defs::config::IsolationType::Vbs);
+            assert!(validate_kernel_owned_memory_manifest(&mut cfg, false).is_err());
+        }
+    }
+
     #[test]
     fn direct_boot_injection_is_available_before_partition_creation() {
         for restricted_injection in [false, true] {
@@ -828,6 +957,34 @@ mod tests {
                 expected,
             );
         }
+    }
+
+    #[derive(mesh::MeshPayload)]
+    struct LiteTestDisk;
+
+    impl vm_resource::ResourceId<DiskHandleKind> for LiteTestDisk {
+        const ID: &'static str = "lite-test-disk";
+    }
+
+    #[test]
+    fn kernel_owned_ram_accepts_standard_block_resources_and_rejects_other_devices() {
+        use virtio_resources::blk::VirtioBlkHandle;
+        use virtio_resources::rng::VirtioRngHandle;
+
+        for read_only in [false, true] {
+            let resource = Resource::new(VirtioBlkHandle {
+                disk: Resource::new(LiteTestDisk),
+                read_only,
+                serial: None,
+            });
+            let handle = validate_copy_only_virtio(resource)
+                .unwrap()
+                .into_inner::<VirtioBlkHandle>()
+                .unwrap();
+            assert_eq!(handle.read_only, read_only);
+            assert_eq!(handle.disk.id(), "lite-test-disk");
+        }
+        assert!(validate_copy_only_virtio(Resource::new(VirtioRngHandle)).is_err());
     }
 
     #[cfg(guest_arch = "aarch64")]
@@ -1084,6 +1241,123 @@ struct GenericInitiatorSource {
     vnode: u32,
 }
 
+fn validate_copy_only_virtio(
+    resource: Resource<VirtioDeviceHandle>,
+) -> anyhow::Result<Resource<VirtioDeviceHandle>> {
+    match resource.id() {
+        "virtio-blk" | "virtio-net" | "virtio-vsock" => Ok(resource),
+        id => anyhow::bail!("guest_memfd_lite does not support virtio resource '{id}'"),
+    }
+}
+
+fn validate_kernel_owned_memory_manifest(
+    cfg: &mut Manifest,
+    restoring: bool,
+) -> anyhow::Result<()> {
+    let mut chipset = cfg.chipset.clone();
+    chipset.with_generic_cmos_rtc = false;
+    anyhow::ensure!(
+        chipset == BaseChipsetManifest::empty(),
+        "guest_memfd_lite only supports the minimal direct-boot base chipset"
+    );
+    let supported_isolation = matches!(
+        (&cfg.load_mode, cfg.hypervisor.with_isolation),
+        (
+            LoadMode::Linux {
+                isolation: openvmm_defs::config::LinuxIsolationConfig::None,
+                ..
+            },
+            None
+        ) | (
+            LoadMode::Linux {
+                isolation: openvmm_defs::config::LinuxIsolationConfig::Snp {
+                    restricted_injection: false,
+                },
+                ..
+            },
+            Some(openvmm_defs::config::IsolationType::Snp { .. })
+        )
+    );
+    anyhow::ensure!(
+        cfg!(all(target_os = "linux", guest_arch = "x86_64"))
+            && supported_isolation
+            && cfg.hypervisor.with_vtl2.is_none(),
+        "guest_memfd_lite requires nonisolated or normal-injection SNP x86 Linux direct boot without VTL2"
+    );
+    anyhow::ensure!(
+        cfg.hypervisor.with_isolation.is_none() || cfg.virtio_devices.is_empty(),
+        "SNP guest_memfd_lite requires PCIe placement for every virtio device"
+    );
+    anyhow::ensure!(
+        !restoring && cfg.numa.nodes.len() == 1 && cfg.numa.distances.is_empty(),
+        "guest_memfd_lite does not support restore or NUMA"
+    );
+    let mem = cfg.numa.nodes[0]
+        .mem
+        .as_ref()
+        .context("guest_memfd_lite requires RAM")?;
+    anyhow::ensure!(
+        !mem.private_memory
+            && !mem.transparent_hugepages
+            && !mem.hugepages
+            && mem.hugepage_size.is_none()
+            && mem.host_numa_node.is_none(),
+        "guest_memfd_lite requires base-page kernel backing without host NUMA binding"
+    );
+    anyhow::ensure!(
+        cfg.vmbus.is_none()
+            && cfg.vtl2_vmbus.is_none()
+            && cfg.vmbus_devices.is_empty()
+            && cfg.floppy_disks.is_empty()
+            && cfg.ide_disks.is_empty()
+            && cfg.vpci_devices.is_empty()
+            && matches!(cfg.vmgs, None | Some(VmgsResource::Ephemeral))
+            && cfg.debugger_rpc.is_none()
+            && cfg.framebuffer.is_none()
+            && cfg.vga_firmware.is_none()
+            && !cfg.vtl2_gfx
+            && cfg.isa_dma_controller.is_none()
+            && cfg.pci_chipset_devices.is_empty()
+            && !cfg.chipset_capabilities.with_i440bx_host_pci_bridge
+            && !cfg.chipset_capabilities.with_generic_isa_dma
+            && !cfg.chipset_capabilities.with_psp
+            && !cfg.chipset_capabilities.with_guest_watchdog
+            && cfg.pcie_generic_initiators.is_empty()
+            && cfg
+                .pcie_root_complexes
+                .iter()
+                .all(|rc| rc.iommu.is_none() && rc.cxl.is_none() && rc.vnode.is_none())
+            && cfg.chipset_devices.iter().all(|device| matches!(
+                device.resource.id(),
+                "serial_16550"
+                    | "pic"
+                    | "pit"
+                    | "generic-ioapic"
+                    | "hyperv_power_management"
+                    | "missing-dev"
+            )),
+        "guest_memfd_lite only supports bounced virtio-blk/net/vsock, serial, and the minimal chipset"
+    );
+    cfg.virtio_devices = std::mem::take(&mut cfg.virtio_devices)
+        .into_iter()
+        .map(|(bus, resource)| Ok((bus, validate_copy_only_virtio(resource)?)))
+        .collect::<anyhow::Result<_>>()?;
+    cfg.pcie_devices = std::mem::take(&mut cfg.pcie_devices)
+        .into_iter()
+        .map(|mut device| {
+            let handle = device
+                .resource
+                .into_inner::<virtio_resources::VirtioPciDeviceHandle>()
+                .context("guest_memfd_lite forbids assigned and non-virtio PCIe devices")?;
+            device.resource = Resource::new(virtio_resources::VirtioPciDeviceHandle(
+                validate_copy_only_virtio(handle.0)?,
+            ));
+            Ok(device)
+        })
+        .collect::<anyhow::Result<_>>()?;
+    Ok(())
+}
+
 impl InitializedVm {
     /// Creates and initializes a VM using the given backend.
     async fn new(
@@ -1105,7 +1379,7 @@ impl InitializedVm {
         hypervisor: &mut H,
         #[cfg_attr(not(guest_arch = "aarch64"), expect(unused_variables))]
         platform_info: virt::PlatformInfo,
-        cfg: Manifest,
+        mut cfg: Manifest,
         shared_memory: Option<SharedMemoryBacking>,
     ) -> anyhow::Result<Self>
     where
@@ -1227,7 +1501,7 @@ impl InitializedVm {
         let device_assignment_msi_iova_range =
             resolve_device_assignment_msi_iova_range(platform_info.device_assignment_msi_iova);
 
-        let proto = hypervisor
+        let mut proto = hypervisor
             .new_partition(virt::ProtoPartitionConfig {
                 processor_topology: &processor_topology,
                 hv_config,
@@ -1238,6 +1512,11 @@ impl InitializedVm {
                 device_assignment_msi_iova_range,
             })
             .context("failed to create the prototype partition")?;
+
+        let kernel_owned_memory = proto.requires_kernel_memory_backing();
+        if kernel_owned_memory {
+            validate_kernel_owned_memory_manifest(&mut cfg, shared_memory.is_some())?;
+        }
 
         let physical_address_size = proto.max_physical_address_size();
 
@@ -1442,6 +1721,7 @@ impl InitializedVm {
             } else {
                 proto.guest_memory_io_policy()
             })
+            .single_mapper(kernel_owned_memory)
             .vtl0_alias_map(vtl0_alias_map)
             .supports_memory_fault_resolution(supports_memory_fault_resolution)
             .x86_legacy_support(
@@ -1464,6 +1744,17 @@ impl InitializedVm {
                 anyhow::bail!("node {vnode}: hugepage_size={size} requires hugepages=on");
             }
 
+            let kernel_backing = if existing_mappable.is_none() {
+                proto
+                    .create_memory_backing(&ranges)
+                    .context("failed to create hypervisor-owned RAM backing (no fallback)")?
+            } else {
+                None
+            };
+            anyhow::ensure!(
+                !kernel_owned_memory || kernel_backing.is_some(),
+                "copy-only kernel RAM requires backing from the selected hypervisor"
+            );
             let mut backing = membacking::RamBackingRequest::new(ranges)
                 .prefetch(mem.prefetch_memory)
                 .private_memory(mem.private_memory)
@@ -1474,6 +1765,12 @@ impl InitializedVm {
             }
             if let Some(mappable) = existing_mappable.take() {
                 backing = backing.existing_mappable(mappable);
+            } else if let Some(file) = kernel_backing {
+                backing = backing.existing_mappable(
+                    sparse_mmap::new_mappable_from_file(&file, true, false)
+                        .context("failed to prepare hypervisor-owned RAM mapping")?
+                        .into(),
+                );
             }
 
             memory_builder = memory_builder.add_backing(backing);
@@ -3903,6 +4200,10 @@ impl LoadedVm {
                     }),
                     VmRpc::AddVmbusDevice(rpc) => {
                         rpc.handle_failable(async |(vtl, resource)| {
+                            anyhow::ensure!(
+                                self.inner.gm.io_policy() != guestmem::GuestMemoryIoPolicy::CopyOnly,
+                                "copy-only guest RAM does not support device hotplug"
+                            );
                             let vmbus = match vtl {
                                 DeviceVtl::Vtl0 => self.inner.vmbus_server.as_ref(),
                                 DeviceVtl::Vtl1 => None,
@@ -3984,15 +4285,23 @@ impl LoadedVm {
                     }
                     VmRpc::ReadMemory(rpc) => {
                         rpc.handle_failable_sync(|(gpa, size)| {
+                            anyhow::ensure!(
+                                self.inner.gm.io_policy() != guestmem::GuestMemoryIoPolicy::CopyOnly,
+                                "copy-only guest RAM does not support debugger memory exports"
+                            );
                             let mut bytes = vec![0u8; size];
                             self.inner
                                 .gm
                                 .read_at(gpa, bytes.as_mut_slice())
-                                .map(|_| bytes)
+                                .map(|_| bytes).map_err(anyhow::Error::from)
                         });
                     }
                     VmRpc::WriteMemory(rpc) => rpc.handle_failable_sync(|(gpa, bytes)| {
-                        self.inner.gm.write_at(gpa, bytes.as_slice())
+                        anyhow::ensure!(
+                            self.inner.gm.io_policy() != guestmem::GuestMemoryIoPolicy::CopyOnly,
+                            "copy-only guest RAM does not support debugger memory access"
+                        );
+                        self.inner.gm.write_at(gpa, bytes.as_slice()).map_err(anyhow::Error::from)
                     }),
                     VmRpc::UpdateCliParams(rpc) => {
                         rpc.handle_failable_sync(|params| match &mut self.inner.load_mode {
@@ -4007,6 +4316,10 @@ impl LoadedVm {
                     }
                     VmRpc::AddPcieDevice(rpc) => {
                         rpc.handle_failable(async |(port_name, resource)| {
+                            anyhow::ensure!(
+                                self.inner.gm.io_policy() != guestmem::GuestMemoryIoPolicy::CopyOnly,
+                                "copy-only guest RAM does not support device hotplug"
+                            );
                             // Find the root complex and its index for the named port.
                             let (rc_idx, rc) = self.inner.pcie_root_complexes.iter()
                                 .enumerate()
@@ -4140,6 +4453,10 @@ impl LoadedVm {
                     VmRpc::AddVpciDevice(rpc) => {
                         rpc.handle_failable(async |(instance_id, resource)| {
                             anyhow::ensure!(
+                                self.inner.gm.io_policy() != guestmem::GuestMemoryIoPolicy::CopyOnly,
+                                "copy-only guest RAM does not support device hotplug"
+                            );
+                            anyhow::ensure!(
                                 !self
                                     .inner
                                     .dynamic_vpci_devices
@@ -4243,7 +4560,13 @@ impl LoadedVm {
                         });
                     }
                     VmRpc::DumpState(rpc) => {
-                        rpc.handle_failable(async |file| self.dump_state(file).await)
+                        rpc.handle_failable(async |file| {
+                            anyhow::ensure!(
+                                self.inner.gm.io_policy() != guestmem::GuestMemoryIoPolicy::CopyOnly,
+                                "copy-only guest RAM does not support memory dumps"
+                            );
+                            self.dump_state(file).await
+                        })
                             .await
                     }
                 },
@@ -4370,6 +4693,10 @@ impl LoadedVm {
     ///
     /// TODO: virtio & vmbus unsupported.
     async fn save(&mut self) -> anyhow::Result<SavedState> {
+        anyhow::ensure!(
+            self.inner.gm.io_policy() != guestmem::GuestMemoryIoPolicy::CopyOnly,
+            "copy-only guest RAM does not support snapshots or saved state"
+        );
         Ok(SavedState {
             units: self.state_units.save().await?,
         })
@@ -4377,6 +4704,10 @@ impl LoadedVm {
 
     /// Restore state on the VM.
     async fn restore(&mut self, state: SavedState) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.inner.gm.io_policy() != guestmem::GuestMemoryIoPolicy::CopyOnly,
+            "copy-only guest RAM does not support restore"
+        );
         self.state_units.restore(state.units).await?;
         Ok(())
     }

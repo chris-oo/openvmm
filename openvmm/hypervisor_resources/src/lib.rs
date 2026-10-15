@@ -48,10 +48,42 @@ pub struct MshvHandle {
     pub mshv: std::fs::File,
     /// Disable MSHV handling of SNP GHCB CPUID requests.
     pub snp_disable_cpuid_offload: bool,
+    /// Use kernel-owned, shared-only RAM backing. Defaults to false.
+    #[mesh(4)]
+    pub guest_memfd_lite: bool,
 }
 
 impl ResourceId<HypervisorKind> for MshvHandle {
     const ID: &'static str = "mshv";
+}
+
+/// Pure MSHV initialization parameters.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct MshvConfig {
+    /// Disable MSHV handling of SNP GHCB CPUID requests.
+    pub snp_disable_cpuid_offload: bool,
+    /// Use kernel-owned, shared-only RAM backing.
+    pub guest_memfd_lite: bool,
+}
+
+impl MshvConfig {
+    /// Parses MSHV parameters without opening the hypervisor device.
+    pub fn parse(params: &[(&str, &str)]) -> anyhow::Result<Self> {
+        let mut config = Self::default();
+        for &(key, value) in params {
+            let target = match key {
+                "snp_disable_cpuid_offload" => &mut config.snp_disable_cpuid_offload,
+                "guest_memfd_lite" => &mut config.guest_memfd_lite,
+                _ => anyhow::bail!("unknown mshv parameter: {key}"),
+            };
+            *target = match value {
+                "true" | "1" | "yes" => true,
+                "false" | "0" | "no" => false,
+                _ => anyhow::bail!("invalid boolean value for {key}: {value}"),
+            };
+        }
+        Ok(config)
+    }
 }
 
 /// Handle for the WHP hypervisor backend.
@@ -199,17 +231,85 @@ mod tests {
     use super::*;
     use test_with_tracing::test;
 
+    #[derive(MeshPayload)]
+    struct LegacyMshvHandle {
+        mshv: std::fs::File,
+        snp_disable_cpuid_offload: bool,
+    }
+
+    #[derive(MeshPayload)]
+    struct LegacyScopedMshvHandle {
+        mshv: std::fs::File,
+        snp_disable_cpuid_offload: bool,
+        scoped_host_access: bool,
+    }
+
     #[test]
-    fn mshv_handle_preserves_cpuid_offload_setting() {
+    fn removed_host_access_flag_does_not_enable_lite_backing() {
+        let legacy = LegacyScopedMshvHandle {
+            mshv: std::fs::File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap(),
+            snp_disable_cpuid_offload: false,
+            scoped_host_access: true,
+        };
+        let handle: MshvHandle = mesh::OwnedMessage::new(legacy).parse().unwrap();
+        assert!(!handle.guest_memfd_lite);
+    }
+
+    #[test]
+    fn mshv_config_boolean_parameters() {
+        assert_eq!(MshvConfig::parse(&[]).unwrap(), MshvConfig::default());
+        for value in ["true", "1", "yes"] {
+            let config = MshvConfig::parse(&[("snp_disable_cpuid_offload", value)]).unwrap();
+            assert!(config.snp_disable_cpuid_offload);
+        }
+        for value in ["false", "0", "no"] {
+            assert_eq!(
+                MshvConfig::parse(&[("snp_disable_cpuid_offload", value)]).unwrap(),
+                MshvConfig::default()
+            );
+        }
+        for params in [
+            [("snp_scoped_host_access", "invalid")],
+            [("snp_scoped_host_access", "true")],
+            [("snp_scoped_host_access", "false")],
+            [("snp_disable_cpuid_offload", "invalid")],
+            [("unknown", "false")],
+        ] {
+            assert!(MshvConfig::parse(&params).is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_mshv_handle_defaults_kernel_backing_off() {
         for snp_disable_cpuid_offload in [false, true] {
-            let original = MshvHandle {
+            let legacy = LegacyMshvHandle {
                 mshv: std::fs::File::open(std::env::current_exe().unwrap()).unwrap(),
                 snp_disable_cpuid_offload,
             };
-            let message = mesh::OwnedMessage::new(original).serialize();
+            let message = mesh::OwnedMessage::new(legacy).serialize();
             let handle: MshvHandle = mesh::OwnedMessage::serialized(message).parse().unwrap();
+            assert!(!handle.guest_memfd_lite);
             assert_eq!(handle.snp_disable_cpuid_offload, snp_disable_cpuid_offload);
             assert!(handle.mshv.metadata().unwrap().is_file());
         }
+    }
+
+    #[test]
+    fn guest_memfd_lite_defaults_and_round_trip() {
+        assert!(!MshvConfig::parse(&[]).unwrap().guest_memfd_lite);
+        assert!(
+            MshvConfig::parse(&[("guest_memfd_lite", "true")])
+                .unwrap()
+                .guest_memfd_lite
+        );
+        assert!(MshvConfig::parse(&[("guest_memfd_lite", "invalid")]).is_err());
+        let handle = MshvHandle {
+            mshv: std::fs::File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap(),
+            snp_disable_cpuid_offload: false,
+            guest_memfd_lite: true,
+        };
+        let message = mesh::OwnedMessage::new(handle).serialize();
+        let handle: MshvHandle = mesh::OwnedMessage::serialized(message).parse().unwrap();
+        assert!(handle.guest_memfd_lite);
     }
 }

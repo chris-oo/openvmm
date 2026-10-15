@@ -19,7 +19,8 @@ impl vm_resource::ResolveResource<HypervisorKind, MshvHandle> for MshvResolver {
     fn resolve(&self, resource: MshvHandle, _input: ()) -> Result<Self::Output, Self::Error> {
         Ok(ResolvedHypervisorBackend::new(
             virt_mshv::LinuxMshv::from(resource.mshv)
-                .with_snp_cpuid_offload_disabled(resource.snp_disable_cpuid_offload),
+                .with_snp_cpuid_offload_disabled(resource.snp_disable_cpuid_offload)
+                .with_guest_memfd_lite(resource.guest_memfd_lite),
         ))
     }
 }

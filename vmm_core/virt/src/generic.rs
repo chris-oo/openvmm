@@ -449,6 +449,23 @@ pub trait ProtoPartition {
         guestmem::GuestMemoryIoPolicy::Direct
     }
 
+    /// Creates backend-owned shared RAM in the VM worker's address space.
+    ///
+    /// `ranges` are ordered GPA ranges packed consecutively into the file.
+    /// An error must propagate without falling back to ordinary RAM.
+    /// Backends that use ordinary userspace backing return `None`.
+    fn create_memory_backing(
+        &mut self,
+        _ranges: &[MemoryRange],
+    ) -> Result<Option<std::fs::File>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Whether RAM must come from the backend's kernel-owned memory file.
+    fn requires_kernel_memory_backing(&self) -> bool {
+        false
+    }
+
     /// Constructs the full partition.
     fn build(
         self,

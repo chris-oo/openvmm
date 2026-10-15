@@ -19,6 +19,7 @@ use x86_64 as arch;
 
 // irqfd is arch-independent (MSI routing + MSHV_IRQFD), wired up on both
 // x86_64 and aarch64.
+mod guest_memfd_lite;
 pub mod irqfd;
 
 use guestmem::DoorbellRegistration;
@@ -112,6 +113,7 @@ impl VcpuFdExt for VcpuFd {
 pub struct LinuxMshv {
     mshv: Mshv,
     snp_disable_cpuid_offload: bool,
+    guest_memfd_lite: bool,
 }
 
 impl LinuxMshv {
@@ -126,6 +128,11 @@ impl LinuxMshv {
         self.snp_disable_cpuid_offload = disabled;
         self
     }
+    /// Opts into kernel-owned RAM without falling back to legacy backing.
+    pub fn with_guest_memfd_lite(mut self, enabled: bool) -> Self {
+        self.guest_memfd_lite = enabled;
+        self
+    }
 }
 
 impl From<std::fs::File> for LinuxMshv {
@@ -135,6 +142,7 @@ impl From<std::fs::File> for LinuxMshv {
             // TODO: fix mshv_bindings to not need this unsafe code.
             mshv: unsafe { Mshv::new_with_fd_number(file.into_raw_fd()) },
             snp_disable_cpuid_offload: false,
+            guest_memfd_lite: false,
         }
     }
 }
@@ -233,6 +241,10 @@ impl<'a> MshvProtoPartition<'a> {
             vmfd,
             vps,
             bsp,
+            #[cfg(guest_arch = "x86_64")]
+            guest_memfd_lite: false,
+            #[cfg(guest_arch = "x86_64")]
+            guest_memfd_backing: None,
         })
     }
 }
@@ -283,6 +295,10 @@ pub struct MshvProtoPartition<'a> {
     vmfd: VmFd,
     vps: Vec<MshvVpInner>,
     bsp: VcpuFd,
+    #[cfg(guest_arch = "x86_64")]
+    guest_memfd_lite: bool,
+    #[cfg(guest_arch = "x86_64")]
+    guest_memfd_backing: Option<guest_memfd_lite::GuestMemfdBacking>,
 }
 
 /// A partition running on the /dev/mshv hypervisor.
@@ -343,10 +359,84 @@ impl MshvIsolationState {
     }
 }
 
+struct MshvMemoryOwner<F = VmFd> {
+    // Close the partition before releasing its kernel-owned memory file.
+    vmfd: F,
+    guest_memfd: Option<guest_memfd_lite::GuestMemfdBacking>,
+}
+
+impl<F> MshvMemoryOwner<F> {
+    fn new(vmfd: F) -> Self {
+        Self {
+            vmfd,
+            guest_memfd: None,
+        }
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    fn with_guest_memfd(mut self, backing: Option<guest_memfd_lite::GuestMemfdBacking>) -> Self {
+        self.guest_memfd = backing;
+        self
+    }
+}
+
+impl<F> std::ops::Deref for MshvMemoryOwner<F> {
+    type Target = F;
+
+    fn deref(&self) -> &Self::Target {
+        &self.vmfd
+    }
+}
+
+#[cfg(all(test, guest_arch = "x86_64"))]
+mod memory_owner_tests {
+    use super::MshvMemoryOwner;
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+    use test_with_tracing::test;
+
+    struct DropEvent {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        name: &'static str,
+    }
+
+    impl Drop for DropEvent {
+        fn drop(&mut self) {
+            self.events.lock().push(self.name);
+        }
+    }
+
+    #[test]
+    fn guest_memfd_source_survives_until_the_final_partition_owner() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let file = Arc::new(
+            std::fs::File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap(),
+        );
+        let weak = Arc::downgrade(&file);
+        let owner = Arc::new(
+            MshvMemoryOwner::new(DropEvent {
+                events: events.clone(),
+                name: "kernel closed",
+            })
+            .with_guest_memfd(Some(super::guest_memfd_lite::GuestMemfdBacking {
+                file,
+                ranges: Vec::new(),
+            })),
+        );
+        let other_owner = owner.clone();
+        drop(owner);
+        assert!(weak.upgrade().is_some());
+        assert!(events.lock().is_empty());
+        drop(other_owner);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(*events.lock(), ["kernel closed"]);
+    }
+}
+
 #[derive(Inspect)]
 struct MshvPartitionInner {
     #[inspect(skip)]
-    vmfd: VmFd,
+    vmfd: Arc<MshvMemoryOwner>,
     /// The BSP's VcpuFd, retained for partition-level register access
     /// (VM state get/set). Only used while VPs are stopped.
     #[inspect(skip)]
@@ -878,6 +968,9 @@ impl<T: Into<ErrorInner>> From<T> for Error {
 // TODO: Chunk this up into smaller types.
 #[derive(Error, Debug)]
 enum ErrorInner {
+    #[cfg(guest_arch = "x86_64")]
+    #[error(transparent)]
+    GuestMemfdLite(#[from] guest_memfd_lite::GuestMemfdError),
     #[error("operation not supported")]
     NotSupported,
     #[error("create_vm failed")]
@@ -1076,12 +1169,14 @@ impl PartitionAccessState for MshvPartition {
 #[derive(Debug, Default)]
 struct MshvMemoryRangeState {
     ranges: Vec<Option<MshvMemoryRange>>,
+    guest_memfd_primary_base: Option<u64>,
 }
 
 #[derive(Debug, Copy, Clone)]
 struct MshvMemoryRange {
     region: mshv_user_mem_region,
     mapped: bool,
+    guest_memfd: Option<guest_memfd_lite::GuestMemfdRegion>,
 }
 
 impl virt::PartitionMemoryMapper for MshvPartition {
@@ -1120,6 +1215,65 @@ impl virt::PartitionMemoryMap for MshvPartitionInner {
         exec: bool,
     ) -> anyhow::Result<()> {
         let mut state = self.memory.lock();
+        if let Some(backing) = &self.vmfd.guest_memfd {
+            #[cfg(guest_arch = "x86_64")]
+            if let Some(snp) = self.isolation.snp() {
+                snp.check_lite_mapping_change()?;
+            }
+            let tracked = state
+                .ranges
+                .iter()
+                .flatten()
+                .map(|r| {
+                    r.guest_memfd.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "guest_memfd_lite refuses mixed legacy memory registrations"
+                        )
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let decision = backing.decide_mapping(
+                guest_memfd_lite::MapRequest {
+                    userspace_addr: data as u64,
+                    size: size as u64,
+                    gpa: addr,
+                    writable,
+                    executable: exec,
+                },
+                state.guest_memfd_primary_base,
+                &tracked,
+            )?;
+            let region = decision.region;
+            guest_memfd_lite::set_region(&self.vmfd, &region).map_err(|err| {
+                anyhow::Error::new(err).context("MSHV_SET_GUEST_MEMFD failed (no legacy fallback)")
+            })?;
+            let range = Some(MshvMemoryRange {
+                region: mshv_user_mem_region {
+                    size: region.size,
+                    guest_pfn: region.guest_pfn,
+                    userspace_addr: data as u64,
+                    flags: region.flags,
+                    rsvd: [0; 7],
+                },
+                mapped: true,
+                guest_memfd: Some(region),
+            });
+            if let Some(slot) = state.ranges.iter_mut().find(|r| r.is_none()) {
+                *slot = range;
+            } else {
+                state.ranges.push(range);
+            }
+            state.guest_memfd_primary_base = Some(decision.primary_base);
+            tracing::info!(
+                fd = region.fd,
+                gpa_start = addr,
+                gpa_end = addr + region.size,
+                file_offset = region.offset,
+                bytes = region.size,
+                "mshv guest_memfd_lite map success"
+            );
+            return Ok(());
+        }
 
         // Memory slots cannot be resized but can be moved within the guest
         // address space. Find the existing slot if there is one.
@@ -1167,17 +1321,65 @@ impl virt::PartitionMemoryMap for MshvPartitionInner {
         state.ranges[slot_to_use] = Some(MshvMemoryRange {
             region: mem_region,
             mapped,
+            guest_memfd: None,
         });
         Ok(())
     }
 
     fn unmap_range(&self, addr: u64, size: u64) -> anyhow::Result<()> {
+        if self.vmfd.guest_memfd.is_some() {
+            anyhow::ensure!(
+                size != 0 && addr.is_multiple_of(4096) && size.is_multiple_of(4096),
+                "guest_memfd_lite unmaps require nonempty 4 KiB ranges"
+            );
+        }
         let unmap_start = addr >> HV_PAGE_SHIFT;
         let unmap_end = addr
             .checked_add(size)
             .ok_or_else(|| anyhow::anyhow!("unmap range overflows the guest address space"))?
             >> HV_PAGE_SHIFT;
         let mut state = self.memory.lock();
+        if self.vmfd.guest_memfd.is_some() {
+            #[cfg(guest_arch = "x86_64")]
+            if let Some(snp) = self.isolation.snp() {
+                snp.check_lite_mapping_change()?;
+            }
+            let tracked = state
+                .ranges
+                .iter()
+                .flatten()
+                .map(|r| {
+                    r.guest_memfd.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "guest_memfd_lite refuses mixed legacy memory registrations"
+                        )
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            for args in guest_memfd_lite::decide_unmapping(&tracked, addr, size)? {
+                guest_memfd_lite::set_region(&self.vmfd, &args).map_err(|err| {
+                    anyhow::Error::new(err)
+                        .context("MSHV_SET_GUEST_MEMFD unmap failed; registration retained")
+                })?;
+                for entry in &mut state.ranges {
+                    if entry
+                        .as_ref()
+                        .is_some_and(|r| r.region.guest_pfn == args.guest_pfn)
+                    {
+                        *entry = None;
+                    }
+                }
+                tracing::info!(
+                    fd = args.fd,
+                    gpa_start = args.guest_pfn << HV_PAGE_SHIFT,
+                    gpa_end = (args.guest_pfn << HV_PAGE_SHIFT) + args.size,
+                    file_offset = args.offset,
+                    bytes = args.size,
+                    "mshv guest_memfd_lite unmap success"
+                );
+            }
+            return Ok(());
+        }
         for range in state.ranges.iter().flatten() {
             let region_start = range.region.guest_pfn;
             let region_end = region_start
