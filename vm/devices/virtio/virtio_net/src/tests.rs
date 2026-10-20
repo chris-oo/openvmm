@@ -916,7 +916,6 @@ fn owned_worker(
         active_state,
         negotiated_features: features.bank(0).into(),
         negotiated_features_bank1: features.bank(1).into(),
-        retired: false,
     }
 }
 
@@ -1401,15 +1400,11 @@ async fn owned_raw_rx_addresses_use_header_offset(driver: DefaultDriver) {
         .unwrap();
     assert_eq!(bytes, [0xCC; 3]);
     let (work, len) = pool.take_rx_work(id).unwrap();
-    worker
-        .virtio_state
-        .rx_in_order
-        .complete(
-            &mut worker.virtio_state.rx_queue,
-            work.into_completion(),
-            len,
-        )
-        .unwrap();
+    worker.virtio_state.rx_in_order.complete(
+        &mut worker.virtio_state.rx_queue,
+        work.into_completion(),
+        len,
+    );
     mem.read_at(DATA_BASE + header_size() as u64, &mut bytes)
         .unwrap();
     assert_eq!(&bytes, b"raw");
@@ -1603,81 +1598,6 @@ async fn owned_arena_backpressure_is_independent_of_queue_size(driver: DefaultDr
         ])
         .is_err()
     );
-}
-
-#[async_test]
-async fn owned_completion_metadata_failure_retires_split_and_packed(driver: DefaultDriver) {
-    for packed in [false, true] {
-        let mapping = Arc::new(sparse_mmap::SparseMapping::new(TOTAL_MEM_SIZE).unwrap());
-        mapping.alloc(0, TOTAL_MEM_SIZE).unwrap();
-        let mem = GuestMemory::new("net completion fault", mapping.clone());
-        let features = if packed {
-            VirtioDeviceFeatures::new()
-                .with_version_1(true)
-                .with_ring_packed(true)
-        } else {
-            VirtioDeviceFeatures::new()
-        };
-        let mut worker = owned_worker(&driver, &mem, QUEUE_SIZE, features);
-        if packed {
-            mem.write_at(TX_DESC_ADDR, &DATA_BASE.to_le_bytes())
-                .unwrap();
-            mem.write_at(TX_DESC_ADDR + 8, &(NET_HEADER_SIZE + 64).to_le_bytes())
-                .unwrap();
-            mem.write_at(TX_DESC_ADDR + 12, &0u16.to_le_bytes())
-                .unwrap();
-            mem.write_at(
-                TX_DESC_ADDR + 14,
-                &DescriptorFlags::new()
-                    .with_available(true)
-                    .into_bits()
-                    .to_le_bytes(),
-            )
-            .unwrap();
-            let work = worker
-                .virtio_state
-                .tx_in_order
-                .try_next(&mut worker.virtio_state.tx_queue)
-                .unwrap()
-                .unwrap();
-            worker.queue_tx_packet(work).unwrap();
-        } else {
-            let mut avail = 0;
-            queue_owned_tx(&mut worker, &mem, 0, &mut avail, QUEUE_SIZE);
-            queue_owned_tx(&mut worker, &mem, 2, &mut avail, QUEUE_SIZE);
-        }
-        let (queue, _) = new_mock_queue();
-        let mut endpoint = crate::EndpointQueueState {
-            queue: Box::new(queue),
-        };
-        let fault_page = if packed { TX_AVAIL_ADDR } else { TX_USED_ADDR };
-        mapping
-            .unmap(fault_page as usize, guestmem::PAGE_SIZE)
-            .unwrap();
-        assert!(worker.transmit_pending_segments(&mut endpoint).is_err());
-        let state = worker.virtio_state.tx_queue.queue_state();
-        worker.drain_owned(endpoint.queue.as_mut()).await.unwrap();
-        assert!(
-            worker
-                .active_state
-                .pending_tx_packets
-                .iter()
-                .all(Option::is_none)
-        );
-        mapping
-            .alloc(fault_page as usize, guestmem::PAGE_SIZE)
-            .unwrap();
-        assert!(
-            worker
-                .virtio_state
-                .tx_in_order
-                .try_next(&mut worker.virtio_state.tx_queue)
-                .is_err()
-        );
-        assert!(worker.complete_tx_packet(TxId(0)).is_err());
-        assert_eq!(worker.virtio_state.tx_queue.queue_state(), state);
-        assert_eq!(state.used_index, if packed { 0x8001 } else { 0 });
-    }
 }
 
 #[async_test]
@@ -1946,7 +1866,7 @@ async fn owned_tx_backpressure_leaves_guest_work_available(driver: DefaultDriver
 }
 
 #[async_test]
-async fn owned_retirement_waits_for_actual_backend_consumption(driver: DefaultDriver) {
+async fn owned_error_drain_waits_for_actual_backend_consumption(driver: DefaultDriver) {
     use std::future::Future;
 
     let mem = test_memory();
@@ -2148,7 +2068,6 @@ async fn owned_endpoint_restart_quiesces_old_consumers_and_recovers_slots(driver
                 Err(crate::WorkerError::EndpointNotQuiescent),
             ));
             let worker = coordinator.workers[0].state_mut().unwrap();
-            assert!(worker.retired);
             assert!(!worker.active_state.pending_rx_packets.has_room(true));
             assert!(old_handle.probe.lock().memory.is_some());
             retained_mem.read_at(first_gpa, &mut bytes).unwrap();
@@ -2198,7 +2117,6 @@ async fn owned_endpoint_restart_quiesces_old_consumers_and_recovers_slots(driver
         );
         {
             let worker = coordinator.workers[0].state_mut().unwrap();
-            assert!(!worker.retired);
             assert!(
                 worker
                     .active_state

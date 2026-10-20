@@ -88,7 +88,6 @@ pub struct VirtioBlkDevice {
 #[derive(InspectMut)]
 struct BlkWorker {
     disk: Disk,
-    completion_failed: bool,
     read_only: bool,
     serial: Option<[u8; VIRTIO_BLK_ID_BYTES]>,
     stats: WorkerStats,
@@ -111,7 +110,6 @@ struct WorkerStats {
     discard_ops: Counter,
     bounce_ops: Counter,
     direct_ops: Counter,
-    completion_errors: Counter,
     errors: Counter,
 }
 
@@ -128,7 +126,6 @@ struct IoCompletion {
     bytes_written: u32,
     stat: IoStat,
     bounced: bool,
-    status_written: bool,
 }
 
 /// Which stat counter to increment for a completed IO.
@@ -143,23 +140,8 @@ enum IoStat {
 
 impl BlkWorker {
     /// Complete a descriptor and accumulate stats.
-    fn finish_io(&mut self, state: &mut BlkQueueState, completion: IoCompletion) {
-        if !completion.status_written && !self.completion_failed {
-            self.completion_failed = true;
-            self.stats.completion_errors.increment();
-        }
-        if !self.completion_failed
-            && let Err(err) = state
-                .queue
-                .complete(completion.work.into_completion(), completion.bytes_written)
-        {
-            self.completion_failed = true;
-            self.stats.completion_errors.increment();
-            tracelimit::error_ratelimited!(
-                error = &err as &dyn std::error::Error,
-                "virtio-blk completion failed; retiring queue and draining I/O"
-            );
-        }
+    fn finish_io(&mut self, queue: &mut VirtioQueue, completion: IoCompletion) {
+        queue.complete(completion.work, completion.bytes_written);
         match completion.stat {
             IoStat::Read => self.stats.read_ops.increment(),
             IoStat::Write => self.stats.write_ops.increment(),
@@ -179,12 +161,12 @@ impl BlkWorker {
     ///
     /// Called during `poll_disable()` after the worker task has been stopped.
     /// The `FuturesUnordered` still holds any IOs that were in flight when
-    /// `until_stopped` returned. This retains owned buffers until backend IO
-    /// finishes. A retired queue receives no further used-ring completions.
-    fn poll_drain(&mut self, state: &mut BlkQueueState, cx: &mut Context<'_>) -> Poll<()> {
+    /// `until_stopped` returned. This drains them, ensuring all descriptor
+    /// completions are written to the used ring before the queue is dropped.
+    fn poll_drain(&mut self, queue: &mut VirtioQueue, cx: &mut Context<'_>) -> Poll<()> {
         loop {
             match self.ios.poll_next_unpin(cx) {
-                Poll::Ready(Some(completion)) => self.finish_io(state, completion),
+                Poll::Ready(Some(completion)) => self.finish_io(queue, completion),
                 Poll::Ready(None) => return Poll::Ready(()),
                 Poll::Pending => return Poll::Pending,
             }
@@ -201,9 +183,9 @@ impl AsyncRun<BlkQueueState> for BlkWorker {
         stop.until_stopped(async {
             // Set once the queue can no longer produce work, because the guest
             // violated the queue protocol. Fetching stops, but in-flight IOs
-            // keep draining. Publish completions only while the completion
-            // path is healthy; the worker exits once accepted IO is done.
-            let mut queue_done = self.completion_failed;
+            // keep draining so their descriptors are still completed; the
+            // worker exits once they are done.
+            let mut queue_done = false;
 
             while !(queue_done && self.ios.is_empty()) {
                 enum Event {
@@ -247,8 +229,7 @@ impl AsyncRun<BlkQueueState> for BlkWorker {
                         queue_done = true;
                     }
                     Event::Completed(completion) => {
-                        self.finish_io(state, completion);
-                        queue_done |= self.completion_failed;
+                        self.finish_io(&mut state.queue, completion);
                     }
                 }
             }
@@ -334,7 +315,6 @@ impl VirtioBlkDevice {
         Ok(Self {
             worker: TaskControl::new(BlkWorker {
                 disk,
-                completion_failed: false,
                 read_only,
                 serial,
                 stats: WorkerStats::default(),
@@ -460,10 +440,6 @@ impl VirtioDevice for VirtioBlkDevice {
         initial_state: Option<QueueState>,
     ) -> anyhow::Result<()> {
         assert_eq!(idx, 0);
-        anyhow::ensure!(
-            !self.worker.get_mut().0.completion_failed,
-            "virtio-blk queue was retired after completion failure; reset the device"
-        );
 
         let queue_event = PolledWait::new(&self.driver, resources.event)
             .context("failed to create queue event")?;
@@ -520,19 +496,13 @@ impl VirtioDevice for VirtioBlkDevice {
         self.worker.stop().await;
         // Drain in-flight IOs to completion. The FuturesUnordered lives in
         // BlkWorker and survives the stop — its pending disk IO futures are
-        // polled here until all accepted backend IO finishes. Completion
-        // failure prevents further publication, not backend draining.
+        // polled here until all descriptors are completed in the used ring.
         let (worker, queue_state) = self.worker.get_mut();
-        let state = queue_state.expect("state exists after stop");
-        poll_fn(|cx| worker.poll_drain(state, cx)).await;
+        let queue = &mut queue_state.expect("state exists after stop").queue;
+        poll_fn(|cx| worker.poll_drain(queue, cx)).await;
         // Remove the queue state (drops VirtioQueue).
         let state = self.worker.remove().queue.queue_state();
         Some(state)
-    }
-
-    async fn reset(&mut self) {
-        self.stop_queue(0).await;
-        self.worker.get_mut().0.completion_failed = false;
     }
 
     fn supports_save_restore(&self) -> bool {
@@ -552,29 +522,35 @@ async fn process_request(
     serial: Option<[u8; VIRTIO_BLK_ID_BYTES]>,
     work: VirtioQueueCallbackWork,
 ) -> IoCompletion {
-    let (bytes_written, stat, bounced, status) =
-        match process_request_inner(disk, mem, read_only, serial, &work).await {
-            Ok((bytes_written, stat, bounced)) => {
-                (bytes_written + 1, stat, bounced, VIRTIO_BLK_S_OK)
+    match process_request_inner(disk, mem, read_only, serial, &work).await {
+        Ok((bytes_written, stat, bounced)) => {
+            if let Err(err) = write_status_byte(mem, &work, VIRTIO_BLK_S_OK) {
+                tracelimit::error_ratelimited!(
+                    error = &err as &dyn std::error::Error,
+                    "failed to write status byte"
+                );
             }
-            Err(status) => (1, IoStat::Error, false, status),
-        };
-    let status_written = match write_status_byte(mem, &work, status) {
-        Ok(()) => true,
-        Err(err) => {
-            tracelimit::error_ratelimited!(
-                error = &err as &dyn std::error::Error,
-                "failed to write virtio-blk status; retiring queue"
-            );
-            false
+            IoCompletion {
+                work,
+                bytes_written: bytes_written + 1, // +1 for status byte
+                stat,
+                bounced,
+            }
         }
-    };
-    IoCompletion {
-        work,
-        bytes_written,
-        stat,
-        bounced,
-        status_written,
+        Err(status) => {
+            if let Err(err) = write_status_byte(mem, &work, status) {
+                tracelimit::error_ratelimited!(
+                    error = &err as &dyn std::error::Error,
+                    "failed to write error status byte"
+                );
+            }
+            IoCompletion {
+                work,
+                bytes_written: 1, // just the status byte
+                stat: IoStat::Error,
+                bounced: false,
+            }
+        }
     }
 }
 

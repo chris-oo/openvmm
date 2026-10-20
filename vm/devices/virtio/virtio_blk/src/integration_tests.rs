@@ -1465,72 +1465,7 @@ async fn copy_only_read_waits_for_backend_before_copyback(driver: DefaultDriver)
 }
 
 #[async_test]
-async fn completion_failure_requires_reset_before_fresh_io(driver: DefaultDriver) {
-    for force_bounce in [false, true] {
-        let probe = Arc::new(IoProbe::default());
-        let disk = Disk::new(TestDisk4K::new(64 * 1024, 512).with_io_probe(probe.clone())).unwrap();
-        let mut harness = TestHarness::new(&driver, disk, false);
-        if force_bounce {
-            harness.device = harness.device.with_bounce_io();
-            probe.guest_base.store(
-                harness.mem.full_mapping().unwrap().0 as usize,
-                Ordering::SeqCst,
-            );
-        }
-        harness.enable().await;
-        let data_gpa = harness.post_read_request(0, 0, 512);
-        write_descriptor(
-            &harness.mem,
-            DESC_ADDR,
-            1,
-            data_gpa,
-            512,
-            DescriptorFlags::new().with_write(true).with_next(true),
-            2,
-        );
-        write_descriptor(
-            &harness.mem,
-            DESC_ADDR,
-            2,
-            TOTAL_MEM_SIZE as u64,
-            1,
-            DescriptorFlags::new().with_write(true),
-            0,
-        );
-        probe.wait_entered(&driver).await;
-        let state = harness.device.stop_queue(0).await.unwrap();
-        assert_eq!(state.used_index, 0);
-        assert_eq!(probe.read_ops.load(Ordering::SeqCst), 1);
-        assert!(
-            harness
-                .try_start_with_state(&VirtioDeviceFeatures::new(), Some(state))
-                .await
-                .is_err()
-        );
-        assert!(harness.try_enable().await.is_err());
-        assert_eq!(
-            virtio::test_helpers::read_used_idx(&harness.mem, USED_ADDR),
-            0
-        );
-
-        harness.device.reset().await;
-        assert!(!harness.device.worker.get_mut().0.completion_failed);
-        assert!(harness.device.worker.get_mut().0.ios.is_empty());
-        assert_eq!(harness.device.supports_save_restore(), !force_bounce);
-        init_avail_ring(&harness.mem, AVAIL_ADDR);
-        init_used_ring(&harness.mem, USED_ADDR);
-        harness.avail_idx = 0;
-        harness.used_idx = 0;
-        harness.enable().await;
-        harness.post_read_request(0, 0, 512);
-        assert_eq!(harness.wait_for_used().await.1, 513);
-        harness.device.stop_queue(0).await;
-        assert_eq!(probe.read_ops.load(Ordering::SeqCst), 2);
-    }
-}
-
-#[async_test]
-async fn backend_error_completes_without_retiring_queue(driver: DefaultDriver) {
+async fn backend_error_completes_and_allows_further_io(driver: DefaultDriver) {
     for force_bounce in [false, true] {
         let probe = Arc::new(IoProbe::default());
         let disk = Disk::new(TestDisk4K::new(64 * 1024, 512).with_io_probe(probe.clone())).unwrap();
@@ -1547,12 +1482,11 @@ async fn backend_error_completes_without_retiring_queue(driver: DefaultDriver) {
         assert_eq!(harness.wait_for_used().await.1, 513);
         assert_eq!(harness.read_status(data + 512), VIRTIO_BLK_S_OK);
         harness.device.stop_queue(0).await;
-        assert!(!harness.device.worker.get_mut().0.completion_failed);
     }
 }
 
 #[async_test]
-async fn reset_drains_inflight_io_before_clearing_completion_failure(driver: DefaultDriver) {
+async fn stop_drains_inflight_io_after_status_write_failure(driver: DefaultDriver) {
     for force_bounce in [false, true] {
         let probe = Arc::new(IoProbe::default());
         let (release, gate) = mesh::oneshot();
@@ -1575,19 +1509,18 @@ async fn reset_drains_inflight_io_before_clearing_completion_failure(driver: Def
         );
         probe.wait_entered(&driver).await;
         {
-            let mut reset = pin!(harness.device.reset());
-            assert!(futures::poll!(&mut reset).is_pending());
+            let mut stop = pin!(harness.device.stop_queue(0));
+            assert!(futures::poll!(&mut stop).is_pending());
             release.send(());
-            reset.await;
+            assert_eq!(stop.await.unwrap().used_index, 1);
         }
         let (worker, queue) = harness.device.worker.get_mut();
         assert!(queue.is_none());
         assert!(worker.ios.is_empty());
-        assert!(!worker.completion_failed);
         assert_eq!(probe.read_ops.load(Ordering::SeqCst), 1);
         assert_eq!(
             virtio::test_helpers::read_used_idx(&harness.mem, USED_ADDR),
-            0
+            1
         );
     }
 }

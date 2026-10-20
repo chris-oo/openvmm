@@ -179,13 +179,7 @@ impl AsyncRun<PmemQueue> for PmemWorker {
             match work {
                 Ok(work) => {
                     let bytes = process_pmem_request(self, &state.mem, &work);
-                    if let Err(err) = state.queue.complete(work.into_completion(), bytes) {
-                        tracing::error!(
-                            error = &err as &dyn std::error::Error,
-                            "queue completion failed; stopping until reset"
-                        );
-                        break;
-                    }
+                    state.queue.complete(work, bytes);
                 }
                 Err(err) => {
                     tracing::error!(error = &err as &dyn std::error::Error, "queue error");

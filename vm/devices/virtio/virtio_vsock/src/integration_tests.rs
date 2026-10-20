@@ -259,18 +259,11 @@ impl TestHarness {
         self.with_fallback_memory(false)
     }
 
-    async fn assert_retired(&mut self) -> [virtio::queue::QueueState; 3] {
+    async fn stop_queues(&mut self) -> [virtio::queue::QueueState; 3] {
         let mut states = Vec::new();
         states.push(self.device.stop_queue(0).await.unwrap());
-        // A fresh queue cannot be mixed with queues from the retired generation.
-        assert!(self.start_queue(0, None).await.is_err());
         for index in 1..3 {
             states.push(self.device.stop_queue(index).await.unwrap());
-        }
-        assert!(self.device.failed.load(Ordering::Relaxed));
-        assert!(!self.device.supports_save_restore());
-        for (index, state) in states.iter().enumerate() {
-            assert!(self.start_queue(index as u16, Some(*state)).await.is_err());
         }
         states.try_into().unwrap()
     }
@@ -347,20 +340,7 @@ impl TestHarness {
         use futures::AsyncReadExt;
 
         self.reset_rings();
-        // Start one fresh queue, then check that old state is still rejected
-        // until the entire new generation has been constructed.
         self.start_queue(0, None).await.unwrap();
-        assert!(
-            self.start_queue(
-                1,
-                Some(virtio::queue::QueueState {
-                    avail_index: 1,
-                    used_index: 1
-                })
-            )
-            .await
-            .is_err()
-        );
         self.start_queue(1, None).await.unwrap();
         self.start_queue(2, None).await.unwrap();
         let stream = self.connect_guest_to_host(listener, 1024, port).await;
@@ -386,7 +366,6 @@ impl TestHarness {
         for index in 0..3 {
             self.device.stop_queue(index).await.unwrap();
         }
-        assert!(!self.device.failed.load(Ordering::Relaxed));
     }
 
     /// Create a harness with a Unix listener at the expected socket path for the
@@ -766,14 +745,9 @@ async fn stop_resume_preserves_queue_cursors_without_replay(
         .await;
     let mut states = Vec::new();
     states.push(harness.device.stop_queue(0).await.unwrap());
-    if force || automatic {
-        assert!(harness.start_queue(0, Some(states[0])).await.is_err());
-        assert!(harness.start_queue(0, None).await.is_err());
-    }
     for index in 1..3 {
         states.push(harness.device.stop_queue(index).await.unwrap());
     }
-    assert!(!harness.device.failed.load(Ordering::Relaxed));
     for (index, state) in states.into_iter().enumerate() {
         harness
             .start_queue(index as u16, Some(state))
@@ -893,88 +867,10 @@ async fn automatic_bounce_stop_resume_preserves_queue_cursors_without_replay(
 }
 
 #[async_test]
-async fn copy_only_tx_publication_fault_does_not_replay_stream_bytes(driver: DefaultDriver) {
-    tx_publication_fault_does_not_replay_stream_bytes(driver, true, false).await;
-}
-
-#[async_test]
-async fn automatic_tx_publication_fault_allows_fresh_guest_reset(driver: DefaultDriver) {
-    tx_publication_fault_does_not_replay_stream_bytes(driver, false, false).await;
-}
-
-#[async_test]
-async fn direct_publication_fault_disables_restore_until_fresh_reset(driver: DefaultDriver) {
-    tx_publication_fault_does_not_replay_stream_bytes(driver, false, true).await;
-}
-
-async fn tx_publication_fault_does_not_replay_stream_bytes(
-    driver: DefaultDriver,
-    bounce_io: bool,
-    direct: bool,
-) {
+async fn copy_only_rx_copy_faults_close_socket_without_replay(driver: DefaultDriver) {
     use futures::AsyncReadExt;
 
-    for after_marker in [false, true] {
-        let harness = TestHarness::new(&driver, tempfile::tempdir().unwrap());
-        let (mut harness, fault) = if direct {
-            harness.with_safe_fallback_memory()
-        } else {
-            harness.with_fault_memory()
-        };
-        harness.device.bounce_io = bounce_io;
-        assert!(!harness.mem.supports_kernel_lock());
-        let mut listener = harness.create_port_listener(5200);
-        harness.enable().await;
-        assert_eq!(harness.device.bounce_io, !direct);
-        let stream = harness
-            .connect_guest_to_host(&mut listener, 1024, 5200)
-            .await;
-        let mut stream = PolledSocket::new(&driver, stream).unwrap();
-        if after_marker {
-            fault.read.store(TX_AVAIL_ADDR, Ordering::SeqCst);
-        } else {
-            // The next used element, after the successful REQUEST.
-            fault.write.store(TX_USED_ADDR + 4 + 8, Ordering::SeqCst);
-        }
-        let data = b"send this once";
-        let header = harness.guest_header(1024, 5200, Operation::RW, data.len() as u32, 0);
-        harness.post_tx_packet(&header, data);
-        harness.post_tx_packet(&header, data);
-        let mut received = vec![0; data.len()];
-        CancelContext::new()
-            .with_timeout(Duration::from_secs(5))
-            .until_cancelled(async {
-                stream.read_exact(&mut received).await.unwrap();
-                let mut extra = [0; 1];
-                assert_eq!(stream.read(&mut extra).await.unwrap(), 0);
-            })
-            .await
-            .unwrap();
-        assert_eq!(&received, data);
-        assert!(!harness.device.supports_save_restore());
-        let states = harness.assert_retired().await;
-        assert_eq!(states[1].avail_index, 2);
-        assert_eq!(states[1].used_index, if after_marker { 2 } else { 1 });
-        assert_eq!(
-            virtio::test_helpers::read_used_idx(&harness.mem, TX_USED_ADDR),
-            if after_marker { 2 } else { 1 }
-        );
-        if !direct {
-            assert_eq!(fault.preemptive_locks.load(Ordering::SeqCst), 0);
-        }
-        assert_eq!(fault.exports.load(Ordering::SeqCst), 0);
-        fault.read.store(u64::MAX, Ordering::SeqCst);
-        fault.write.store(u64::MAX, Ordering::SeqCst);
-        harness.verify_fresh_reset(&mut listener, 5200).await;
-        assert_eq!(harness.device.supports_save_restore(), direct);
-    }
-}
-
-#[async_test]
-async fn copy_only_rx_faults_retire_without_replay(driver: DefaultDriver) {
-    use futures::AsyncReadExt;
-
-    for failure in ["header", "payload", "used", "notify", "short"] {
+    for failure in ["header", "payload", "short"] {
         let (mut harness, fault) =
             TestHarness::new(&driver, tempfile::tempdir().unwrap()).with_fault_memory();
         let mut listener = harness.create_port_listener(5201);
@@ -993,8 +889,6 @@ async fn copy_only_rx_faults_retire_without_replay(driver: DefaultDriver) {
             "payload" => fault
                 .write
                 .store(gpa + u64::from(HDR_SIZE), Ordering::SeqCst),
-            "used" => fault.write.store(RX_USED_ADDR + 4 + 8, Ordering::SeqCst),
-            "notify" => fault.read.store(RX_AVAIL_ADDR, Ordering::SeqCst),
             "short" => {}
             _ => unreachable!(),
         }
@@ -1013,15 +907,12 @@ async fn copy_only_rx_faults_retire_without_replay(driver: DefaultDriver) {
             })
             .await
             .unwrap();
-        let states = harness.assert_retired().await;
+        let states = harness.stop_queues().await;
         assert_eq!(
             states[0].avail_index,
             if failure == "short" { 1 } else { 2 }
         );
-        assert_eq!(
-            states[0].used_index,
-            if failure == "notify" { 2 } else { 1 }
-        );
+        assert_eq!(states[0].used_index, 1);
         if failure != "short" {
             assert_eq!(
                 harness.read_header(gpa).operation(),
@@ -1031,14 +922,7 @@ async fn copy_only_rx_faults_retire_without_replay(driver: DefaultDriver) {
                     Operation::RW
                 }
             );
-            assert_eq!(
-                harness.read_rx_data(gpa, 8),
-                if failure == "used" || failure == "notify" {
-                    b"response".to_vec()
-                } else {
-                    vec![0; 8]
-                }
-            );
+            assert_eq!(harness.read_rx_data(gpa, 8), vec![0; 8]);
         }
         assert_eq!(fault.preemptive_locks.load(Ordering::SeqCst), 0);
         assert_eq!(fault.exports.load(Ordering::SeqCst), 0);
@@ -1049,7 +933,7 @@ async fn copy_only_rx_faults_retire_without_replay(driver: DefaultDriver) {
 }
 
 #[async_test]
-async fn copy_only_malformed_tx_retires_without_completion(driver: DefaultDriver) {
+async fn copy_only_malformed_tx_stops_without_completion(driver: DefaultDriver) {
     malformed_tx_allows_fresh_guest_reset(driver, true).await;
 }
 
@@ -1114,7 +998,6 @@ async fn direct_malformed_tx_keeps_independent_connection_and_queues(driver: Def
         for index in 0..3 {
             harness.device.stop_queue(index).await.unwrap();
         }
-        assert!(!harness.device.failed.load(Ordering::Relaxed));
     }
 }
 
@@ -1162,7 +1045,6 @@ async fn direct_rx_packet_error_closes_only_affected_connection(driver: DefaultD
         for index in 0..3 {
             harness.device.stop_queue(index).await.unwrap();
         }
-        assert!(!harness.device.failed.load(Ordering::Relaxed));
     }
 }
 
@@ -1211,7 +1093,7 @@ async fn malformed_tx_allows_fresh_guest_reset(driver: DefaultDriver, bounce_io:
             })
             .await
             .unwrap();
-        let states = harness.assert_retired().await;
+        let states = harness.stop_queues().await;
         assert_eq!(states[1].avail_index, 2);
         assert_eq!(states[1].used_index, 1);
         harness.verify_fresh_reset(&mut listener, 5202).await;

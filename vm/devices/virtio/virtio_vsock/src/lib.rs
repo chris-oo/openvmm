@@ -47,9 +47,6 @@ use std::io::IoSlice;
 use std::io::IoSliceMut;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 use task_control::AsyncRun;
 use task_control::StopTask;
 use task_control::TaskControl;
@@ -86,9 +83,6 @@ pub struct VirtioVsockDevice {
     #[inspect(skip)]
     base_path: PathBuf,
     bounce_io: bool,
-    fresh_queues: bool,
-    #[inspect(skip)]
-    failed: Arc<AtomicBool>,
 }
 
 impl VirtioVsockDevice {
@@ -115,20 +109,13 @@ impl VirtioVsockDevice {
         let driver = driver_source.simple();
         let listener = PolledSocket::new(&driver, listener)
             .context("failed to create polled socket for vsock relay listener")?;
-        let failed = Arc::new(AtomicBool::new(false));
         Ok(Self {
             guest_cid,
             driver: driver.clone(),
-            worker: TaskControl::new(VsockWorker {
-                driver,
-                listener,
-                failed: failed.clone(),
-            }),
+            worker: TaskControl::new(VsockWorker { driver, listener }),
             started_queues: [const { None }; QUEUE_COUNT],
             base_path,
             bounce_io: false,
-            fresh_queues: false,
-            failed,
         })
     }
 
@@ -193,18 +180,6 @@ impl VirtioDevice for VirtioVsockDevice {
             !self.worker.has_state(),
             "virtio-vsock worker already started"
         );
-        if self.failed.load(Ordering::Relaxed) {
-            anyhow::ensure!(
-                initial_state.is_none(),
-                "cannot restore retired virtio-vsock queues"
-            );
-        }
-        if self.bounce_io || self.failed.load(Ordering::Relaxed) {
-            anyhow::ensure!(
-                self.fresh_queues || self.started_queues.iter().all(Option::is_none),
-                "stop all old virtio-vsock queues before resetting"
-            );
-        }
         if self
             .started_queues
             .get(idx as usize)
@@ -244,14 +219,9 @@ impl VirtioDevice for VirtioVsockDevice {
         .context("failed to create virtio queue")?;
 
         self.started_queues[idx as usize] = Some(queue);
-        self.fresh_queues |= self.bounce_io || self.failed.load(Ordering::Relaxed);
 
         // Start the worker if all queues are started.
         if self.started_queues.iter().all(|q| q.is_some()) {
-            // Only a complete fresh queue generation can clear retirement.
-            // Old queue cursors must not replay socket I/O or used markers.
-            self.failed.store(false, Ordering::Relaxed);
-            self.fresh_queues = false;
             let state = VsockWorkerState {
                 rx_queue: self.started_queues[RX_QUEUE_INDEX].take().unwrap(),
                 tx_queue: self.started_queues[TX_QUEUE_INDEX].take().unwrap().fuse(),
@@ -291,7 +261,7 @@ impl VirtioDevice for VirtioVsockDevice {
     }
 
     fn supports_save_restore(&self) -> bool {
-        !self.bounce_io && !self.failed.load(Ordering::Relaxed)
+        !self.bounce_io
     }
 }
 
@@ -383,7 +353,6 @@ impl VsockWorkerState {
 struct VsockWorker {
     driver: VmTaskDriver,
     listener: PolledSocket<UnixListener>,
-    failed: Arc<AtomicBool>,
 }
 
 impl VsockWorker {
@@ -399,11 +368,8 @@ impl VsockWorker {
             }
             tracelimit::error_ratelimited!(%err, "error handling vsock tx work");
         }
-        state
-            .tx_queue
-            .get_mut()
-            .complete(work.into_completion(), 0)
-            .context("failed to publish vsock tx completion")
+        state.tx_queue.get_mut().complete(work, 0);
+        Ok(())
     }
 
     /// Handle a work item from the TX virtqueue (guest -> host).
@@ -554,10 +520,7 @@ impl VsockWorker {
                     0
                 }
             };
-            state
-                .rx_queue
-                .complete(queue_work.into_completion(), bytes)
-                .context("failed to publish vsock rx completion")?;
+            state.rx_queue.complete(queue_work, bytes);
         }
 
         state.queue_pending(pending);
@@ -605,7 +568,7 @@ impl AsyncRun<VsockWorkerState> for VsockWorker {
                         match r {
                             Ok(work) => {
                                 if let Err(err) = self.handle_guest_tx(state, work) {
-                                    tracelimit::error_ratelimited!(%err, "vsock tx failed; retiring queues");
+                                    tracelimit::error_ratelimited!(%err, "vsock tx failed; stopping worker");
                                     break;
                                 }
                             }
@@ -624,7 +587,7 @@ impl AsyncRun<VsockWorkerState> for VsockWorker {
                     r = rx_ready => {
                         let work = r.unwrap();
                         if let Err(err) = self.handle_host_rx(state, work) {
-                            tracelimit::error_ratelimited!(%err, "vsock rx failed; retiring queues");
+                            tracelimit::error_ratelimited!(%err, "vsock rx failed; stopping worker");
                             break;
                         }
                     }
@@ -656,7 +619,6 @@ impl AsyncRun<VsockWorkerState> for VsockWorker {
                     }
                 };
             }
-            self.failed.store(true, Ordering::Relaxed);
             // Close sockets before dropping their readiness futures. No socket
             // operation retains a guest mapping or an owned payload buffer.
             state.connections.clear();

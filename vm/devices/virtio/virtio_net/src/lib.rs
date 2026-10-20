@@ -607,7 +607,7 @@ struct PendingTxPacket {
     /// Arena slot retained until the backend no longer uses the packet.
     slot: Option<usize>,
     submitted: bool,
-    /// Recorded before guest publication so retirement can release finished I/O.
+    /// Recorded before guest publication so error draining can release finished I/O.
     backend_done: bool,
 }
 
@@ -768,7 +768,6 @@ impl Device {
             active_state,
             negotiated_features,
             negotiated_features_bank1,
-            retired: false,
         };
         let coordinator = self.coordinator.state_mut().unwrap();
         let worker_task = &mut coordinator.workers[idx];
@@ -865,9 +864,6 @@ impl Coordinator {
 
     async fn restart_queues(&mut self, c_state: &mut CoordinatorState) -> Result<(), WorkerError> {
         if self.owned_restart_pending {
-            for worker in &mut self.workers {
-                worker.state_mut().unwrap().retired = true;
-            }
             return Err(WorkerError::EndpointNotQuiescent);
         }
         let mut had_queues = false;
@@ -904,9 +900,6 @@ impl Coordinator {
 
         for (worker, mut queue) in self.workers.iter_mut().zip(queues) {
             let worker_state = worker.state_mut().unwrap();
-            if worker_state.retired {
-                continue;
-            }
             let state = &mut worker_state.active_state;
             let n = state
                 .pending_rx_packets
@@ -940,7 +933,6 @@ impl AsyncRun<Worker> for NetQueue {
                     "virtio net error"
                 );
                 if worker.active_state.pending_rx_packets.is_owned() {
-                    worker.retired = true;
                     if let Some(state) = self.state.as_mut() {
                         let drained = stop
                             .until_stopped(worker.drain_owned(state.queue.as_mut()))
@@ -954,7 +946,7 @@ impl AsyncRun<Worker> for NetQueue {
                             Ok(Err(err)) => {
                                 tracelimit::error_ratelimited!(
                                     error = err.as_ref() as &dyn std::error::Error,
-                                    "failed to drain retired owned network queue"
+                                    "failed to drain owned network queue"
                                 );
                             }
                             Ok(Ok(())) => {}
@@ -1026,7 +1018,6 @@ struct Worker {
     negotiated_features: NetworkFeaturesBank0,
     #[inspect(skip)]
     negotiated_features_bank1: NetworkFeaturesBank1,
-    retired: bool,
 }
 
 impl Worker {
@@ -1038,7 +1029,7 @@ impl Worker {
         // Be careful not to wait on actions with unbounded blocking time (e.g.
         // guest actions, or waiting for network packets to arrive) without
         // wrapping the wait on `stop.until_stopped`.
-        if self.retired || queue.state.is_none() {
+        if queue.state.is_none() {
             // wait for an active queue
             stop.until_stopped(pending()).await?
         }
@@ -1161,10 +1152,11 @@ impl Worker {
                 );
                 // Complete (drop) the packet in avail order via the in-order
                 // completion discipline.
-                self.virtio_state
-                    .tx_in_order
-                    .complete(&mut self.virtio_state.tx_queue, work.into_completion(), 0)
-                    .map_err(|e| WorkerError::Endpoint(e.into()))?;
+                self.virtio_state.tx_in_order.complete(
+                    &mut self.virtio_state.tx_queue,
+                    work.into_completion(),
+                    0,
+                );
             }
         }
         Ok(())
@@ -1532,10 +1524,11 @@ impl Worker {
                     // Complete (drop) the buffer in avail order via the in-order
                     // completion discipline. Reason traced by callee.
                     self.active_state.stats.rx_dropped.increment();
-                    self.virtio_state
-                        .rx_in_order
-                        .complete(&mut self.virtio_state.rx_queue, work.into_completion(), 0)
-                        .map_err(|e| WorkerError::Endpoint(e.into()))?;
+                    self.virtio_state.rx_in_order.complete(
+                        &mut self.virtio_state.rx_queue,
+                        work.into_completion(),
+                        0,
+                    );
                 }
                 Err(RxQueueError::DuplicateIndex(work)) => {
                     // A duplicate descriptor index cannot be tracked (the pool
@@ -1594,14 +1587,11 @@ impl Worker {
             } else {
                 state.stats.rx_packets.increment();
             }
-            self.virtio_state
-                .rx_in_order
-                .complete(
-                    &mut self.virtio_state.rx_queue,
-                    work.into_completion(),
-                    bytes,
-                )
-                .map_err(|e| WorkerError::Endpoint(e.into()))?;
+            self.virtio_state.rx_in_order.complete(
+                &mut self.virtio_state.rx_queue,
+                work.into_completion(),
+                bytes,
+            );
         }
 
         state.stats.rx_packets_per_wake.add_sample(n as u64);
@@ -1758,10 +1748,11 @@ impl Worker {
                 .release_tx(slot)
                 .map_err(WorkerError::Endpoint)?;
         }
-        self.virtio_state
-            .tx_in_order
-            .complete(&mut self.virtio_state.tx_queue, tx_packet.completion, 0)
-            .map_err(|e| WorkerError::Endpoint(e.into()))?;
+        self.virtio_state.tx_in_order.complete(
+            &mut self.virtio_state.tx_queue,
+            tx_packet.completion,
+            0,
+        );
         self.active_state.stats.tx_packets.increment();
         Ok(())
     }
@@ -1789,10 +1780,6 @@ impl Worker {
     /// Drop both accepted and unsent TX once, without resubmission. The
     /// completion tracker preserves available order even for shuffled IDs.
     fn finish_owned_restart(&mut self) -> Result<(), WorkerError> {
-        if self.retired {
-            return Ok(());
-        }
-        self.retired = true;
         self.active_state.data.tx_segments.clear();
         for packet in &mut self.active_state.pending_tx_packets {
             let Some(packet) = packet.take() else {
@@ -1804,17 +1791,17 @@ impl Worker {
                     .release_tx(slot)
                     .map_err(WorkerError::Endpoint)?;
             }
-            self.virtio_state
-                .tx_in_order
-                .complete(&mut self.virtio_state.tx_queue, packet.completion, 0)
-                .map_err(|e| WorkerError::Endpoint(e.into()))?;
+            self.virtio_state.tx_in_order.complete(
+                &mut self.virtio_state.tx_queue,
+                packet.completion,
+                0,
+            );
             self.active_state.stats.tx_dropped.increment();
         }
         self.active_state
             .pending_rx_packets
             .rearm_owned_rx()
             .map_err(WorkerError::Endpoint)?;
-        self.retired = false;
         Ok(())
     }
 
