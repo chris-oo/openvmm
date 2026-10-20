@@ -82,7 +82,6 @@ pub struct VirtioVsockDevice {
     started_queues: [Option<VirtioQueue>; QUEUE_COUNT],
     #[inspect(skip)]
     base_path: PathBuf,
-    bounce_io: bool,
 }
 
 impl VirtioVsockDevice {
@@ -115,16 +114,7 @@ impl VirtioVsockDevice {
             worker: TaskControl::new(VsockWorker { driver, listener }),
             started_queues: [const { None }; QUEUE_COUNT],
             base_path,
-            bounce_io: false,
         })
-    }
-
-    /// Uses bounded owned buffers for socket I/O instead of guest mappings.
-    ///
-    /// This changes device memory access, not hypervisor host-access permissions.
-    pub fn with_bounce_io(mut self) -> Self {
-        self.bounce_io = true;
-        self
     }
 }
 
@@ -169,13 +159,6 @@ impl VirtioDevice for VirtioVsockDevice {
         features: &VirtioDeviceFeatures,
         initial_state: Option<virtio::queue::QueueState>,
     ) -> anyhow::Result<()> {
-        if resources.guest_memory.io_policy() == guestmem::GuestMemoryIoPolicy::CopyOnly {
-            anyhow::ensure!(
-                self.bounce_io || self.started_queues.iter().all(Option::is_none),
-                "cannot change vsock memory policy with active queues"
-            );
-            self.bounce_io = true;
-        }
         anyhow::ensure!(
             !self.worker.has_state(),
             "virtio-vsock worker already started"
@@ -203,11 +186,7 @@ impl VirtioDevice for VirtioVsockDevice {
         let queue_event = PolledWait::new(&self.driver, resources.event)
             .context("failed to create queue event")?;
 
-        let memory = if self.bounce_io {
-            resources.guest_memory.copy_only_view()
-        } else {
-            resources.guest_memory
-        };
+        let memory = resources.guest_memory;
         let queue = VirtioQueue::new(
             *features,
             resources.params,
@@ -261,7 +240,7 @@ impl VirtioDevice for VirtioVsockDevice {
     }
 
     fn supports_save_restore(&self) -> bool {
-        !self.bounce_io
+        false
     }
 }
 
@@ -357,19 +336,11 @@ struct VsockWorker {
 
 impl VsockWorker {
     /// Handle a work item from the tx virtqueue (guest -> host).
-    fn handle_guest_tx(
-        &mut self,
-        state: &mut VsockWorkerState,
-        work: VirtioQueueCallbackWork,
-    ) -> anyhow::Result<()> {
+    fn handle_guest_tx(&mut self, state: &mut VsockWorkerState, work: VirtioQueueCallbackWork) {
         if let Err(err) = self.handle_guest_tx_inner(state, &work) {
-            if state.memory.io_policy() == guestmem::GuestMemoryIoPolicy::CopyOnly {
-                return Err(err);
-            }
             tracelimit::error_ratelimited!(%err, "error handling vsock tx work");
         }
         state.tx_queue.get_mut().complete(work, 0);
-        Ok(())
     }
 
     /// Handle a work item from the TX virtqueue (guest -> host).
@@ -490,12 +461,6 @@ impl VsockWorker {
             .rx_queue
             .try_peek()?
             .context("vsock rx descriptor disappeared")?;
-        if state.memory.io_policy() == guestmem::GuestMemoryIoPolicy::CopyOnly {
-            anyhow::ensure!(
-                payload_capacity(peeked_work.payload(), true)? >= VSOCK_HEADER_SIZE as u64,
-                "guest buffer too small for vsock header"
-            );
-        }
 
         let (packet, pending) = state.connections.get_rx_packet(
             &state.memory,
@@ -510,9 +475,6 @@ impl VsockWorker {
             let bytes = match Self::write_packet(state, &queue_work, &packet) {
                 Ok(bytes) => bytes,
                 Err(err) => {
-                    if state.memory.io_policy() == guestmem::GuestMemoryIoPolicy::CopyOnly {
-                        return Err(err);
-                    }
                     tracelimit::error_ratelimited!(%err, "failed to write vsock packet");
                     state
                         .connections
@@ -566,12 +528,7 @@ impl AsyncRun<VsockWorkerState> for VsockWorker {
                     }
                     r = state.tx_queue.select_next_some() => {
                         match r {
-                            Ok(work) => {
-                                if let Err(err) = self.handle_guest_tx(state, work) {
-                                    tracelimit::error_ratelimited!(%err, "vsock tx failed; stopping worker");
-                                    break;
-                                }
-                            }
+                            Ok(work) => self.handle_guest_tx(state, work),
                             Err(err) => {
                                 // The queue is retired: the rejected chain is
                                 // never consumed, so retrying would fail

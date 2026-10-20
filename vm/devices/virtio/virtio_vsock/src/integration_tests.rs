@@ -229,8 +229,17 @@ struct TestHarness {
 }
 
 impl TestHarness {
-    fn with_fault_memory(mut self) -> (Self, Arc<MemoryFault>) {
-        self.device = self.device.with_bounce_io();
+    fn with_memory_mode(mut self, mode: TestMemoryMode) -> Self {
+        match mode {
+            TestMemoryMode::Mapped => {}
+            TestMemoryMode::CopyOnly => self.mem = self.mem.copy_only_view(),
+            TestMemoryMode::KernelDenied => self = self.with_kernel_denied_memory().0,
+            TestMemoryMode::SafeFallback => self = self.with_safe_fallback_memory().0,
+        }
+        self
+    }
+
+    fn with_fault_memory(self) -> (Self, Arc<MemoryFault>) {
         self.with_kernel_denied_memory()
     }
 
@@ -715,31 +724,20 @@ impl TestHarness {
 
 #[async_test]
 async fn normal_stop_resume_preserves_queue_cursors_without_replay(driver: DefaultDriver) {
-    stop_resume_preserves_queue_cursors_without_replay(driver, false, false).await;
+    stop_resume_preserves_queue_cursors_without_replay(driver, TestMemoryMode::Mapped).await;
 }
 
 async fn stop_resume_preserves_queue_cursors_without_replay(
     driver: DefaultDriver,
-    force: bool,
-    automatic: bool,
+    memory_mode: TestMemoryMode,
 ) {
     use futures::AsyncReadExt;
 
     let mut harness = TestHarness::new(&driver, tempfile::tempdir().unwrap());
-    if force {
-        harness.device = harness.device.with_bounce_io();
-    }
-    if automatic {
-        harness = harness.with_kernel_denied_memory().0;
-        assert!(!harness.device.bounce_io);
-    }
+    harness = harness.with_memory_mode(memory_mode);
     let mut listener = harness.create_port_listener(5210);
     harness.enable().await;
-    assert_eq!(harness.device.bounce_io, force || automatic);
-    assert_eq!(
-        harness.device.supports_save_restore(),
-        !(force || automatic)
-    );
+    assert!(!harness.device.supports_save_restore());
     let _old_stream = harness
         .connect_guest_to_host(&mut listener, 1024, 5210)
         .await;
@@ -778,10 +776,7 @@ async fn stop_resume_preserves_queue_cursors_without_replay(
         virtio::test_helpers::read_used_idx(&harness.mem, TX_USED_ADDR),
         3
     );
-    assert_eq!(
-        harness.device.supports_save_restore(),
-        !(force || automatic)
-    );
+    assert!(!harness.device.supports_save_restore());
     for index in 0..3 {
         harness.device.stop_queue(index).await.unwrap();
     }
@@ -789,12 +784,11 @@ async fn stop_resume_preserves_queue_cursors_without_replay(
 
 #[async_test]
 async fn copy_only_stop_resume_preserves_queue_cursors_without_replay(driver: DefaultDriver) {
-    stop_resume_preserves_queue_cursors_without_replay(driver, true, false).await;
+    stop_resume_preserves_queue_cursors_without_replay(driver, TestMemoryMode::CopyOnly).await;
 }
 
 #[async_test]
 async fn owned_policy_distinguishes_safe_fallback_from_explicit_denial(driver: DefaultDriver) {
-    let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone()));
     for backing_denied in [false, true] {
         for policy in [
             guestmem::GuestMemoryIoPolicy::Direct,
@@ -814,16 +808,8 @@ async fn owned_policy_distinguishes_safe_fallback_from_explicit_denial(driver: D
                 (harness.mem.io_policy() == guestmem::GuestMemoryIoPolicy::CopyOnly),
                 requires_owned
             );
-            let input = virtio::resolve::VirtioResolveInput {
-                driver_source: &driver_source,
-                guest_memory: Some(&harness.mem),
-            };
-            assert_eq!(input.bounce_io(false), requires_owned);
-            assert!(input.bounce_io(true));
-            assert!(!harness.device.bounce_io);
             harness.enable().await;
-            assert_eq!(harness.device.bounce_io, requires_owned);
-            assert_eq!(harness.device.supports_save_restore(), !requires_owned);
+            assert!(!harness.device.supports_save_restore());
             for index in 0..3 {
                 harness.device.stop_queue(index).await.unwrap();
             }
@@ -860,10 +846,10 @@ async fn safe_fallback_does_not_admit_kernel_vhost(driver: DefaultDriver) {
 }
 
 #[async_test]
-async fn automatic_bounce_stop_resume_preserves_queue_cursors_without_replay(
+async fn backing_copy_only_stop_resume_preserves_queue_cursors_without_replay(
     driver: DefaultDriver,
 ) {
-    stop_resume_preserves_queue_cursors_without_replay(driver, false, true).await;
+    stop_resume_preserves_queue_cursors_without_replay(driver, TestMemoryMode::KernelDenied).await;
 }
 
 #[async_test]
@@ -893,6 +879,7 @@ async fn copy_only_rx_copy_faults_close_socket_without_replay(driver: DefaultDri
             _ => unreachable!(),
         }
         stream.write_all(b"response").await.unwrap();
+        assert_eq!(harness.wait_for_rx_used().await.1, 0);
         CancelContext::new()
             .with_timeout(Duration::from_secs(5))
             .until_cancelled(async {
@@ -908,11 +895,8 @@ async fn copy_only_rx_copy_faults_close_socket_without_replay(driver: DefaultDri
             .await
             .unwrap();
         let states = harness.stop_queues().await;
-        assert_eq!(
-            states[0].avail_index,
-            if failure == "short" { 1 } else { 2 }
-        );
-        assert_eq!(states[0].used_index, 1);
+        assert_eq!(states[0].avail_index, 2);
+        assert_eq!(states[0].used_index, 2);
         if failure != "short" {
             assert_eq!(
                 harness.read_header(gpa).operation(),
@@ -933,16 +917,29 @@ async fn copy_only_rx_copy_faults_close_socket_without_replay(driver: DefaultDri
 }
 
 #[async_test]
-async fn copy_only_malformed_tx_stops_without_completion(driver: DefaultDriver) {
-    malformed_tx_allows_fresh_guest_reset(driver, true).await;
+async fn copy_only_malformed_tx_completes_and_allows_fresh_guest_reset(driver: DefaultDriver) {
+    malformed_tx_allows_fresh_guest_reset(driver).await;
 }
 
 #[async_test]
 async fn direct_malformed_tx_keeps_independent_connection_and_queues(driver: DefaultDriver) {
+    malformed_tx_keeps_independent_connection_and_queues(driver, TestMemoryMode::Mapped).await;
+}
+
+#[async_test]
+async fn copy_only_malformed_tx_keeps_independent_connection_and_queues(driver: DefaultDriver) {
+    malformed_tx_keeps_independent_connection_and_queues(driver, TestMemoryMode::CopyOnly).await;
+}
+
+async fn malformed_tx_keeps_independent_connection_and_queues(
+    driver: DefaultDriver,
+    memory_mode: TestMemoryMode,
+) {
     use futures::AsyncReadExt;
 
     for malformed in 0..4 {
-        let mut harness = TestHarness::new(&driver, tempfile::tempdir_in(".").unwrap());
+        let mut harness = TestHarness::new(&driver, tempfile::tempdir_in(".").unwrap())
+            .with_memory_mode(memory_mode);
         let mut listener = harness.create_port_listener(5202);
         harness.enable().await;
         let _stream = harness
@@ -994,7 +991,7 @@ async fn direct_malformed_tx_keeps_independent_connection_and_queues(driver: Def
             .unwrap()
             .unwrap();
         assert_eq!(received, data);
-        assert!(harness.device.supports_save_restore());
+        assert!(!harness.device.supports_save_restore());
         for index in 0..3 {
             harness.device.stop_queue(index).await.unwrap();
         }
@@ -1003,11 +1000,20 @@ async fn direct_malformed_tx_keeps_independent_connection_and_queues(driver: Def
 
 #[async_test]
 async fn direct_rx_packet_error_closes_only_affected_connection(driver: DefaultDriver) {
+    rx_packet_error_closes_only_affected_connection(driver, false).await;
+}
+
+#[async_test]
+async fn copy_only_rx_packet_error_closes_only_affected_connection(driver: DefaultDriver) {
+    rx_packet_error_closes_only_affected_connection(driver, true).await;
+}
+
+async fn rx_packet_error_closes_only_affected_connection(driver: DefaultDriver, copy_only: bool) {
     use futures::AsyncReadExt;
 
     for short in [false, true] {
         let (mut harness, fault) = TestHarness::new(&driver, tempfile::tempdir_in(".").unwrap())
-            .with_safe_fallback_memory();
+            .with_fallback_memory(copy_only);
         let mut listener = harness.create_port_listener(5211);
         harness.enable().await;
         let bad = harness
@@ -1041,21 +1047,19 @@ async fn direct_rx_packet_error_closes_only_affected_connection(driver: DefaultD
         good.write_all(b"unaffected").await.unwrap();
         assert_eq!(harness.wait_for_rx_used().await.1, HDR_SIZE + 10);
         assert_eq!(harness.read_rx_data(gpa, 10), b"unaffected");
-        assert!(harness.device.supports_save_restore());
+        assert!(!harness.device.supports_save_restore());
         for index in 0..3 {
             harness.device.stop_queue(index).await.unwrap();
         }
     }
 }
 
-async fn malformed_tx_allows_fresh_guest_reset(driver: DefaultDriver, bounce_io: bool) {
+async fn malformed_tx_allows_fresh_guest_reset(driver: DefaultDriver) {
     use futures::AsyncReadExt;
 
     for malformed in 0..4 {
-        let mut harness = TestHarness::new(&driver, tempfile::tempdir().unwrap());
-        if bounce_io {
-            harness.device = harness.device.with_bounce_io();
-        }
+        let mut harness = TestHarness::new(&driver, tempfile::tempdir().unwrap())
+            .with_memory_mode(TestMemoryMode::CopyOnly);
         let mut listener = harness.create_port_listener(5202);
         harness.enable().await;
         let stream = harness
@@ -1085,6 +1089,8 @@ async fn malformed_tx_allows_fresh_guest_reset(driver: DefaultDriver, bounce_io:
                 0,
             );
         }
+        assert_eq!(harness.wait_for_tx_used().await.1, 0);
+        let states = harness.stop_queues().await;
         CancelContext::new()
             .with_timeout(Duration::from_secs(5))
             .until_cancelled(async {
@@ -1093,9 +1099,8 @@ async fn malformed_tx_allows_fresh_guest_reset(driver: DefaultDriver, bounce_io:
             })
             .await
             .unwrap();
-        let states = harness.stop_queues().await;
         assert_eq!(states[1].avail_index, 2);
-        assert_eq!(states[1].used_index, 1);
+        assert_eq!(states[1].used_index, 2);
         harness.verify_fresh_reset(&mut listener, 5202).await;
     }
 }
@@ -1104,9 +1109,9 @@ async fn malformed_tx_allows_fresh_guest_reset(driver: DefaultDriver, bounce_io:
 async fn copy_only_reset_closes_socket_with_readiness_pending(driver: DefaultDriver) {
     use futures::AsyncReadExt;
 
-    let mut harness = TestHarness::new(&driver, tempfile::tempdir().unwrap());
-    assert!(harness.device.supports_save_restore());
-    harness.device = harness.device.with_bounce_io();
+    let mut harness = TestHarness::new(&driver, tempfile::tempdir().unwrap())
+        .with_memory_mode(TestMemoryMode::CopyOnly);
+    assert!(!harness.device.supports_save_restore());
     let mut listener = harness.create_port_listener(5203);
     harness.enable().await;
     let stream = harness
@@ -1890,52 +1895,49 @@ async fn host_connect_two_connections_get_different_ports(driver: DefaultDriver)
 #[async_test]
 #[cfg_attr(windows, ignore)]
 async fn guest_send_exercises_ring_buffer(driver: DefaultDriver) {
-    guest_send_exercises_ring_buffer_inner(driver, false, TestMemoryMode::Mapped).await;
+    guest_send_exercises_ring_buffer_inner(driver, TestMemoryMode::Mapped).await;
 }
 
 #[async_test]
 #[cfg_attr(windows, ignore)]
 async fn copy_only_tx_snapshot_survives_backpressure(driver: DefaultDriver) {
-    guest_send_exercises_ring_buffer_inner(driver, true, TestMemoryMode::Mapped).await;
+    guest_send_exercises_ring_buffer_inner(driver, TestMemoryMode::CopyOnly).await;
 }
 
 #[async_test]
 #[cfg_attr(windows, ignore)]
 async fn automatic_tx_snapshot_survives_backpressure_without_mapping(driver: DefaultDriver) {
-    guest_send_exercises_ring_buffer_inner(driver, false, TestMemoryMode::KernelDenied).await;
+    guest_send_exercises_ring_buffer_inner(driver, TestMemoryMode::KernelDenied).await;
 }
 
 #[async_test]
 #[cfg_attr(windows, ignore)]
 async fn safe_fallback_tx_keeps_direct_mode_without_raw_locks(driver: DefaultDriver) {
-    guest_send_exercises_ring_buffer_inner(driver, false, TestMemoryMode::SafeFallback).await;
+    guest_send_exercises_ring_buffer_inner(driver, TestMemoryMode::SafeFallback).await;
 }
 
 #[derive(Clone, Copy)]
 enum TestMemoryMode {
     Mapped,
+    CopyOnly,
     KernelDenied,
     SafeFallback,
 }
 
 async fn guest_send_exercises_ring_buffer_inner(
     driver: DefaultDriver,
-    bounce_io: bool,
     memory_mode: TestMemoryMode,
 ) {
     let tmp_dir = tempfile::tempdir_in(".").unwrap();
-    let mut harness = TestHarness::new(&driver, tmp_dir);
-    match memory_mode {
-        TestMemoryMode::Mapped => {}
-        TestMemoryMode::KernelDenied => harness = harness.with_kernel_denied_memory().0,
-        TestMemoryMode::SafeFallback => harness = harness.with_safe_fallback_memory().0,
-    }
+    let mut harness = TestHarness::new(&driver, tmp_dir).with_memory_mode(memory_mode);
     if !matches!(memory_mode, TestMemoryMode::Mapped) {
-        assert!(!harness.device.bounce_io);
         assert!(!harness.mem.supports_kernel_lock());
         assert_eq!(
             harness.mem.io_policy(),
-            if matches!(memory_mode, TestMemoryMode::KernelDenied) {
+            if matches!(
+                memory_mode,
+                TestMemoryMode::CopyOnly | TestMemoryMode::KernelDenied
+            ) {
                 guestmem::GuestMemoryIoPolicy::CopyOnly
             } else {
                 guestmem::GuestMemoryIoPolicy::Direct
@@ -1943,18 +1945,14 @@ async fn guest_send_exercises_ring_buffer_inner(
         );
         assert_eq!(
             (harness.mem.io_policy() == guestmem::GuestMemoryIoPolicy::CopyOnly),
-            matches!(memory_mode, TestMemoryMode::KernelDenied)
+            matches!(
+                memory_mode,
+                TestMemoryMode::CopyOnly | TestMemoryMode::KernelDenied
+            )
         );
-    }
-    if bounce_io {
-        harness.device = harness.device.with_bounce_io();
     }
     let mut listener = harness.create_port_listener(5050);
     harness.enable().await;
-    assert_eq!(
-        harness.device.bounce_io,
-        bounce_io || matches!(memory_mode, TestMemoryMode::KernelDenied)
-    );
 
     let stream = harness
         .connect_guest_to_host(&mut listener, 1024, 5050)
@@ -1981,7 +1979,7 @@ async fn guest_send_exercises_ring_buffer_inner(
         // Wait for the tx descriptor to be consumed so the device processes
         // each packet before we queue the next.
         harness.wait_for_tx_used().await;
-        if harness.device.bounce_io {
+        if harness.mem.io_policy() == guestmem::GuestMemoryIoPolicy::CopyOnly {
             harness
                 .mem
                 .write_at(DATA_BASE + u64::from(HDR_SIZE), &[0xff; CHUNK_SIZE])
@@ -2051,53 +2049,39 @@ async fn guest_send_exercises_ring_buffer_inner(
 /// Host sends data to the guest through an established connection.
 #[async_test]
 async fn host_send_respects_credit(driver: DefaultDriver) {
-    host_send_respects_credit_inner(driver, false, TestMemoryMode::Mapped).await;
+    host_send_respects_credit_inner(driver, TestMemoryMode::Mapped).await;
 }
 
 #[async_test]
 async fn copy_only_host_send_respects_credit(driver: DefaultDriver) {
-    host_send_respects_credit_inner(driver, true, TestMemoryMode::Mapped).await;
+    host_send_respects_credit_inner(driver, TestMemoryMode::CopyOnly).await;
 }
 
 #[async_test]
 async fn automatic_host_send_respects_credit_without_mapping(driver: DefaultDriver) {
-    host_send_respects_credit_inner(driver, false, TestMemoryMode::KernelDenied).await;
+    host_send_respects_credit_inner(driver, TestMemoryMode::KernelDenied).await;
 }
 
 #[async_test]
 async fn safe_fallback_rx_keeps_direct_mode_without_raw_locks(driver: DefaultDriver) {
-    host_send_respects_credit_inner(driver, false, TestMemoryMode::SafeFallback).await;
+    host_send_respects_credit_inner(driver, TestMemoryMode::SafeFallback).await;
 }
 
-async fn host_send_respects_credit_inner(
-    driver: DefaultDriver,
-    bounce_io: bool,
-    memory_mode: TestMemoryMode,
-) {
+async fn host_send_respects_credit_inner(driver: DefaultDriver, memory_mode: TestMemoryMode) {
     let tmp_dir = tempfile::tempdir_in(".").unwrap();
-    let mut harness = TestHarness::new(&driver, tmp_dir);
-    match memory_mode {
-        TestMemoryMode::Mapped => {}
-        TestMemoryMode::KernelDenied => harness = harness.with_kernel_denied_memory().0,
-        TestMemoryMode::SafeFallback => harness = harness.with_safe_fallback_memory().0,
-    }
+    let mut harness = TestHarness::new(&driver, tmp_dir).with_memory_mode(memory_mode);
     if !matches!(memory_mode, TestMemoryMode::Mapped) {
-        assert!(!harness.device.bounce_io);
         assert!(!harness.mem.supports_kernel_lock());
         assert_eq!(
             (harness.mem.io_policy() == guestmem::GuestMemoryIoPolicy::CopyOnly),
-            matches!(memory_mode, TestMemoryMode::KernelDenied)
+            matches!(
+                memory_mode,
+                TestMemoryMode::CopyOnly | TestMemoryMode::KernelDenied
+            )
         );
-    }
-    if bounce_io {
-        harness.device = harness.device.with_bounce_io();
     }
     let mut listener = harness.create_port_listener(5002);
     harness.enable().await;
-    assert_eq!(
-        harness.device.bounce_io,
-        bounce_io || matches!(memory_mode, TestMemoryMode::KernelDenied)
-    );
 
     let stream = harness
         .connect_guest_to_host(&mut listener, 1024, 5002)

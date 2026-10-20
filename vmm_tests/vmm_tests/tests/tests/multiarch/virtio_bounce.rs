@@ -11,7 +11,6 @@ use petri::PetriVmBuilder;
 use petri::openvmm::OpenVmmPetriBackend;
 use petri::pipette::cmd;
 use virtio_resources::VirtioPciDeviceHandle;
-use virtio_resources::blk::VirtioBlkBounceDiskHandle;
 use virtio_resources::blk::VirtioBlkHandle;
 use virtio_resources::net::VirtioNetHandle;
 use vm_resource::IntoResource;
@@ -24,16 +23,21 @@ async fn virtio_blk_forced_bounce(
 ) -> anyhow::Result<()> {
     const BLOCK_SIZE: usize = 4096;
     const BLOCK_COUNT: usize = 256;
-    let disk = VirtioBlkBounceDiskHandle::Ram {
-        len: 16 * 1024 * 1024,
-    }
+    let disk = disk_backend_resources::LayeredDiskHandle::single_layer(
+        disk_backend_resources::layer::RamDiskLayerHandle {
+            len: Some(16 * 1024 * 1024),
+            sector_size: None,
+        },
+    )
     .into_resource();
     let (vm, agent) = config
+        .with_no_hv()
         .with_virtio_vsock()
         .modify_backend(move |backend| {
             backend
                 .with_pcie_root_topology(1, 1, 2)
                 .with_custom_config(move |config| {
+                    config.hypervisor.force_guest_memory_bounce = true;
                     config.pcie_devices.push(PcieDeviceConfig {
                         port_name: "s0rc0rp1".into(),
                         resource: VirtioPciDeviceHandle(
@@ -41,8 +45,6 @@ async fn virtio_blk_forced_bounce(
                                 disk,
                                 read_only: false,
                                 serial: Some("FORCED-BOUNCE".into()),
-                                bounce_io: true,
-                                bounce_disk: None,
                             }
                             .into_resource(),
                         )
@@ -92,11 +94,13 @@ async fn virtio_net_forced_bounce(
     config: PetriVmBuilder<OpenVmmPetriBackend>,
 ) -> anyhow::Result<()> {
     let (vm, agent) = config
+        .with_no_hv()
         .with_virtio_vsock()
         .modify_backend(|backend| {
             backend
                 .with_pcie_root_topology(1, 1, 2)
                 .with_custom_config(|config| {
+                    config.hypervisor.force_guest_memory_bounce = true;
                     config.pcie_devices.push(PcieDeviceConfig {
                         port_name: "s0rc0rp1".into(),
                         resource: VirtioPciDeviceHandle(
@@ -109,7 +113,6 @@ async fn virtio_net_forced_bounce(
                                     recv: None,
                                 }
                                 .into_resource(),
-                                bounce_io: true,
                             }
                             .into_resource(),
                         )
@@ -175,8 +178,15 @@ async fn virtio_vsock_forced_bounce(
     config: PetriVmBuilder<OpenVmmPetriBackend>,
 ) -> anyhow::Result<()> {
     let (vm, agent) = config
-        .with_virtio_vsock_bounce()
-        .modify_backend(|backend| backend.with_pcie_root_topology(1, 1, 1))
+        .with_no_hv()
+        .with_virtio_vsock()
+        .modify_backend(|backend| {
+            backend
+                .with_pcie_root_topology(1, 1, 1)
+                .with_custom_config(|config| {
+                    config.hypervisor.force_guest_memory_bounce = true;
+                })
+        })
         .run()
         .await?;
     for round in 0..2 {

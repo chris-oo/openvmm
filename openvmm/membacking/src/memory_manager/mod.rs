@@ -762,9 +762,17 @@ impl GuestMemoryManager {
         DeviceMemoryMapper::new(self.region_manager.client().clone())
     }
 
-    /// Returns a client for registering DMA mappers (VFIO, iommufd).
-    pub fn dma_mapper_client(&self) -> crate::region_manager::DmaMapperClient {
-        crate::region_manager::DmaMapperClient::new(self.region_manager.client())
+    /// Returns a client for registering DMA mappers (VFIO, iommufd), unless
+    /// the guest backing forbids I/O exports.
+    pub fn dma_mapper_client(&self) -> Option<crate::region_manager::DmaMapperClient> {
+        if guestmem::GuestMemoryAccess::io_policy(&*self.va_mapper)
+            == guestmem::GuestMemoryIoPolicy::CopyOnly
+        {
+            return None;
+        }
+        Some(crate::region_manager::DmaMapperClient::new(
+            self.region_manager.client(),
+        ))
     }
 
     /// Returns an object for manipulating the visibility state of different RAM
@@ -981,6 +989,7 @@ mod tests {
             assert!(memory.sharing().is_none());
         }
         assert!(manager.shared_memory_backing().is_none());
+        assert!(manager.dma_mapper_client().is_none());
         assert_eq!(
             GuestMemory::allocate(0x1000).io_policy(),
             guestmem::GuestMemoryIoPolicy::Direct

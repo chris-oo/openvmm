@@ -317,7 +317,7 @@ async fn vm_config_from_command_line(
     mesh: &VmmMesh,
     opt: &Options,
 ) -> anyhow::Result<(Config, VmResources)> {
-    let snp_bounce = opt.validate_vm_options()?;
+    opt.validate_vm_options()?;
 
     let (_, serial_driver) = DefaultPool::spawn_on_thread("serial");
     let uefi = opt.effective_uefi()?;
@@ -591,7 +591,6 @@ async fn vm_config_from_command_line(
         nsid,
         lun,
         ref relay,
-        bounce_io: _,
     } in &opt.disk
     {
         if serial.is_some() {
@@ -700,7 +699,6 @@ async fn vm_config_from_command_line(
         nsid: _,
         lun: _,
         relay: _,
-        bounce_io: _,
     } in &opt.nvme
     {
         if serial.is_some() {
@@ -732,7 +730,6 @@ async fn vm_config_from_command_line(
         nsid: _,
         lun: _,
         relay: _,
-        bounce_io,
     } in &opt.virtio_blk
     {
         if underhill.is_some() {
@@ -746,7 +743,6 @@ async fn vm_config_from_command_line(
                 storage_builder::DiskLocation::VirtioBlk {
                     pcie_port: pcie_port.clone(),
                     serial: serial.clone(),
-                    bounce_io: bounce_io || snp_bounce,
                 },
                 kind,
                 is_dvd,
@@ -811,7 +807,6 @@ async fn vm_config_from_command_line(
                 max_queues: None,
                 underhill: false,
                 pcie_port: None,
-                bounce_io: false,
             },
             &mut nic_index,
             &mut resources,
@@ -1885,7 +1880,6 @@ async fn vm_config_from_command_line(
             max_queues: vport.max_queues,
             mac_address: vport.mac_address,
             endpoint: vport.endpoint,
-            bounce_io: cli_cfg.bounce_io || snp_bounce,
         }
         .into_resource();
         if let Some(pcie_port) = &cli_cfg.pcie_port {
@@ -2056,7 +2050,6 @@ async fn vm_config_from_command_line(
             guest_cid: 0x3,
             base_path: vsock_path.clone(),
             listener,
-            bounce_io: opt.virtio_vsock_bounce || snp_bounce,
         }
         .into_resource();
         add_virtio_device(virtio_vsock_bus.clone(), resource, &mut pcie_devices);
@@ -2183,6 +2176,7 @@ async fn vm_config_from_command_line(
             }),
             with_isolation,
             nested_virt: opt.nested_virt,
+            force_guest_memory_bounce: opt.force_guest_memory_bounce,
         },
         #[cfg(windows)]
         kernel_vmnics,

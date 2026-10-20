@@ -2460,7 +2460,6 @@ async fn build_virtio_device(
                     .parse::<MacAddress>()
                     .context("invalid mac address")?,
                 endpoint,
-                bounce_io: false,
             }
             .into_resource()
         }
@@ -2477,7 +2476,6 @@ async fn build_virtio_device(
                 guest_cid: guest_cid.unwrap_or(OPENVMM_DEFAULT_VSOCK_GUEST_CID),
                 base_path: socket_path,
                 listener,
-                bounce_io: false,
             }
             .into_resource()
         }
@@ -2505,7 +2503,18 @@ async fn build_virtio_blk(
     let disk = if snp_bounce {
         match backend.kind.context("missing disk backend kind")? {
             vmservice::disk_backend::Kind::File(file) => {
-                open_snp_block_backend(file, read_only)?.into_resource()
+                let file = open_snp_block_backend(file, read_only)?;
+                #[cfg(target_os = "linux")]
+                {
+                    use std::os::unix::fs::FileTypeExt;
+                    if file.metadata()?.file_type().is_block_device() {
+                        disk_backend_resources::BlockDeviceDiskHandle { file }.into_resource()
+                    } else {
+                        disk_backend_resources::FileDiskHandle(file).into_resource()
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                disk_backend_resources::FileDiskHandle(file).into_resource()
             }
         }
     } else {
@@ -2515,17 +2524,10 @@ async fn build_virtio_blk(
         disk,
         read_only,
         serial,
-        bounce_io: false,
-        bounce_disk: None,
     })
 }
 
-fn open_snp_block_backend(
-    config: vmservice::FileDisk,
-    read_only: bool,
-) -> anyhow::Result<virtio_resources::blk::VirtioBlkBounceDiskHandle> {
-    use virtio_resources::blk::VirtioBlkBounceDiskHandle;
-
+fn open_snp_block_backend(config: vmservice::FileDisk, read_only: bool) -> anyhow::Result<File> {
     let metadata = std::fs::metadata(&config.path)
         .with_context(|| format!("failed to inspect {}", config.path))?;
     let supported = metadata.is_file();
@@ -2570,15 +2572,24 @@ fn open_snp_block_backend(
         );
         fcntl(&file, FcntlArg::F_SETFL(flags))?;
         if metadata.file_type().is_block_device() {
-            return Ok(VirtioBlkBounceDiskHandle::BlockDevice(file));
+            return Ok(file);
         }
     }
     anyhow::ensure!(
         metadata.is_file(),
         "MSHV SNP block backing must be a regular file or Linux block device"
     );
-    crate::storage_builder::validate_bounce_file(config.path.as_ref(), config.direct)?;
-    Ok(VirtioBlkBounceDiskHandle::File(file))
+    anyhow::ensure!(!config.direct, "SNP regular files require buffered I/O");
+    anyhow::ensure!(
+        !std::path::Path::new(&config.path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| ["vhd", "vhdx", "vmgs", "iso", "vmdk"]
+                .iter()
+                .any(|format| extension.eq_ignore_ascii_case(format))),
+        "SNP regular files require a plain disk image"
+    );
+    Ok(file)
 }
 
 fn build_virtio_fs(
@@ -3034,7 +3045,7 @@ mod tests {
     }
 
     #[test]
-    fn snp_service_block_resource_is_reviewed_without_forcing_bounce() {
+    fn snp_service_uses_normal_disk_backends() {
         let file = tempfile::Builder::new().suffix(".raw").tempfile().unwrap();
         file.as_file().set_len(512).unwrap();
         for snp_bounce in [false, true] {
@@ -3043,11 +3054,9 @@ mod tests {
                 snp_bounce,
             ))
             .unwrap();
-            assert!(!handle.bounce_io);
-            assert!(handle.bounce_disk.is_none());
             assert!(handle.read_only);
             assert_eq!(handle.serial.as_deref(), Some("snp-block"));
-            assert_eq!(handle.disk.id() == "virtio-blk-bounce-disk", snp_bounce);
+            assert_eq!(handle.disk.id(), if snp_bounce { "file" } else { "block" });
         }
         assert!(
             futures::executor::block_on(build_virtio_blk(file_blk("/dev/null", false), true))
@@ -3067,7 +3076,13 @@ mod tests {
                 file_blk(file.path().to_str().unwrap(), direct),
                 true,
             ));
-            assert!(result.err().unwrap().to_string().contains("`bounce`"));
+            assert!(
+                result
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("SNP regular files")
+            );
         }
     }
 
@@ -3109,7 +3124,6 @@ mod tests {
         use nix::fcntl::OFlag;
         use nix::fcntl::fcntl;
         use std::os::unix::fs::FileTypeExt;
-        use virtio_resources::blk::VirtioBlkBounceDiskHandle;
 
         let path = std::env::var("OPENVMM_BOUNCE_TEST_BLOCK_PATH").unwrap();
         assert!(
@@ -3129,11 +3143,7 @@ mod tests {
                     path: alias.to_str().unwrap().into(),
                     direct,
                 };
-                let VirtioBlkBounceDiskHandle::BlockDevice(file) =
-                    open_snp_block_backend(config, read_only).unwrap()
-                else {
-                    panic!("block device was classified as a regular file");
-                };
+                let file = open_snp_block_backend(config, read_only).unwrap();
                 assert!(file.metadata().unwrap().file_type().is_block_device());
                 let flags = OFlag::from_bits_retain(fcntl(&file, FcntlArg::F_GETFL).unwrap());
                 assert_eq!(flags.contains(OFlag::O_DIRECT), direct);
@@ -3151,9 +3161,7 @@ mod tests {
                     true,
                 ))
                 .unwrap();
-                assert!(!handle.bounce_io);
-                assert!(handle.bounce_disk.is_none());
-                assert_eq!(handle.disk.id(), "virtio-blk-bounce-disk");
+                assert_eq!(handle.disk.id(), "block");
             }
         }
     }

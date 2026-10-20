@@ -19,7 +19,6 @@ use inspect::Inspect;
 use inspect::InspectMut;
 use inspect_counters::Counter;
 use pal_async::wait::PolledWait;
-use scsi_buffers::MAX_BOUNCE_IO_SIZE;
 use scsi_buffers::RequestBuffers;
 use std::future::Future;
 use std::future::poll_fn;
@@ -58,10 +57,6 @@ use zerocopy::IntoBytes;
 const DEFAULT_SEG_MAX: u32 = virtio::DEFAULT_QUEUE_SIZE as u32 - 2;
 
 /// Limits descriptor consumption until an in-flight request finishes.
-///
-/// With the 1 MiB forced-bounce request limit, frontend payload staging is
-/// bounded to 64 MiB per device queue, excluding metadata and backend buffers.
-/// The byte bound does not apply to unrestricted Direct fallback requests.
 const MAX_IO_DEPTH: usize = 64;
 
 /// The virtio-blk device.
@@ -73,8 +68,6 @@ pub struct VirtioBlkDevice {
     driver: VmTaskDriver,
     read_only: bool,
     supports_discard: bool,
-    bounce_io: bool,
-    bounce_supported: bool,
     config: VirtioBlkConfig,
 }
 
@@ -109,7 +102,6 @@ struct WorkerStats {
     flush_ops: Counter,
     discard_ops: Counter,
     bounce_ops: Counter,
-    direct_ops: Counter,
     errors: Counter,
 }
 
@@ -152,8 +144,6 @@ impl BlkWorker {
         }
         if completion.bounced {
             self.stats.bounce_ops.increment();
-        } else if matches!(completion.stat, IoStat::Read | IoStat::Write) {
-            self.stats.direct_ops.increment();
         }
     }
 
@@ -323,37 +313,8 @@ impl VirtioBlkDevice {
             driver: driver_source.simple(),
             read_only,
             supports_discard,
-            bounce_io: false,
-            bounce_supported: false,
             config,
         })
-    }
-
-    /// Uses bounded owned buffers for all payload I/O on this device.
-    ///
-    /// This restricts device-facing memory access, not kernel registration or
-    /// hypervisor host-access permissions.
-    pub fn with_bounce_io(mut self) -> Self {
-        self.bounce_supported = true;
-        self.enable_bounce_io();
-        self
-    }
-
-    fn with_bounce_support(mut self) -> Self {
-        self.bounce_supported = true;
-        self.configure_bounce_limits();
-        self
-    }
-
-    fn enable_bounce_io(&mut self) {
-        self.bounce_io = true;
-        self.configure_bounce_limits();
-    }
-
-    fn configure_bounce_limits(&mut self) {
-        self.config.size_max = self.config.blk_size.max(guestmem::PAGE_SIZE as u32);
-        self.config.seg_max =
-            DEFAULT_SEG_MAX.min((MAX_BOUNCE_IO_SIZE / self.config.size_max as usize).max(1) as u32);
     }
 }
 
@@ -381,9 +342,6 @@ impl VirtioDevice for VirtioBlkDevice {
 
         if self.read_only {
             features |= VIRTIO_BLK_F_RO;
-        }
-        if self.bounce_supported {
-            features |= VIRTIO_BLK_F_SIZE_MAX;
         }
         if self.supports_discard {
             features |= VIRTIO_BLK_F_DISCARD;
@@ -444,29 +402,7 @@ impl VirtioDevice for VirtioBlkDevice {
         let queue_event = PolledWait::new(&self.driver, resources.event)
             .context("failed to create queue event")?;
 
-        if (resources.guest_memory.io_policy() == guestmem::GuestMemoryIoPolicy::CopyOnly)
-            && !self.bounce_io
-        {
-            anyhow::ensure!(
-                self.bounce_supported,
-                "kernel-denied virtio-blk memory requires reviewed bounce disk admission"
-            );
-            let required = VIRTIO_BLK_F_SIZE_MAX | VIRTIO_BLK_F_SEG_MAX;
-            anyhow::ensure!(
-                features.bank(0) & required == required,
-                "automatic block staging requires negotiated SIZE_MAX and SEG_MAX"
-            );
-            anyhow::ensure!(
-                self.config.blk_size as usize <= MAX_BOUNCE_IO_SIZE,
-                "bounce I/O does not support sectors larger than the request limit"
-            );
-            self.bounce_io = true;
-        }
-        let memory = if self.bounce_io {
-            resources.guest_memory.copy_only_view()
-        } else {
-            resources.guest_memory
-        };
+        let memory = resources.guest_memory;
         let queue = VirtioQueue::new(
             *features,
             resources.params,
@@ -477,7 +413,6 @@ impl VirtioDevice for VirtioBlkDevice {
         )
         .context("failed to create virtio queue")?;
 
-        tracelimit::info_ratelimited!(bounce_io = self.bounce_io, "virtio-blk queue configured");
         self.worker.insert(
             self.driver.clone(),
             "virtio-blk-worker",
@@ -506,7 +441,7 @@ impl VirtioDevice for VirtioBlkDevice {
     }
 
     fn supports_save_restore(&self) -> bool {
-        !self.bounce_io
+        true
     }
 }
 
@@ -729,8 +664,8 @@ fn copy_regions(
 /// for the entire data payload. If the descriptor chain's memory
 /// layout is compatible with [`PagedRange`] (all interior boundaries
 /// page-aligned or GPA-contiguous), the IO targets guest memory
-/// directly. Otherwise, a bounce buffer is allocated and data is
-/// copied through it.
+/// without frontend staging, preserving its I/O policy for the backend.
+/// Otherwise, a gathering buffer is allocated and data is copied through it.
 ///
 /// Returns `Ok((data_bytes_written_to_guest, bounced))` on success.
 async fn do_io(
@@ -747,11 +682,9 @@ async fn do_io(
     } else {
         0
     };
-    let data_len = if is_read {
-        total_payload.saturating_sub(1)
-    } else {
-        total_payload.saturating_sub(skip_bytes)
-    };
+    let data_len = total_payload
+        .checked_sub(if is_read { 1 } else { skip_bytes })
+        .ok_or(VIRTIO_BLK_S_IOERR)?;
 
     if data_len == 0 {
         return Ok((0, false));
@@ -761,10 +694,6 @@ async fn do_io(
     // (the caller adds +1 for the status byte). No legitimate IO should be
     // anywhere near this limit.
     if data_len > u32::MAX as u64 - 1 {
-        return Err(VIRTIO_BLK_S_IOERR);
-    }
-    let force_bounce = mem.io_policy() == guestmem::GuestMemoryIoPolicy::CopyOnly;
-    if force_bounce && data_len > MAX_BOUNCE_IO_SIZE as u64 {
         return Err(VIRTIO_BLK_S_IOERR);
     }
 
@@ -784,9 +713,8 @@ async fn do_io(
         return Err(VIRTIO_BLK_S_IOERR);
     }
 
-    let compatible = try_build_gpn_list(&regions);
     let (mut io_mem, io_range, bounced) =
-        if let Some((gpns, offset, len)) = compatible.filter(|_| !force_bounce) {
+        if let Some((gpns, offset, len)) = try_build_gpn_list(&regions) {
             // Fast path: descriptor chain is PagedRange-compatible.
             (None, OwnedPagedRange { gpns, offset, len }, false)
         } else {
@@ -853,8 +781,34 @@ fn write_status_byte(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_with_tracing::test;
 
     // ---- copy_regions tests ----
+
+    #[test]
+    fn copy_regions_rejects_invalid_lengths() {
+        let guest = GuestMemory::allocate(4096).copy_only_view();
+        let mut bounce = [0; 512];
+        for region in [
+            DataRegion { addr: 0, len: 513 },
+            DataRegion {
+                addr: u64::MAX - 255,
+                len: 512,
+            },
+        ] {
+            for to_bounce in [false, true] {
+                assert_eq!(
+                    copy_regions(
+                        &mut bounce,
+                        &guest,
+                        std::slice::from_ref(&region),
+                        to_bounce
+                    ),
+                    Err(VIRTIO_BLK_S_IOERR)
+                );
+            }
+        }
+    }
 
     #[test]
     fn copy_regions_roundtrip() {

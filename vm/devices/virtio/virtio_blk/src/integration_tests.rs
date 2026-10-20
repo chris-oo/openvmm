@@ -5,8 +5,7 @@
 //!
 //! These tests construct a full `VirtioBlkDevice` with guest memory, a RAM
 //! disk backend, and real virtio queues — then drive requests through the
-//! descriptor ring just as a guest driver would. An ignored Linux test also
-//! supports disposable host block devices.
+//! descriptor ring just as a guest driver would.
 
 use crate::VirtioBlkDevice;
 use disk_backend::Disk;
@@ -909,6 +908,7 @@ impl TestDisk4K {
 }
 
 struct IoProbe {
+    copy_only: bool,
     guest_base: AtomicUsize,
     read_ops: AtomicUsize,
     write_ops: AtomicUsize,
@@ -919,6 +919,7 @@ struct IoProbe {
 impl Default for IoProbe {
     fn default() -> Self {
         Self {
+            copy_only: false,
             guest_base: AtomicUsize::new(0),
             read_ops: AtomicUsize::new(0),
             write_ops: AtomicUsize::new(0),
@@ -944,13 +945,18 @@ impl IoProbe {
     }
 
     async fn check(&self, buffers: &RequestBuffers<'_>, is_read: bool) {
-        assert_eq!(
-            buffers.guest_memory().io_policy(),
-            guestmem::GuestMemoryIoPolicy::Direct
-        );
-        assert!(buffers.guest_memory().supports_kernel_lock());
-        let (base, _) = buffers.guest_memory().full_mapping().unwrap();
-        assert_ne!(base as usize, self.guest_base.load(Ordering::SeqCst));
+        let memory = buffers.guest_memory();
+        if self.copy_only {
+            assert_eq!(memory.io_policy(), guestmem::GuestMemoryIoPolicy::CopyOnly);
+            assert!(!memory.supports_kernel_lock());
+            assert!(memory.full_mapping().is_none());
+            assert!(buffers.lock(is_read).is_err());
+        } else {
+            assert_eq!(memory.io_policy(), guestmem::GuestMemoryIoPolicy::Direct);
+            assert!(memory.supports_kernel_lock());
+            let (base, _) = memory.full_mapping().unwrap();
+            assert_ne!(base as usize, self.guest_base.load(Ordering::SeqCst));
+        }
         if is_read {
             self.read_ops.fetch_add(1, Ordering::SeqCst);
         } else {
@@ -960,202 +966,6 @@ impl IoProbe {
         let gate = self.gate.lock().take();
         if let Some(gate) = gate {
             gate.await.unwrap();
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-#[derive(Inspect)]
-struct ProbedBlockDisk {
-    disk: Disk,
-    #[inspect(skip)]
-    probe: Arc<IoProbe>,
-}
-
-#[cfg(target_os = "linux")]
-impl DiskIo for ProbedBlockDisk {
-    fn disk_type(&self) -> &str {
-        "reviewed-block-test"
-    }
-
-    fn sector_count(&self) -> u64 {
-        self.disk.sector_count()
-    }
-
-    fn sector_size(&self) -> u32 {
-        self.disk.sector_size()
-    }
-
-    fn physical_sector_size(&self) -> u32 {
-        self.disk.physical_sector_size()
-    }
-
-    fn disk_id(&self) -> Option<[u8; 16]> {
-        self.disk.disk_id()
-    }
-
-    fn is_read_only(&self) -> bool {
-        self.disk.is_read_only()
-    }
-
-    fn is_fua_respected(&self) -> bool {
-        self.disk.is_fua_respected()
-    }
-
-    async fn read_vectored(
-        &self,
-        buffers: &RequestBuffers<'_>,
-        sector: u64,
-    ) -> Result<(), DiskError> {
-        self.probe.check(buffers, true).await;
-        self.disk.read_vectored(buffers, sector).await
-    }
-
-    async fn write_vectored(
-        &self,
-        buffers: &RequestBuffers<'_>,
-        sector: u64,
-        fua: bool,
-    ) -> Result<(), DiskError> {
-        self.probe.check(buffers, false).await;
-        self.disk.write_vectored(buffers, sector, fua).await
-    }
-
-    async fn sync_cache(&self) -> Result<(), DiskError> {
-        self.disk.sync_cache().await
-    }
-
-    async fn unmap(
-        &self,
-        sector: u64,
-        count: u64,
-        block_level_only: bool,
-    ) -> Result<(), DiskError> {
-        self.disk.unmap(sector, count, block_level_only).await
-    }
-
-    fn unmap_behavior(&self) -> disk_backend::UnmapBehavior {
-        self.disk.unmap_behavior()
-    }
-}
-
-#[cfg(target_os = "linux")]
-#[async_test]
-#[ignore = "requires a disposable device-mapper fixture in OPENVMM_BOUNCE_TEST_BLOCK_PATH"]
-/// Requires a 32 MiB disposable mapping named `openvmm-bounce-test-*`.
-/// Set `OPENVMM_BOUNCE_TEST_SECTOR_SIZE` to its logical sector size.
-/// This test overwrites the first 4 KiB; never use a disk containing needed data.
-async fn reviewed_block_device_uses_owned_buffers(driver: DefaultDriver) {
-    use std::os::unix::fs::OpenOptionsExt;
-    use virtio_resources::blk::VirtioBlkBounceDiskHandle;
-    use vm_resource::IntoResource;
-    use vm_resource::ResourceResolver;
-    use vm_resource::kind::DiskHandleKind;
-
-    let path = std::env::var("OPENVMM_BOUNCE_TEST_BLOCK_PATH").unwrap();
-    assert!(
-        std::path::Path::new(&path)
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .starts_with("openvmm-bounce-test-"),
-        "use a disposable test mapping, never an existing host disk"
-    );
-    let sector_size: u32 = std::env::var("OPENVMM_BOUNCE_TEST_SECTOR_SIZE")
-        .unwrap()
-        .parse()
-        .unwrap();
-    let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone()));
-    let mut resolver = ResourceResolver::new();
-    resolver.add_async_resolver::<DiskHandleKind, _, VirtioBlkBounceDiskHandle, _>(
-        crate::resolver::VirtioBlkResolver,
-    );
-    resolver
-        .add_async_resolver::<DiskHandleKind, _, disk_backend_resources::BlockDeviceDiskHandle, _>(
-            disk_blockdevice::resolver::StaticBlockDeviceResolver,
-        );
-    for direct in [false, true] {
-        for read_only in [false, true] {
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(!read_only)
-                .custom_flags(if direct {
-                    nix::fcntl::OFlag::O_DIRECT.bits()
-                } else {
-                    0
-                })
-                .open(&path)
-                .unwrap();
-            let disk = resolver
-                .resolve(
-                    VirtioBlkBounceDiskHandle::BlockDevice(file).into_resource(),
-                    disk_backend::resolve::ResolveDiskParameters {
-                        read_only,
-                        driver_source: &driver_source,
-                    },
-                )
-                .await
-                .unwrap()
-                .0;
-            assert_eq!(disk.sector_size(), sector_size);
-            assert_eq!(
-                disk.sector_count() * u64::from(sector_size),
-                32 * 1024 * 1024
-            );
-            assert!(disk.physical_sector_size() >= sector_size);
-            assert_eq!(disk.is_read_only(), read_only);
-            let probe = Arc::new(IoProbe::default());
-            let disk = Disk::new(ProbedBlockDisk {
-                disk,
-                probe: probe.clone(),
-            })
-            .unwrap();
-            let mut harness = TestHarness::new(&driver, disk, read_only);
-            harness.device = harness.device.with_bounce_support();
-            assert!(!harness.device.bounce_io);
-            probe.guest_base.store(
-                harness.mem.full_mapping().unwrap().0 as usize,
-                Ordering::SeqCst,
-            );
-            harness.mem = harness.mem.copy_only_view();
-            let features = VirtioDeviceFeatures::new().with_device_specific_low(
-                VIRTIO_BLK_F_SIZE_MAX | VIRTIO_BLK_F_SEG_MAX | VIRTIO_BLK_F_FLUSH,
-            );
-            harness.try_enable_with_features(&features).await.unwrap();
-            assert!(harness.device.bounce_io);
-            let pattern = vec![0x5a; 4096];
-            let data = harness.post_write_request(0, 0, &pattern);
-            assert_eq!(harness.wait_for_used().await.1, 1);
-            let mut status = [0xff];
-            harness
-                .mem
-                .read_at(data + pattern.len() as u64, &mut status)
-                .unwrap();
-            assert_eq!(
-                status[0],
-                if read_only {
-                    VIRTIO_BLK_S_IOERR
-                } else {
-                    VIRTIO_BLK_S_OK
-                }
-            );
-            let read = harness.post_read_request(3, 0, 4096);
-            assert_eq!(harness.wait_for_used().await.1, 4097);
-            let mut actual = vec![0; 4096];
-            harness.mem.read_at(read, &mut actual).unwrap();
-            assert_eq!(actual, pattern);
-            let flush_status = harness.next_data_offset + u64::from(REQ_HEADER_SIZE);
-            harness.post_flush_request(6);
-            assert_eq!(harness.wait_for_used().await.1, 1);
-            harness.mem.read_at(flush_status, &mut status).unwrap();
-            assert_eq!(status[0], VIRTIO_BLK_S_OK);
-            harness.device.stop_queue(0).await;
-            assert_eq!(probe.read_ops.load(Ordering::SeqCst), 1);
-            assert_eq!(
-                probe.write_ops.load(Ordering::SeqCst),
-                usize::from(!read_only)
-            );
         }
     }
 }
@@ -1250,14 +1060,20 @@ impl DiskIo for TestDisk4K {
 }
 
 #[async_test]
-async fn copy_only_aligned_io_uses_owned_buffers(driver: DefaultDriver) {
-    let probe = Arc::new(IoProbe::default());
+async fn copy_only_aligned_io_reaches_backend_without_staging(driver: DefaultDriver) {
+    let probe = Arc::new(IoProbe {
+        copy_only: true,
+        ..Default::default()
+    });
     let disk = Disk::new(TestDisk4K::new(64 * 1024, 512).with_io_probe(probe.clone())).unwrap();
     let mut harness = TestHarness::new(&driver, disk, false);
-    harness.device = harness.device.with_bounce_io();
-    probe.guest_base.store(
-        harness.mem.full_mapping().unwrap().0 as usize,
-        Ordering::SeqCst,
+    harness.mem = harness.mem.copy_only_view();
+    assert!(harness.device.supports_save_restore());
+    assert_eq!(harness.device.config.size_max, 0);
+    assert_eq!(harness.device.config.seg_max, crate::DEFAULT_SEG_MAX);
+    assert_eq!(
+        harness.device.traits().device_features.bank(0) & VIRTIO_BLK_F_SIZE_MAX,
+        0
     );
     harness.enable().await;
     harness.next_data_offset = DATA_BASE + guestmem::PAGE_SIZE as u64 - REQ_HEADER_SIZE as u64;
@@ -1278,174 +1094,16 @@ async fn copy_only_aligned_io_uses_owned_buffers(driver: DefaultDriver) {
 }
 
 #[async_test]
-async fn automatic_bounce_without_force_uses_owned_buffers(driver: DefaultDriver) {
-    let probe = Arc::new(IoProbe::default());
-    let disk = Disk::new(TestDisk4K::new(64 * 1024, 512).with_io_probe(probe.clone())).unwrap();
-    let mut harness = TestHarness::new(&driver, disk, false);
-    harness.device = harness.device.with_bounce_support();
-    assert!(!harness.device.bounce_io);
-    probe.guest_base.store(
-        harness.mem.full_mapping().unwrap().0 as usize,
-        Ordering::SeqCst,
-    );
-    harness.mem = harness.mem.copy_only_view();
-    assert!(!harness.mem.supports_kernel_lock());
-    let features = VirtioDeviceFeatures::new()
-        .with_device_specific_low(VIRTIO_BLK_F_SIZE_MAX | VIRTIO_BLK_F_SEG_MAX);
-    harness.try_enable_with_features(&features).await.unwrap();
-    assert!(harness.device.bounce_io);
-    assert!(!harness.device.supports_save_restore());
-    let pattern = vec![0x5a; 512];
-    harness.post_write_request(0, 0, &pattern);
-    assert_eq!(harness.wait_for_used().await.1, 1);
-    let read_gpa = harness.post_read_request(3, 0, pattern.len() as u32);
-    assert_eq!(harness.wait_for_used().await.1, 513);
-    let mut read = vec![0; pattern.len()];
-    harness.mem.read_at(read_gpa, &mut read).unwrap();
-    assert_eq!(read, pattern);
-    harness.device.stop_queue(0).await;
-    assert_eq!(probe.write_ops.load(Ordering::SeqCst), 1);
-    assert_eq!(probe.read_ops.load(Ordering::SeqCst), 1);
-}
-
-#[async_test]
-async fn automatic_bounce_rejects_unreviewed_disk_at_activation(driver: DefaultDriver) {
-    let disk = Disk::new(TestDisk4K::new(64 * 1024, 512)).unwrap();
-    let mut harness = TestHarness::new(&driver, disk, false);
-    harness.mem = harness.mem.copy_only_view();
-    assert!(!harness.device.bounce_io);
-    let error = harness.try_enable().await.unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("requires reviewed bounce disk admission")
-    );
-    assert!(!harness.device.worker.has_state());
-}
-
-#[async_test]
-async fn deferred_bounce_contract_is_advertised_before_negotiation(driver: DefaultDriver) {
-    let disk = Disk::new(TestDisk4K::new(64 * 1024, 512)).unwrap();
-    let mut harness = TestHarness::new(&driver, disk, false);
-    harness.device = harness.device.with_bounce_support();
-    let advertised = harness.device.traits().device_features;
-    let required = VIRTIO_BLK_F_SIZE_MAX | VIRTIO_BLK_F_SEG_MAX;
-    assert_eq!(advertised.bank(0) & required, required);
-    let features = VirtioDeviceFeatures::new().with_device_specific_low(required);
-    let limits = (
-        harness.device.config.size_max,
-        harness.device.config.seg_max,
-    );
-    assert!(limits.0 != 0);
-    assert!(u64::from(limits.0) * u64::from(limits.1) <= scsi_buffers::MAX_BOUNCE_IO_SIZE as u64);
-    harness.try_enable_with_features(&features).await.unwrap();
-    assert!(!harness.device.bounce_io);
-    harness.device.stop_queue(0).await;
-
-    harness.mem = harness.mem.copy_only_view();
-    let error = harness.try_enable().await.unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("requires negotiated SIZE_MAX and SEG_MAX")
-    );
-    assert!(!harness.device.bounce_io);
-    assert!(!harness.device.worker.has_state());
-    harness.try_enable_with_features(&features).await.unwrap();
-    assert!(harness.device.bounce_io);
-    assert_eq!(
-        (
-            harness.device.config.size_max,
-            harness.device.config.seg_max
-        ),
-        limits
-    );
-    assert_eq!(
-        harness.device.traits().device_features.bank(0),
-        advertised.bank(0)
-    );
-    harness.device.stop_queue(0).await;
-}
-
-#[async_test]
-async fn known_direct_contract_rejects_late_kernel_denial_without_changing_limits(
-    driver: DefaultDriver,
-) {
-    let disk = Disk::new(TestDisk4K::new(64 * 1024, 512)).unwrap();
-    let mut harness = TestHarness::new(&driver, disk, false);
-    let features = harness.device.traits().device_features;
-    assert_eq!(features.bank(0) & VIRTIO_BLK_F_SIZE_MAX, 0);
-    let limits = (
-        harness.device.config.size_max,
-        harness.device.config.seg_max,
-    );
-    assert_eq!(limits, (0, crate::DEFAULT_SEG_MAX));
-    harness.try_enable_with_features(&features).await.unwrap();
-    harness.device.stop_queue(0).await;
-    harness.mem = harness.mem.copy_only_view();
-    let error = harness
-        .try_enable_with_features(&features)
-        .await
-        .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("requires reviewed bounce disk admission")
-    );
-    assert!(!harness.device.worker.has_state());
-    assert!(!harness.device.bounce_io);
-    assert_eq!(
-        (
-            harness.device.config.size_max,
-            harness.device.config.seg_max
-        ),
-        limits
-    );
-    assert_eq!(
-        harness.device.traits().device_features.bank(0),
-        features.bank(0)
-    );
-}
-
-#[async_test]
-async fn copy_only_write_snapshot_survives_delayed_backend(driver: DefaultDriver) {
-    let probe = Arc::new(IoProbe::default());
+async fn copy_only_read_waits_for_backend_before_completion(driver: DefaultDriver) {
+    let probe = Arc::new(IoProbe {
+        copy_only: true,
+        ..Default::default()
+    });
     let (release, gate) = mesh::oneshot();
     *probe.gate.lock() = Some(gate);
     let disk = Disk::new(TestDisk4K::new(64 * 1024, 512).with_io_probe(probe.clone())).unwrap();
     let mut harness = TestHarness::new(&driver, disk, false);
-    harness.device = harness.device.with_bounce_io();
-    probe.guest_base.store(
-        harness.mem.full_mapping().unwrap().0 as usize,
-        Ordering::SeqCst,
-    );
-    harness.enable().await;
-    let pattern = vec![0x37; 512];
-    let data_gpa = harness.post_write_request(0, 0, &pattern);
-    probe.wait_entered(&driver).await;
-    harness.mem.write_at(data_gpa, &[0xe1; 512]).unwrap();
-    release.send(());
-    harness.wait_for_used().await;
-    let read_gpa = harness.post_read_request(3, 0, 512);
-    harness.wait_for_used().await;
-    let mut actual = [0; 512];
-    harness.mem.read_at(read_gpa, &mut actual).unwrap();
-    assert_eq!(actual.as_slice(), pattern);
-    harness.device.stop_queue(0).await;
-}
-
-#[async_test]
-async fn copy_only_read_waits_for_backend_before_copyback(driver: DefaultDriver) {
-    let probe = Arc::new(IoProbe::default());
-    let (release, gate) = mesh::oneshot();
-    *probe.gate.lock() = Some(gate);
-    let disk = Disk::new(TestDisk4K::new(64 * 1024, 512).with_io_probe(probe.clone())).unwrap();
-    let mut harness = TestHarness::new(&driver, disk, false);
-    harness.device = harness.device.with_bounce_io();
-    probe.guest_base.store(
-        harness.mem.full_mapping().unwrap().0 as usize,
-        Ordering::SeqCst,
-    );
+    harness.mem = harness.mem.copy_only_view();
     harness.enable().await;
     let data_gpa = harness.post_read_request(0, 0, 512);
     harness.mem.write_at(data_gpa, &[0x9d; 512]).unwrap();
@@ -1465,13 +1123,104 @@ async fn copy_only_read_waits_for_backend_before_copyback(driver: DefaultDriver)
 }
 
 #[async_test]
+async fn copy_only_ram_backend_copies_payload(driver: DefaultDriver) {
+    let disk = ram_disk(64 * 1024, false);
+    let mut harness = TestHarness::new(&driver, disk, false);
+    harness.mem = harness.mem.copy_only_view();
+    harness.enable().await;
+    let pattern = [0x67; 4096];
+    let write_gpa = harness.post_write_request(0, 8, &pattern);
+    assert_eq!(harness.wait_for_used().await.1, 1);
+    assert_eq!(
+        harness.read_status(write_gpa + pattern.len() as u64),
+        VIRTIO_BLK_S_OK
+    );
+    let read_gpa = harness.post_read_request(3, 8, pattern.len() as u32);
+    assert_eq!(harness.wait_for_used().await.1, pattern.len() as u32 + 1);
+    assert_eq!(
+        harness.read_status(read_gpa + pattern.len() as u64),
+        VIRTIO_BLK_S_OK
+    );
+    let mut actual = [0; 4096];
+    harness.mem.read_at(read_gpa, &mut actual).unwrap();
+    assert_eq!(actual, pattern);
+    harness.device.stop_queue(0).await;
+}
+
+#[async_test]
+async fn copy_only_aligned_request_above_one_mib_reaches_backend(driver: DefaultDriver) {
+    const DATA_SIZE: u32 = 2 * 1024 * 1024;
+    const DATA_ADDR: u64 = 0x20000;
+    let probe = Arc::new(IoProbe {
+        copy_only: true,
+        ..Default::default()
+    });
+    let disk =
+        Disk::new(TestDisk4K::new(4 * 1024 * 1024, 512).with_io_probe(probe.clone())).unwrap();
+    let mut harness = TestHarness::new(&driver, disk, false);
+    harness.mem = GuestMemory::allocate(4 * 1024 * 1024).copy_only_view();
+    init_avail_ring(&harness.mem, AVAIL_ADDR);
+    init_used_ring(&harness.mem, USED_ADDR);
+    harness.enable().await;
+    let header = VirtioBlkReqHeader {
+        request_type: VIRTIO_BLK_T_IN,
+        reserved: 0,
+        sector: 0,
+    };
+    harness.mem.write_at(DATA_BASE, header.as_bytes()).unwrap();
+    write_descriptor(
+        &harness.mem,
+        DESC_ADDR,
+        0,
+        DATA_BASE,
+        REQ_HEADER_SIZE,
+        DescriptorFlags::new().with_next(true),
+        1,
+    );
+    write_descriptor(
+        &harness.mem,
+        DESC_ADDR,
+        1,
+        DATA_ADDR,
+        DATA_SIZE + 1,
+        DescriptorFlags::new().with_write(true),
+        0,
+    );
+    harness
+        .mem
+        .fill_at(DATA_ADDR, 0x55, DATA_SIZE as usize)
+        .unwrap();
+    make_available(
+        &harness.mem,
+        AVAIL_ADDR,
+        QUEUE_SIZE,
+        0,
+        &mut harness.avail_idx,
+    );
+    harness.queue_event.signal();
+    assert_eq!(harness.wait_for_used().await.1, DATA_SIZE + 1);
+    assert_eq!(
+        harness.read_status(DATA_ADDR + u64::from(DATA_SIZE)),
+        VIRTIO_BLK_S_OK
+    );
+    let mut actual = vec![0xff; DATA_SIZE as usize];
+    harness.mem.read_at(DATA_ADDR, &mut actual).unwrap();
+    assert!(actual.iter().all(|&byte| byte == 0));
+    assert_eq!(probe.read_ops.load(Ordering::SeqCst), 1);
+    harness.device.stop_queue(0).await;
+}
+
+#[async_test]
 async fn backend_error_completes_and_allows_further_io(driver: DefaultDriver) {
-    for force_bounce in [false, true] {
-        let probe = Arc::new(IoProbe::default());
+    for copy_only in [false, true] {
+        let probe = Arc::new(IoProbe {
+            copy_only,
+            ..Default::default()
+        });
         let disk = Disk::new(TestDisk4K::new(64 * 1024, 512).with_io_probe(probe.clone())).unwrap();
         let mut harness = TestHarness::new(&driver, disk, false);
-        if force_bounce {
-            harness.device = harness.device.with_bounce_io();
+        if copy_only {
+            harness.mem = harness.mem.copy_only_view();
         }
         harness.enable().await;
         let data = harness.post_read_request(0, 128, 512);
@@ -1487,14 +1236,17 @@ async fn backend_error_completes_and_allows_further_io(driver: DefaultDriver) {
 
 #[async_test]
 async fn stop_drains_inflight_io_after_status_write_failure(driver: DefaultDriver) {
-    for force_bounce in [false, true] {
-        let probe = Arc::new(IoProbe::default());
+    for copy_only in [false, true] {
+        let probe = Arc::new(IoProbe {
+            copy_only,
+            ..Default::default()
+        });
         let (release, gate) = mesh::oneshot();
         *probe.gate.lock() = Some(gate);
         let disk = Disk::new(TestDisk4K::new(64 * 1024, 512).with_io_probe(probe.clone())).unwrap();
         let mut harness = TestHarness::new(&driver, disk, false);
-        if force_bounce {
-            harness.device = harness.device.with_bounce_io();
+        if copy_only {
+            harness.mem = harness.mem.copy_only_view();
         }
         harness.enable().await;
         harness.post_read_request(0, 0, 512);
@@ -1526,25 +1278,20 @@ async fn stop_drains_inflight_io_after_status_write_failure(driver: DefaultDrive
 }
 
 #[async_test]
-async fn owned_io_survives_pause_resume(driver: DefaultDriver) {
-    for force_bounce in [false, true] {
-        let probe = Arc::new(IoProbe::default());
+async fn io_survives_pause_resume(driver: DefaultDriver) {
+    for copy_only in [false, true] {
+        let probe = Arc::new(IoProbe {
+            copy_only,
+            ..Default::default()
+        });
         let disk = Disk::new(TestDisk4K::new(64 * 1024, 512).with_io_probe(probe.clone())).unwrap();
         let mut harness = TestHarness::new(&driver, disk, false);
-        probe.guest_base.store(
-            harness.mem.full_mapping().unwrap().0 as usize,
-            Ordering::SeqCst,
-        );
-        if force_bounce {
-            harness.device = harness.device.with_bounce_io();
-        } else {
-            harness.device = harness.device.with_bounce_support();
+        if copy_only {
             harness.mem = harness.mem.copy_only_view();
         }
-        let features = VirtioDeviceFeatures::new()
-            .with_device_specific_low(VIRTIO_BLK_F_SIZE_MAX | VIRTIO_BLK_F_SEG_MAX);
+        let features = VirtioDeviceFeatures::new();
         harness.try_enable_with_features(&features).await.unwrap();
-        assert!(!harness.device.supports_save_restore());
+        assert!(harness.device.supports_save_restore());
         let pattern = [0x5a; 512];
         harness.post_write_request(0, 7, &pattern);
         assert_eq!(harness.wait_for_used().await.1, 1);
@@ -1566,7 +1313,7 @@ async fn owned_io_survives_pause_resume(driver: DefaultDriver) {
         let mut data = [0; 512];
         harness.mem.read_at(data_gpa, &mut data).unwrap();
         assert_eq!(data, pattern);
-        assert!(!harness.device.supports_save_restore());
+        assert!(harness.device.supports_save_restore());
         let state = harness.device.stop_queue(0).await.unwrap();
         assert_eq!(
             state,
@@ -1581,57 +1328,7 @@ async fn owned_io_survives_pause_resume(driver: DefaultDriver) {
 }
 
 #[async_test]
-async fn copy_only_oversize_rejected_before_backend(driver: DefaultDriver) {
-    let probe = Arc::new(IoProbe::default());
-    let disk = Disk::new(TestDisk4K::new(64 * 1024, 512).with_io_probe(probe.clone())).unwrap();
-    let mut harness = TestHarness::new(&driver, disk, false);
-    harness.device = harness.device.with_bounce_io();
-    harness.enable().await;
-    let status_gpa = harness.post_raw_request(0, VIRTIO_BLK_T_OUT, 0);
-    write_descriptor(
-        &harness.mem,
-        DESC_ADDR,
-        0,
-        DATA_BASE,
-        scsi_buffers::MAX_BOUNCE_IO_SIZE as u32 + REQ_HEADER_SIZE + 512,
-        DescriptorFlags::new().with_next(true),
-        1,
-    );
-    assert_eq!(harness.wait_for_used().await.1, 1);
-    let mut status = [0];
-    harness.mem.read_at(status_gpa, &mut status).unwrap();
-    assert_eq!(status[0], VIRTIO_BLK_S_IOERR);
-    assert_eq!(probe.write_ops.load(Ordering::SeqCst), 0);
-    harness.device.stop_queue(0).await;
-}
-
-#[async_test]
-async fn copy_only_advertises_compatible_limits(driver: DefaultDriver) {
-    let disk = ram_disk(64 * 1024, false);
-    let mut harness = TestHarness::new(&driver, disk, false);
-    assert!(harness.device.supports_save_restore());
-    assert_eq!(harness.device.config.size_max, 0);
-    harness.device = harness.device.with_bounce_io();
-    assert_ne!(
-        harness
-            .device
-            .traits()
-            .device_features
-            .device_specific_low()
-            & VIRTIO_BLK_F_SIZE_MAX,
-        0,
-    );
-    assert_eq!(harness.device.config.size_max, guestmem::PAGE_SIZE as u32);
-    assert_eq!(harness.device.config.seg_max, crate::DEFAULT_SEG_MAX);
-    assert!(
-        harness.device.config.size_max as usize * harness.device.config.seg_max as usize
-            <= scsi_buffers::MAX_BOUNCE_IO_SIZE
-    );
-    assert!(!harness.device.supports_save_restore());
-}
-
-#[async_test]
-async fn legacy_scattered_request_above_bounce_limit_still_succeeds(driver: DefaultDriver) {
+async fn large_scattered_request_still_succeeds(driver: DefaultDriver) {
     let probe = Arc::new(IoProbe::default());
     let disk =
         Disk::new(TestDisk4K::new(4 * 1024 * 1024, 512).with_io_probe(probe.clone())).unwrap();
@@ -1917,6 +1614,16 @@ async fn discard_512b_sector_any_count_succeeds(driver: DefaultDriver) {
 
 // --- Bounce buffer integration tests ---
 
+#[async_test]
+async fn bounce_buffer_write_read_roundtrip(driver: DefaultDriver) {
+    scattered_write_read_roundtrip(driver, false).await;
+}
+
+#[async_test]
+async fn copy_only_scattered_io_uses_gathering_fallback(driver: DefaultDriver) {
+    scattered_write_read_roundtrip(driver, true).await;
+}
+
 /// Write and read using a descriptor chain that forces the bounce buffer
 /// fallback, then verify the data survives the roundtrip.
 ///
@@ -1928,10 +1635,12 @@ async fn discard_512b_sector_any_count_succeeds(driver: DefaultDriver) {
 /// by a gap and sit at non-page-aligned offsets, making PagedRange
 /// construction impossible. The device must fall back to copying through
 /// the bounce buffer for both write and read.
-#[async_test]
-async fn bounce_buffer_write_read_roundtrip(driver: DefaultDriver) {
+async fn scattered_write_read_roundtrip(driver: DefaultDriver, copy_only: bool) {
     let disk = ram_disk(64 * 1024, false);
     let mut harness = TestHarness::new(&driver, disk, false);
+    if copy_only {
+        harness.mem = harness.mem.copy_only_view();
+    }
     harness.enable().await;
 
     let frag_size: u32 = 256;

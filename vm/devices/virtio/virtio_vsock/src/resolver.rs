@@ -34,11 +34,6 @@ impl ResolveResource<VirtioDeviceHandle, VirtioVsockHandle> for VirtioVsockResol
             resource.base_path.into(),
             resource.listener,
         )?;
-        let device = if input.bounce_io(resource.bounce_io) {
-            device.with_bounce_io()
-        } else {
-            device
-        };
         Ok(device.into())
     }
 }

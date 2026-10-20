@@ -121,6 +121,7 @@ pub struct NumaNodeCli {
     /// Memory configuration (size, shared, prefetch, hugepages, etc.).
     #[kv(flatten)]
     pub memory: MemoryCli,
+
     /// Host NUMA node to bind memory allocation to.
     pub host_numa_node: Option<u32>,
     /// Explicit VP indices for this node.
@@ -149,6 +150,15 @@ pub struct NumaDistanceCli {
     long_version = openvmm_build_info::get().long_version(),
 )]
 pub struct Options {
+    /// Force guest-memory copies instead of exporting guest pages for I/O.
+    ///
+    /// Unsupported direct-access operations fail during resolution or use.
+    /// VMBus rings and synthetic-page loans may be unavailable. Host-owned
+    /// I/O buffers remain kernel-accessible. MSHV SNP requires this policy
+    /// automatically, without this option.
+    #[clap(long)]
+    pub force_guest_memory_bounce: bool,
+
     /// processor count
     #[clap(short = 'p', long, value_name = "COUNT", default_value = "1")]
     pub processors: u32,
@@ -617,7 +627,7 @@ options:
     ///   --net consomme:hostfwd=tcp:127.0.0.1:8080-:80
     ///   --net consomme:hostfwd=tcp:\[::1\]:8080-:80
     ///   --net consomme:10.0.0.0/24,hostfwd=tcp::22-:22,hostfwd=udp::5000-:5000
-    #[clap(long, value_parser = parse_non_bounce_nic)]
+    #[clap(long)]
     pub net: Vec<NicConfigCli>,
 
     /// expose a virtual NIC using the Windows kernel-mode vmswitch.
@@ -857,12 +867,6 @@ The openhcl personality requires explicit --hv --vtl2."#
     #[clap(long, value_name = "PATH")]
     pub virtio_vsock_path: Option<String>,
 
-    /// force owned in-process vsock staging (requires --virtio-vsock-path)
-    /// Kernel-denied guest memory uses owned staging automatically.
-    #[clap(long, requires = "virtio_vsock_path")]
-    #[cfg_attr(target_os = "linux", clap(conflicts_with = "virtio_vsock_vhost_cid"))]
-    pub virtio_vsock_bounce: bool,
-
     /// expose the guest in the host AF_VSOCK namespace using the Linux
     /// vhost_vsock kernel backend
     #[cfg(target_os = "linux")]
@@ -1036,7 +1040,7 @@ flags:
     ///
     /// Prefix with `pcie_port=<port_name>:` to expose the nic over emulated PCIe
     /// at the specified port.
-    #[clap(long, value_parser = parse_non_bounce_nic)]
+    #[clap(long)]
     pub mana: Vec<NicConfigCli>,
 
     /// use a specific hypervisor interface, with optional backend-specific
@@ -1439,34 +1443,6 @@ impl Options {
         })
     }
 
-    /// Reject bounce mode outside supported per-device options.
-    pub fn validate_bounce_options(&self) -> anyhow::Result<()> {
-        for disk in self.disk.iter().chain(&self.nvme) {
-            disk.validate_bounce_scope(false)?;
-        }
-        for disk in &self.virtio_blk {
-            disk.validate_bounce_scope(true)?;
-        }
-        for nic in self.net.iter().chain(&self.mana) {
-            if nic.bounce_io {
-                anyhow::bail!("`bounce:` is only supported with --virtio-net");
-            }
-        }
-        for nic in &self.virtio_net {
-            nic.validate_bounce_io().map_err(anyhow::Error::msg)?;
-        }
-        if self.virtio_vsock_bounce {
-            if self.virtio_vsock_path.is_none() {
-                anyhow::bail!("--virtio-vsock-bounce requires --virtio-vsock-path");
-            }
-            #[cfg(target_os = "linux")]
-            if self.virtio_vsock_vhost_cid.is_some() {
-                anyhow::bail!("--virtio-vsock-bounce does not support kernel vhost-vsock");
-            }
-        }
-        Ok(())
-    }
-
     /// Returns the structured UEFI configuration with deprecated options merged in.
     pub fn effective_uefi(&self) -> anyhow::Result<Option<UefiCli>> {
         let mut uefi = match &self.uefi {
@@ -1627,7 +1603,7 @@ impl Options {
             );
         }
         for nic in &self.virtio_net {
-            nic.validate_bounce_backend()
+            nic.validate_copy_only_backend()
                 .map_err(anyhow::Error::msg)
                 .context("MSHV SNP requires a bounce-capable virtio-net backend")?;
         }
@@ -1695,7 +1671,6 @@ impl Options {
     pub fn validate_vm_options(&self) -> anyhow::Result<bool> {
         let snp_bounce = self.validate_isolation_options()?;
         self.validate_igvm_options()?;
-        self.validate_bounce_options()?;
         Ok(snp_bounce)
     }
 
@@ -2636,7 +2611,6 @@ pub struct DiskCli {
     pub nsid: Option<u32>,
     pub lun: Option<u8>,
     pub relay: Option<(String, Option<u32>)>,
-    pub bounce_io: bool,
 }
 
 #[derive(Copy, Clone)]
@@ -2678,8 +2652,6 @@ struct DiskArgs {
     #[kv(flag)]
     ro: bool,
     #[kv(flag)]
-    bounce: bool,
-    #[kv(flag)]
     dvd: bool,
     #[kv(flag, key = "vtl2", present = DeviceVtl::Vtl2, absent = DeviceVtl::Vtl0)]
     vtl: DeviceVtl,
@@ -2717,22 +2689,6 @@ impl FromStr for DiskCli {
         let nsid = args.nsid;
         let lun = args.lun;
         let relay = args.relay.map(|r| (r.name, r.location));
-
-        if args.bounce {
-            if underhill.is_some()
-                || vtl != DeviceVtl::Vtl0
-                || is_dvd
-                || controller.is_some()
-                || relay.is_some()
-            {
-                anyhow::bail!(
-                    "`bounce` is incompatible with relay, named controllers, vtl2, and dvd"
-                );
-            }
-            if !matches!(args.kind, DiskCliKind::File { .. } | DiskCliKind::Memory(_)) {
-                anyhow::bail!("`bounce` only supports plain regular-file and RAM disks");
-            }
-        }
 
         if serial.as_ref().is_some_and(|serial| {
             serial.bytes().any(|byte| {
@@ -2796,18 +2752,7 @@ impl FromStr for DiskCli {
             nsid,
             lun,
             relay,
-            bounce_io: args.bounce,
         })
-    }
-}
-
-impl DiskCli {
-    /// Check the argument scope after parsing the shared disk syntax.
-    pub fn validate_bounce_scope(&self, virtio_blk: bool) -> anyhow::Result<()> {
-        if self.bounce_io && !virtio_blk {
-            anyhow::bail!("`bounce` is only supported by `--virtio-blk`");
-        }
-        Ok(())
     }
 }
 
@@ -3282,33 +3227,17 @@ pub struct NicConfigCli {
     pub max_queues: Option<u16>,
     pub underhill: bool,
     pub pcie_port: Option<String>,
-    pub bounce_io: bool,
-}
-
-fn parse_non_bounce_nic(s: &str) -> Result<NicConfigCli, String> {
-    let config: NicConfigCli = s.parse()?;
-    if config.bounce_io {
-        return Err("`bounce:` is only supported with --virtio-net".into());
-    }
-    Ok(config)
 }
 
 impl NicConfigCli {
-    pub fn validate_bounce_io(&self) -> Result<(), String> {
-        if !self.bounce_io {
-            return Ok(());
-        }
-        self.validate_bounce_backend()
-    }
-
-    fn validate_bounce_backend(&self) -> Result<(), String> {
+    fn validate_copy_only_backend(&self) -> Result<(), String> {
         if self.underhill || self.vtl != DeviceVtl::Vtl0 {
-            return Err("`bounce:` is incompatible with `uh` and `vtl2`".into());
+            return Err("copy-only networking requires a VTL0 software endpoint".into());
         }
         match self.endpoint {
             EndpointConfigCli::Consomme { .. } | EndpointConfigCli::None => Ok(()),
             EndpointConfigCli::Tap { .. } if cfg!(target_os = "linux") => Ok(()),
-            _ => Err("`bounce:` requires consomme, Linux tap, or none".into()),
+            _ => Err("copy-only networking requires consomme, Linux tap, or none".into()),
         }
     }
 }
@@ -3321,7 +3250,6 @@ impl FromStr for NicConfigCli {
         let mut max_queues = None;
         let mut underhill = false;
         let mut pcie_port = None;
-        let mut bounce_io = false;
         while let Some((opt, rest)) = s.split_once(':') {
             if let Some((opt, val)) = opt.split_once('=') {
                 match opt {
@@ -3342,7 +3270,6 @@ impl FromStr for NicConfigCli {
                         vtl = DeviceVtl::Vtl2;
                     }
                     "uh" => underhill = true,
-                    "bounce" => bounce_io = true,
                     _ => break,
                 }
             }
@@ -3358,16 +3285,13 @@ impl FromStr for NicConfigCli {
         }
 
         let endpoint = s.parse()?;
-        let config = NicConfigCli {
+        Ok(NicConfigCli {
             vtl,
             endpoint,
             max_queues,
             underhill,
             pcie_port,
-            bounce_io,
-        };
-        config.validate_bounce_io()?;
-        Ok(config)
+        })
     }
 }
 
@@ -4165,57 +4089,28 @@ mod tests {
     use test_with_tracing::test;
 
     #[test]
-    fn test_disk_cli_bounce() {
-        assert!(!"mem:1M".parse::<DiskCli>().unwrap().bounce_io);
-        let disk: DiskCli = "file:disk.raw,pcie_port=rp0,ro,serial=DATA,bounce"
-            .parse()
-            .unwrap();
-        assert!(disk.bounce_io);
-        assert!(disk.read_only);
-        assert_eq!(disk.pcie_port.as_deref(), Some("rp0"));
-        assert_eq!(disk.serial.as_deref(), Some("DATA"));
+    fn force_guest_memory_bounce_is_vm_wide_and_defaults_off() {
+        assert!(
+            !Options::try_parse_from(["openvmm"])
+                .unwrap()
+                .force_guest_memory_bounce
+        );
+        assert!(
+            Options::try_parse_from(["openvmm", "--force-guest-memory-bounce"])
+                .unwrap()
+                .force_guest_memory_bounce
+        );
     }
 
     #[test]
-    fn test_disk_cli_bounce_rejects_incompatible_contexts() {
-        for disk in [
-            "mem:1M,bounce,dvd",
-            "mem:1M,bounce,vtl2",
-            "mem:1M,bounce,uh",
-            "mem:1M,bounce,uh-nvme",
-            "mem:1M,bounce,on=controller",
-            "mem:1M,bounce,on=controller,relay=openhcl",
-            "memdiff:mem:1M,bounce",
-            "prwrap:mem:1M,bounce",
-            "mem:1M,bounce=true",
+    fn per_device_bounce_options_are_not_accepted() {
+        for args in [
+            vec!["openvmm", "--virtio-blk", "mem:1M,bounce"],
+            vec!["openvmm", "--virtio-net", "bounce:consomme"],
+            vec!["openvmm", "--virtio-vsock-bounce"],
         ] {
-            assert!(disk.parse::<DiskCli>().is_err(), "{disk}");
+            assert!(Options::try_parse_from(args).is_err());
         }
-    }
-
-    #[test]
-    fn test_bounce_options_reject_other_disk_flags() {
-        for flag in ["--disk", "--nvme"] {
-            let opt = Options::try_parse_from(["openvmm", flag, "mem:1M,bounce"]).unwrap();
-            assert_eq!(
-                opt.validate_bounce_options().unwrap_err().to_string(),
-                "`bounce` is only supported by `--virtio-blk`"
-            );
-        }
-        let opt = Options::try_parse_from([
-            "openvmm",
-            "--virtio-blk",
-            "mem:1M,bounce",
-            "--virtio-blk",
-            "mem:1M",
-            "--disk",
-            "mem:1M",
-        ])
-        .unwrap();
-        opt.validate_bounce_options().unwrap();
-        assert!(opt.virtio_blk[0].bounce_io);
-        assert!(!opt.virtio_blk[1].bounce_io);
-        assert!(!opt.disk[0].bounce_io);
     }
 
     /// `--version` reports the resolved build identity rather than clap's
@@ -4803,7 +4698,6 @@ mod tests {
         let config = NicConfigCli::from_str("none").unwrap();
         assert_eq!(config.vtl, DeviceVtl::Vtl0);
         assert!(config.max_queues.is_none());
-        assert!(!config.bounce_io);
         assert!(!config.underhill);
         assert!(config.pcie_port.is_none());
         assert!(matches!(config.endpoint, EndpointConfigCli::None));
@@ -4840,84 +4734,6 @@ mod tests {
         assert!(NicConfigCli::from_str("pcie_port:none").is_err());
     }
 
-    #[test]
-    fn test_nic_bounce_prefix_order_and_options() {
-        for value in [
-            "bounce:pcie_port=rp0:queues=4:consomme:10.0.0.0/24,hostfwd=tcp:127.0.0.1:8080-:80",
-            "queues=4:pcie_port=rp0:bounce:consomme:10.0.0.0/24,hostfwd=tcp:127.0.0.1:8080-:80",
-        ] {
-            let config: NicConfigCli = value.parse().unwrap();
-            assert!(config.bounce_io);
-            assert_eq!(config.pcie_port.as_deref(), Some("rp0"));
-            assert_eq!(config.max_queues, Some(4));
-            assert_eq!(
-                config.endpoint,
-                EndpointConfigCli::Consomme {
-                    cidr: Some("10.0.0.0/24".into()),
-                    host_fwd: vec![HostPortConfigCli {
-                        protocol: HostPortProtocolCli::Tcp,
-                        host_address: Some("127.0.0.1".parse().unwrap()),
-                        host_port: 8080,
-                        guest_port: 80,
-                    }],
-                }
-            );
-        }
-        assert!(NicConfigCli::from_str("bounce:none").unwrap().bounce_io);
-        assert_eq!(
-            NicConfigCli::from_str("bounce:tap:tap0").is_ok(),
-            cfg!(target_os = "linux")
-        );
-        for value in [
-            "bounce:uh:consomme",
-            "uh:bounce:consomme",
-            "bounce:vtl2:none",
-            "vtl2:bounce:none",
-            "bounce:dio",
-            "bounce:vmnic",
-            "bounce:vhost-user:path/to/net.sock",
-        ] {
-            assert!(NicConfigCli::from_str(value).is_err(), "{value}");
-        }
-    }
-
-    #[test]
-    fn test_nic_bounce_cli_scope() {
-        for flag in ["--net", "--mana"] {
-            assert!(
-                Options::try_parse_from(["openvmm", flag, "bounce:consomme"]).is_err(),
-                "{flag}"
-            );
-            let mut opt = Options::try_parse_from(["openvmm", flag, "consomme"]).unwrap();
-            if flag == "--net" {
-                opt.net[0].bounce_io = true;
-            } else {
-                opt.mana[0].bounce_io = true;
-            }
-            assert!(opt.validate_bounce_options().is_err());
-        }
-        let mut opt = Options::try_parse_from([
-            "openvmm",
-            "--virtio-net",
-            "bounce:consomme",
-            "--virtio-net",
-            "consomme",
-            "--net",
-            "consomme",
-            "--mana",
-            "none",
-        ])
-        .unwrap();
-        opt.validate_bounce_options().unwrap();
-        assert!(opt.virtio_net[0].bounce_io);
-        assert!(!opt.virtio_net[1].bounce_io);
-        assert!(!opt.net[0].bounce_io);
-        assert!(!opt.mana[0].bounce_io);
-        opt.virtio_net[0].vtl = DeviceVtl::Vtl2;
-        assert!(opt.validate_bounce_options().is_err());
-        assert!(Options::try_parse_from(["openvmm", "--bounce"]).is_err());
-    }
-
     #[cfg(unix)]
     #[test]
     fn test_vhost_user_rejects_bounce() {
@@ -4926,48 +4742,6 @@ mod tests {
             "path/to/net.sock,device_id=1,queue_sizes=[256],bounce",
         ] {
             assert!(Options::try_parse_from(["openvmm", "--vhost-user", value]).is_err());
-        }
-    }
-
-    #[test]
-    fn test_virtio_vsock_bounce_cli() {
-        let opt = Options::try_parse_from(["openvmm"]).unwrap();
-        assert!(!opt.virtio_vsock_bounce);
-        assert!(Options::try_parse_from(["openvmm", "--virtio-vsock-bounce"]).is_err());
-        for bus in ["mmio", "pci", "pcie", "pcie:custom"] {
-            let opt = Options::try_parse_from([
-                "openvmm",
-                "--virtio-vsock-path",
-                "path/to/vsock",
-                "--virtio-vsock-bounce",
-                "--virtio-vsock-bus",
-                bus,
-            ])
-            .unwrap();
-            assert!(opt.virtio_vsock_bounce);
-            assert_eq!(opt.virtio_vsock_path.as_deref(), Some("path/to/vsock"));
-            opt.validate_bounce_options().unwrap();
-        }
-        #[cfg(target_os = "linux")]
-        {
-            assert!(
-                Options::try_parse_from([
-                    "openvmm",
-                    "--virtio-vsock-vhost-cid",
-                    "3",
-                    "--virtio-vsock-bounce",
-                ])
-                .is_err()
-            );
-            let mut opt = Options::try_parse_from([
-                "openvmm",
-                "--virtio-vsock-path",
-                "path/to/vsock",
-                "--virtio-vsock-bounce",
-            ])
-            .unwrap();
-            opt.virtio_vsock_vhost_cid = Some(3);
-            assert!(opt.validate_bounce_options().is_err());
         }
     }
 
@@ -6210,16 +5984,15 @@ mod tests {
             "--memory",
             "thp=off",
             "--virtio-blk",
-            "mem:1M,bounce",
+            "mem:1M",
             "--virtio-blk",
-            "file:path/to/disk.raw,bounce",
+            "file:path/to/disk.raw",
             "--virtio-net",
-            "bounce:consomme",
+            "consomme",
             "--virtio-net",
-            "bounce:none",
+            "none",
             "--virtio-vsock-path",
             "path/to/vsock",
-            "--virtio-vsock-bounce",
             "--com1",
             "console",
             "--hv",
@@ -6232,7 +6005,6 @@ mod tests {
     #[test]
     fn test_snp_bounce_rejects_other_devices() {
         let devices = vec![
-            vec!["--virtio-blk", "file:path/to/disk.raw;direct,bounce"],
             vec!["--virtio-blk", "file:path/to/disk.raw;direct"],
             vec!["--virtio-net", "vtl2:none"],
             vec!["--virtio-net", "uh:none"],
