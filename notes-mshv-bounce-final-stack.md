@@ -120,3 +120,68 @@ Coverage must include:
 Keep the existing exact-transfer, vsock partial-write, guest-input safety,
 and CopyOnly DMA protections. New coverage and later squash work are separate
 from the rebase.
+
+## Latest-main rebase
+
+The current bounce stack was copied onto upstream `main`, change ID
+`yywkuopm`, on 2026-10-21. The user approved new change IDs so the separate
+usermode-lock, lite, integration, and historical branches could remain
+unchanged. No feature commits were squashed.
+
+| Pre-rebase change ID | Rebased change ID | Role |
+| --- | --- | --- |
+| `lspwqqqu` | `ntxotomx` | Foundations |
+| `osyznnpq` | `tmtsmuvz` | Storage |
+| `ltxryxrn` | `wyqukmov` | Network/vsock |
+| `poyqlmtw` | `llulpvzx` | MSHV SNP |
+| `rwvusozw` | `lmzzsxzq` | VM-service SNP |
+| `zpowklwv` | `lskxuoru` | VM-service host block |
+| `urpzwrks` | `zlkwzyts` | Queue-policy rollback |
+| `losxqlwv` | `xlvkzsnt` | Central CopyOnly simplification |
+| `ystkqzwp` | `mrprmxzq` | FUA rollback |
+| `ymyoooky` | `ykykunst` | Comment/layout cleanup |
+| `vnrmnomr` | `slmxvmpo` | Adjacent cleanup |
+| `xtxmzryz` | `xrtkmmtr` | These saved findings |
+
+The original tested source and notes remain reachable through
+`pre-rebase-bounce-20261021` and `pre-rebase-bounce-notes-20261021`.
+The source bookmark is `mshv-bounce-simplified`; the findings have their own
+bookmark, `mshv-bounce-stack-notes`. The findings are a review artifact, not
+one of the five proposed feature commits.
+
+The only textual rebase conflict was in Petri's default virtio-vsock
+selection. The resolution keeps upstream's `isolated_without_paravisor`
+default while removing the obsolete per-device bounce flag in the later
+policy-removal commit. The final `petri/src/vm/mod.rs` matches upstream.
+
+### Upstream support now available
+
+- `vmm_tests/vmm_tests/tests/tests/x86_64/snp_linux_direct.rs:13,18`
+  registers one- and two-VP SNP boot cases through
+  `configs(snp_linux_direct_x64)`.
+- `vmm_tests/vmm_test_macros/src/lib.rs:1414` requires MSHV and an AMD host
+  for that configuration. Passing an ordinary local KVM test does not
+  establish SNP coverage.
+- `flowey/flowey_lib_hvlite/src/build_snp_linux_direct_igvm.rs:54`
+  builds the SNP test IGVM and embeds pipette in its initrd.
+- `openvmm/openvmm_core/src/worker/vm_loaders/igvm.rs:917` passes the
+  runtime PCIe host bridges into the device tree. The SNP bootshim builds
+  PCIe SSDT and MCFG tables from those bridges in
+  `vm/loader/snp_bootshim/src/acpi_tables.rs:36`.
+- `vm/loader/igvmfilegen/src/snp_linux_direct.rs:140` reserves output
+  space rather than embedding the old fixed ACPI topology. This addresses
+  the earlier PCIe-capable IGVM fixture limitation.
+- `vmm_tests/vmm_tests/tests/tests/ttrpc.rs:39` provides the existing
+  local RPC regression and reusable launch/configuration helpers.
+
+### Rebase validation
+
+- Native check, all-target Clippy, and no-dependency docs passed for the
+  selected memory, MSHV, storage, virtio, management, and Petri packages.
+- 708 package tests passed, three skipped.
+- All three existing forced-bounce VMM tests and the ordinary local ttrpc
+  interface VMM test passed. These are not new SNP/ttrpc hardware tests.
+- ARM Windows/macOS/Linux management, device, and Petri Clippy passed.
+- No SNP hardware campaign was run after this rebase. The earlier hardware
+  results above apply only to the preserved pre-rebase source.
+- Rebase evidence is under `target/rebased-main-20261021/`.
