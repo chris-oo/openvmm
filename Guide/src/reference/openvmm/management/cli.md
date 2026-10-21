@@ -123,9 +123,8 @@ describes the source definitions.
   offloading enabled. This diagnostic parameter is meaningful only with
   `--isolation snp`.
 * MSHV SNP always uses copy-only host access and owned bounce buffers.
-  There is no direct-access mode or host-access opt-in. The former
-  `snp_scoped_host_access` parameter is not accepted. Non-isolated MSHV
-  guests retain their existing device and guest-memory behavior.
+  Non-isolated MSHV guests retain their existing device and guest-memory
+  behavior.
   Base-page backing is required: pass `--memory size=<SIZE>,thp=off`.
   Transparent huge pages and explicit huge pages are not supported.
   For NUMA configurations, pass `thp=off` on every `--numa` node instead
@@ -136,9 +135,9 @@ describes the source definitions.
   Host-owned I/O buffers remain kernel-accessible. See
   [guest-memory I/O policy](#guest-memory-io-policy).
 
-  The device allowlist contains these three bounced virtio devices, serial
-  ports, and the minimal chipset. Other devices are rejected before their
-  resources are opened. This includes kernel vhost, vhost-user, assigned
+  The device allowlist contains virtio-blk, virtio-net, in-process vsock,
+  serial ports, and the minimal chipset. Other devices are rejected before
+  their resources are opened. This includes kernel vhost, vhost-user, assigned
   devices, remote PCIe devices, CXL, persistent memory, filesystem devices,
   RNG, and virtio console. With `--hv`, also pass `--no-vmbus`.
   Snapshot restore, guest memory dumps, and the debugger are not supported.
@@ -151,10 +150,9 @@ describes the source definitions.
   I/O. The API does not expose RAM disks or parse structured image files.
 
   Both usermode VA locks and kernel locks are denied. Copies use
-  fault-contained `GuestMemory` operations, without per-copy permission
-  leases or VP cancellation. A mapping fault requests read or write host
-  permission and retries the full operation. Confirmed grants remain until
-  a guest GPA-attribute conflict requires release. The selected backend and
+  fault-contained `GuestMemory` operations. A mapping fault requests read or
+  write host permission and retries the full operation. Confirmed grants remain
+  until a guest GPA-attribute conflict requires release. The selected backend and
   isolation mode fix the backing's copy-only policy before memory views exist;
   changing guest page visibility does not change that policy.
   Grant denial returns a guest-memory I/O error, not partition-wide poison.
@@ -168,23 +166,17 @@ describes the source definitions.
 
   Control-page preparation validates guest addresses but does not release
   cached grants. Normal GPA-attribute conflicts revoke those grants.
-  OpenVMM does not keep a separate control-page reservation table. The kernel
-  and hypervisor enforce their control-page and permission contracts.
+  The kernel and hypervisor enforce their control-page and permission contracts.
   GHCB replacement clears the old registration before setting the new one.
   Unregister waits for a successful clear before acknowledgement.
   Control-operation failures remain explicit; supported replacement and
-  disable operations depend on the backend. VP teardown waits for processor
-  binders and their VP file descriptors to retire, not just the dispatch loop.
-  Normal and post-construction error teardown drain running devices, join
-  owned state-unit tasks, and shut down both VMBus servers before RAM disposal.
+  disable operations depend on the backend.
   Normal teardown releases registered memory before its backing.
   Closing the partition also precedes
   release of the bootstrap VMSA's configuration-owned backing.
 
-  This mode uses existing MSHV calls. It does not add a Hyper-V ABI, kernel
-  memory-management enforcement, or large-page support. Do not treat it as
-  a completed isolation feature. Private-page handoff race tests remain an
-  acceptance requirement.
+  This mode does not provide kernel memory-management enforcement or
+  large-page support.
 * `--nested-virt`: Expose hardware virtualization (VMX/SVM) to the guest so it
   can run its own hypervisor (Hyper-V, KVM, etc.). Only supported on `x86_64`,
   and only by backends that support nested virtualization (currently WHP and
@@ -595,13 +587,12 @@ owned buffers. Linux block devices use aligned buffers for kernel I/O.
 Virtio-blk retains its existing gathering copy for descriptor chains that
 cannot form one paged range; it does not add mandatory payload staging.
 
-TAP and Consomme copy packets in their software backends without a second
-virtio-net arena. In-process vsock uses its existing temporary-buffer fallback
+TAP and Consomme copy packets in their software backends.
+In-process vsock uses its existing temporary-buffer fallback
 when guest memory cannot be locked. Kernel vhost-vsock and vhost-user require
 exportable memory and reject copy-only memory.
 
-There are no per-device `bounce`, `bounce:`, or `--virtio-vsock-bounce`
-options. Normal device limits, queue completion policy, and snapshot
+Normal device limits, queue completion policy, and snapshot
 capabilities are not changed merely by choosing copy-only memory. This does
 not add serialization for live host socket connections or make SNP snapshot
 restore supported.

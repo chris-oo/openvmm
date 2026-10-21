@@ -1437,8 +1437,7 @@ impl hv1_hypercall::StartVirtualProcessor<hvdef::hypercall::InitialVpContextX64>
                     "failed to handle SNP StartVirtualProcessor"
                 );
                 hvdef::HvError::InvalidVpState
-            })?;
-        Ok(())
+            })
     }
 }
 

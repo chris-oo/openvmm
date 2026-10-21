@@ -751,8 +751,7 @@ impl virt::Processor for MshvProcessor<'_> {
                 }
             }
 
-            let exit = self.runner.run();
-            match exit {
+            match self.runner.run() {
                 Ok(exit) => {
                     self.handle_exit(&exit, dev).await?;
                 }
@@ -1204,6 +1203,7 @@ impl MshvDoorbellEntry {
         if ret < 0 {
             return Err(io::Error::last_os_error());
         }
+
         Ok(Self {
             partition: Arc::downgrade(partition),
             event,

@@ -10,7 +10,7 @@
 //!
 //! Copy-only guest memory supports Consomme, TAP, and null software endpoints.
 //! The frontend passes guest memory directly to the backend buffer pool.
-//! Software backends copy packet data without a separate frontend arena.
+//! Software backends copy packet data.
 
 #![expect(missing_docs)]
 #![forbid(unsafe_code)]

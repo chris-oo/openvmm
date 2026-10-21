@@ -121,7 +121,6 @@ pub struct NumaNodeCli {
     /// Memory configuration (size, shared, prefetch, hugepages, etc.).
     #[kv(flatten)]
     pub memory: MemoryCli,
-
     /// Host NUMA node to bind memory allocation to.
     pub host_numa_node: Option<u32>,
     /// Explicit VP indices for this node.
@@ -570,8 +569,6 @@ valid disk kinds:
 
 flags:
     `ro`                           open disk as read-only
-    `bounce`                       force owned block staging (default: off)
-                                   only plain regular files and RAM disks; no wrappers
 
 options:
     `pcie_port=<name>`             present the disk using pcie under the specified port
@@ -884,9 +881,6 @@ The openhcl personality requires explicit --hv --vtl2."#
     /// Prefix with `uh:` to add this NIC via Mana emulation through OpenHCL,
     /// `vtl2:` to assign this NIC to VTL2, or `pcie_port=<port_name>:` to
     /// expose the NIC over emulated PCIe at the specified port.
-    /// Prefix with `bounce:` to force owned staging for this NIC only
-    /// (consomme, Linux tap, or none; VTL0 only).
-    /// Kernel-denied guest memory uses owned staging automatically.
     #[clap(long)]
     pub virtio_net: Vec<NicConfigCli>,
 

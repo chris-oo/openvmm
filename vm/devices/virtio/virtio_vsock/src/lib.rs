@@ -476,6 +476,9 @@ impl VsockWorker {
                 Ok(bytes) => bytes,
                 Err(err) => {
                     tracelimit::error_ratelimited!(%err, "failed to write vsock packet");
+
+                    // We can't recover from this. Remove the connection so any future attempts
+                    // to use it will fail.
                     state
                         .connections
                         .remove(&ConnectionKey::from_rx_packet(&packet.header));
@@ -651,7 +654,9 @@ fn lock_payload_data<'a, T: LockedRange<'a>>(
         "data length mismatch in vsock packet"
     );
     if !mem.supports_kernel_lock() {
-        // Copy-only memory and emulated IOMMUs use read_at/write_at.
+        // Memory behind an emulated IOMMU has no stable host mapping to lock,
+        // so fall back to a bounce buffer via read_at/write_at.
+        // Copy-only memory also requires this fallback.
         return Ok(None);
     }
 

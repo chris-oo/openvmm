@@ -56,7 +56,6 @@ use zerocopy::IntoBytes;
 /// byte, so the data segment limit is `DEFAULT_QUEUE_SIZE - 2`.
 const DEFAULT_SEG_MAX: u32 = virtio::DEFAULT_QUEUE_SIZE as u32 - 2;
 
-/// Limits descriptor consumption until an in-flight request finishes.
 const MAX_IO_DEPTH: usize = 64;
 
 /// The virtio-blk device.
@@ -402,11 +401,10 @@ impl VirtioDevice for VirtioBlkDevice {
         let queue_event = PolledWait::new(&self.driver, resources.event)
             .context("failed to create queue event")?;
 
-        let memory = resources.guest_memory;
         let queue = VirtioQueue::new(
             *features,
             resources.params,
-            memory.clone(),
+            resources.guest_memory.clone(),
             resources.notify,
             queue_event,
             initial_state,
@@ -416,7 +414,10 @@ impl VirtioDevice for VirtioBlkDevice {
         self.worker.insert(
             self.driver.clone(),
             "virtio-blk-worker",
-            BlkQueueState { queue, memory },
+            BlkQueueState {
+                queue,
+                memory: resources.guest_memory,
+            },
         );
         self.worker.start();
         Ok(())
@@ -664,8 +665,8 @@ fn copy_regions(
 /// for the entire data payload. If the descriptor chain's memory
 /// layout is compatible with [`PagedRange`] (all interior boundaries
 /// page-aligned or GPA-contiguous), the IO targets guest memory
-/// without frontend staging, preserving its I/O policy for the backend.
-/// Otherwise, a gathering buffer is allocated and data is copied through it.
+/// directly. Otherwise, a bounce buffer is allocated and data is
+/// copied through it.
 ///
 /// Returns `Ok((data_bytes_written_to_guest, bounced))` on success.
 async fn do_io(
@@ -719,10 +720,12 @@ async fn do_io(
             (None, OwnedPagedRange { gpns, offset, len }, false)
         } else {
             // Slow path: allocate a bounce buffer.
+            // TODO: cap data_len to a reasonable maximum (e.g. seg_max * PAGE_SIZE)
+            // to prevent a malicious guest from causing unbounded allocation.
             let data_len_usize = data_len as usize;
             let mut bounce_mem = GuestMemory::allocate(data_len_usize);
             let num_pages = data_len_usize.div_ceil(guestmem::PAGE_SIZE);
-            let gpns = (0..num_pages as u64).collect();
+            let gpns: Vec<u64> = (0..num_pages as u64).collect();
 
             if !is_read {
                 let buf = bounce_mem.inner_buf_mut().ok_or(VIRTIO_BLK_S_IOERR)?;
@@ -739,6 +742,7 @@ async fn do_io(
                 true,
             )
         };
+
     let effective_mem = io_mem.as_ref().unwrap_or(mem);
     let range =
         PagedRange::new(io_range.offset, io_range.len, &io_range.gpns).ok_or(VIRTIO_BLK_S_IOERR)?;

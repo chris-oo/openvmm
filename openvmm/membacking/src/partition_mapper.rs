@@ -1,7 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Implements the partition mapper, which maps regions into VM partitions.
+//! Implements the partition mapper, which is responsible for mapping regions
+//! into VM partitions.
 
 // UNSAFETY: Calling unsafe partition memory mapping functions.
 #![expect(unsafe_code)]
@@ -35,7 +36,7 @@ pub enum PartitionMapperError {
 impl PartitionMapper {
     /// Returns a new partition mapper.
     ///
-    /// If `pin_mappings`, call [`PartitionMemoryMap::pin_range`] on each mapped region.
+    /// If `pin_mappings`, call [`PartitionMemoryMap::pin_range`] on any region that is mapped.
     pub fn new(
         partition: &Arc<dyn PartitionMemoryMap>,
         mapper: Arc<VaMapper>,
@@ -60,38 +61,48 @@ impl PartitionMapper {
         range: MemoryRange,
         params: MapParams,
     ) -> Result<(), PartitionMapperError> {
+        // Ensure this range does not exceed the mapper's reserved VA range.
         assert!(range.end() <= self.mapper.len() as u64);
+
+        // If the partition is gone then there is nothing to do.
         let Some(partition) = self.partition.upgrade() else {
             return Ok(());
         };
+
         let addr = range.start().checked_add(self.offset).unwrap();
         let size = range.len() as usize;
         let data = self.mapper.as_ptr().wrapping_add(range.start() as usize);
+
         match self.mapper.process() {
             None => {
-                // SAFETY: The mapper retains the VA reservation for this mapping.
+                // SAFETY: Mapper will ensure the VA range is reserved (but not
+                // necessarily mapped) for its lifetime.
                 unsafe { partition.map_range(data, size, addr, params.writable, params.executable) }
             }
-            Some(process) => match process {
-                #[cfg(not(windows))]
-                _ => unreachable!(),
-                #[cfg(windows)]
-                process => {
-                    // SAFETY: The mapper retains the remote VA reservation.
-                    unsafe {
-                        partition.map_remote_range(
-                            process.as_handle(),
-                            data,
-                            size,
-                            addr,
-                            params.writable,
-                            params.executable,
-                        )
+            Some(process) => {
+                match process {
+                    #[cfg(not(windows))]
+                    _ => unreachable!(),
+                    #[cfg(windows)]
+                    process => {
+                        // SAFETY: Mapper will ensure the VA range is reserved (but not
+                        // necessarily mapped) for its lifetime.
+                        unsafe {
+                            partition.map_remote_range(
+                                process.as_handle(),
+                                data,
+                                size,
+                                addr,
+                                params.writable,
+                                params.executable,
+                            )
+                        }
                     }
                 }
-            },
+            }
         }
         .map_err(PartitionMapperError::Map)?;
+
         if params.prefetch {
             if let Err(err) = partition.prefetch_range(addr, size as u64) {
                 tracing::warn!(
@@ -102,20 +113,27 @@ impl PartitionMapper {
                 );
             }
         }
+
         if self.pin_mappings {
             if let Err(err) = partition.pin_range(addr, size as u64) {
+                // Unmap the range to ensure we stay in a consistent state.
                 partition
                     .unmap_range(addr, size as u64)
                     .expect("unmap cannot fail");
                 return Err(PartitionMapperError::Pin(err));
             }
         }
+
         Ok(())
     }
 
-    /// Unmaps complete regions contained in `range`.
+    /// Unmaps regions in `range`.
     ///
-    /// This cannot fail, but some hypervisors panic on a partial region unmap.
+    /// `range` may overlap zero, one, or many regions that were mapped with
+    /// `map_region`, but it must fully contain any regions it overlaps.
+    ///
+    /// This cannot fail, but on some hypervisors, it may panic on partial
+    /// region unmap.
     pub fn unmap_region(&mut self, range: MemoryRange) {
         if let Some(partition) = self.partition.upgrade() {
             partition
@@ -127,7 +145,8 @@ impl PartitionMapper {
 
 impl Drop for PartitionMapper {
     fn drop(&mut self) {
-        // Unmap before releasing the VA reservation.
+        // Ensure everything is unmapped from the partition since the underlying
+        // VA is going away.
         self.unmap_region(MemoryRange::new(0..self.mapper.len() as u64));
     }
 }
