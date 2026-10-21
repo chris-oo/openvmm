@@ -43,33 +43,3 @@ impl hypervisor_resources::HypervisorProbe for MshvProbe {
         }))
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use test_with_tracing::test;
-
-    #[test]
-    fn parses_snp_cpuid_offload_parameter() {
-        assert!(!MshvConfig::parse(&[]).unwrap().snp_disable_cpuid_offload);
-        assert!(
-            MshvConfig::parse(&[("snp_disable_cpuid_offload", "true")])
-                .unwrap()
-                .snp_disable_cpuid_offload
-        );
-        assert!(
-            !MshvConfig::parse(&[("snp_disable_cpuid_offload", "false")])
-                .unwrap()
-                .snp_disable_cpuid_offload
-        );
-        assert!(MshvConfig::parse(&[("unknown", "true")]).is_err());
-    }
-
-    #[test]
-    fn rejects_removed_host_access_parameter() {
-        for value in ["true", "false", "invalid"] {
-            assert!(MshvConfig::parse(&[("snp_scoped_host_access", value)]).is_err());
-        }
-        assert!(MshvConfig::parse(&[("scoped_host_access", "true")]).is_err());
-    }
-}

@@ -6,7 +6,7 @@ use std::io::Write;
 
 /// A simple, single-threaded byte ring buffer with a fixed capacity.
 pub struct RingBuffer {
-    buf: Vec<u8>,
+    buf: Box<[u8]>,
     /// Index of the first readable byte.
     head: usize,
     /// Number of bytes currently stored.
@@ -17,7 +17,7 @@ impl RingBuffer {
     /// Creates a new ring buffer that can hold up to `capacity` bytes.
     pub fn new(capacity: usize) -> Self {
         Self {
-            buf: vec![0; capacity],
+            buf: vec![0; capacity].into_boxed_slice(),
             head: 0,
             len: 0,
         }

@@ -2533,42 +2533,42 @@ impl InitializedVm {
         // Register the VFIO resolver, which spawns a container manager task
         // internally to share containers across assigned devices.
         #[cfg(target_os = "linux")]
-        let (vfio_inspect, vfio_cdev_inspect) =
-            if let Some(dma_mapper_client) = memory_manager.dma_mapper_client() {
-                let vfio_resolver = vfio_assigned_device::resolver::VfioDeviceResolver::new(
-                    driver_source.builder().build("vfio-container-mgr"),
-                    dma_mapper_client.clone(),
-                );
-                let handle = vfio_resolver.inspect_handle();
-                resolver.add_async_resolver::<
+        let (vfio_inspect, vfio_cdev_inspect) = 'vfio: {
+            let Some(dma_mapper_client) = memory_manager.dma_mapper_client() else {
+                break 'vfio (None, None);
+            };
+            let vfio_resolver = vfio_assigned_device::resolver::VfioDeviceResolver::new(
+                driver_source.builder().build("vfio-container-mgr"),
+                dma_mapper_client.clone(),
+            );
+            let handle = vfio_resolver.inspect_handle();
+            resolver.add_async_resolver::<
                 vm_resource::kind::PciDeviceHandleKind,
                 _,
                 vfio_assigned_device_resources::VfioDeviceHandle,
                 _,
             >(vfio_resolver);
 
-                // Register the VFIO cdev + iommufd resolver for devices opened
-                // via the cdev interface. Spawns a VfioCdevManager task that
-                // shares IOAS contexts across devices with the same --iommu ID.
-                // Devices behind an accel-capable SMMU carry their nesting
-                // context in the per-device DmaTarget, so no separate side-channel
-                // is needed.
-                let cdev_resolver = vfio_assigned_device::resolver::VfioCdevDeviceResolver::new(
-                    driver_source.builder().build("vfio-cdev-mgr"),
-                    dma_mapper_client,
-                );
-                let cdev_handle = cdev_resolver.inspect_handle();
-                resolver.add_async_resolver::<
+            // Register the VFIO cdev + iommufd resolver for devices opened
+            // via the cdev interface. Spawns a VfioCdevManager task that
+            // shares IOAS contexts across devices with the same --iommu ID.
+            // Devices behind an accel-capable SMMU carry their nesting
+            // context in the per-device DmaTarget, so no separate side-channel
+            // is needed.
+            let cdev_resolver = vfio_assigned_device::resolver::VfioCdevDeviceResolver::new(
+                driver_source.builder().build("vfio-cdev-mgr"),
+                dma_mapper_client,
+            );
+            let cdev_handle = cdev_resolver.inspect_handle();
+            resolver.add_async_resolver::<
                 vm_resource::kind::PciDeviceHandleKind,
                 _,
                 vfio_assigned_device_resources::VfioCdevDeviceHandle,
                 _,
             >(cdev_resolver);
 
-                (Some(handle), Some(cdev_handle))
-            } else {
-                (None, None)
-            };
+            (Some(handle), Some(cdev_handle))
+        };
 
         // Instantiate SMMU devices and build port-level lookup maps.
         // When active, PCIe devices on the covered root complexes get

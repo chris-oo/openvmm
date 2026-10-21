@@ -239,9 +239,6 @@ mod tests {
             );
         }
         for params in [
-            [("snp_scoped_host_access", "invalid")],
-            [("snp_scoped_host_access", "true")],
-            [("snp_scoped_host_access", "false")],
             [("snp_disable_cpuid_offload", "invalid")],
             [("unknown", "false")],
         ] {

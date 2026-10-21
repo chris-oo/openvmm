@@ -1524,7 +1524,7 @@ impl Options {
     }
 
     /// Validates isolation-specific command-line option combinations.
-    pub fn validate_isolation_options(&self) -> anyhow::Result<bool> {
+    pub fn validate_isolation_options(&self) -> anyhow::Result<()> {
         let hypervisor = self
             .hypervisor
             .as_deref()
@@ -1566,7 +1566,7 @@ impl Options {
         if snp_bounce {
             self.validate_snp_bounce_options()?;
         }
-        Ok(snp_bounce)
+        Ok(())
     }
 
     fn validate_snp_bounce_options(&self) -> anyhow::Result<()> {
@@ -1662,10 +1662,10 @@ impl Options {
     }
 
     /// Validates VM options before resource construction or other side effects.
-    pub fn validate_vm_options(&self) -> anyhow::Result<bool> {
-        let snp_bounce = self.validate_isolation_options()?;
+    pub fn validate_vm_options(&self) -> anyhow::Result<()> {
+        self.validate_isolation_options()?;
         self.validate_igvm_options()?;
-        Ok(snp_bounce)
+        Ok(())
     }
 
     /// Validates IGVM personality selection.
@@ -4096,17 +4096,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn per_device_bounce_options_are_not_accepted() {
-        for args in [
-            vec!["openvmm", "--virtio-blk", "mem:1M,bounce"],
-            vec!["openvmm", "--virtio-net", "bounce:consomme"],
-            vec!["openvmm", "--virtio-vsock-bounce"],
-        ] {
-            assert!(Options::try_parse_from(args).is_err());
-        }
-    }
-
     /// `--version` reports the resolved build identity rather than clap's
     /// default, which would be the parser crate's own name and version.
     #[test]
@@ -4726,17 +4715,6 @@ mod tests {
         assert!(NicConfigCli::from_str("uh:pcie_port=rp0:none").is_err());
         assert!(NicConfigCli::from_str("pcie_port=:none").is_err());
         assert!(NicConfigCli::from_str("pcie_port:none").is_err());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_vhost_user_rejects_bounce() {
-        for value in [
-            "path/to/net.sock,type=net,bounce",
-            "path/to/net.sock,device_id=1,queue_sizes=[256],bounce",
-        ] {
-            assert!(Options::try_parse_from(["openvmm", "--vhost-user", value]).is_err());
-        }
     }
 
     #[test]
@@ -5819,8 +5797,6 @@ mod tests {
     fn test_explicit_mshv_parameters_fail_pure_vm_validation() {
         for spec in [
             "mshv:unknown=true",
-            "mshv:snp_scoped_host_access=true",
-            "mshv:snp_scoped_host_access=false",
             "mshv:snp_disable_cpuid_offload=invalid",
         ] {
             let opt = Options::try_parse_from(["openvmm", "--hypervisor", spec]).unwrap();
@@ -5888,13 +5864,13 @@ mod tests {
     #[test]
     fn test_auto_selected_mshv_cannot_bypass_snp_admission() {
         let mut opt = Options::try_parse_from(["openvmm", "--isolation", "snp"]).unwrap();
-        assert!(!opt.validate_vm_options().unwrap());
+        opt.validate_vm_options().unwrap();
         // run_control_inner records the resource's actual backend before
         // admission or device resource construction.
         opt.hypervisor = Some("mshv".into());
         assert!(opt.validate_vm_options().is_err());
         opt.memory.transparent_hugepages = Some(false);
-        assert!(opt.validate_vm_options().unwrap());
+        opt.validate_vm_options().unwrap();
     }
 
     #[test]

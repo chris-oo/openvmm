@@ -112,18 +112,9 @@ impl FileDisk {
         Ok(offset)
     }
 
-    fn io_buffer(len: usize) -> Result<Vec<u8>, DiskError> {
-        let mut buffer = Vec::new();
-        buffer.try_reserve_exact(len).map_err(|err| {
-            DiskError::Io(std::io::Error::new(std::io::ErrorKind::OutOfMemory, err))
-        })?;
-        buffer.resize(len, 0);
-        Ok(buffer)
-    }
-
     pub async fn read(&self, buffers: &RequestBuffers<'_>, sector: u64) -> Result<(), DiskError> {
         let offset = self.io_offset(sector, buffers.len())?;
-        let mut buffer = Self::io_buffer(buffers.len())?;
+        let mut buffer = vec![0; buffers.len()];
         let file = self.file.clone();
         let buffer = unblock(move || -> Result<_, std::io::Error> {
             ReadWriteAt::read_exact_at(file.as_ref(), &mut buffer, offset)?;
@@ -142,7 +133,7 @@ impl FileDisk {
         _fua: bool,
     ) -> Result<(), DiskError> {
         let offset = self.io_offset(sector, buffers.len())?;
-        let mut buffer = Self::io_buffer(buffers.len())?;
+        let mut buffer = vec![0; buffers.len()];
         let file = self.file.clone();
         buffers.reader().read(&mut buffer)?;
         unblock(move || ReadWriteAt::write_all_at(file.as_ref(), &buffer, offset))
