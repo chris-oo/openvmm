@@ -139,21 +139,15 @@ impl FileDisk {
         &self,
         buffers: &RequestBuffers<'_>,
         sector: u64,
-        fua: bool,
+        _fua: bool,
     ) -> Result<(), DiskError> {
         let offset = self.io_offset(sector, buffers.len())?;
         let mut buffer = Self::io_buffer(buffers.len())?;
         let file = self.file.clone();
         buffers.reader().read(&mut buffer)?;
-        unblock(move || -> Result<(), std::io::Error> {
-            ReadWriteAt::write_all_at(file.as_ref(), &buffer, offset)?;
-            if fua {
-                file.sync_data()?;
-            }
-            Ok(())
-        })
-        .await
-        .map_err(DiskError::Io)?;
+        unblock(move || ReadWriteAt::write_all_at(file.as_ref(), &buffer, offset))
+            .await
+            .map_err(DiskError::Io)?;
         Ok(())
     }
 
@@ -192,7 +186,7 @@ impl DiskIo for FileDisk {
     }
 
     fn is_fua_respected(&self) -> bool {
-        true
+        false
     }
 
     async fn read_vectored(
@@ -340,15 +334,15 @@ mod tests {
     }
 
     #[async_test]
-    async fn copy_only_file_roundtrip_with_fua() {
+    async fn copy_only_file_roundtrip_with_explicit_flush() {
         let disk = file_disk();
-        assert!(disk.is_fua_respected());
+        assert!(!disk.is_fua_respected());
         let memory = GuestMemory::allocate(SECTOR_SIZE).copy_only_view();
         memory.write_at(0, &[0x42; SECTOR_SIZE]).unwrap();
         disk.write_vectored(
             &OwnedRequestBuffers::linear(0, SECTOR_SIZE, false).buffer(&memory),
             0,
-            true,
+            false,
         )
         .await
         .unwrap();
