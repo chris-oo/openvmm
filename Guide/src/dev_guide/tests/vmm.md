@@ -187,7 +187,31 @@ build for a different platform. The supported targets are:
 |--------|-------------|
 | `windows-x64` | Windows x86_64 (Hyper-V / WHP) |
 | `windows-aarch64` | Windows ARM64 (Hyper-V / WHP) |
-| `linux-x64` | Linux x86_64 |
+| `linux-x64` | Linux x86_64 (GNU, the Linux x64 default) |
+| `linux-musl-x64` | Linux x86_64 with statically linked musl binaries |
+
+Use `linux-musl-x64` when the target host has an older glibc version than
+your build host. To prepare a bundle without running tests, add
+`--build-only`:
+
+```bash
+cargo xflowey vmm-tests-run --target linux-musl-x64 \
+    --filter "test(my_test_name)" --build-only --dir target/vmm-tests-musl
+```
+
+Copy the complete output directory to the target host, then run its generated
+script:
+
+```bash
+bash path/to/vmm-tests-musl/run.sh
+```
+
+The script selects `vmm-tests-run-target --target linux-musl-x64` with the
+bundled musl Flowey executable and test archive. It preserves the selected
+filter and artifact setup. The target host does not need a Rust toolchain
+or source checkout. It still needs the host capabilities and external
+dependencies required by the selected tests; external artifacts can still
+be fetched on demand.
 
 **Cross-compiling for Windows from WSL2** is fully supported, you can build
 and run Windows VMM tests directly from your WSL2 shell. This requires the
@@ -222,6 +246,30 @@ When running Hyper-V tests, your user account must be a member of the
 Hyper-V Administrators group.
 
 To see all available options: `cargo xflowey vmm-tests-run --help`.
+
+### Copy-only Block I/O and SNP
+
+The `virtio_blk_bounce` tests verify block payloads through RAM, regular-file,
+and host-block backends. They also hot-add a second disk, remove it, and
+re-add it. Persistent backends are re-added read-only and checked against
+the written payload. Guest PCI drivers are unbound before removal; these
+tests do not cover surprise removal.
+
+The `snp_linux_direct_x64` variants use an SNP IGVM and automatic copy-only
+memory on an AMD MSHV host. The `ttrpc::snp` cases exercise VM creation and
+PCIe add/remove through the RPC API.
+
+Host-block cases require Linux, `losetup`, and permission to create loop
+devices (`CAP_SYS_ADMIN`). Enable them explicitly with
+`PETRI_CAPABILITIES=loop_device`. The tests create and detach their own
+temporary loop devices; they do not accept arbitrary host disks.
+
+For a prepared bundle on a host with those permissions:
+
+```bash
+PETRI_CAPABILITIES=loop_device NEXTEST_TEST_THREADS=1 \
+    bash path/to/vmm-tests-musl/run.sh
+```
 
 ### Lazy Fetch (Default)
 

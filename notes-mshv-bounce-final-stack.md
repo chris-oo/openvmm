@@ -182,6 +182,77 @@ policy-removal commit. The final `petri/src/vm/mod.rs` matches upstream.
 - All three existing forced-bounce VMM tests and the ordinary local ttrpc
   interface VMM test passed. These are not new SNP/ttrpc hardware tests.
 - ARM Windows/macOS/Linux management, device, and Petri Clippy passed.
-- No SNP hardware campaign was run after this rebase. The earlier hardware
-  results above apply only to the preserved pre-rebase source.
+- At the rebase hand-off, no post-rebase SNP hardware campaign had run.
+  Subsequent hardware results are recorded below.
 - Rebase evidence is under `target/rebased-main-20261021/`.
+
+## Implemented SNP, host-block, and RPC coverage
+
+The post-rebase follow-up added:
+
+- Registered block tests for ordinary forced-CopyOnly guests and SNP IGVM
+  guests, with RAM, regular-file, buffered host-block, and direct host-block
+  backends.
+- Separate boot and hot-added disks, verified binary payloads and backing
+  files, removal, and read-only re-add for persistent backends.
+- SNP-over-ttrpc tests for regular files and buffered/direct host block
+  devices, covering create, add, remove, I/O, and complete process teardown.
+- Owned disposable loop fixtures behind `PETRI_CAPABILITIES=loop_device`.
+  A keeper descriptor and kernel autoclear protect against loop-device
+  leaks when a test is killed.
+- Portable `--target linux-musl-x64` Flowey bundles. The target host needs
+  neither a Rust toolchain nor the build host's glibc version.
+
+Removal is quiesced: the guest virtio-pci driver is unbound while MMIO is
+still present, then the host removes the function. Tests wait for complete
+guest PCI teardown before re-add. The user confirmed that surprise removal
+is a known issue and selected this scope; no production PCIe removal code
+was changed.
+
+The new RPC tests needed a below-4-GiB ECAM override in this test setup.
+Without it, the SNP guest reported no PCI configuration access function
+and could not discover its virtio devices.
+
+**The user requires this override to remain a separate local-only top
+commit. It will not be submitted.** Do not fold it into the proposed
+VM-service commit or any other submitted change. Its coupled ECAM reference
+documentation stays in that local commit too. Non-SNP ECAM placement is
+unchanged.
+
+`mshv-bounce-simplified` identifies the tests and runner changes without the
+override. `mshv-snp-ecam-local` identifies the local top commit above it.
+The SNP RPC hardware results below include this local override; they are
+not evidence that the submission candidate works without it on this host.
+
+Ordinary MSHV test guests retain Hyper-V clocks with VMBus disabled.
+Ordinary KVM CopyOnly tests keep Hyper-V disabled because page overlays
+need pointer access. Backend selection uses Petri's host context.
+
+### Hardware and local results
+
+- Final registered hardware run: 11 passed, no failures. It includes two
+  ordinary host-block cases, four SNP block cases, three SNP RPC cases,
+  and upstream one-/two-VP SNP boot tests.
+- Six local KVM VMM regressions passed, including existing block/net/vsock
+  bounce tests, the new RAM/file hotplug tests, and ordinary ttrpc.
+- Final native Clippy/docs and 212 package tests passed, with one privileged
+  test skipped locally. ARM Windows/macOS/Linux checks also passed.
+- The previously ignored VM-service host-block opener unit test passed
+  against an owned device-mapper linear target, including buffered/direct
+  and read-only/read-write descriptor modes.
+- Both established RAM/file SNP campaigns now boot the same PCIe-capable
+  IGVM. Their approved guest kernel, initrd, payloads, and nonce are
+  unchanged. Each passed 30,720 verified block operations, two TCP/vsock
+  rounds, all driver unbind/rebind cycles, 13 raw-trace-proven release/resume
+  pairs, and 65,537 balanced pins.
+- The host was observed already rebooted after the user authorized reset.
+  No extra reboot or forced partition deletion was performed. Hardware
+  results use kernel `6.18.34.mshv3-mshv-lite-shared-5e10`, not the earlier
+  cached-grants kernel.
+- Evidence is under `target/snp-igvm-coverage-20261021/` and
+  `target/snp-igvm-lifecycle-20261021/`. Earlier failed setup attempts remain
+  separate from the accepted final run.
+
+The normal local WSL account lacks loop-device privileges. Real host-block
+and device-mapper cases ran on `chris-mshv`; they were not replaced by
+regular-file proxies.

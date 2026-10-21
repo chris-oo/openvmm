@@ -8,6 +8,8 @@
 // Linux.
 #[cfg(target_os = "linux")]
 mod fd_passing;
+#[cfg(target_os = "linux")]
+mod snp;
 
 use anyhow::Context;
 use futures::AsyncBufReadExt;
@@ -87,7 +89,7 @@ async fn test_ttrpc_no_vmbus(
     let tempdir = tempfile::tempdir()?;
     let (mut child, client, _stderr_task) = launch_openvmm(
         &driver,
-        &params,
+        params.log_source,
         &openvmm,
         &tempdir.path().join("ttrpc.sock"),
         &tempdir.path().join("openvmm.pid"),
@@ -269,8 +271,14 @@ async fn test_ttrpc_interface(
         petri_artifacts_common::tags::MachineArch::Aarch64 => "ttyAMA0",
     };
 
-    let (mut child, client, _stderr_task) =
-        launch_openvmm(&driver, &params, &openvmm, &socket_path, &pidfile_path).await?;
+    let (mut child, client, _stderr_task) = launch_openvmm(
+        &driver,
+        params.log_source,
+        &openvmm,
+        &socket_path,
+        &pidfile_path,
+    )
+    .await?;
 
     let query_props = || {
         client.call().start(
@@ -1111,8 +1119,14 @@ async fn test_ttrpc_uefi_boot(
     let pidfile_path = tempdir.path().join("openvmm.pid");
     let com1_path = tempdir.path().join("com1.sock");
 
-    let (mut child, client, _stderr_task) =
-        launch_openvmm(&driver, &params, &openvmm, &socket_path, &pidfile_path).await?;
+    let (mut child, client, _stderr_task) = launch_openvmm(
+        &driver,
+        params.log_source,
+        &openvmm,
+        &socket_path,
+        &pidfile_path,
+    )
+    .await?;
 
     client
             .call()
@@ -1568,7 +1582,7 @@ async fn mount_virtio_fs(
 /// task (which must be kept alive for the child's lifetime).
 async fn launch_openvmm(
     driver: &DefaultDriver,
-    params: &petri::PetriTestParams<'_>,
+    log_source: &petri::PetriLogSource,
     openvmm: &ResolvedArtifact,
     socket_path: &Path,
     pidfile_path: &Path,
@@ -1596,7 +1610,7 @@ async fn launch_openvmm(
     let stderr_task = driver.spawn(
         "stderr",
         petri::log_task(
-            params.log_source.log_file("stderr")?,
+            log_source.log_file("stderr")?,
             PolledPipe::new(driver, stderr_read)?,
             "openvmm stderr",
         ),
