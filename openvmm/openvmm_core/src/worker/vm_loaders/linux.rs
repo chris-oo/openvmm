@@ -34,6 +34,8 @@ pub enum Error {
     Dt(#[source] DeviceTreeError),
     #[error("failed to write EFI/ACPI tables to guest memory")]
     Efi(#[source] guestmem::GuestMemoryError),
+    #[error("failed to build EFI metadata")]
+    EfiMetadata(#[source] loader::efi::Error),
     #[error("failed to finalize SNP VMSA")]
     SnpVmsa(#[source] anyhow::Error),
 }
@@ -134,29 +136,31 @@ fn smbios_tables_from_config(
         uuid,
     } = system;
 
-    const DEFAULT_BIOS_VENDOR: &str = "OpenVMM";
-    const DEFAULT_BIOS_VERSION: &str = "OpenVMM Direct";
-    const DEFAULT_BIOS_RELEASE_DATE: &str = "06/19/2026";
-    const DEFAULT_BIOS_MAJOR: u8 = 0;
-    const DEFAULT_BIOS_MINOR: u8 = 0;
-    const DEFAULT_MANUFACTURER: &str = "OpenVMM";
-    const DEFAULT_PRODUCT_NAME: &str = "OpenVMM Virtual Machine";
+    let defaults = smbios::SmbiosTables::default();
 
     smbios::SmbiosTables {
         bios: smbios::SmbiosBiosInfo {
-            vendor: vendor.as_deref().unwrap_or(DEFAULT_BIOS_VENDOR),
-            version: bios_version.as_deref().unwrap_or(DEFAULT_BIOS_VERSION),
-            release_date: release_date.as_deref().unwrap_or(DEFAULT_BIOS_RELEASE_DATE),
-            major: release.map_or(DEFAULT_BIOS_MAJOR, |(major, _)| major),
-            minor: release.map_or(DEFAULT_BIOS_MINOR, |(_, minor)| minor),
+            vendor: vendor.as_deref().unwrap_or(defaults.bios.vendor),
+            version: bios_version.as_deref().unwrap_or(defaults.bios.version),
+            release_date: release_date
+                .as_deref()
+                .unwrap_or(defaults.bios.release_date),
+            major: release.map_or(defaults.bios.major, |(major, _)| major),
+            minor: release.map_or(defaults.bios.minor, |(_, minor)| minor),
         },
         system: smbios::SmbiosSystemInfo {
-            manufacturer: manufacturer.as_deref().unwrap_or(DEFAULT_MANUFACTURER),
-            product_name: product_name.as_deref().unwrap_or(DEFAULT_PRODUCT_NAME),
-            version: system_version.as_deref().unwrap_or(""),
-            serial_number: serial_number.as_deref().unwrap_or(""),
-            sku_number: sku_number.as_deref().unwrap_or(""),
-            family: family.as_deref().unwrap_or(""),
+            manufacturer: manufacturer
+                .as_deref()
+                .unwrap_or(defaults.system.manufacturer),
+            product_name: product_name
+                .as_deref()
+                .unwrap_or(defaults.system.product_name),
+            version: system_version.as_deref().unwrap_or(defaults.system.version),
+            serial_number: serial_number
+                .as_deref()
+                .unwrap_or(defaults.system.serial_number),
+            sku_number: sku_number.as_deref().unwrap_or(defaults.system.sku_number),
+            family: family.as_deref().unwrap_or(defaults.system.family),
             // SMBIOS (>= 2.6) stores the Type 1 UUID's first three fields
             // little-endian, which is exactly the in-memory byte layout of our
             // `Guid` type, so its raw bytes go in directly with no swap. The
@@ -265,19 +269,10 @@ fn write_efi_and_acpi_tables(
     smbios: &openvmm_defs::config::SmbiosConfig,
 ) -> Result<Aarch64EfiInfo, Error> {
     use memory_range::MemoryRange;
-    use uefi_specs::uefi::boot::ACPI_20_TABLE_GUID;
-    use uefi_specs::uefi::boot::EFI_2_70_SYSTEM_TABLE_REVISION;
     use uefi_specs::uefi::boot::EFI_MEMORY_DESCRIPTOR_VERSION;
     use uefi_specs::uefi::boot::EFI_MEMORY_WB;
-    use uefi_specs::uefi::boot::EFI_RT_PROPERTIES_TABLE_GUID;
-    use uefi_specs::uefi::boot::EFI_SYSTEM_TABLE_SIGNATURE;
     use uefi_specs::uefi::boot::EfiMemoryDescriptor;
     use uefi_specs::uefi::boot::EfiMemoryType;
-    use uefi_specs::uefi::boot::EfiRtPropertiesTable;
-    use uefi_specs::uefi::boot::EfiSystemTable;
-    use uefi_specs::uefi::boot::LINUX_EFI_MEMRESERVE_TABLE_GUID;
-    use uefi_specs::uefi::boot::LinuxEfiMemreserve;
-    use uefi_specs::uefi::boot::SMBIOS3_TABLE_GUID;
 
     // Helper to align a value up to the given power-of-two alignment.
     fn align_up(val: u64, align: u64) -> u64 {
@@ -293,101 +288,32 @@ fn write_efi_and_acpi_tables(
 
     // --- EFI metadata (page 1): systab, config table, vendor, rt props ---
     // Page 0 is reserved for the memory map (written last).
-    let mut cursor = efi_base + 0x1000;
-
-    // EFI System Table
-    let systab_addr = cursor;
-    cursor += size_of::<EfiSystemTable>() as u64;
-
-    // Configuration table entries (24 bytes each: 16-byte GUID + 8-byte pointer)
-    const CONFIG_ENTRY_SIZE: u64 = 24;
-    let num_config_entries: u64 = 4;
-    let config_table_addr = cursor;
-    cursor += num_config_entries * CONFIG_ENTRY_SIZE;
-
-    // Firmware vendor string — NUL-terminated UTF-16LE
-    let fw_vendor_addr = cursor;
-    let fw_vendor: Vec<u8> = "OpenVMM\0"
-        .encode_utf16()
-        .flat_map(|c| c.to_le_bytes())
-        .collect();
-    cursor += fw_vendor.len() as u64;
-    cursor = align_up(cursor, 8);
-
-    // EFI RT Properties Table — tells the OS no runtime services are available.
-    let rt_props_addr = cursor;
-    let rt_props = EfiRtPropertiesTable::NONE_SUPPORTED;
-    cursor += size_of::<EfiRtPropertiesTable>() as u64;
-
-    // Linux EFI persistent memory reservation root. The EFI stub normally
-    // installs this before entering the kernel. Drivers append reservations
-    // that must survive kexec, including GIC ITS LPI tables.
-    cursor = align_up(cursor, 8);
-    let memreserve_addr = cursor;
-    let memreserve = LinuxEfiMemreserve::default();
-    cursor += size_of::<LinuxEfiMemreserve>() as u64;
-
-    // SMBIOS — unlike x86 (which brute-force scans the F-segment for the
-    // `_SM3_` anchor), the aarch64 kernel discovers DMI only via the SMBIOS3
-    // EFI configuration-table entry. Reserve the entry point and structure
-    // table from the metadata page (16-byte aligned) and build them with the
-    // shared arch-neutral table builder.
-    cursor = align_up(cursor, 16);
-    let smbios_ep_addr = cursor;
-    cursor += loader::smbios::ENTRY_POINT_SIZE as u64;
-    cursor = align_up(cursor, 16);
-    let smbios_table_addr = cursor;
-    let smbios = loader::smbios::build(&smbios_tables_from_config(smbios), smbios_table_addr);
-    cursor += smbios.structure_table.len() as u64;
+    let metadata_base = efi_base
+        .checked_add(0x1000)
+        .ok_or(Error::EfiMetadata(loader::efi::Error::AddressOverflow))?;
+    let metadata =
+        loader::efi::build_metadata(metadata_base, rsdp_addr, &smbios_tables_from_config(smbios))
+            .map_err(Error::EfiMetadata)?;
+    let systab_addr = metadata.systab_addr;
+    let cursor = metadata_base
+        .checked_add(
+            u64::try_from(metadata.data.len())
+                .map_err(|_| Error::EfiMetadata(loader::efi::Error::AddressOverflow))?,
+        )
+        .ok_or(Error::EfiMetadata(loader::efi::Error::AddressOverflow))?;
 
     // Compute how many pages the metadata region spans.
-    let metadata_end = align_up(cursor, 0x1000);
+    let metadata_end = cursor
+        .checked_add(0xfff)
+        .ok_or(Error::EfiMetadata(loader::efi::Error::AddressOverflow))?
+        & !0xfff;
     let metadata_pages = (metadata_end - efi_base) / 0x1000;
     assert!(
         cursor <= rsdp_addr,
         "EFI metadata ({cursor:#x}) overflows into ACPI tables region ({rsdp_addr:#x})",
     );
 
-    // Now write everything.
-    gm.write_at(rt_props_addr, rt_props.as_bytes())
-        .map_err(Error::Efi)?;
-    gm.write_at(memreserve_addr, memreserve.as_bytes())
-        .map_err(Error::Efi)?;
-
-    gm.write_at(smbios_ep_addr, &smbios.entry_point)
-        .map_err(Error::Efi)?;
-    gm.write_at(smbios_table_addr, &smbios.structure_table)
-        .map_err(Error::Efi)?;
-
-    let mut config_entries = Vec::new();
-    for (guid, address) in [
-        (ACPI_20_TABLE_GUID, rsdp_addr),
-        (EFI_RT_PROPERTIES_TABLE_GUID, rt_props_addr),
-        (SMBIOS3_TABLE_GUID, smbios_ep_addr),
-        (LINUX_EFI_MEMRESERVE_TABLE_GUID, memreserve_addr),
-    ] {
-        config_entries.extend_from_slice(guid.as_bytes());
-        config_entries.extend_from_slice(&address.to_le_bytes());
-    }
-    gm.write_at(config_table_addr, &config_entries)
-        .map_err(Error::Efi)?;
-
-    gm.write_at(fw_vendor_addr, &fw_vendor)
-        .map_err(Error::Efi)?;
-
-    let mut systab = EfiSystemTable {
-        signature: EFI_SYSTEM_TABLE_SIGNATURE,
-        revision: EFI_2_70_SYSTEM_TABLE_REVISION,
-        header_size: size_of::<EfiSystemTable>() as u32,
-        firmware_vendor: fw_vendor_addr,
-        firmware_revision: 1,
-        number_of_table_entries: num_config_entries,
-        configuration_table: config_table_addr,
-        ..Default::default()
-    };
-    // UEFI spec 4.2: CRC32 is computed over header_size bytes with crc32 zeroed.
-    systab.crc32 = crc32fast::hash(systab.as_bytes());
-    gm.write_at(systab_addr, systab.as_bytes())
+    gm.write_at(systab_addr, &metadata.data)
         .map_err(Error::Efi)?;
 
     // --- Memory map (page 0) ---

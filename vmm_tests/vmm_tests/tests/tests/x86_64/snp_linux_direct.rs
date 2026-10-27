@@ -35,14 +35,12 @@ async fn boot_with_vps(
             transparent_hugepages: false,
             ..Default::default()
         })
-        .modify_backend(|b| {
-            b.with_pcie_root_topology(1, 1, 1)
-                .with_custom_config(|c| c.pcie_ecam_below_4gb = true)
-        })
+        .modify_backend(|b| b.with_pcie_root_topology(1, 1, 1))
         .run()
         .await?;
 
     let shell = agent.unix_shell();
+    crate::utils::snp_firmware::verify(&agent).await?;
     let dmesg = cmd!(shell, "dmesg").read().await?;
     for marker in [
         "SEV: Status: SEV SEV-ES SEV-SNP".to_string(),
