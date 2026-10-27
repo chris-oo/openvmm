@@ -59,14 +59,37 @@ pub struct SmbiosSystemInfo<'a> {
     pub uuid: [u8; 16],
 }
 
-/// Aggregate of the SMBIOS structures to build. The caller supplies all of the
-/// identity strings and the system UUID.
+/// Aggregate of the SMBIOS structures to build. Defaults describe OpenVMM
+/// direct boot with an all-zero UUID; callers can override the identity.
 #[derive(Debug, Copy, Clone)]
 pub struct SmbiosTables<'a> {
     /// Type 0 BIOS Information.
     pub bios: SmbiosBiosInfo<'a>,
     /// Type 1 System Information.
     pub system: SmbiosSystemInfo<'a>,
+}
+
+impl Default for SmbiosTables<'_> {
+    fn default() -> Self {
+        Self {
+            bios: SmbiosBiosInfo {
+                vendor: "OpenVMM",
+                version: "OpenVMM Direct",
+                release_date: "06/19/2026",
+                major: 0,
+                minor: 0,
+            },
+            system: SmbiosSystemInfo {
+                manufacturer: "OpenVMM",
+                product_name: "OpenVMM Virtual Machine",
+                version: "",
+                serial_number: "",
+                sku_number: "",
+                family: "",
+                uuid: [0; 16],
+            },
+        }
+    }
 }
 
 /// Size in bytes of the SMBIOS 3.0 (64-bit) entry point (`_SM3_`). Callers that

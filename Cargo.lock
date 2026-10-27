@@ -6271,7 +6271,6 @@ dependencies = [
  "chipset_legacy",
  "chipset_resources",
  "closeable_mutex",
- "crc32fast",
  "cxl_spec",
  "debug_ptr",
  "disk_backend",
@@ -8573,6 +8572,7 @@ dependencies = [
  "minimal_rt_build",
  "test_with_tracing",
  "thiserror 2.0.16",
+ "uefi_specs",
  "x86defs",
  "zerocopy",
 ]
