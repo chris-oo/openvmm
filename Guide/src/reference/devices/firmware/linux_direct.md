@@ -119,6 +119,12 @@ COM ports from that tree, accepts the guest RAM, and then builds the DSDT,
 FADT, MADT, SRAT, XSDT, and RSDP. It adds an MCFG and a PCIe SSDT when the
 device tree describes host bridges.
 
+The image also contains measured EFI and SMBIOS metadata. The bootshim
+publishes a synthetic EFI system table and a memory map from the final E820
+map, including RAM added at launch. This lets Linux find the ACPI and SMBIOS
+tables through EFI. It does not provide EFI runtime services;
+`igvmfilegen` adds `efi=noruntime` to the measured kernel command line.
+
 ### Launch Requirements
 
 One image boots with any supported CPU count, RAM size, and NUMA layout:
@@ -133,8 +139,10 @@ One image boots with any supported CPU count, RAM size, and NUMA layout:
 
 The image does not fix the ECAM or BAR-window addresses. Use the usual
 `--pcie-root-complex`, `--pcie-root-port`, and PCIe virtio device options.
-Some direct-boot kernels reject an ECAM above 4 GiB unless SMBIOS reports a
-recent BIOS date. For these kernels, also use `--pcie-ecam-below-4gb`.
+Linux can use an ECAM above 4 GiB because the measured SMBIOS tables report
+a recent BIOS date. Newly built images do not need
+`--pcie-ecam-below-4gb`. Rebuild both the generator and bootshim; older images
+do not provide this EFI handoff.
 
 The bootshim supports up to eight generic ECAM host bridges in distinct
 segments. It puts every bridge on NUMA node 0, with identity MMIO windows and
@@ -158,6 +166,9 @@ path, so a guest reports the same UUID whether booted via UEFI or direct boot.
 The SMBIOS UUID defaults to the all-zero GUID, which Linux treats as not
 present and therefore does not expose as `product_uuid`. Pass
 `--smbios type=1,uuid=<GUID>` (or `uuid=random`) to set it.
+
+SNP IGVM boots use the SMBIOS defaults measured into the image. Runtime
+`--smbios` settings do not override that identity.
 
 ## CLI Usage
 

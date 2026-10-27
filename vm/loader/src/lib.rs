@@ -8,6 +8,7 @@ pub mod bzimage;
 #[warn(missing_docs)]
 pub mod common;
 pub mod cpuid;
+pub mod efi;
 pub mod elf;
 pub mod importer;
 pub mod linux;

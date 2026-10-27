@@ -304,11 +304,13 @@ pub const SNP_BOOT_SHIM_PARAMS_VERSION: u32 = 3;
 /// Magic value for the measured platform extension.
 pub const SNP_BOOT_SHIM_PLATFORM_MAGIC: u64 = u64::from_le_bytes(*b"SNPACPI3");
 /// Version of the platform extension.
-pub const SNP_BOOT_SHIM_PLATFORM_VERSION: u32 = 2;
+pub const SNP_BOOT_SHIM_PLATFORM_VERSION: u32 = 3;
 /// Maximum host device-tree size accepted by the fixed SNP profile.
 pub const SNP_BOOT_SHIM_DT_SIZE: u64 = 64 * 1024;
 /// Reserved capacity for the complete generated ACPI table set.
 pub const SNP_BOOT_SHIM_ACPI_SIZE: u64 = 64 * 1024;
+/// Permanent EFI metadata page and two pages for the Linux EFI memory map.
+pub const SNP_BOOT_SHIM_EFI_SIZE: u64 = 3 * hvdef::HV_PAGE_SIZE;
 /// Temporary allocator capacity for bounded full ACPI generation.
 pub const SNP_BOOT_SHIM_HEAP_SIZE: u64 = 1024 * 1024;
 /// Maximum number of PCIe host bridges supported by the SNP bootshim.
@@ -381,9 +383,11 @@ pub struct SnpBootShimPlatformParams {
     pub rsdp_gpa: u64,
     /// SNP page-table encryption bit; PCIe addresses must lie below this bit.
     pub c_bit_mask: u64,
+    pub efi_output_gpa: u64,
+    pub efi_output_size: u64,
 }
 
-const_assert_eq!(size_of::<SnpBootShimPlatformParams>(), 80);
+const_assert_eq!(size_of::<SnpBootShimPlatformParams>(), 96);
 const_assert_eq!(core::mem::offset_of!(boot_params, acpi_rsdp_addr), 0x70);
 
 const_assert_eq!(size_of::<SnpBootShimRange>(), 16);

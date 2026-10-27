@@ -17,7 +17,6 @@ use petri::MemoryConfig;
 use petri::PetriVmBuilder;
 use petri::ProcessorTopology;
 use petri::openvmm::OpenVmmPetriBackend;
-use pipette_client::cmd;
 use virtio_resources::VirtioPciDeviceHandle;
 use virtio_resources::blk::VirtioBlkHandle;
 use vm_resource::IntoResource;
@@ -130,7 +129,7 @@ async fn run(
             backend
                 .with_pcie_root_topology(1, 1, 3)
                 .with_custom_config(move |config| {
-                    config.pcie_ecam_below_4gb = true;
+                    config.pcie_ecam_below_4gb = !isolated;
                     if !isolated {
                         config.hypervisor.force_guest_memory_bounce = true;
                     }
@@ -145,12 +144,7 @@ async fn run(
 
     let result = async {
         if isolated {
-            let shell = agent.unix_shell();
-            let dmesg = cmd!(shell, "dmesg").read().await?;
-            anyhow::ensure!(
-                dmesg.contains("SEV: Status: SEV SEV-ES SEV-SNP"),
-                "guest did not report active SEV-SNP"
-            );
+            crate::utils::snp_firmware::verify(&agent).await?;
         }
         wait_for_disk(&agent, BOOT_SERIAL, true, &driver).await?;
         verify_io(&agent, BOOT_SERIAL, &boot_payload, initial_read_only).await?;

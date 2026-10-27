@@ -4,6 +4,7 @@
 //! Utility functions for VMM tests that can be shared across multiple test
 //! files.
 
+pub(crate) mod snp_firmware;
 pub(crate) mod virtio_blk;
 
 use anyhow::Context;

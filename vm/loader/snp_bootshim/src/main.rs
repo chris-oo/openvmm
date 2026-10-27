@@ -26,6 +26,7 @@
 extern crate alloc;
 
 mod acpi_tables;
+mod firmware;
 mod host_dt;
 
 use loader_defs::linux::SNP_BOOT_SHIM_PARAMS_MAGIC;
@@ -156,6 +157,7 @@ enum Failure {
     Heap = 0x05,
     AcpiTooLarge = 0x06,
     Panic = 0x07,
+    Firmware = 0x08,
     DeviceTree = 0x10,
     DeviceTreeProperty = 0x11,
     TooManyCpus = 0x12,
@@ -232,9 +234,9 @@ fn install_platform_acpi(
         terminate(Failure::AcpiTooLarge);
     }
 
-    // SAFETY: The measured platform page gives the output and RSDP regions,
-    // which are disjoint from the heap that owns these buffers. Publish the
-    // RSDP only after all tables exist.
+    // SAFETY: The measured platform page gives the output, RSDP and EFI
+    // regions, disjoint from the heap. Firmware preparation checks the map
+    // capacity and reserves its storage before Linux can allocate from RAM.
     unsafe {
         core::ptr::copy_nonoverlapping(
             tables.as_ptr(),
@@ -244,6 +246,17 @@ fn install_platform_acpi(
         core::ptr::copy_nonoverlapping(rsdp.as_ptr(), platform.rsdp_gpa as *mut u8, rsdp.len());
         let zero_page = &mut *(params.linux_zero_page as *mut loader_defs::linux::boot_params);
         zero_page.acpi_rsdp_addr = platform.rsdp_gpa;
+        let map = match firmware::prepare(zero_page, platform, params.ram_end) {
+            Ok(map) => map,
+            Err(_) => terminate(Failure::Firmware),
+        };
+        use zerocopy::IntoBytes;
+        let bytes = map.as_slice().as_bytes();
+        core::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            (platform.efi_output_gpa + PAGE_SIZE) as *mut u8,
+            bytes.len(),
+        );
     }
 }
 
@@ -479,7 +492,7 @@ mod arch {
 }
 
 #[cfg(minimal_rt)]
-const STACK_SIZE: usize = 32 * 1024;
+const STACK_SIZE: usize = 64 * 1024;
 
 #[cfg(minimal_rt)]
 #[repr(C, align(16))]

@@ -39,6 +39,13 @@ bridges are present. Images contain zero-filled output storage, not prebuilt
 ACPI tables. One image therefore boots with any supported CPU count, RAM
 size, NUMA layout, and PCIe configuration.
 
+The generator measures a synthetic EFI system table, its configuration tables,
+and default SMBIOS identity into the image. The shim builds the EFI memory map
+from the final E820 map and publishes Linux's 64-bit EFI handoff. The tables
+include ACPI and SMBIOS pointers, but no EFI runtime service implementation.
+The generator adds `efi=noruntime` to the measured kernel command line.
+Runtime SMBIOS overrides do not change the measured identity.
+
 The runtime describes COM1/COM2 when any serial backend is configured, and
 COM3/COM4 only when their individual backend is configured. The shim emits
 only the UARTs in that description. OpenHCL still selects a described COM3
@@ -54,7 +61,8 @@ Rebuild both; there is no static-table fallback.
 The image contains a small measured bootshim. Only pages containing the kernel,
 initrd, boot metadata, SNP special pages, bootshim, or bootshim parameters are
 included as IGVM `PageData`, along with zero-filled permanent ACPI and RSDP
-storage. The DT uses private, already-imported parameter pages. The shim
+storage and the EFI/SMBIOS region. The DT uses private, already-imported
+parameter pages. The shim
 reads the DT without allocating before it accepts any omitted pages. Then it
 accepts the remaining private RAM with `PVALIDATE` and enters Linux. This avoids
 loading and measuring every configured RAM page, but still accepts all RAM
@@ -145,16 +153,15 @@ openvmm --hypervisor mshv --isolation snp --hv --no-vmbus \
   --memory 160MB --processors 2 --vps-per-socket 2 \
   --com1 file=path/to/serial.log \
   --pcie-root-complex rc0,segment=0,start_bus=0,end_bus=31,low_mmio=64M,high_mmio=1G,node=0 \
-  --pcie-ecam-below-4gb \
   --pcie-root-port rc0:disk0 --pcie-root-port rc0:net0 \
   --virtio-blk file:path/to/disk.raw,pcie_port=disk0 \
   --virtio-net pcie_port=net0:consomme
 ```
 
-The below-4-GiB option selects a placement class, not a fixed address.
-Some direct-boot Linux kernels reject MCFG entries above 4 GiB unless SMBIOS
-reports a sufficiently recent BIOS date. Keep this option for those kernels;
-the converter supports 64-bit addresses but cannot bypass that guest policy.
+The measured SMBIOS identity reports a recent BIOS date, so Linux accepts MCFG
+entries above 4 GiB. Newly built images do not need
+`--pcie-ecam-below-4gb`. Older images lack the EFI/SMBIOS handoff; rebuild the
+generator and bootshim together.
 
 This implementation supports at most 255 CPUs, 64 RAM ranges that end at or
 below 512 GiB, the four fixed COM ports, and eight generic ECAM bridges in
@@ -164,14 +171,15 @@ omitted. The bootshim stops the guest when the device tree exceeds these
 limits or puts two bridges in one segment. The x86 device tree does not
 describe an IOMMU or CXL, so the guest does not see them.
 
-The image reserves 64 KiB for the device tree, 64 KiB for generated ACPI,
-a temporary 1-MiB heap, and a 32-KiB bootshim stack. The heap is omitted from
+The image reserves 12 KiB for EFI/SMBIOS metadata and its memory map,
+64 KiB for the device tree, 64 KiB for generated ACPI,
+a temporary 1-MiB heap, and a 64-KiB bootshim stack. The heap is omitted from
 page data and accepted with the RAM gaps before use. ACPI output, RSDP, DT,
 the shim, measured handoff pages, and SNP special pages are imported, not
 accepted again. No final table points into the DT, heap, or shim.
 The bootshim stops the guest if it cannot parse a PCIe bridge, or if a PCIe
-ECAM or MMIO window overlaps RAM or reaches the C-bit. The ACPI arena is
-ACPI-reclaimable in E820; the pinned RSDP remains reserved. The shim copies
+ECAM or MMIO window overlaps RAM or reaches the C-bit. The ACPI arena and RSDP are
+ACPI-reclaimable in E820; the EFI/SMBIOS region remains reserved. The shim copies
 all tables to permanent storage before it publishes the RSDP and Linux
 zero-page pointer. It never enters Linux with partial ACPI.
 

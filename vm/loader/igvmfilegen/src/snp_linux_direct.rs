@@ -22,6 +22,7 @@ use loader::linux::InitrdAddressType;
 use loader::linux::InitrdConfig;
 use loader_defs::linux::SNP_BOOT_SHIM_ACPI_SIZE;
 use loader_defs::linux::SNP_BOOT_SHIM_DT_SIZE;
+use loader_defs::linux::SNP_BOOT_SHIM_EFI_SIZE;
 use loader_defs::linux::SNP_BOOT_SHIM_HEAP_SIZE;
 use loader_defs::linux::SNP_BOOT_SHIM_MAX_RANGES;
 use loader_defs::linux::SNP_BOOT_SHIM_PARAMS_MAGIC;
@@ -152,6 +153,7 @@ pub fn build(params: BuildParams<'_>) -> anyhow::Result<IgvmOutput> {
     let layout = FixedGuestLayout::new(memory_page_count)?;
     let (mut kernel, mut initrd) = open_linux_resources(linux, resources)?;
     let initrd_config = initrd_config(&mut initrd)?;
+    let command_line = kernel_command_line(&linux.command_line)?;
     let mut loader = new_loader(policy, c_bit_position, memory_page_count, injection_type);
     let mut platform = None;
 
@@ -159,7 +161,7 @@ pub fn build(params: BuildParams<'_>) -> anyhow::Result<IgvmOutput> {
         &mut loader.loader(),
         &mut kernel,
         initrd_config,
-        &linux.command_line,
+        &command_line,
         &layout.memory,
         |gpa| {
             platform = Some(reserve_acpi_output(gpa, 1u64 << c_bit_position));
@@ -260,6 +262,48 @@ fn load_bootshim_and_handoff(
     )
 }
 
+fn kernel_command_line(command_line: &std::ffi::CStr) -> anyhow::Result<std::ffi::CString> {
+    let bytes = command_line.to_bytes();
+    let mut quoted = false;
+    let mut token_start = None;
+    let mut boundary = bytes.len();
+    // Keep the required option before Linux's init-argument separator.
+    for (index, byte) in bytes.iter().copied().chain([b' ']).enumerate() {
+        if matches!(byte, b' ' | b'\t'..=b'\r' | 0xa0) && !quoted {
+            if let Some(start) = token_start.take() {
+                let token = &bytes[start..index];
+                let token = token
+                    .strip_prefix(b"\"")
+                    .and_then(|token| token.strip_suffix(b"\""))
+                    .unwrap_or(token);
+                if token == b"--" {
+                    boundary = start;
+                    break;
+                }
+            }
+        } else {
+            token_start.get_or_insert(index);
+            quoted ^= byte == b'"';
+        }
+    }
+    anyhow::ensure!(!quoted, "unterminated quote in SNP kernel command line");
+    let mut output = bytes[..boundary].to_vec();
+    if boundary == bytes.len() && !output.is_empty() {
+        output.push(b' ');
+    }
+    output.extend_from_slice(b"efi=noruntime");
+    if boundary < bytes.len() {
+        output.push(b' ');
+        output.extend_from_slice(&bytes[boundary..]);
+    }
+    // x86 Linux keeps at most COMMAND_LINE_SIZE bytes, including the NUL.
+    anyhow::ensure!(
+        output.len() < 2048,
+        "SNP kernel command line exceeds 2048 bytes including its terminator"
+    );
+    std::ffi::CString::new(output).context("invalid SNP kernel command line")
+}
+
 fn import_bootshim_handoff(
     loader: &mut IgvmLoader<X86Register>,
     shim: &loader::elf::LoadInfo,
@@ -282,6 +326,8 @@ fn import_bootshim_handoff(
             "invalid SNP bootshim range or entry point"
         );
         let platform_gpa = reserve_region(&mut cursor, PAGE_SIZE, ram_end)?;
+        platform.efi_output_gpa = reserve_region(&mut cursor, SNP_BOOT_SHIM_EFI_SIZE, ram_end)?;
+        platform.efi_output_size = SNP_BOOT_SHIM_EFI_SIZE;
         platform.dt_gpa = reserve_region(&mut cursor, SNP_BOOT_SHIM_DT_SIZE, ram_end)?;
         platform.dt_size = SNP_BOOT_SHIM_DT_SIZE;
         platform.heap_gpa = reserve_region(&mut cursor, SNP_BOOT_SHIM_HEAP_SIZE, ram_end)?;
@@ -294,6 +340,26 @@ fn import_bootshim_handoff(
             "SNP ACPI workspace overlaps the bootshim or lies outside RAM"
         );
         let mut importer = loader.loader();
+        let firmware = loader::efi::build_metadata(
+            platform.efi_output_gpa,
+            platform.rsdp_gpa,
+            &loader::smbios::SmbiosTables::default(),
+        )
+        .context("building SNP EFI metadata")?;
+        ensure!(
+            firmware.systab_addr == platform.efi_output_gpa
+                && firmware.data.len() <= PAGE_SIZE as usize,
+            "SNP EFI metadata exceeds its permanent metadata page"
+        );
+        importer
+            .import_pages(
+                platform.efi_output_gpa / PAGE_SIZE,
+                platform.efi_output_size / PAGE_SIZE,
+                "snp-bootshim-efi",
+                BootPageAcceptance::Exclusive,
+                &firmware.data,
+            )
+            .context("importing SNP EFI metadata")?;
         importer
             .import_pages(
                 platform_gpa / PAGE_SIZE,
@@ -597,6 +663,47 @@ mod tests {
             .digest
             .clone();
         assert_eq!(measured_digest, expected_launch_digest);
+    }
+
+    #[test]
+    fn kernel_command_line_disables_runtime_before_init_args() {
+        for (input, expected) in [
+            (c"", c"efi=noruntime"),
+            (c"console=ttyS0", c"console=ttyS0 efi=noruntime"),
+            (c"-- init", c"efi=noruntime -- init"),
+            (
+                c"efi=runtime -- efi=runtime",
+                c"efi=runtime efi=noruntime -- efi=runtime",
+            ),
+            (
+                c"tag=\" -- \" -- init",
+                c"tag=\" -- \" efi=noruntime -- init",
+            ),
+            (c"\"--\" init", c"efi=noruntime \"--\" init"),
+            (c"tag=--", c"tag=-- efi=noruntime"),
+            (
+                c"console=ttyS0\t-- init",
+                c"console=ttyS0\tefi=noruntime -- init",
+            ),
+        ] {
+            assert_eq!(kernel_command_line(input).unwrap(), expected);
+        }
+        assert!(kernel_command_line(c"tag=\"unterminated").is_err());
+        let input = std::ffi::CString::new([0xff, b' ', b'-', b'-']).unwrap();
+        assert_eq!(
+            kernel_command_line(&input).unwrap().as_bytes(),
+            b"\xff efi=noruntime --"
+        );
+        let input = std::ffi::CString::new(b"a\xa0--\xa0init".to_vec()).unwrap();
+        assert_eq!(
+            kernel_command_line(&input).unwrap().as_bytes(),
+            b"a\xa0efi=noruntime --\xa0init"
+        );
+        let suffix_len = b" efi=noruntime".len();
+        let input = std::ffi::CString::new(vec![b'a'; 2047 - suffix_len]).unwrap();
+        assert_eq!(kernel_command_line(&input).unwrap().as_bytes().len(), 2047);
+        let input = std::ffi::CString::new(vec![b'a'; 2048 - suffix_len]).unwrap();
+        assert!(kernel_command_line(&input).is_err());
     }
 
     #[test]
@@ -951,7 +1058,28 @@ mod tests {
         assert_eq!(platform.magic, SNP_BOOT_SHIM_PLATFORM_MAGIC);
         assert_eq!(platform.c_bit_mask, TEST_C_BIT_MASK);
         assert_eq!(platform.version, SNP_BOOT_SHIM_PLATFORM_VERSION);
-        assert_eq!(platform.dt_gpa, LAYOUT_PARAMS_GPA + 2 * PAGE_SIZE);
+        assert_eq!(platform.efi_output_gpa, LAYOUT_PARAMS_GPA + 2 * PAGE_SIZE);
+        assert_eq!(platform.efi_output_size, SNP_BOOT_SHIM_EFI_SIZE);
+        let metadata = loader::efi::build_metadata(
+            platform.efi_output_gpa,
+            platform.rsdp_gpa,
+            &loader::smbios::SmbiosTables::default(),
+        )
+        .unwrap();
+        assert_eq!(metadata.systab_addr, platform.efi_output_gpa);
+        let metadata_page = imported_page(&output, platform.efi_output_gpa);
+        assert_eq!(&metadata_page[..metadata.data.len()], metadata.data);
+        assert!(metadata_page[metadata.data.len()..].iter().all(|&b| b == 0));
+        for gpa in (platform.efi_output_gpa + PAGE_SIZE
+            ..platform.efi_output_gpa + platform.efi_output_size)
+            .step_by(PAGE_SIZE as usize)
+        {
+            assert_eq!(imported_page(&output, gpa), [0; PAGE_SIZE as usize]);
+        }
+        assert_eq!(
+            platform.dt_gpa,
+            platform.efi_output_gpa + SNP_BOOT_SHIM_EFI_SIZE
+        );
         assert_eq!(platform.dt_size, SNP_BOOT_SHIM_DT_SIZE);
         assert_eq!(platform.heap_gpa, platform.dt_gpa + platform.dt_size);
         assert_eq!(platform.heap_size, SNP_BOOT_SHIM_HEAP_SIZE);

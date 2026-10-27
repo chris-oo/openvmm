@@ -22,11 +22,8 @@ fn rpc_error(status: mesh_rpc::service::Status) -> anyhow::Error {
     anyhow::anyhow!("RPC failed: {status:?}")
 }
 
-// TODO: Enable once the SNP guest can use ECAM above 4 GiB. The non-ttrpc
-// SNP tests cover the same block I/O paths with ECAM below 4 GiB.
 #[vmm_test_with(
     openvmm,
-    ignore(reason = "SNP guest needs support for PCI ECAM above 4 GiB"),
     configs(linux_direct_x64[snp][
         artifacts::OPENVMM_NATIVE,
         artifacts::snp_igvm::SNP_LINUX_DIRECT_IGVM_X64
@@ -42,7 +39,6 @@ async fn virtio_blk_file<A>(
 
 #[vmm_test_with(
     openvmm,
-    ignore(reason = "SNP guest needs support for PCI ECAM above 4 GiB"),
     configs(linux_direct_x64[snp][
         artifacts::OPENVMM_NATIVE,
         artifacts::snp_igvm::SNP_LINUX_DIRECT_IGVM_X64
@@ -58,7 +54,6 @@ async fn virtio_blk_file_direct<A>(
 
 #[vmm_test_with(
     openvmm,
-    ignore(reason = "SNP guest needs support for PCI ECAM above 4 GiB"),
     configs(linux_direct_x64[snp][
         artifacts::OPENVMM_NATIVE,
         artifacts::snp_igvm::SNP_LINUX_DIRECT_IGVM_X64
@@ -74,7 +69,6 @@ async fn virtio_blk_vmdk<A>(
 
 #[vmm_test_with(
     openvmm,
-    ignore(reason = "SNP guest needs support for PCI ECAM above 4 GiB"),
     requires(loop_device),
     configs(linux_direct_x64[snp][
         artifacts::OPENVMM_NATIVE,
@@ -98,7 +92,6 @@ async fn virtio_blk_host_block_buffered<A>(
 
 #[vmm_test_with(
     openvmm,
-    ignore(reason = "SNP guest needs support for PCI ECAM above 4 GiB"),
     requires(loop_device),
     configs(linux_direct_x64[snp][
         artifacts::OPENVMM_NATIVE,
@@ -304,12 +297,7 @@ pub(super) async fn run_with_boot(
         .context("guest pipette connection timed out")??;
     anyhow::ensure!(agent.local_vsock_cid() == Some(42), "wrong guest vsock CID");
     if isolated {
-        let shell = agent.unix_shell();
-        let dmesg = cmd!(shell, "dmesg").read().await?;
-        anyhow::ensure!(
-            dmesg.contains("SEV: Status: SEV SEV-ES SEV-SNP"),
-            "guest did not confirm active SNP"
-        );
+        crate::utils::snp_firmware::verify(&agent).await?;
     }
     wait_for_disk(&agent, BOOT_SERIAL, true, &driver).await?;
     verify_io(&agent, BOOT_SERIAL, &boot_pattern, initial_read_only).await?;

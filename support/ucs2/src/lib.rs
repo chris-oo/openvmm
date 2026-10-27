@@ -3,10 +3,18 @@
 
 // UNSAFETY: Defining and implementing from_slice_unchecked.
 #![expect(unsafe_code)]
+#![no_std]
 
 //! Wrappers around possibly misaligned `[u8]` buffers containing UCS-2 LE data.
 
-use std::fmt;
+extern crate alloc;
+
+use alloc::borrow::Borrow;
+use alloc::borrow::Cow;
+use alloc::borrow::ToOwned;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::fmt;
 use thiserror::Error;
 
 /// Errors which may occur while parsing UCS-2
@@ -78,7 +86,7 @@ impl AsRef<Ucs2LeSlice> for Ucs2LeVec {
     }
 }
 
-impl std::ops::Deref for Ucs2LeVec {
+impl core::ops::Deref for Ucs2LeVec {
     type Target = Ucs2LeSlice;
 
     fn deref(&self) -> &Ucs2LeSlice {
@@ -86,21 +94,21 @@ impl std::ops::Deref for Ucs2LeVec {
     }
 }
 
-impl std::borrow::Borrow<Ucs2LeSlice> for Ucs2LeVec {
+impl Borrow<Ucs2LeSlice> for Ucs2LeVec {
     fn borrow(&self) -> &Ucs2LeSlice {
         self.as_ref()
     }
 }
 
-impl<'a> From<&'a Ucs2LeSlice> for std::borrow::Cow<'a, Ucs2LeSlice> {
+impl<'a> From<&'a Ucs2LeSlice> for Cow<'a, Ucs2LeSlice> {
     fn from(val: &'a Ucs2LeSlice) -> Self {
-        std::borrow::Cow::Borrowed(val)
+        Cow::Borrowed(val)
     }
 }
 
-impl From<Ucs2LeVec> for std::borrow::Cow<'_, Ucs2LeSlice> {
+impl From<Ucs2LeVec> for Cow<'_, Ucs2LeSlice> {
     fn from(val: Ucs2LeVec) -> Self {
-        std::borrow::Cow::Owned(val)
+        Cow::Owned(val)
     }
 }
 
@@ -181,7 +189,7 @@ impl Ucs2LeSlice {
     unsafe fn from_slice_unchecked(buf: &[u8]) -> &Ucs2LeSlice {
         // SAFETY: caller has maintained invariants, and `Ucs2LeSlice` has the
         // same representation as [u8]
-        unsafe { std::mem::transmute(buf) }
+        unsafe { core::mem::transmute(buf) }
     }
 
     /// View the underlying data as raw bytes.
