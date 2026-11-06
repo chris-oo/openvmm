@@ -67,6 +67,9 @@ pub struct GuestMemoryManager {
 struct RamBacking {
     /// The file-backed memory handle. `None` for private (anonymous) backings.
     mappable: Option<Mappable>,
+    /// First byte in the file backing this request's packed RAM ranges.
+    file_offset: u64,
+    restartable: bool,
     /// GPA ranges covered by this backing.
     ranges: Vec<MemoryRange>,
     /// Prefetch pages at build time.
@@ -151,6 +154,12 @@ pub enum MemoryBuildError {
     /// Private memory is incompatible with an existing memory backing.
     #[error("private memory is incompatible with an existing memory backing")]
     PrivateMemoryWithExistingBacking,
+    /// An imported backing offset is not aligned to a host page.
+    #[error("existing RAM backing offset {0:#x} is not host-page-aligned")]
+    UnalignedExistingBackingOffset(u64),
+    /// The imported backing offset and packed RAM size overflow.
+    #[error("existing RAM backing range overflows the file offset space")]
+    ExistingBackingRangeOverflow,
     /// Hugepage size is too large.
     #[error("hugepage size {0} is too large")]
     HugepageSizeTooLarge(MemorySize),
@@ -212,6 +221,8 @@ pub struct RamBackingRequest {
     hugepages: bool,
     hugepage_size: Option<u64>,
     existing_mappable: Option<Mappable>,
+    file_offset: u64,
+    restartable: bool,
     host_numa_node: Option<u32>,
 }
 
@@ -229,6 +240,8 @@ impl RamBackingRequest {
             hugepages: false,
             hugepage_size: None,
             existing_mappable: None,
+            file_offset: 0,
+            restartable: true,
             host_numa_node: None,
         }
     }
@@ -269,6 +282,29 @@ impl RamBackingRequest {
     /// When set, no new allocation is performed for this backing.
     pub fn existing_mappable(mut self, mappable: Mappable) -> Self {
         self.existing_mappable = Some(mappable);
+        self.file_offset = 0;
+        self.restartable = true;
+        self
+    }
+
+    /// Imports RAM from a host-page-aligned offset in an existing Linux file.
+    ///
+    /// The request's GPA ranges are packed consecutively starting at
+    /// `file_offset`, regardless of gaps in GPA space. The caller must ensure
+    /// the file covers the complete range and remains suitable for mapping.
+    /// This can describe slices of partition-owned backing such as guestmemfd;
+    /// it does not perform private/shared conversion or control DMA visibility.
+    ///
+    /// Offset imports cannot be exported by
+    /// [`GuestMemoryManager::shared_memory_backing`] for restart, even at
+    /// offset zero: the file can belong to the current partition.
+    /// All host views are eagerly mapped so a revoked page fails access
+    /// instead of repeatedly retrying a lazy mapping.
+    #[cfg(target_os = "linux")]
+    pub fn existing_mappable_at(mut self, mappable: Mappable, file_offset: u64) -> Self {
+        self.existing_mappable = Some(mappable);
+        self.file_offset = file_offset;
+        self.restartable = false;
         self
     }
 
@@ -422,6 +458,20 @@ impl GuestMemoryBuilder {
 
         // Validate per-request constraints.
         for req in &backing_requests {
+            if !req
+                .file_offset
+                .is_multiple_of(SparseMapping::page_size() as u64)
+            {
+                return Err(MemoryBuildError::UnalignedExistingBackingOffset(
+                    req.file_offset,
+                ));
+            }
+            req.ranges
+                .iter()
+                .try_fold(req.file_offset, |offset, range| {
+                    offset.checked_add(range.len())
+                })
+                .ok_or(MemoryBuildError::ExistingBackingRangeOverflow)?;
             if req.private_memory && self.x86_legacy_support {
                 return Err(MemoryBuildError::PrivateMemoryWithLegacy);
             }
@@ -485,6 +535,8 @@ impl GuestMemoryBuilder {
             if req.private_memory {
                 backings.push(RamBacking {
                     mappable: None,
+                    file_offset: 0,
+                    restartable: false,
                     ranges: req.ranges,
                     prefetch: req.prefetch,
                     transparent_hugepages: req.transparent_hugepages,
@@ -538,6 +590,8 @@ impl GuestMemoryBuilder {
 
             backings.push(RamBacking {
                 mappable: Some(mappable),
+                file_offset: req.file_offset,
+                restartable: req.restartable,
                 ranges: req.ranges,
                 // On Windows, hugepage (SEC_LARGE_PAGES) backing only yields 2 MB
                 // SLAT entries when the SLAT is populated in >= 512-page batches;
@@ -575,6 +629,9 @@ impl GuestMemoryBuilder {
             max_addr,
             max_hugepage_size,
             self.supports_memory_fault_resolution,
+            backings
+                .iter()
+                .any(|backing| backing.mappable.is_some() && !backing.restartable),
         )
         .await
         .map_err(MemoryBuildError::VaMapper)?;
@@ -584,7 +641,7 @@ impl GuestMemoryBuilder {
         // Build RAM regions from each backing's ranges.
         let mut ram_regions = Vec::new();
         for backing in &backings {
-            let mut file_offset = 0u64;
+            let mut file_offset = backing.file_offset;
             for range in &backing.ranges {
                 // Split for x86 legacy PAM/VGA regions if needed.
                 let sub_ranges =
@@ -707,6 +764,14 @@ pub struct GuestMemoryClient {
     mapping_manager: MappingManagerClient,
 }
 
+#[derive(Debug, Error)]
+pub enum AliasedGuestMemoryError {
+    #[error("failed to create guest memory mapper")]
+    Mapper(#[from] VaMapperError),
+    #[error("failed to create aliased guest memory")]
+    MultiRegion(#[from] guestmem::MultiRegionError),
+}
+
 impl GuestMemoryClient {
     /// Retrieves a [`GuestMemory`] object to access guest memory from this
     /// process.
@@ -719,6 +784,23 @@ impl GuestMemoryClient {
             "ram",
             self.mapping_manager.new_mapper(false).await?,
         ))
+    }
+
+    /// Retrieves a [`GuestMemory`] object that aliases the lower GPA range at
+    /// `alias_bit`.
+    pub async fn aliased_guest_memory(
+        &self,
+        debug_name: impl Into<Arc<str>>,
+        alias_bit: u64,
+    ) -> Result<GuestMemory, AliasedGuestMemoryError> {
+        Ok(GuestMemory::new_multi_region(
+            debug_name,
+            alias_bit,
+            vec![
+                Some(self.mapping_manager.new_mapper(false).await?),
+                Some(self.mapping_manager.new_mapper(false).await?),
+            ],
+        )?)
     }
 }
 
@@ -775,11 +857,11 @@ impl GuestMemoryManager {
     /// guest may see unpredictable results.
     ///
     /// Returns `None` unless there is exactly one backing and it is
-    /// file-backed. This currently means multi-backing and private-memory
-    /// configurations cannot be restarted.
+    /// file-backed at offset zero and restartable. This means multi-backing,
+    /// private-memory and offset-import configurations cannot be restarted.
     pub fn shared_memory_backing(&self) -> Option<SharedMemoryBacking> {
         // Require exactly one backing, and it must be file-backed.
-        if self.guest_ram.len() != 1 {
+        if self.guest_ram.len() != 1 || !self.guest_ram[0].restartable {
             return None;
         }
         Some(SharedMemoryBacking {
@@ -926,6 +1008,164 @@ mod tests {
     use super::*;
     use pal_async::async_test;
     use std::error::Error as _;
+    use test_with_tracing::test;
+
+    #[cfg(target_os = "linux")]
+    #[async_test]
+    async fn test_existing_backing_offset_preserves_packed_ranges() {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::fs::FileExt;
+
+        let page = SparseMapping::page_size() as u64;
+        let file = std::fs::File::from(
+            sparse_mmap::alloc_shared_memory((3 * page) as usize, "offset-test").unwrap(),
+        );
+        file.write_all_at(&[0xa0], 0).unwrap();
+        file.write_all_at(&[0xb1], page).unwrap();
+        file.write_all_at(&[0xc2], 2 * page).unwrap();
+        let mappable = Mappable::from(OwnedFd::from(file.try_clone().unwrap()));
+        let manager = GuestMemoryBuilder::new()
+            .add_backing(
+                RamBackingRequest::new(vec![
+                    MemoryRange::new(page..2 * page),
+                    MemoryRange::new(4 * page..5 * page),
+                ])
+                .existing_mappable_at(mappable, page),
+            )
+            .build(5 * page)
+            .await
+            .unwrap();
+        let primary = GuestMemory::new("offset-primary", manager.va_mapper.clone());
+        let secondary = manager.client().guest_memory().await.unwrap();
+        assert_eq!(primary.read_plain::<u8>(page).unwrap(), 0xb1);
+        assert_eq!(secondary.read_plain::<u8>(4 * page).unwrap(), 0xc2);
+        primary.write_at(page, &[0xd3]).unwrap();
+        secondary.write_at(4 * page, &[0xe4]).unwrap();
+        assert_eq!(secondary.read_plain::<u8>(page).unwrap(), 0xd3);
+        assert_eq!(primary.read_plain::<u8>(4 * page).unwrap(), 0xe4);
+        let mut byte = [0];
+        for (offset, expected) in [(0, 0xa0), (page, 0xd3), (2 * page, 0xe4)] {
+            file.read_exact_at(&mut byte, offset).unwrap();
+            assert_eq!(byte, [expected]);
+        }
+        assert!(secondary.read_plain::<u8>(3 * page).is_err());
+        assert!(manager.shared_memory_backing().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[async_test]
+    async fn test_existing_backing_rejects_invalid_offset() {
+        let page = SparseMapping::page_size() as u64;
+        for (offset, overflow) in [(1, false), (u64::MAX - (page - 1), true)] {
+            let mappable = sparse_mmap::alloc_shared_memory(page as usize, "offset-test").unwrap();
+            let error = GuestMemoryBuilder::new()
+                .add_backing(
+                    RamBackingRequest::new(vec![MemoryRange::new(0..page)])
+                        .existing_mappable_at(mappable.into(), offset),
+                )
+                .build(page)
+                .await
+                .unwrap_err();
+            if overflow {
+                assert!(matches!(
+                    error,
+                    MemoryBuildError::ExistingBackingRangeOverflow
+                ));
+            } else {
+                assert!(matches!(
+                    error,
+                    MemoryBuildError::UnalignedExistingBackingOffset(1)
+                ));
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[async_test]
+    async fn test_existing_mappable_resets_offset_for_restart() {
+        let page = SparseMapping::page_size() as u64;
+        let mappable: Mappable =
+            sparse_mmap::alloc_shared_memory((2 * page) as usize, "offset-test")
+                .unwrap()
+                .into();
+        let manager = GuestMemoryBuilder::new()
+            .add_backing(
+                RamBackingRequest::new(vec![MemoryRange::new(0..page)])
+                    .existing_mappable_at(mappable.clone(), page)
+                    .existing_mappable(mappable),
+            )
+            .build(page)
+            .await
+            .unwrap();
+        let memory = manager.client().guest_memory().await.unwrap();
+        memory.write_at(0, &[0x42]).unwrap();
+        let backing = manager.shared_memory_backing().unwrap().into_mappable();
+        drop(memory);
+        drop(manager);
+        let restored = GuestMemoryBuilder::new()
+            .add_backing(
+                RamBackingRequest::new(vec![MemoryRange::new(0..page)]).existing_mappable(backing),
+            )
+            .build(page)
+            .await
+            .unwrap();
+        assert_eq!(
+            restored
+                .client()
+                .guest_memory()
+                .await
+                .unwrap()
+                .read_plain::<u8>(0)
+                .unwrap(),
+            0x42
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[async_test]
+    async fn offset_zero_partition_backing_is_not_exported_and_faults_fail() {
+        let page = SparseMapping::page_size();
+        let file: std::fs::File = sparse_mmap::alloc_shared_memory(page, "revoked-ram-test")
+            .unwrap()
+            .into();
+        let fd = std::os::fd::OwnedFd::from(file.try_clone().unwrap());
+        let manager = GuestMemoryBuilder::new()
+            .add_backing(
+                RamBackingRequest::new(vec![MemoryRange::new(0..page as u64)])
+                    .existing_mappable_at(fd.into(), 0),
+            )
+            .build(page as u64)
+            .await
+            .unwrap();
+        assert!(manager.shared_memory_backing().is_none());
+        let gm = manager.client().guest_memory().await.unwrap();
+        assert!(!guestmem::GuestMemoryAccess::supports_locking(
+            manager.va_mapper.as_ref()
+        ));
+        assert!(!gm.supports_locking());
+        assert!(gm.sharing().is_none());
+        assert!(
+            gm.lock_gpns(guestmem::AccessType::Read, false, &[0])
+                .is_err()
+        );
+        let alias_bit = 1 << 20;
+        let alias = manager
+            .client()
+            .aliased_guest_memory("revocable-alias-test", alias_bit)
+            .await
+            .unwrap();
+        assert!(!alias.supports_locking());
+        assert!(alias.sharing().is_none());
+        gm.write_at(0, &[0x35]).unwrap();
+        assert_eq!(alias.read_plain::<u8>(alias_bit).unwrap(), 0x35);
+        // Truncation produces SIGBUS on an existing mapping, like a revoked
+        // private guestmemfd page. GuestMemory must return an error, not retry.
+        file.set_len(0).unwrap();
+        assert!(gm.read_plain::<u8>(0).is_err());
+        assert!(gm.write_at(0, &[0xee]).is_err());
+        assert!(alias.read_plain::<u8>(alias_bit).is_err());
+        assert!(alias.write_at(alias_bit, &[0xee]).is_err());
+    }
 
     /// Build a GuestMemoryManager with the given backing range groups,
     /// and return a GuestMemory handle for read/write testing.
@@ -1159,7 +1399,6 @@ mod tests {
             assert_eq!(buf, pattern_b);
         });
     }
-
     /// Builds a manager with a single THP-enabled shared RAM backing and
     /// returns a [`GuestMemory`] over the **primary** mapper. Soft large pages
     /// (the Windows deferred-protect scheme that maps guest RAM read-only until
@@ -1221,5 +1460,28 @@ mod tests {
             .unwrap();
         assert_eq!(locked.pages()[0][0].load(Ordering::SeqCst), 0);
         drop(locked);
+    }
+    #[test]
+    fn test_aliased_guest_memory() {
+        DefaultPool::run_with(|_| async {
+            let page = SparseMapping::page_size() as u64;
+            let range = MemoryRange::new(0..4 * page);
+            let (mgr, _gm) = build_and_get_memory(&[&[range]]).await;
+            let alias_bit = 8 * page;
+            let gm = mgr
+                .client()
+                .aliased_guest_memory("aliased", alias_bit)
+                .await
+                .unwrap();
+
+            let pattern = vec![0x5A; page as usize];
+            gm.write_at(alias_bit + page, &pattern).unwrap();
+
+            let mut buf = vec![0u8; page as usize];
+            gm.read_at(page, &mut buf).unwrap();
+            assert_eq!(buf, pattern);
+
+            assert!(gm.read_at(alias_bit + range.end(), &mut buf).is_err());
+        });
     }
 }
