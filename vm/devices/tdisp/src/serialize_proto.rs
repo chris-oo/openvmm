@@ -101,6 +101,11 @@ pub fn validate_response(response: &GuestToHostResponse) -> anyhow::Result<()> {
 
     // Only require a result field if the response is a success.
     if response.result == TdispGuestOperationErrorCode::Success as i32 {
+        anyhow::ensure!(
+            response.tdi_state_before != TdispTdiState::Uninitialized as i32
+                && response.tdi_state_after != TdispTdiState::Uninitialized as i32,
+            "proto validation: successful response must contain confirmed TDI states"
+        );
         require_field!(response.response)?;
         if let Some(Response::GetTdiReport(req)) = &response.response {
             require_enum!(req.report_type, TdispReportType)?;

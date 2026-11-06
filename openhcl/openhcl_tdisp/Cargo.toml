@@ -20,6 +20,9 @@ anyhow.workspace = true
 futures.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+test_with_tracing.workspace = true
+
 # Both validators talk to /dev/mshv_vtl, and SEV-TIO also to /dev/sev-guest.
 [target.'cfg(target_os = "linux")'.dependencies]
 hcl.workspace = true

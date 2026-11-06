@@ -8,6 +8,7 @@ use crate::tests::mocks::new_machine;
 use tdisp_proto::TdispGuestUnbindReason;
 use tdisp_proto::TdispReportType;
 use tdisp_proto::TdispTdiState;
+use test_with_tracing::test;
 
 // ── Valid forward-progress transitions ───────────────────────────────────────
 
@@ -250,4 +251,40 @@ fn test_attestation_report_invalid_type_from_locked_returns_error_without_state_
     ));
     assert_eq!(mock.machine.state(), TdispTdiState::Locked);
     assert_eq!(*mock.last_call.lock(), Some(LastCall::BindDevice));
+}
+
+#[test]
+fn quarantine_rejects_direct_facade_calls() {
+    let mut mock = new_machine();
+    mock.control.lock().fail = Some(LastCall::BindDevice);
+    assert!(matches!(
+        mock.machine.request_lock_device_resources(),
+        Err(TdispGuestOperationError::HostFailedToProcessCommand)
+    ));
+    assert_eq!(mock.machine.state(), TdispTdiState::Uninitialized);
+    assert!(!mock.gate.is_allowed());
+    let calls = mock.control.lock().calls.len();
+    assert!(mock.machine.request_start_tdi().is_err());
+    assert!(mock.machine.request_lock_device_resources().is_err());
+    assert!(
+        mock.machine
+            .request_unbind(TdispGuestUnbindReason::Graceful)
+            .is_err()
+    );
+    assert!(
+        mock.machine
+            .tdisp_negotiate_protocol(crate::test_helpers::TDISP_MOCK_GUEST_PROTOCOL)
+            .is_err()
+    );
+    assert!(
+        mock.machine
+            .request_attestation_report(TdispReportType::GuestDeviceId)
+            .is_err()
+    );
+    assert!(
+        mock.machine
+            .request_modify_mmio_range(crate::TdispMmioRangeAction::UnblockMmioRange, 0, 0, 4096)
+            .is_err()
+    );
+    assert_eq!(mock.control.lock().calls.len(), calls);
 }

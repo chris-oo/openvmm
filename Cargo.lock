@@ -5989,6 +5989,7 @@ dependencies = [
  "sev_guest_device",
  "tdisp",
  "tdisp_proto",
+ "test_with_tracing",
  "tracelimit",
  "tracing",
  "virt",
@@ -8914,11 +8915,17 @@ name = "tdisp"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bitfield-struct 0.11.0",
+ "blocking",
+ "futures",
+ "mesh",
  "parking_lot",
  "prost",
  "static_assertions",
  "tdisp_proto",
+ "test_with_tracing",
+ "thiserror 2.0.16",
  "tracing",
  "zerocopy",
 ]

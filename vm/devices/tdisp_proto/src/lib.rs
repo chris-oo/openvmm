@@ -124,9 +124,11 @@ pub trait GuestToHostResponseExt {
     fn response<T: GuestToHostResponseVariant>(self) -> Result<T, TdispGuestOperationError>;
 
     /// Returns the TDI state of the device before the command was processed, if available.
+    /// Indeterminate state is valid only with a recognized non-success result.
     fn tdi_state_before_enum(&self) -> Option<TdispTdiState>;
 
     /// Returns the TDI state of the device after the command was processed, if available.
+    /// Indeterminate state is valid only with a recognized non-success result.
     fn tdi_state_after_enum(&self) -> Option<TdispTdiState>;
 }
 
@@ -148,31 +150,11 @@ impl GuestToHostResponseExt for GuestToHostResponse {
     }
 
     fn tdi_state_before_enum(&self) -> Option<TdispTdiState> {
-        let old_state = TdispTdiState::from_i32(self.tdi_state_before);
-
-        // These are the only valid states the host can advertise.
-        if old_state != Some(TdispTdiState::Unlocked)
-            && old_state != Some(TdispTdiState::Locked)
-            && old_state != Some(TdispTdiState::Run)
-        {
-            return None;
-        }
-
-        old_state
+        response_state(self.tdi_state_before, self.result)
     }
 
     fn tdi_state_after_enum(&self) -> Option<TdispTdiState> {
-        let new_state = TdispTdiState::from_i32(self.tdi_state_after);
-
-        // These are the only valid states the host can advertise.
-        if new_state != Some(TdispTdiState::Unlocked)
-            && new_state != Some(TdispTdiState::Locked)
-            && new_state != Some(TdispTdiState::Run)
-        {
-            return None;
-        }
-
-        new_state
+        response_state(self.tdi_state_after, self.result)
     }
 
     fn response<T: GuestToHostResponseVariant>(self) -> Result<T, TdispGuestOperationError> {
@@ -186,6 +168,23 @@ impl GuestToHostResponseExt for GuestToHostResponse {
             Some(err) => Err(err.into()),
             None => Err(TdispGuestOperationErrorCode::Unknown.into()),
         }
+    }
+}
+
+fn response_state(state: i32, result: i32) -> Option<TdispTdiState> {
+    match TdispTdiState::from_i32(state)? {
+        state @ (TdispTdiState::Unlocked | TdispTdiState::Locked | TdispTdiState::Run) => {
+            Some(state)
+        }
+        TdispTdiState::Uninitialized
+            if matches!(
+                TdispGuestOperationErrorCode::from_i32(result),
+                Some(code) if code != TdispGuestOperationErrorCode::Success
+            ) =>
+        {
+            Some(TdispTdiState::Uninitialized)
+        }
+        TdispTdiState::Uninitialized => None,
     }
 }
 

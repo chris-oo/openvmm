@@ -443,7 +443,7 @@ impl TdispClientState {
         // Record state transitions based on the TDI state returned by the host in the response, if available.
         match res.tdi_state_after_enum() {
             Some(state) => self.mutable_state.update_tdi_state(state),
-            None => std::panic!("tdisp: host returned a completely unknown TDI state in response"),
+            None => anyhow::bail!("tdisp: host returned an invalid TDI state in response"),
         }
 
         match res.error_code() {
@@ -1367,9 +1367,11 @@ impl TdispClientState {
 mod tests {
     use super::*;
 
+    use futures::FutureExt;
     use tdisp::devicereport::TdispTdiReportInterfaceInfo;
     use tdisp::devicereport::TdispTdiReportMmioFlags;
     use tdisp::devicereport::TdispTdiReportMmioInterfaceInfo;
+    use test_with_tracing::test;
 
     /// A transport for the classification tests, which never send a command.
     #[derive(Inspect)]
@@ -1406,6 +1408,76 @@ mod tests {
             Vtl::Vtl0,
             present_bars,
         )
+    }
+
+    #[derive(Inspect)]
+    struct RejectingTransport {
+        command_name: &'static str,
+        before: TdispTdiState,
+    }
+
+    impl TdispCommandTransport for RejectingTransport {
+        fn bus_device_id(&self) -> u64 {
+            0
+        }
+
+        fn send_command<'a>(
+            &'a self,
+            command: GuestToHostCommand,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<GuestToHostResponse>> + Send + Sync + 'a>>
+        {
+            Box::pin(async move {
+                let wire = crate::serialize_command(&command);
+                let command = crate::deserialize_command(&wire)?;
+                assert_eq!(command.type_name(), Some(self.command_name));
+                let response = GuestToHostResponse {
+                    result: TdispGuestOperationErrorCode::HostFailedToProcessCommand as i32,
+                    tdi_state_before: self.before as i32,
+                    tdi_state_after: TdispTdiState::Uninitialized as i32,
+                    response: None,
+                };
+                let wire = crate::serialize_response(&response);
+                crate::deserialize_response(&wire)
+            })
+        }
+    }
+
+    #[test]
+    fn failed_bind_replaces_cached_state_with_indeterminate() {
+        futures::executor::block_on(async {
+            let mut state = new_state();
+            state.transport = Box::new(RejectingTransport {
+                command_name: "Bind",
+                before: TdispTdiState::Unlocked,
+            });
+            state.mutable_state.tdi_state = TdispTdiState::Unlocked;
+
+            let error = state.bind_interface().await.unwrap_err();
+            assert!(error.to_string().contains("HostFailedToProcessCommand"));
+            assert_eq!(state.tdi_state(), TdispTdiState::Uninitialized);
+        });
+    }
+
+    #[test]
+    fn failed_unbind_keeps_indeterminate_state_and_remains_fatal() {
+        futures::executor::block_on(async {
+            let mut state = new_state();
+            state.transport = Box::new(RejectingTransport {
+                command_name: "Unbind",
+                before: TdispTdiState::Run,
+            });
+            state.mutable_state.tdi_state = TdispTdiState::Run;
+
+            let panic =
+                std::panic::AssertUnwindSafe(state.unbind(TdispGuestUnbindReason::Graceful))
+                    .catch_unwind()
+                    .await
+                    .unwrap_err();
+            let message = panic.downcast_ref::<String>().unwrap();
+            assert!(message.contains("tdisp_unbind: error response from host, cannot continue"));
+            assert!(message.contains("HostFailedToProcessCommand"));
+            assert_eq!(state.tdi_state(), TdispTdiState::Uninitialized);
+        });
     }
 
     /// Build a minimal `TdiReportStruct` containing only the given
