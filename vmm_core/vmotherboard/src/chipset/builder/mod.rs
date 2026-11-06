@@ -62,18 +62,30 @@ impl ChipsetDevices {
     ///
     /// Cleanup remains owned even if the completion future is abandoned.
     pub fn teardown(&mut self) -> impl Future<Output = ()> {
-        let devices = std::mem::take(&mut self.arc_mutex_device_units);
+        let devices = self.drain_device_units();
         let (send, recv) = mesh::oneshot();
         self.driver
             .spawn("teardown-chipset-devices", async move {
-                for device in devices.into_iter().rev() {
-                    device.remove().await;
-                }
+                devices.await;
                 send.send(());
             })
             .detach();
         async move {
             recv.await.expect("chipset teardown task failed");
+        }
+    }
+
+    /// Takes all static device units into an owned asynchronous drain.
+    ///
+    /// Stop state units first. Keep the executor, partition and RAM alive until
+    /// this future completes. For assignments with uncertain release, retain this
+    /// future on cancellation: it owns remaining units and awaits in-flight removal.
+    pub fn drain_device_units(&mut self) -> impl Future<Output = ()> + Send + 'static {
+        let units = std::mem::take(&mut self.arc_mutex_device_units);
+        async move {
+            for unit in units.into_iter().rev() {
+                unit.remove().await;
+            }
         }
     }
 

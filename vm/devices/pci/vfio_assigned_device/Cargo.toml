@@ -18,6 +18,8 @@ parking_lot.workspace = true
 pci_core.workspace = true
 pci_resources.workspace = true
 smmu.workspace = true
+sparse_mmap.workspace = true
+tdisp.workspace = true
 vfio_sys.workspace = true
 vfio-bindings.workspace = true
 vfio_assigned_device_resources.workspace = true
@@ -28,9 +30,12 @@ anyhow.workspace = true
 async-trait.workspace = true
 tracelimit.workspace = true
 tracing.workspace = true
+thiserror.workspace = true
 zerocopy.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
+futures.workspace = true
+nix.workspace = true
 test_with_tracing.workspace = true
 
 [lints]
