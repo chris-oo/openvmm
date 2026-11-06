@@ -55,7 +55,7 @@ pub enum OpenvmmPipelines {
     /// Build and run VMM.Perf without Petri/nextest
     VmmPerf(VmmPerfCli),
 
-    /// Provision and run a standalone x64 mshv development VM.
+    /// Provision and run a standalone mshv or FVP development VM.
     Incubator(incubator::IncubatorCli),
 
     /// Run VMM tests on a target system with artifacts built by `VmmTestsRun`.

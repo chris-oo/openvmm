@@ -144,6 +144,8 @@ impl SimpleFlowNode for Node {
                         uefi_x64: true,
                         uefi_aarch64: false,
                         qemu_system_aarch64_linux_x64: false,
+                        fvp_cca_platform_aarch64: false,
+                        fvp_cca_payload_aarch64: false,
                     },
                     uefi_firmware_flavor: None,
                     needs_virtio_win_drivers: true,

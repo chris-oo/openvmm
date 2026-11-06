@@ -43,5 +43,5 @@ rpm = { workspace = true, features = ["payload", "zstd-compression"] }
 workspace = true
 
 [package.metadata.xtask.unused-deps]
-# Pulled in via prelude
+# Required by derives expanded through the Flowey prelude.
 ignored = ["serde"]

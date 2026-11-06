@@ -6,8 +6,7 @@ Petri, keeping builds, caches, and logs on the host.
 ## Launcher and boot selection
 
 `[incubator]` selects the launcher and VM resources; `[boot]` selects the guest
-environment and defaults to `linux-direct`. These profiles run on x64 Linux
-hosts; OpenVMM requires KVM.
+environment and defaults to `linux-direct`. The QEMU and OpenVMM profiles run on x64 Linux hosts; OpenVMM requires KVM.
 
 | Launcher | Boot environment | Current support |
 |----------|------------------|-----------------|
@@ -15,6 +14,10 @@ hosts; OpenVMM requires KVM.
 | `openvmm` | `linux-direct` | x64 Linux guest on x64 Linux |
 | `openvmm` | `mshv` | x64 mshv root partition on x64 Linux |
 | `qemu-tcg` | `mshv` | Not implemented |
+| `qemu-cca` | `linux-direct` | Diagnostic AArch64 CCA host |
+| `fvp-cca` | `linux-direct` | Licensed Arm FVP CCA host on Linux |
+
+CCA profiles reject `mshv` boot and extra profile devices.
 
 Registered VMM tests use [Petri nested tests](vmm.md#nested-tests), not an
 Incubator Flowey target runner. Each Incubator invocation cold-boots a VM.
@@ -34,6 +37,75 @@ The kernel and static Pipette binary must match the guest architecture. Place
 Pipette and the command binary beneath the shared directory.
 Profile devices are provisioned for VFIO before the command runs.
 
+## CCA commands
+
+FVP uses Petri's checked platform validation, staging, and teardown. Supply the
+qualified model and firmware package externally; Incubator does not build
+Shrinkwrap or model dependencies.
+
+```bash
+cargo run -p incubator -- \
+  --profile petri/incubator/profiles/aarch64-fvp-cca.toml \
+  --fvp-platform-root path/to/platform-root \
+  --shrinkwrap-package-root path/to/package-root \
+  --kernel path/to/Image --initrd path/to/initrd \
+  --share path/to/shared-root --output-dir path/to/results \
+  --fvp-input-share path/to/prepared-inputs \
+  --guest-pipette /share/pipette --no-pty \
+  --map-command-path path/to/shared-root/test-binary
+```
+
+The prepared input directory must contain `.openvmm-fvp-share.json`, a JSON
+array of relative regular-file paths, including Pipette. It is not a recursive
+directory share. `--share` remains the root for host-to-guest path mapping;
+`--fvp-input-share` selects the separate prepared inputs. Each invocation copies
+the listed files into a fresh input directory. With `--map-command-path`, it
+also copies only the selected host executable, unless the inventory already
+supplies that path. An existing inventory entry always uses the prepared copy.
+Other host files are not included automatically. Guest-resident commands such
+as `/bin/sh` do not need a host copy. FVP snapshots declared inputs before boot
+and publishes capabilities only after validation and readiness.
+An explicit `--timeout` overrides the FVP test-execution deadline; other phase
+deadlines remain in the profile. `--fvp-result-file` selects a fresh result
+file directly under the canonical output directory.
+
+The `aarch64-qemu-cca.toml` profile retains a separate diagnostic launch path.
+Supply `--kernel`, `--initrd`, and `--firmware` explicitly. You can override
+its executable with `--qemu-binary`. This platform is not qualified; launch,
+boot, and agent failures return an error with the log directory.
+
+### Provision an FVP environment
+
+On an x64 Linux model host, prepare the licensed runtime and qualified
+firmware and Linux payloads, then run:
+
+```bash
+cargo xflowey incubator \
+  --profile petri/incubator/profiles/aarch64-fvp-cca.toml \
+  --fvp-platform-root path/to/platform-root \
+  --shrinkwrap-package-root path/to/firmware-package \
+  --kernel path/to/host/Image --initrd path/to/host/initrd \
+  --prepare-only
+```
+
+The platform root can also come from `PETRI_FVP_PLATFORM_ROOT`. FVP does
+not require host KVM. Its pinned model image must already be cached, and
+its Shrinkwrap checkout and virtualenv must match the runtime identity.
+Flowey does not build firmware, kernels, or the model, and does not run
+`shrinkwrap build`.
+
+Flowey builds Incubator and static AArch64 Pipette, stages them under the
+share, and prints a reusable command. It supplies `--no-pty` for FVP.
+Keep the output directory beneath the share and outside the platform and
+firmware roots. To execute rather than prepare, replace `--prepare-only`
+with `-- --map-command-path -- path/to/program` and its arguments. The
+program must be inside the share.
+
+The FVP dependency release and archive-digest options also accept verified
+prebuilt firmware and host payload packages instead of extracted local
+inputs. See [CCA and FVP nested tests](vmm/qemu_cca.md) for package identity,
+payload provenance, model provisioning, and qualification limits.
+
 ## OpenVMM commands
 
 ### Provision an mshv environment
@@ -46,9 +118,8 @@ cargo xflowey incubator \
   --timeout 600 --no-pty -- /bin/sh -c 'test -c /dev/mshv && uname -a'
 ```
 
-`--profile` is required. Provisioning currently supports only x64 OpenVMM
-profiles with `mshv` boot; other launcher, architecture, or boot combinations
-are rejected. Flowey leaves the source file untouched and prepares a copy,
+`--profile` is required. MSHV provisioning supports only x64 OpenVMM profiles
+with `mshv` boot. Flowey leaves the source file untouched and prepares a copy,
 preserving its VM settings and boot options while replacing `binary`,
 `host-boot`, `firmware`, and `boot-artifacts` with resolved paths. These source
 paths may be placeholders; use CLI artifact overrides to supply local inputs.

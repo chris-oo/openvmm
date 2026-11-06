@@ -11,6 +11,7 @@
 
 use anyhow::Context as _;
 use flowey::node::prelude::ReadVar;
+use flowey::node::prelude::fs_err;
 use flowey::pipeline::prelude::*;
 use flowey_lib_hvlite::_jobs::local_build_and_run_nextest_vmm_tests::VmmTestSelections;
 use flowey_lib_hvlite::common::CommonArch;
@@ -38,6 +39,11 @@ use std::process::Stdio;
 
 /// Build and run VMM tests with automatic artifact discovery
 #[derive(clap::Args)]
+#[clap(group(
+    clap::ArgGroup::new("fvp_archive_hashes")
+        .args(["fvp_package_sha256", "fvp_payload_sha256"])
+        .multiple(true)
+))]
 pub struct VmmTestsRunCli {
     /// Specify what target to build the VMM tests for
     ///
@@ -123,10 +129,36 @@ pub struct VmmTestsRunCli {
     /// How many times to run the tests
     #[clap(long)]
     repetitions: Option<u64>,
-
-    /// Run emulated tests
+    /// Include guests with another architecture, using QEMU or FVP.
+    ///
+    /// Required for an AArch64 FVP L1 on an x64 model host. The outer test
+    /// still builds for the native host; this does not enable ignored tests.
     #[clap(long)]
     include_emulated: bool,
+
+    /// Release containing the selected prebuilt FVP packages.
+    #[clap(long, requires = "fvp_archive_hashes")]
+    fvp_deps_version: Option<String>,
+
+    /// Payload release if different from --fvp-deps-version.
+    #[clap(long, requires_all = ["fvp_deps_version", "fvp_payload_sha256"])]
+    fvp_payload_version: Option<String>,
+
+    /// Local FVP firmware archive instead of downloading the release package.
+    #[clap(long, requires_all = ["fvp_deps_version", "fvp_package_sha256"])]
+    fvp_package_archive: Option<PathBuf>,
+
+    /// Expected SHA-256 of the FVP firmware archive.
+    #[clap(long, requires = "fvp_deps_version")]
+    fvp_package_sha256: Option<String>,
+
+    /// Local FVP host and reference-guest payload archive.
+    #[clap(long, requires_all = ["fvp_deps_version", "fvp_payload_sha256"])]
+    fvp_payload_archive: Option<PathBuf>,
+
+    /// Expected SHA-256 of the FVP host and reference-guest payload archive.
+    #[clap(long, requires = "fvp_deps_version")]
+    fvp_payload_sha256: Option<String>,
 }
 
 struct CargoNextestListRequest<'a> {
@@ -224,6 +256,12 @@ impl IntoPipeline for VmmTestsRunCli {
             disable_secure_avic,
             repetitions,
             include_emulated,
+            fvp_deps_version,
+            fvp_payload_version,
+            fvp_package_archive,
+            fvp_package_sha256,
+            fvp_payload_archive,
+            fvp_payload_sha256,
         } = self;
 
         let repetitions =
@@ -251,23 +289,7 @@ impl IntoPipeline for VmmTestsRunCli {
 
         let include_ignored = build_only;
 
-        // By default, filter out tests that run inside emulators with
-        // different architectures so that you don't need qemu installed
-        let filter = if !include_emulated {
-            // This is kind of a hack, but the macro should always include
-            // the architecture in this format at least once.
-            //
-            // Using target arch here rather than host arch (which is what
-            // matters for requiring qemu), since presumably you really wanted
-            // the native tests for a different architecture if you manually
-            // specified it.
-            match target_architecture {
-                CommonArch::X86_64 => format!("({filter}) & !test(_aarch64_)"),
-                CommonArch::Aarch64 => format!("({filter}) & !test(_x64_)"),
-            }
-        } else {
-            filter
-        };
+        let mut filter = guest_arch_filter(filter, target_architecture, include_emulated);
 
         // Run artifact discovery inline at pipeline construction time since
         // flowey doesn't support conditional requests yet
@@ -278,7 +300,7 @@ impl IntoPipeline for VmmTestsRunCli {
         );
 
         // Determine which tests match the filter
-        let suites = run_cargo_nextest_list(CargoNextestListRequest {
+        let mut suites = run_cargo_nextest_list(CargoNextestListRequest {
             repo_root: &repo_root,
             target: &target_str,
             filter: &filter,
@@ -297,10 +319,35 @@ impl IntoPipeline for VmmTestsRunCli {
         // Query for the required artifacts
         let mut artifacts = Vec::new();
         let mut nested = Vec::new();
-        for suite in suites.values() {
-            let mut output = query_test_binary_artifacts(suite)?;
+        let mut excluded = Vec::new();
+        for suite in suites.values_mut() {
+            let mut output = query_configured_suite_artifacts(
+                suite,
+                fvp_deps_version.is_some(),
+                &mut query_test_binary_artifacts,
+                &mut excluded,
+            )?;
             nested.append(&mut output.nested);
             artifacts.append(&mut output.into_artifacts_list());
+        }
+        suites.retain(|_, suite| !suite.testcases.is_empty());
+        if !excluded.is_empty() {
+            log::info!(
+                "Skipping {} FVP package-dependent tests; configure \
+                 --fvp-deps-version and package digests to include them",
+                excluded.len()
+            );
+            let exclusions = excluded
+                .into_iter()
+                .map(|name| format!("test(={name})"))
+                .collect::<Vec<_>>()
+                .join(" + ");
+            filter = format!("({filter}) & !({exclusions})");
+            anyhow::ensure!(
+                !suites.is_empty(),
+                "selected tests require FVP packages; specify --fvp-deps-version \
+                 and the required firmware or payload SHA-256"
+            );
         }
 
         // Query artifacts for nested tests
@@ -346,6 +393,11 @@ impl IntoPipeline for VmmTestsRunCli {
                 if !output.nested.is_empty() {
                     anyhow::bail!("recursive nesting not supported");
                 }
+                anyhow::ensure!(
+                    fvp_deps_version.is_some() || !uses_fvp_packages(&output),
+                    "nested tests require FVP packages; specify --fvp-deps-version \
+                     and the required firmware or payload SHA-256"
+                );
                 artifacts.append(&mut output.into_artifacts_list());
             }
         }
@@ -355,6 +407,20 @@ impl IntoPipeline for VmmTestsRunCli {
         for artifact in artifacts {
             resolved.resolve_artifact(&artifact)?;
         }
+        anyhow::ensure!(
+            fvp_deps_version.is_none()
+                || resolved.prebuilt_artifacts.fvp_cca_platform_aarch64
+                || resolved.prebuilt_artifacts.fvp_cca_payload_aarch64,
+            "FVP package options require a test that uses FVP firmware or payloads"
+        );
+        anyhow::ensure!(
+            fvp_package_sha256.is_none() || resolved.prebuilt_artifacts.fvp_cca_platform_aarch64,
+            "FVP firmware options require a test that uses the FVP backend"
+        );
+        anyhow::ensure!(
+            fvp_payload_sha256.is_none() || resolved.prebuilt_artifacts.fvp_cca_payload_aarch64,
+            "FVP payload options require a test that uses the FVP payload"
+        );
 
         // Determine whether we need hyper-v and/or hardware isolation
         resolved.needs_hyperv = suites
@@ -453,6 +519,19 @@ impl IntoPipeline for VmmTestsRunCli {
         validate_output_dir(dir.as_deref(), target_os, needs_windows_disk)?;
         let test_content_dir = dir.unwrap_or_else(|| repo_root.join("target").join("vmm_tests"));
         std::fs::create_dir_all(&test_content_dir).context("failed to create output directory")?;
+        for archive in [&fvp_package_archive, &fvp_payload_archive]
+            .into_iter()
+            .flatten()
+        {
+            let archive = fs_err::canonicalize(archive)
+                .context("cannot resolve the local FVP dependency archive")?;
+            let output = fs_err::canonicalize(&test_content_dir)
+                .context("cannot resolve the test output directory")?;
+            anyhow::ensure!(
+                !archive.starts_with(output),
+                "local FVP dependency archives must be outside the test output directory"
+            );
+        }
 
         let openvmm_repo = flowey_lib_common::git_checkout::RepoSource::ExistingClone(
             ReadVar::from_static(repo_root),
@@ -467,6 +546,21 @@ impl IntoPipeline for VmmTestsRunCli {
         );
 
         job = job.dep_on(|_| flowey_lib_hvlite::_jobs::cfg_versions::Request::Init);
+
+        if let Some(version) = fvp_deps_version {
+            let local_archive = fvp_package_archive.map(std::path::absolute).transpose()?;
+            let local_payload_archive = fvp_payload_archive.map(std::path::absolute).transpose()?;
+            job = job.dep_on(move |_| {
+                flowey_lib_hvlite::_jobs::cfg_versions::Request::FvpCcaPlatform {
+                    version,
+                    payload_version: fvp_payload_version,
+                    archive_sha256: fvp_package_sha256,
+                    local_archive: local_archive.map(ReadVar::from_static),
+                    payload_archive_sha256: fvp_payload_sha256,
+                    local_payload_archive: local_payload_archive.map(ReadVar::from_static),
+                }
+            });
+        }
 
         // Override kernel with local paths if both kernel and modules are specified
         if let (Some(kernel_path), Some(modules_path)) =
@@ -546,6 +640,18 @@ impl IntoPipeline for VmmTestsRunCli {
 /// Get test binaries and associated matching tests for a given nextest filter.
 // TODO: this function should really be a flowey node without automatic
 // dependency installation, but that would require conditional requests.
+fn guest_arch_filter(filter: String, target_arch: CommonArch, include_emulated: bool) -> String {
+    if include_emulated {
+        return filter;
+    }
+    // Test names describe guest architectures, including emulated nested L1s,
+    // not just the outer executable's target. Keep main's opt-in emulation policy.
+    match target_arch {
+        CommonArch::X86_64 => format!("({filter}) & !test(_aarch64_)"),
+        CommonArch::Aarch64 => format!("({filter}) & !test(_x64_)"),
+    }
+}
+
 fn run_cargo_nextest_list<'a>(
     req: CargoNextestListRequest<'a>,
 ) -> anyhow::Result<BTreeMap<String, RustSuite>> {
@@ -657,6 +763,53 @@ fn query_test_binary_artifacts(suite: &RustSuite) -> anyhow::Result<ArtifactList
     log::info!("Querying artifacts for {} tests", suite.testcases.len());
 
     petri_artifacts_core::query_test_binary_artifacts(&suite.binary_path, &suite.testcases)
+}
+
+fn uses_fvp_packages(output: &ArtifactListOutput) -> bool {
+    use petri_artifacts_common::artifacts::FVP_CCA_PAYLOAD_AARCH64;
+    use petri_artifacts_common::artifacts::FVP_CCA_PLATFORM_AARCH64;
+
+    output.required.iter().chain(&output.optional).any(|id| {
+        matches!(
+            id.as_str(),
+            FVP_CCA_PLATFORM_AARCH64::GLOBAL_UNIQUE_ID | FVP_CCA_PAYLOAD_AARCH64::GLOBAL_UNIQUE_ID
+        )
+    })
+}
+
+fn query_configured_suite_artifacts(
+    suite: &mut RustSuite,
+    fvp_configured: bool,
+    query: &mut impl FnMut(&RustSuite) -> anyhow::Result<ArtifactListOutput>,
+    excluded: &mut Vec<String>,
+) -> anyhow::Result<ArtifactListOutput> {
+    let output = query(suite)?;
+    if fvp_configured || !uses_fvp_packages(&output) {
+        return Ok(output);
+    }
+
+    let mut combined = ArtifactListOutput {
+        required: Vec::new(),
+        optional: Vec::new(),
+        nested: Vec::new(),
+    };
+    let mut retained = Vec::new();
+    for name in &suite.testcases {
+        let mut output = query(&RustSuite {
+            binary_path: suite.binary_path.clone(),
+            testcases: vec![name.clone()],
+        })?;
+        if uses_fvp_packages(&output) {
+            excluded.push(name.clone());
+            continue;
+        }
+        combined.required.append(&mut output.required);
+        combined.optional.append(&mut output.optional);
+        combined.nested.append(&mut output.nested);
+        retained.push(name.clone());
+    }
+    suite.testcases = retained;
+    Ok(combined)
 }
 
 #[derive(clap::ValueEnum, Copy, Clone)]
@@ -871,6 +1024,218 @@ mod tests {
     use petri_artifacts_vmm_test::artifacts::openhcl_igvm;
     use petri_artifacts_vmm_test::artifacts::vmfw_dll;
     use test_with_tracing::test;
+
+    #[derive(clap::Parser)]
+    struct TestCli {
+        #[clap(flatten)]
+        run: VmmTestsRunCli,
+    }
+
+    #[test]
+    fn foreign_fvp_guest_selection_uses_the_existing_emulation_opt_in() -> anyhow::Result<()> {
+        use clap::Parser;
+
+        let filter = "test(cca_in_place_smoke_on_fvp)";
+        let cli = TestCli::try_parse_from(["test", "--filter", filter, "--include-emulated"])?;
+        assert_eq!(
+            guest_arch_filter(cli.run.filter, CommonArch::X86_64, cli.run.include_emulated,),
+            filter
+        );
+        assert_eq!(
+            guest_arch_filter(filter.into(), CommonArch::X86_64, false),
+            format!("({filter}) & !test(_aarch64_)")
+        );
+        assert_eq!(
+            guest_arch_filter("all()".into(), CommonArch::Aarch64, false),
+            "(all()) & !test(_x64_)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fvp_package_options_require_complete_identity() {
+        use clap::Parser;
+
+        for args in [
+            vec!["test", "--fvp-deps-version", "0.3.0-local-fvp"],
+            vec!["test", "--fvp-package-sha256", "digest"],
+            vec!["test", "--fvp-package-archive", "package.tar.gz"],
+            vec!["test", "--fvp-payload-archive", "payload.tar.gz"],
+        ] {
+            assert!(TestCli::try_parse_from(args).is_err());
+        }
+
+        assert!(
+            TestCli::try_parse_from([
+                "test",
+                "--fvp-deps-version",
+                "0.3.0-local-fvp",
+                "--fvp-package-sha256",
+                &"0".repeat(64),
+                "--fvp-package-archive",
+                "openvmm-test-fvp-cca.aarch64.0.3.0-local-fvp.tar.gz",
+            ])
+            .is_ok()
+        );
+        assert!(
+            TestCli::try_parse_from([
+                "test",
+                "--fvp-deps-version",
+                "0.3.0-local-fvp",
+                "--fvp-payload-sha256",
+                &"0".repeat(64),
+                "--fvp-payload-archive",
+                "openvmm-test-fvp-cca-payload.aarch64.0.3.0-local-fvp.tar.gz",
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn fvp_payload_version_is_optional_and_independently_selected() -> anyhow::Result<()> {
+        use clap::Parser;
+
+        let digest = "0".repeat(64);
+        let args = [
+            "test",
+            "--fvp-deps-version",
+            "source-firmware",
+            "--fvp-payload-sha256",
+            &digest,
+        ];
+        assert!(
+            TestCli::try_parse_from(args)?
+                .run
+                .fvp_payload_version
+                .is_none()
+        );
+        let cli = TestCli::try_parse_from(
+            args.into_iter()
+                .chain(["--fvp-payload-version", "reference-payload"]),
+        )?;
+        assert_eq!(cli.run.fvp_deps_version.as_deref(), Some("source-firmware"));
+        assert_eq!(
+            cli.run.fvp_payload_version.as_deref(),
+            Some("reference-payload")
+        );
+        assert!(
+            TestCli::try_parse_from(["test", "--fvp-payload-version", "reference-payload"])
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fvp_artifact_selects_firmware_without_qemu() {
+        use petri_artifacts_common::artifacts::FVP_CCA_PLATFORM_AARCH64;
+
+        let mut selections =
+            ResolvedArtifactSelections::new(CommonTriple::X86_64_LINUX_GNU.as_triple(), false)
+                .unwrap();
+        selections
+            .resolve_artifact(FVP_CCA_PLATFORM_AARCH64::GLOBAL_UNIQUE_ID)
+            .unwrap();
+
+        assert!(selections.prebuilt_artifacts.fvp_cca_platform_aarch64);
+        assert!(!selections.prebuilt_artifacts.qemu_system_aarch64_linux_x64);
+    }
+
+    #[test]
+    fn fvp_payload_artifact_selects_the_qualified_payload_directory() {
+        use petri_artifacts_common::artifacts::FVP_CCA_PAYLOAD_AARCH64;
+
+        let mut selections =
+            ResolvedArtifactSelections::new(CommonTriple::X86_64_LINUX_GNU.as_triple(), false)
+                .unwrap();
+        selections
+            .resolve_artifact(FVP_CCA_PAYLOAD_AARCH64::GLOBAL_UNIQUE_ID)
+            .unwrap();
+        assert!(selections.prebuilt_artifacts.fvp_cca_payload_aarch64);
+        assert!(!selections.prebuilt_artifacts.test_linux_kernel_aarch64);
+        assert!(!selections.prebuilt_artifacts.test_linux_kernel_cca_aarch64);
+    }
+
+    fn query_mock_suite(suite: &RustSuite) -> anyhow::Result<ArtifactListOutput> {
+        use petri_artifacts_common::artifacts::FVP_CCA_PAYLOAD_AARCH64;
+        use petri_artifacts_common::artifacts::FVP_CCA_PLATFORM_AARCH64;
+
+        let mut output = ArtifactListOutput {
+            required: Vec::new(),
+            optional: Vec::new(),
+            nested: Vec::new(),
+        };
+        for name in &suite.testcases {
+            match name.as_str() {
+                "ordinary_with_fvp_in_name" => output.required.push("ordinary".into()),
+                "firmware_consumer" => output
+                    .required
+                    .push(FVP_CCA_PLATFORM_AARCH64::GLOBAL_UNIQUE_ID.into()),
+                "payload_consumer" => output
+                    .optional
+                    .push(FVP_CCA_PAYLOAD_AARCH64::GLOBAL_UNIQUE_ID.into()),
+                "ordinary_nested" => output.nested.push(("archive".into(), vec!["inner".into()])),
+                _ => anyhow::bail!("unexpected mock test"),
+            }
+        }
+        Ok(output)
+    }
+
+    fn mock_fvp_suite() -> RustSuite {
+        RustSuite {
+            binary_path: "test-binary".into(),
+            testcases: [
+                "ordinary_with_fvp_in_name",
+                "firmware_consumer",
+                "payload_consumer",
+                "ordinary_nested",
+            ]
+            .map(String::from)
+            .to_vec(),
+        }
+    }
+
+    #[test]
+    fn unconfigured_fvp_discovery_preserves_ordinary_and_nested_cases() {
+        let mut suite = mock_fvp_suite();
+        let mut excluded = Vec::new();
+        let output = query_configured_suite_artifacts(
+            &mut suite,
+            false,
+            &mut query_mock_suite,
+            &mut excluded,
+        )
+        .unwrap();
+        assert_eq!(
+            suite.testcases,
+            ["ordinary_with_fvp_in_name", "ordinary_nested"]
+        );
+        assert_eq!(excluded, ["firmware_consumer", "payload_consumer"]);
+        assert_eq!(output.required, ["ordinary"]);
+        assert!(output.optional.is_empty());
+        assert_eq!(output.nested, [("archive".into(), vec!["inner".into()])]);
+    }
+
+    #[test]
+    fn configured_fvp_discovery_keeps_every_case_and_queries_once() {
+        let mut suite = mock_fvp_suite();
+        let mut excluded = Vec::new();
+        let mut queries = 0;
+        let output = query_configured_suite_artifacts(
+            &mut suite,
+            true,
+            &mut |suite| {
+                queries += 1;
+                query_mock_suite(suite)
+            },
+            &mut excluded,
+        )
+        .unwrap();
+        assert_eq!(queries, 1);
+        assert_eq!(suite.testcases.len(), 4);
+        assert!(excluded.is_empty());
+        assert!(uses_fvp_packages(&output));
+        assert_eq!(output.nested, [("archive".into(), vec!["inner".into()])]);
+    }
 
     #[test]
     fn linux_targets_resolve() {

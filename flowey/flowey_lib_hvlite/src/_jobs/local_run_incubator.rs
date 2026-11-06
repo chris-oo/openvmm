@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Prepare a standalone mshv Incubator using reusable build/acquisition nodes.
+//! Prepare standalone Incubator backends using reusable acquisition nodes.
 
 use crate::common::CommonArch;
 use crate::common::CommonProfile;
@@ -26,6 +26,7 @@ flowey_request! {
         pub incubator_args: Vec<String>,
         pub done: WriteVar<SideEffect>,
     }
+
 }
 
 new_simple_flow_node!(struct Node);
@@ -212,15 +213,30 @@ impl SimpleFlowNode for Node {
 /// Validate the provisioning recipe selected by an Incubator profile.
 pub fn parse_source_profile(contents: &str) -> anyhow::Result<toml_edit::DocumentMut> {
     let config: toml_edit::DocumentMut = contents.parse()?;
+    source_backend(contents)?;
+    Ok(config)
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum SourceBackend {
+    Mshv,
+    Fvp,
+}
+
+pub fn source_backend(contents: &str) -> anyhow::Result<SourceBackend> {
+    let config: toml_edit::DocumentMut = contents.parse()?;
     let incubator = config.get("incubator").context("missing [incubator]")?;
+    if incubator.get("type").and_then(|v| v.as_str()) == Some("fvp-cca") {
+        return Ok(SourceBackend::Fvp);
+    }
     let boot = config.get("boot").context("missing [boot]")?;
     anyhow::ensure!(
         incubator.get("type").and_then(|v| v.as_str()) == Some("openvmm")
             && incubator.get("arch").and_then(|v| v.as_str()) == Some("x86-64")
             && boot.get("type").and_then(|v| v.as_str()) == Some("mshv"),
-        "Incubator provisioning currently supports only type=openvmm, arch=x86-64, boot.type=mshv profiles"
+        "Incubator provisioning supports type=fvp-cca or type=openvmm, arch=x86-64, boot.type=mshv profiles"
     );
-    Ok(config)
+    Ok(SourceBackend::Mshv)
 }
 
 fn resolve_profile(
@@ -232,6 +248,10 @@ fn resolve_profile(
     kernel_cmdline: Option<&str>,
     hypervisor_cmdline: Option<&str>,
 ) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        source_backend(source)? == SourceBackend::Mshv,
+        "MSHV profile resolution requires an MSHV source profile"
+    );
     let mut config = parse_source_profile(source)?;
     config["incubator"]["binary"] = toml_edit::value(path_str(openvmm)?);
     config["boot"]["host-boot"] = toml_edit::value(path_str(host_boot)?);
@@ -246,18 +266,18 @@ fn resolve_profile(
     Ok(config.to_string())
 }
 
-fn path_str(path: &Path) -> anyhow::Result<&str> {
+pub(super) fn path_str(path: &Path) -> anyhow::Result<&str> {
     path.to_str()
         .with_context(|| format!("path is not valid UTF-8: {}", path.display()))
 }
 
-fn shell_word(word: &str) -> String {
+pub(super) fn shell_word(word: &str) -> String {
     format!("'{}'", word.replace('\'', "'\\''"))
 }
 
 // Build outputs live in Flowey's replaceable work directory. Keep an immutable
 // pair for direct runs, without copying unchanged binaries on each kernel edit.
-fn stage_runtime(root: &Path, files: &[(&str, &Path)]) -> anyhow::Result<PathBuf> {
+pub(super) fn stage_runtime(root: &Path, files: &[(&str, &Path)]) -> anyhow::Result<PathBuf> {
     let mut hash = sha2::Sha256::new();
     let mut hashes = Vec::new();
     for (name, source) in files {
@@ -313,6 +333,15 @@ mod tests {
 
     const SOURCE_PROFILE: &str =
         include_str!("../../../../petri/incubator/profiles/x86_64-mshv.toml");
+
+    #[test]
+    fn fvp_dispatch_does_not_require_mshv_boot_settings() -> anyhow::Result<()> {
+        let fvp = include_str!("../../../../petri/incubator/profiles/aarch64-fvp-cca.toml");
+        assert_eq!(source_backend(fvp)?, SourceBackend::Fvp);
+        assert_eq!(source_backend(SOURCE_PROFILE)?, SourceBackend::Mshv);
+        assert!(parse_source_profile(fvp)?.get("boot").is_none());
+        Ok(())
+    }
 
     #[test]
     fn unsupported_profiles_are_rejected_before_provisioning() {

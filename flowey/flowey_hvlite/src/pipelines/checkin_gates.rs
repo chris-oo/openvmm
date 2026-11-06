@@ -1890,7 +1890,8 @@ impl IntoPipeline for CheckinGatesCli {
                     junit_test_label: test_label,
                     target: target.as_triple(),
                     nextest_profile: flowey_lib_hvlite::run_cargo_nextest_run::NextestProfile::Ci,
-                    nextest_filter_expr: Some(nextest_filter_expr),
+                    // Licensed-model execution is opt-in, not part of PR/CVM gates.
+                    nextest_filter_expr: Some(format!("({nextest_filter_expr}) & !test(_on_fvp)")),
                     test_content_config: TestContentConfig::Uninitialized {
                         test_content_dir: None,
                         built_artifacts: resolve_vmm_tests_artifacts(ctx),
