@@ -22,9 +22,20 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use thiserror::Error;
 
+mod vfio;
+pub use vfio::VfioDevice;
+
+#[cfg(any(target_arch = "aarch64", test))]
+pub mod arm;
+pub mod arm_smccc;
+
 mod ioctl {
+    #[cfg(any(target_arch = "aarch64", test))]
+    use super::KvmArmRmiInitRipas;
     #[cfg(target_arch = "aarch64")]
     use super::KvmArmRmiPopulate;
+    use super::KvmMemoryAttributes2;
+    use super::KvmPreFaultMemory;
     use kvm_bindings::*;
     #[cfg(target_arch = "x86_64")]
     use nix::errno::Errno;
@@ -33,8 +44,12 @@ mod ioctl {
     use nix::ioctl_readwrite_bad;
     use nix::ioctl_write_int_bad;
     use nix::ioctl_write_ptr;
+    #[cfg(any(target_arch = "aarch64", test))]
+    use nix::ioctl_write_ptr_bad;
     use nix::request_code_none;
     use nix::request_code_readwrite;
+    #[cfg(any(target_arch = "aarch64", test))]
+    use nix::request_code_write;
     use std::mem::size_of;
 
     const KVMIO: u8 = 0xae;
@@ -125,16 +140,35 @@ mod ioctl {
         0xd2,
         kvm_memory_attributes
     );
+    pub(super) const SET_MEMORY_ATTRIBUTES2: nix::sys::ioctl::ioctl_num_type =
+        request_code_readwrite!(KVMIO, 0xd2, size_of::<KvmMemoryAttributes2>());
+    ioctl_readwrite_bad!(
+        kvm_set_memory_attributes2,
+        SET_MEMORY_ATTRIBUTES2,
+        KvmMemoryAttributes2
+    );
     ioctl_readwrite!(kvm_create_device, KVMIO, 0xe0, kvm_create_device);
     ioctl_write_ptr!(kvm_set_device_attr, KVMIO, 0xe1, kvm_device_attr);
     #[cfg(target_arch = "x86_64")]
     ioctl_write_ptr!(kvm_get_device_attr, KVMIO, 0xe2, kvm_device_attr);
     ioctl_readwrite!(kvm_create_guest_memfd, KVMIO, 0xd4, kvm_create_guest_memfd);
+    pub(super) const PRE_FAULT_MEMORY: nix::sys::ioctl::ioctl_num_type =
+        request_code_readwrite!(KVMIO, 0xd5, size_of::<KvmPreFaultMemory>());
+    ioctl_readwrite_bad!(kvm_pre_fault_memory, PRE_FAULT_MEMORY, KvmPreFaultMemory);
     #[cfg(target_arch = "aarch64")]
     ioctl_readwrite_bad!(
         kvm_arm_rmi_populate,
         request_code_readwrite!(KVMIO, 0xd7, size_of::<KvmArmRmiPopulate>()),
         KvmArmRmiPopulate
+    );
+    #[cfg(any(target_arch = "aarch64", test))]
+    pub(super) const ARM_RMI_INIT_RIPAS: nix::sys::ioctl::ioctl_num_type =
+        request_code_write!(KVMIO, 0xd8, size_of::<KvmArmRmiInitRipas>());
+    #[cfg(any(target_arch = "aarch64", test))]
+    ioctl_write_ptr_bad!(
+        kvm_arm_rmi_init_ripas,
+        ARM_RMI_INIT_RIPAS,
+        KvmArmRmiInitRipas
     );
     #[cfg(target_arch = "x86_64")]
     ioctl_readwrite_bad!(
@@ -177,8 +211,15 @@ const KVM_X86_SNP_VM_UAPI: libc::c_int = 4;
 
 pub const KVM_MEMORY_EXIT_FLAG_PRIVATE_UAPI: u64 = 1 << 3;
 
+pub const KVM_CAP_GUEST_MEMFD_FLAGS_UAPI: u32 = 244;
+pub const GUEST_MEMFD_FLAG_MMAP_UAPI: u64 = 1 << 0;
+pub const GUEST_MEMFD_FLAG_INIT_SHARED_UAPI: u64 = 1 << 1;
+
 #[cfg(target_arch = "aarch64")]
-pub const KVM_CAP_ARM_RMI_UAPI: u32 = 249;
+pub const KVM_CAP_ARM_RMI_V14_UAPI: u32 = 249;
+pub const KVM_CAP_GUEST_MEMFD_MEMORY_ATTRIBUTES_UAPI: u32 = 250;
+#[cfg(target_arch = "aarch64")]
+pub const KVM_CAP_ARM_RMI_UAPI: u32 = 251;
 #[cfg(target_arch = "aarch64")]
 pub const KVM_ARM_RMI_POPULATE_FLAGS_MEASURE_UAPI: u32 = 1 << 0;
 #[cfg(target_arch = "aarch64")]
@@ -242,6 +283,75 @@ pub struct KvmArmRmiPopulate {
     pub reserved: u32,
 }
 
+/// Guestmemfd-relative request for the experimental guest_memfd/CCA ABI:
+/// `KVM_SET_MEMORY_ATTRIBUTES2`.
+///
+/// Unlike `kvm_memory_attributes`, this request is issued on the guestmemfd
+/// file descriptor and uses a file offset, not a guest physical address.
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Default, Eq, PartialEq)]
+pub struct KvmMemoryAttributes2 {
+    pub offset: u64,
+    pub size: u64,
+    pub attributes: u64,
+    pub flags: u64,
+    /// Failure location if the kernel successfully copied back an error
+    /// response. See [`set_guest_memfd_memory_attributes`].
+    pub error_offset: u64,
+    pub reserved: [u64; 11],
+}
+
+/// Mutable range for one `KVM_PRE_FAULT_MEMORY` call on a vCPU.
+///
+/// KVM advances `gpa` and reduces `size` to report progress. Callers must
+/// handle partial progress and errors before considering the range ready.
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Default, Eq, PartialEq)]
+pub struct KvmPreFaultMemory {
+    pub gpa: u64,
+    pub size: u64,
+    pub flags: u64,
+    pub padding: [u64; 5],
+}
+
+/// Initial RAM range for the experimental guest_memfd/CCA ABI:
+/// `KVM_ARM_RMI_INIT_RIPAS`.
+///
+/// The range must fit within one guestmemfd-backed memslot. The ioctl also
+/// changes that range's backing attributes to private. It is not just a
+/// change to the Realm's RIPAS metadata.
+#[cfg(any(target_arch = "aarch64", test))]
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Default, Eq, PartialEq)]
+pub struct KvmArmRmiInitRipas {
+    pub base: u64,
+    pub size: u64,
+    pub flags: u64,
+    pub reserved: [u64; 5],
+}
+
+/// Changes a guestmemfd range's attributes using the experimental guest_memfd/CCA ABI.
+///
+/// The caller must coordinate CPU access and DMA mappings with conversion.
+/// This wrapper performs one ioctl; it does not retry partial conversions.
+///
+/// `error_offset` is reset to `u64::MAX` before the call to avoid reporting
+/// stale output after early validation failures. On success it is not an
+/// output. On failure it is meaningful only if the kernel copied back a
+/// complete response. In particular, `EFAULT` may follow a completed or
+/// partial conversion and does not establish whether copyback succeeded.
+pub fn set_guest_memfd_memory_attributes(
+    guest_memfd: BorrowedFd<'_>,
+    attributes: &mut KvmMemoryAttributes2,
+) -> Result<()> {
+    attributes.error_offset = u64::MAX;
+    // SAFETY: `attributes` is valid writable storage for the complete ioctl
+    // request, and the borrowed fd remains open throughout the call.
+    unsafe { ioctl::kvm_set_memory_attributes2(guest_memfd.as_raw_fd(), attributes) }
+        .map_err(Error::SetGuestMemfdMemoryAttributes)?;
+    Ok(())
+}
+
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("failed to open /dev/kvm")]
@@ -252,13 +362,28 @@ pub enum Error {
     SetMemoryRegion(#[source] nix::Error),
     #[error("SetMemoryAttributes")]
     SetMemoryAttributes(#[source] nix::Error),
+    #[error("SetGuestMemfdMemoryAttributes")]
+    SetGuestMemfdMemoryAttributes(#[source] nix::Error),
+    #[error("PreFaultMemory")]
+    PreFaultMemory(#[source] nix::Error),
+    #[error("invalid KVM prefault range or progress: gpa={gpa:#x}, size={size:#x}")]
+    InvalidPreFaultProgress { gpa: u64, size: u64 },
     #[error("CreateGuestMemfd")]
     CreateGuestMemfd(#[source] nix::Error),
     #[error("CreateVm")]
     CreateVm(#[source] nix::Error),
+    #[error("failed to create KVM VFIO bridge")]
+    CreateVfioDevice(#[source] nix::Error),
+    #[error("KVM_DEV_VFIO_FILE_ADD failed")]
+    AddVfioFile(#[source] nix::Error),
+    #[error("KVM_DEV_VFIO_FILE_DEL failed")]
+    RemoveVfioFile(#[source] nix::Error),
     #[cfg(target_arch = "aarch64")]
     #[error("ArmRmiPopulate")]
     ArmRmiPopulate(#[source] nix::Error),
+    #[cfg(target_arch = "aarch64")]
+    #[error("ArmRmiInitRipas")]
+    ArmRmiInitRipas(#[source] nix::Error),
     #[error("missing KVM capability: {0}")]
     MissingCapability(&'static str),
     #[error("unsupported KVM VM type: {0:?}")]
@@ -505,6 +630,20 @@ impl Kvm {
         self.new_vm_with_type(raw_vm_type)
     }
 
+    #[cfg(target_arch = "aarch64")]
+    pub fn new_realm_vm_with_max_ipa_size(&self, max_ipa_bits: u8) -> Result<(Partition, u8)> {
+        for ipa_bits in (32..=max_ipa_bits).rev() {
+            match self.new_vm(VmType::Realm { ipa_bits }) {
+                Ok(vm) => return Ok((vm, ipa_bits)),
+                Err(Error::CreateVm(nix::errno::Errno::EINVAL)) => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Err(Error::UnsupportedVmType(VmType::Realm {
+            ipa_bits: max_ipa_bits,
+        }))
+    }
+
     fn raw_vm_type(&self, vm_type: VmType) -> Result<libc::c_int> {
         match vm_type {
             VmType::Default => Ok(self.default_vm_type()),
@@ -658,6 +797,19 @@ impl Partition {
         // the duration of the ioctl. KVM may update it to report partial progress.
         unsafe { ioctl::kvm_arm_rmi_populate(self.vm.as_raw_fd(), populate) }
             .map_err(Error::ArmRmiPopulate)?;
+        Ok(())
+    }
+
+    /// Initializes RIPAS_RAM and private backing attributes before activation.
+    ///
+    /// This performs one request without retrying. A failed request must not
+    /// be assumed to leave the backing attributes unchanged.
+    #[cfg(target_arch = "aarch64")]
+    pub fn arm_rmi_init_ripas(&self, range: &KvmArmRmiInitRipas) -> Result<()> {
+        // SAFETY: `range` is valid storage for the complete ioctl request
+        // and the partition owns the VM fd for the duration of the call.
+        unsafe { ioctl::kvm_arm_rmi_init_ripas(self.vm.as_raw_fd(), range) }
+            .map_err(Error::ArmRmiInitRipas)?;
         Ok(())
     }
 
@@ -996,8 +1148,18 @@ impl Partition {
     }
 
     pub fn create_guest_memfd(&self, size: u64) -> Result<File> {
+        self.create_guest_memfd_with_flags(size, 0)
+    }
+
+    /// Creates guestmemfd backing with explicit kernel-supported flags.
+    ///
+    /// Callers opting into mmap/in-place conversion must check the relevant
+    /// capabilities and coordinate their memory mappings. Existing callers
+    /// of [`Self::create_guest_memfd`] retain flags-zero behavior.
+    pub fn create_guest_memfd_with_flags(&self, size: u64, flags: u64) -> Result<File> {
         let mut guest_memfd = kvm_create_guest_memfd {
             size,
+            flags,
             ..Default::default()
         };
         // SAFETY: `guest_memfd` is a valid C ABI struct for KVM to read.
@@ -1275,7 +1437,73 @@ pub enum RoutingEntry {
 
 pub struct Processor<'a>(&'a Partition, u32);
 
+fn pre_fault_memory_all(
+    gpa: u64,
+    size: u64,
+    mut prefault: impl FnMut(&mut KvmPreFaultMemory) -> Result<()>,
+) -> Result<()> {
+    let invalid = || Error::InvalidPreFaultProgress { gpa, size };
+    let end = gpa.checked_add(size).ok_or_else(invalid)?;
+    if size == 0 || !gpa.is_multiple_of(4096) || !size.is_multiple_of(4096) {
+        return Err(invalid());
+    }
+    let mut range = KvmPreFaultMemory {
+        gpa,
+        size,
+        ..Default::default()
+    };
+    let mut retries = 0;
+    while range.size != 0 {
+        let previous = (range.gpa, range.size);
+        let result = prefault(&mut range);
+        if range.gpa.checked_add(range.size) != Some(end)
+            || range.gpa < previous.0
+            || range.size > previous.1
+            || !range.gpa.is_multiple_of(4096)
+            || !range.size.is_multiple_of(4096)
+            || range.flags != 0
+            || range.padding != [0; 5]
+        {
+            return Err(invalid());
+        }
+        match result {
+            Ok(()) if range.size < previous.1 => retries = 0,
+            Ok(()) => return Err(invalid()),
+            Err(Error::PreFaultMemory(errno))
+                if matches!(errno, nix::errno::Errno::EINTR | nix::errno::Errno::EAGAIN)
+                    && (range.gpa, range.size) == previous
+                    && retries < 16 =>
+            {
+                retries += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 impl<'a> Processor<'a> {
+    /// Prefaults a range once, preserving KVM's progress and syscall error.
+    ///
+    /// Success may cover only part of the range. The caller must handle
+    /// remaining bytes, no progress, and errors without assuming DMA readiness.
+    pub fn pre_fault_memory(&self, range: &mut KvmPreFaultMemory) -> Result<()> {
+        // SAFETY: `range` is valid writable storage for the complete request
+        // and the partition keeps the vCPU fd alive throughout the call.
+        unsafe { ioctl::kvm_pre_fault_memory(self.get().vcpu.as_raw_fd(), range) }
+            .map_err(Error::PreFaultMemory)?;
+        Ok(())
+    }
+
+    /// Prefaults every page, checking each returned range before retrying.
+    ///
+    /// The caller must hold visibility stable and exclude holes and device
+    /// memory. Only unchanged EINTR/EAGAIN failures are retried, at most sixteen
+    /// times without progress. Any other failure leaves DMA readiness unknown.
+    pub fn pre_fault_memory_all(&self, gpa: u64, size: u64) -> Result<()> {
+        pre_fault_memory_all(gpa, size, |range| self.pre_fault_memory(range))
+    }
+
     pub fn enable_synic(&self) -> Result<()> {
         // TODO: We are not checking KVM_CAP_ENABLE_CAP_VM first.
         // TODO: We are not calling KVM_CHECK_EXTENSION first.
@@ -1995,17 +2223,11 @@ impl<'a> VpRunner<'a> {
                 }
             }
             #[cfg(target_arch = "x86_64")]
-            KVM_EXIT_HYPERCALL => {
-                // SAFETY: this is the active union field.
-                let hypercall = unsafe { &mut self.run_data().__bindgen_anon_1.hypercall };
-                Exit::Hypercall {
-                    nr: hypercall.nr,
-                    args: hypercall.args,
-                    result: &mut hypercall.ret,
-                    // SAFETY: this is the active field for KVM_EXIT_HYPERCALL.
-                    flags: unsafe { hypercall.__bindgen_anon_1.flags },
-                }
-            }
+            KVM_EXIT_HYPERCALL => x86_hypercall_exit(self.run_data()),
+            #[cfg(target_arch = "aarch64")]
+            KVM_EXIT_HYPERCALL => arm::hypercall_exit(self.run_data()),
+            #[cfg(target_arch = "aarch64")]
+            arm::KVM_EXIT_ARM64_TIO_UAPI => arm::tio_exit(self.run_data()),
             #[cfg(target_arch = "x86_64")]
             KVM_EXIT_X86_WRMSR => {
                 // SAFETY: this is the active union field.
@@ -2087,6 +2309,19 @@ impl<'a> VpRunner<'a> {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+fn x86_hypercall_exit(run: &mut kvm_run) -> Exit<'_> {
+    // SAFETY: The caller checked that KVM reported KVM_EXIT_HYPERCALL.
+    let hypercall = unsafe { &mut run.__bindgen_anon_1.hypercall };
+    Exit::Hypercall {
+        nr: hypercall.nr,
+        args: hypercall.args,
+        result: &mut hypercall.ret,
+        // SAFETY: This is the active field for KVM_EXIT_HYPERCALL.
+        flags: unsafe { hypercall.__bindgen_anon_1.flags },
+    }
+}
+
 #[derive(Debug)]
 pub enum Exit<'a> {
     Interrupted,
@@ -2119,6 +2354,14 @@ pub enum Exit<'a> {
         result: &'a mut u64,
         flags: u64,
     },
+    /// Arm supplies arguments and results through ONE_REG, not this packet.
+    #[cfg(any(target_arch = "aarch64", test))]
+    ArmHypercall {
+        nr: u64,
+        flags: u64,
+    },
+    #[cfg(any(target_arch = "aarch64", test))]
+    ArmTio(arm::ArmTioExit<'a>),
     #[cfg(target_arch = "x86_64")]
     MsrRead {
         index: u32,
@@ -2264,5 +2507,186 @@ mod tests {
         assert_eq!(update.len, 0x2000);
         assert_eq!(update.type_, KVM_SEV_SNP_PAGE_TYPE_ZERO_UAPI);
         assert_eq!(update.flags, 0);
+    }
+}
+
+#[cfg(test)]
+mod memory_abi_tests {
+    use super::*;
+    use std::mem::align_of;
+    use std::mem::offset_of;
+    use test_with_tracing::test;
+
+    #[test]
+    fn guest_memfd_attributes2_layout() {
+        assert_eq!(size_of::<KvmMemoryAttributes2>(), 128);
+        assert_eq!(align_of::<KvmMemoryAttributes2>(), 8);
+        assert_eq!(offset_of!(KvmMemoryAttributes2, offset), 0);
+        assert_eq!(offset_of!(KvmMemoryAttributes2, size), 8);
+        assert_eq!(offset_of!(KvmMemoryAttributes2, attributes), 16);
+        assert_eq!(offset_of!(KvmMemoryAttributes2, flags), 24);
+        assert_eq!(offset_of!(KvmMemoryAttributes2, error_offset), 32);
+        assert_eq!(offset_of!(KvmMemoryAttributes2, reserved), 40);
+        assert_eq!(KvmMemoryAttributes2::default().reserved, [0; 11]);
+    }
+
+    #[test]
+    fn prefault_consumes_checked_partial_progress() {
+        let mut calls = 0;
+        pre_fault_memory_all(0x4000, 0x3000, |range| {
+            assert_eq!(range.gpa, 0x4000 + calls * 0x1000);
+            assert_eq!(range.size, 0x3000 - calls * 0x1000);
+            calls += 1;
+            range.gpa += 0x1000;
+            range.size -= 0x1000;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn prefault_retries_only_bounded_unchanged_transient_errors() {
+        for errno in [nix::errno::Errno::EINTR, nix::errno::Errno::EAGAIN] {
+            let mut calls = 0;
+            let error = pre_fault_memory_all(0x4000, 0x1000, |_| {
+                calls += 1;
+                Err(Error::PreFaultMemory(errno))
+            })
+            .unwrap_err();
+            assert!(matches!(error, Error::PreFaultMemory(actual) if actual == errno));
+            assert_eq!(calls, 17);
+        }
+        let mut calls = 0;
+        pre_fault_memory_all(0x4000, 0x1000, |range| {
+            calls += 1;
+            if calls == 1 {
+                return Err(Error::PreFaultMemory(nix::errno::Errno::EINTR));
+            }
+            range.gpa += range.size;
+            range.size = 0;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn prefault_rejects_invalid_ranges_before_ioctl() {
+        for (gpa, size) in [(0, 0), (1, 4096), (4096, 1), (u64::MAX - 4095, 4096)] {
+            assert!(
+                pre_fault_memory_all(gpa, size, |_| panic!("invalid range reached ioctl")).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn prefault_rejects_zero_or_inconsistent_progress() {
+        for mutation in 0..7 {
+            let error = pre_fault_memory_all(0x4000, 0x2000, |range| {
+                match mutation {
+                    0 => {}
+                    1 => range.gpa += 4096,
+                    2 => range.size -= 4096,
+                    3 => {
+                        range.gpa += 1;
+                        range.size -= 1;
+                    }
+                    4 => {
+                        range.gpa -= 4096;
+                        range.size += 4096;
+                    }
+                    5 => range.flags = 1,
+                    6 => range.padding[0] = 1,
+                    _ => unreachable!(),
+                }
+                Ok(())
+            })
+            .unwrap_err();
+            assert!(matches!(error, Error::InvalidPreFaultProgress { .. }));
+        }
+    }
+
+    #[test]
+    fn prefault_does_not_retry_partial_errors_or_copyback_failure() {
+        for errno in [nix::errno::Errno::EINTR, nix::errno::Errno::EFAULT] {
+            let mut calls = 0;
+            let error = pre_fault_memory_all(0x4000, 0x2000, |range| {
+                calls += 1;
+                range.gpa += 4096;
+                range.size -= 4096;
+                Err(Error::PreFaultMemory(errno))
+            })
+            .unwrap_err();
+            assert!(matches!(error, Error::PreFaultMemory(actual) if actual == errno));
+            assert_eq!(calls, 1);
+        }
+    }
+
+    #[test]
+    fn pre_fault_memory_layout() {
+        assert_eq!(size_of::<KvmPreFaultMemory>(), 64);
+        assert_eq!(align_of::<KvmPreFaultMemory>(), 8);
+        assert_eq!(offset_of!(KvmPreFaultMemory, gpa), 0);
+        assert_eq!(offset_of!(KvmPreFaultMemory, size), 8);
+        assert_eq!(offset_of!(KvmPreFaultMemory, flags), 16);
+        assert_eq!(offset_of!(KvmPreFaultMemory, padding), 24);
+        assert_eq!(KvmPreFaultMemory::default().padding, [0; 5]);
+    }
+
+    #[test]
+    fn arm_rmi_init_ripas_layout() {
+        assert_eq!(size_of::<KvmArmRmiInitRipas>(), 64);
+        assert_eq!(align_of::<KvmArmRmiInitRipas>(), 8);
+        assert_eq!(offset_of!(KvmArmRmiInitRipas, base), 0);
+        assert_eq!(offset_of!(KvmArmRmiInitRipas, size), 8);
+        assert_eq!(offset_of!(KvmArmRmiInitRipas, flags), 16);
+        assert_eq!(offset_of!(KvmArmRmiInitRipas, reserved), 24);
+        assert_eq!(KvmArmRmiInitRipas::default().reserved, [0; 5]);
+    }
+
+    #[test]
+    fn memory_ioctl_encodings_match_v7_uapi() {
+        assert_eq!(ioctl::SET_MEMORY_ATTRIBUTES2 as u32, 0xc080_aed2);
+        assert_eq!(ioctl::PRE_FAULT_MEMORY as u32, 0xc040_aed5);
+        assert_eq!(ioctl::ARM_RMI_INIT_RIPAS as u32, 0x4040_aed8);
+        assert_eq!(KVM_CAP_GUEST_MEMFD_FLAGS_UAPI, 244);
+        assert_eq!(KVM_CAP_GUEST_MEMFD_MEMORY_ATTRIBUTES_UAPI, 250);
+        assert_eq!(GUEST_MEMFD_FLAG_MMAP_UAPI, 1);
+        assert_eq!(GUEST_MEMFD_FLAG_INIT_SHARED_UAPI, 2);
+    }
+
+    #[test]
+    fn attributes2_failure_preserves_errno_and_clears_stale_output() {
+        let file = File::open("/dev/null").unwrap();
+        let mut attributes = KvmMemoryAttributes2 {
+            offset: 0x2000,
+            size: 0x1000,
+            attributes: KVM_MEMORY_ATTRIBUTE_PRIVATE as u64,
+            error_offset: 0x2000,
+            ..Default::default()
+        };
+        let error = set_guest_memfd_memory_attributes(file.as_fd(), &mut attributes).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::SetGuestMemfdMemoryAttributes(nix::errno::Errno::ENOTTY)
+        ));
+        assert_eq!(attributes.offset, 0x2000);
+        assert_eq!(attributes.size, 0x1000);
+        assert_eq!(attributes.error_offset, u64::MAX);
+    }
+
+    #[test]
+    fn init_ripas_ioctl_preserves_errno() {
+        let file = File::open("/dev/null").unwrap();
+        let range = KvmArmRmiInitRipas {
+            base: 0x4000,
+            size: 0x1000,
+            ..Default::default()
+        };
+        // SAFETY: `range` is valid storage and the fd remains open. The
+        // unrelated device rejects this ioctl without acting on the range.
+        let error = unsafe { ioctl::kvm_arm_rmi_init_ripas(file.as_raw_fd(), &range) }.unwrap_err();
+        assert_eq!(error, nix::errno::Errno::ENOTTY);
     }
 }

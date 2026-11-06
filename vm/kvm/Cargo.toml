@@ -11,9 +11,13 @@ kvm-bindings.workspace = true
 pal.workspace = true
 libc.workspace = true
 nix = { workspace = true, features = ["ioctl"] }
+open_enum.workspace = true
 parking_lot.workspace = true
 signal-hook.workspace = true
 thiserror.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+test_with_tracing.workspace = true
 
 [lints]
 workspace = true
