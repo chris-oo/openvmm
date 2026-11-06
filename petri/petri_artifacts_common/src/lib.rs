@@ -42,9 +42,9 @@ pub mod cca_payload {
     }
     /// Source-built TDISP guest candidate, using the unchanged AHCI oracle.
     pub mod source_built_tdisp {
-        /// Initrd built from the standard userspace and tracked test script.
+        /// Initrd built from the pinned standard userspace and tracked test script.
         pub const INITRD_SHA256: &str =
-            "1f9d8dca9338df5164ba30d83de14a63180fccd9a05fe154371169d6240cfb7b";
+            "b9dc5046ac739a90cf23c1c52073cf6cdedcbabcfa18481b73faa0cdec9f5e92";
     }
     /// Release containing the qualified kernel and immutable base initrd.
     pub const OPENVMM_DEPS_RELEASE: &str = "0.3.0-139";

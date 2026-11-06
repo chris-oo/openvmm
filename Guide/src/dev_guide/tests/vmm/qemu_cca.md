@@ -99,6 +99,13 @@ source-built guest kernel and initrd package, and selects the separate
 `aarch64-fvp-cca-realm-vfio-source-built.toml` profile. A host-only package
 cannot satisfy that test.
 
+The source-built guest uses the hash-pinned standard initrd from
+`openvmm-deps` release `0.3.0-139`, not a rolling local userspace rebuild.
+Its recipe bundles the corresponding sources and licenses. Fresh guest
+construction and default payload packaging produce the approved tuple
+without substituting a retained guest image. The test still checks the exact
+guest hashes; an arbitrary rebuild is not an accepted replacement.
+
 Without `--fvp-deps-version`, artifact discovery excludes FVP
 package-dependent cases, including in `--build-only` mode. Payload-only
 cases can use the release and payload options without firmware options.
