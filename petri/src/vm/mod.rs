@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+/// Licensed Arm FVP configuration and lifecycle.
+pub mod fvp;
 /// Hyper-V VM management
 #[cfg(windows)]
 pub mod hyperv;

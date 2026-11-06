@@ -1,0 +1,22 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# Lists append to the pinned package. Do not replace its semihost setup or trap.
+run:
+  rtvars:
+    INITRD:
+      type: path
+    CMDLINE:
+      type: string
+      value: ''
+    # Keep the unused legacy variable out of Shrinkwrap's path-volume inventory.
+    ROOTFS:
+      type: string
+      value: ''
+  params:
+    -C bp.virtioblockdevice.image_path: ''
+  prerun:
+    - test -f "${rtvar:INITRD}"
+    - cp "${rtvar:INITRD}" "$${SEMIHOSTDIR}/initrd"
+    - >-
+      printf '%s\n' 'Image dtb=fdt.dtb initrd=initrd rdinit=/cca-init.sh console=ttyAMA0 earlycon=pl011,0x1c090000 ip=off' > "$${SEMIHOSTDIR}/startup.nsh"

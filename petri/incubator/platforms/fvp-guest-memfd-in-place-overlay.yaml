@@ -1,0 +1,16 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# Runtime-only overlay. The separately pinned package uses the model's default
+# PCI hierarchy, not the DA recipe's endpoints, certificates, or disk images.
+# Firmware is reused from the recorded local build; no DA qualification implied.
+run:
+  params:
+    -C cluster0.has_permission_indirection_s1: 2
+    -C cluster1.has_permission_indirection_s1: 2
+    -C cluster0.has_permission_indirection_s2: 2
+    -C cluster1.has_permission_indirection_s2: 2
+    -C cluster0.has_permission_overlay_s1: 2
+    -C cluster1.has_permission_overlay_s1: 2
+    -C cluster0.has_permission_overlay_s2: 2
+    -C cluster1.has_permission_overlay_s2: 2

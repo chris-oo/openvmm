@@ -4,10 +4,75 @@
 //! `petri` test artifact declarations used by all petri-based tests, no matter
 //! what VMM backend is being used.
 
+#![deny(unsafe_code)]
+
+/// Published payload identities for the qualified CCA v15 incubators.
+pub mod cca_payload {
+    /// Unchanged reference Realm guest used by the TDISP AHCI test.
+    pub mod tdisp_guest {
+        /// Image qualified with the reference kvmtool guest.
+        pub const LINUX_IMAGE_SHA256: &str =
+            "6bef4c54ac93d8513ad7f125737c9ff0a8b0b7e34720e77253e2b63460002437";
+        /// Unmodified guest driver and TDISP/AHCI test script archive.
+        pub const INITRD_SHA256: &str =
+            "d3ba987d83bd46a60cf2199d7989a7b940499065e1011125775034b5710dad92";
+    }
+    /// Local integration payload for the in-place guest_memfd memory mode.
+    /// These identities do not qualify device assignment.
+    pub mod guest_memfd_in_place {
+        /// Clean linux-cca integration-v7 source revision.
+        pub const LINUX_REVISION: &str = "2b68f486fdbc8d2818309f91199dde46b2b7cdd6";
+        /// Built kernel release.
+        pub const LINUX_RELEASE: &str = "7.2.0-rc3-g2b68f486fdbc";
+        /// Unified host and Realm Image.
+        pub const LINUX_IMAGE_SHA256: &str =
+            "3bfd2bf2e55e17f201ab26cdf8f6bfa7baa4dd3a373ca9c738b1e5f48f5ff01f";
+        /// Kernel configuration, including built-in FVP NIC, Virtio PCI and vsock.
+        pub const LINUX_CONFIG_SHA256: &str =
+            "0728366e9a367fa18f0862c89360e34d92d197f4b91c50f0019953b1ddbff9c3";
+    }
+    /// Source-built host/Realm kernel and standard test-initrd identities.
+    pub mod source_built_in_place {
+        /// Kernel rebuilt from the recorded integration-v7 revision and config.
+        pub const LINUX_IMAGE_SHA256: &str =
+            "373c439808db102a2e455db5a981ec6263416fc971bcaa0f9c2cf21ad4975810";
+        /// Published shared test initrd used by the source-kernel candidate.
+        pub const INITRD_SHA256: &str =
+            "74ecad46de9da08aff7520a93a09fa473276360bcb018e106ae41862a6f2feb2";
+    }
+    /// Source-built TDISP guest candidate, using the unchanged AHCI oracle.
+    pub mod source_built_tdisp {
+        /// Initrd built from the standard userspace and tracked test script.
+        pub const INITRD_SHA256: &str =
+            "1f9d8dca9338df5164ba30d83de14a63180fccd9a05fe154371169d6240cfb7b";
+    }
+    /// Release containing the qualified kernel and immutable base initrd.
+    pub const OPENVMM_DEPS_RELEASE: &str = "0.3.0-139";
+    /// SHA-256 of the published AArch64 CCA kernel archive.
+    pub const KERNEL_ARCHIVE_SHA256: &str =
+        "852e5b6edf09b1e54ac39ba50f34cbe502b24f03b4598a5bc26db29d138217eb";
+    /// SHA-256 of the published AArch64 test-initrd archive.
+    pub const INITRD_ARCHIVE_SHA256: &str =
+        "132b4b4e66b032ee108cd06fc17aee5660b930aade9a3dace4525709a5fbf344";
+    /// SHA-256 of the extracted, unmodified Linux Image.
+    pub const LINUX_IMAGE_SHA256: &str =
+        "2f4dde0a43269ede897b2382b77130e63427b32cb23e968cfc494e82320d5482";
+    /// SHA-256 of the extracted base initrd, before per-run init injection.
+    pub const BASE_INITRD_SHA256: &str =
+        "74ecad46de9da08aff7520a93a09fa473276360bcb018e106ae41862a6f2feb2";
+}
+
 /// Runtime capabilities that VMM tests can require.
 pub mod capabilities {
     /// Software VPCI device emulation support.
     pub const VPCI: &str = "vpci";
+    /// Arm Confidential Compute Architecture support.
+    pub const CCA: &str = "cca";
+    /// CCA host supports the qualified in-place guest_memfd memory mode.
+    pub const GUEST_MEMFD_IN_PLACE: &str = "guest_memfd_in_place";
+    /// Pinned AHCI cdev connected to the host TSM for Realm object tests.
+    /// This does not qualify guest DMA or TDISP LOCK/RUN.
+    pub const CCA_REALM_VFIO: &str = "cca_realm_vfio";
 
     /// Support for resetting a partition running Windows.
     pub const WINDOWS_PARTITION_RESET: &str = "windows_partition_reset";
@@ -19,6 +84,9 @@ pub mod capabilities {
     /// tests.
     pub const KNOWN_CAPABILITIES: &[&str] = &[
         VPCI,
+        CCA,
+        GUEST_MEMFD_IN_PLACE,
+        CCA_REALM_VFIO,
         WINDOWS_PARTITION_RESET,
         NESTED_VIRT,
         "test_disk",
@@ -53,6 +121,10 @@ pub mod artifacts {
         PIPETTE_WINDOWS_AARCH64("pipette.exe", WINDOWS_AARCH64),
         /// Pipette linux aarch64 musl executable
         PIPETTE_LINUX_AARCH64_MUSL("pipette", LINUX_AARCH64_MUSL),
+        /// Pinned FVP CCA firmware package directory.
+        FVP_CCA_PLATFORM_AARCH64("fvp-cca", AARCH64),
+        /// Qualified FVP host and unchanged TDISP guest payload directory.
+        FVP_CCA_PAYLOAD_AARCH64("fvp-cca-payload", AARCH64),
         /// Directory to put petri test logs in
         TEST_LOG_DIRECTORY("test_results", ANY),
     }

@@ -1,0 +1,2332 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+//! Verified, writable FVP snapshots. Neither input root is a runtime mount.
+//!
+//! The caller validates the official payload before passing the kernel and
+//! patched initrd here. This module detects changes while making their snapshots;
+//! it does not establish release provenance. The caller must stop all owned
+//! processes and containers before calling [`PreparedFvpRun::cleanup`]. Dropping
+//! a prepared run deliberately preserves its workspace, including live mounts.
+
+#[cfg(test)]
+use super::FvpPlatform;
+use super::lifecycle::Cancellation;
+use super::platform::PlatformManifest;
+use super::platform::PlatformSources;
+use super::process::Deadline;
+use super::profile::FvpCcaConfig;
+use super::profile::FvpConsole;
+use anyhow::Context;
+use anyhow::ensure;
+use sha2::Digest;
+use sha2::Sha256;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+use std::fs;
+use std::fs::File;
+use std::fs::OpenOptions;
+use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
+use std::io::Write;
+use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Component;
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Command;
+
+/// Checked-in append-only runtime overlay, applied after the platform overlay.
+pub const INITRD_OVERLAY: &str =
+    include_str!("../../../incubator/platforms/fvp-initrd-overlay.yaml");
+/// Required JSON array declaring relative share files and directories.
+/// Unlisted content, including previous outputs and downloaded archives, is not
+/// copied. Directory entries preserve empty roots without authorizing children.
+/// The manifest is not exposed to the guest.
+pub const SHARE_MANIFEST: &str = ".openvmm-fvp-share.json";
+
+const MAX_MANIFEST_SIZE: u64 = 4 * 1024 * 1024;
+const RUN_ID_FILE: &str = ".incubator-run-id";
+const NESTED_PARENT_FILE: &str = "nested-test-parent.json";
+const NESTED_RESULTS: &str = "nested-results";
+
+fn nested_parent_name(name: &str) -> anyhow::Result<String> {
+    let name = name.replace("::", "__");
+    ensure!(
+        !name.is_empty()
+            && Path::new(&name).components().count() == 1
+            && matches!(
+                Path::new(&name).components().next(),
+                Some(Component::Normal(_))
+            )
+            && !name.contains(['/', '\\']),
+        "invalid FVP nested test parent"
+    );
+    Ok(name)
+}
+
+#[derive(Clone, Copy)]
+enum ReportNames {
+    Original,
+    Archive,
+    Publish,
+}
+
+fn output_name(name: &std::ffi::OsStr, reports: ReportNames) -> anyhow::Result<std::ffi::OsString> {
+    ensure!(
+        Path::new(name).components().count() == 1
+            && matches!(
+                Path::new(name).components().next(),
+                Some(Component::Normal(_))
+            )
+            && !name.as_encoded_bytes().contains(&b'/')
+            && !name.as_encoded_bytes().contains(&b'\\'),
+        "invalid FVP output filename"
+    );
+    let Some(report) = name.to_str().filter(|name| name.starts_with("petri.")) else {
+        return Ok(name.to_owned());
+    };
+    match reports {
+        ReportNames::Original => Ok(name.to_owned()),
+        ReportNames::Archive => Ok(format!("{report}.sealed").into()),
+        ReportNames::Publish => Ok(report
+            .strip_suffix(".sealed")
+            .context("FVP nested report is not archived")?
+            .into()),
+    }
+}
+
+fn copy_output(
+    source: &Path,
+    target: &Path,
+    reports: ReportNames,
+    refuse_existing: bool,
+    deadline: &Deadline,
+    cancellation: &Cancellation,
+) -> anyhow::Result<()> {
+    check(deadline, cancellation)?;
+    let metadata = fs::symlink_metadata(source)?;
+    ensure!(
+        !metadata.file_type().is_symlink(),
+        "FVP output contains a symlink"
+    );
+    if metadata.is_dir() {
+        fs::create_dir_all(target)?;
+        ensure!(
+            fs::symlink_metadata(target)?.is_dir(),
+            "FVP output destination must be a regular directory"
+        );
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            let name = output_name(&entry.file_name(), reports)?;
+            copy_output(
+                &entry.path(),
+                &target.join(name),
+                ReportNames::Original,
+                refuse_existing,
+                deadline,
+                cancellation,
+            )?;
+        }
+    } else {
+        ensure!(metadata.is_file(), "FVP output must be a regular file");
+        match fs::symlink_metadata(target) {
+            Ok(_) => {
+                ensure!(
+                    !refuse_existing,
+                    "FVP output publication destination already exists"
+                );
+                ensure!(
+                    digest(&mut open_regular(source)?, deadline, cancellation)?
+                        == digest(&mut open_regular(target)?, deadline, cancellation)?,
+                    "FVP output conflicts with an existing file"
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                copy_verified(source, target, None, deadline, cancellation)?;
+            }
+            Err(error) => return Err(error).context("cannot inspect FVP output destination"),
+        }
+    }
+    check(deadline, cancellation)
+}
+
+/// Copy the current native run's archived results into its outer Petri directory.
+/// The caller must first seal outputs and retire the workspace. The sealed tree
+/// stays unchanged, and an existing destination file is always an error.
+pub(crate) fn publish_nested_results(
+    sealed_output: &Path,
+    outer_output: &Path,
+    deadline: &Deadline,
+) -> anyhow::Result<()> {
+    let cancellation = Cancellation::default();
+    check(deadline, &cancellation)?;
+    ensure!(
+        fs::symlink_metadata(sealed_output)?.is_dir(),
+        "FVP sealed output must be a regular directory"
+    );
+    ensure!(
+        fs::symlink_metadata(outer_output)?.is_dir(),
+        "FVP outer output must be a regular directory"
+    );
+    let archived = sealed_output.join(NESTED_RESULTS);
+    ensure!(
+        fs::symlink_metadata(&archived)?.is_dir(),
+        "FVP archived nested results must be a regular directory"
+    );
+    for entry in fs::read_dir(&archived)? {
+        check(deadline, &cancellation)?;
+        let target = outer_output.join(output_name(&entry?.file_name(), ReportNames::Publish)?);
+        ensure!(
+            !target.starts_with(sealed_output) && !sealed_output.starts_with(&target),
+            "FVP nested publication overlaps the sealed output"
+        );
+    }
+    copy_output(
+        &archived,
+        outer_output,
+        ReportNames::Publish,
+        true,
+        deadline,
+        &cancellation,
+    )
+}
+
+/// Preserve completed model/guest output before removing an owned workspace.
+/// The caller must first stop all writers and validate ownership of both roots.
+/// Existing identical files permit retry; conflicting files are never replaced.
+pub fn persist_outputs(workspace: &Path, output: &Path, deadline: &Deadline) -> anyhow::Result<()> {
+    let cancellation = Cancellation::default();
+    for (source, target) in [
+        (workspace.join("logs"), output.join("consoles")),
+        (workspace.join("config"), output.join("configuration")),
+        (workspace.join("package"), output.join("package")),
+        (workspace.join("share/cca-logs"), output.join("cca-logs")),
+    ] {
+        match fs::symlink_metadata(&source) {
+            Ok(_) => copy_output(
+                &source,
+                &target,
+                ReportNames::Original,
+                false,
+                deadline,
+                &cancellation,
+            )?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("cannot inspect FVP output"),
+        }
+    }
+    let results = workspace.join("share/test_results");
+    match fs::symlink_metadata(&results) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("cannot inspect FVP nested results"),
+        Ok(metadata) => {
+            ensure!(
+                metadata.is_dir(),
+                "FVP nested results must be a regular directory"
+            );
+            let parent_path = workspace.join("config").join(NESTED_PARENT_FILE);
+            let parent = match fs::symlink_metadata(&parent_path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error).context("cannot inspect FVP nested parent"),
+                Ok(_) => {
+                    let mut data = Vec::new();
+                    open_regular(&parent_path)?
+                        .take(1025)
+                        .read_to_end(&mut data)?;
+                    ensure!(
+                        data.len() <= 1024,
+                        "FVP nested parent metadata is too large"
+                    );
+                    Some(nested_parent_name(&serde_json::from_slice::<String>(
+                        &data,
+                    )?)?)
+                }
+            };
+            if let Some(parent) = parent {
+                for entry in fs::read_dir(&results)? {
+                    let entry = entry?;
+                    let (target, reports) = if entry.file_name() == std::ffi::OsStr::new(&parent) {
+                        (output.join(NESTED_RESULTS), ReportNames::Archive)
+                    } else {
+                        (
+                            output.join("test_results").join(entry.file_name()),
+                            ReportNames::Original,
+                        )
+                    };
+                    copy_output(
+                        &entry.path(),
+                        &target,
+                        reports,
+                        false,
+                        deadline,
+                        &cancellation,
+                    )?;
+                }
+            } else {
+                copy_output(
+                    &results,
+                    &output.join("test_results"),
+                    ReportNames::Original,
+                    false,
+                    deadline,
+                    &cancellation,
+                )?;
+            }
+        }
+    }
+    check(deadline, &cancellation)
+}
+
+/// An owned snapshot whose lifetime is independent of process supervision.
+#[derive(Debug)]
+pub struct PreparedFvpRun {
+    root: PathBuf,
+    cleaned: bool,
+    allocation: super::lifecycle::WorkspaceAllocation,
+    release_package: std::cell::Cell<bool>,
+}
+
+impl PreparedFvpRun {
+    /// Record the host-owned result mapping outside the guest's shared tree.
+    pub(crate) fn set_nested_test_parent(&self, parent: &str) -> anyhow::Result<()> {
+        let parent = nested_parent_name(parent)?;
+        let data = serde_json::to_vec(&parent)?;
+        ensure!(
+            data.len() <= 1024,
+            "FVP nested parent metadata is too large"
+        );
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(self.root.join("config").join(NESTED_PARENT_FILE))?;
+        file.write_all(&data)?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    /// Snapshot validated sources before any process uses the workspace.
+    ///
+    /// `share` is a prepared input root, not a repository checkout.
+    /// [`SHARE_MANIFEST`] must provide an explicit list of files to copy.
+    /// Paths may contain shell metacharacters; Rust copies them
+    /// without evaluating shell text.
+    pub fn new(
+        platform: &PlatformSources,
+        kernel: &Path,
+        patched_initrd: &Path,
+        share: &Path,
+        deadline: &Deadline,
+        cancellation: &Cancellation,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_inputs(
+            platform,
+            kernel,
+            patched_initrd,
+            share,
+            &[],
+            deadline,
+            cancellation,
+        )
+    }
+
+    /// Snapshot the share inventory plus explicit runtime-selected guest files.
+    ///
+    /// `additional_inputs` contains relative regular-file paths under `share`, such as
+    /// the source-matched nextest runner. The same containment checks apply to
+    /// manifest entries and additional entries. No directory is copied wholesale.
+    /// A fresh writable `share/test_results` directory holds guest output;
+    /// inventory entries cannot import previous results into that directory.
+    /// The workspace uses a generated shell-safe path outside the persistent
+    /// lock/state directory and does not inherit a user-controlled TMPDIR.
+    pub fn new_with_inputs(
+        platform: &PlatformSources,
+        kernel: &Path,
+        patched_initrd: &Path,
+        share: &Path,
+        additional_inputs: &[PathBuf],
+        deadline: &Deadline,
+        cancellation: &Cancellation,
+    ) -> anyhow::Result<Self> {
+        let parent = std::env::current_dir()?;
+        Self::prepare_in(
+            &parent,
+            platform,
+            (kernel, patched_initrd),
+            share,
+            additional_inputs,
+            deadline,
+            cancellation,
+        )
+    }
+
+    /// Snapshot inputs under an explicit existing, canonical shell-safe parent.
+    ///
+    /// `payload` contains the kernel and patched initrd paths, respectively.
+    /// The parent must be outside the input roots and the persistent lock/state
+    /// directory. The caller retains the same explicit cleanup responsibility.
+    fn prepare_in(
+        parent: &Path,
+        platform: &PlatformSources,
+        payload: (&Path, &Path),
+        share: &Path,
+        additional: &[PathBuf],
+        deadline: &Deadline,
+        cancellation: &Cancellation,
+    ) -> anyhow::Result<Self> {
+        let prepared = Self::allocate_checked(parent, platform, share, deadline, cancellation)?;
+        match prepared.populate_inputs(platform, payload, share, additional, deadline, cancellation)
+        {
+            Ok(()) => Ok(prepared),
+            Err(error) => {
+                prepared
+                    .cleanup()
+                    .context("failed to remove unused FVP staging")?;
+                Err(error)
+            }
+        }
+    }
+
+    /// Allocate empty scaffolding for registration with the lifecycle journal.
+    pub(crate) fn allocate_for_session(
+        platform: &PlatformSources,
+        share: &Path,
+        deadline: &Deadline,
+        cancellation: &Cancellation,
+    ) -> anyhow::Result<Self> {
+        let parent = std::env::current_dir()?;
+        Self::allocate_checked(&parent, platform, share, deadline, cancellation)
+    }
+
+    /// Allocate native snapshots below the validated persistent output root.
+    pub(crate) fn allocate_for_session_in(
+        parent: &Path,
+        platform: &PlatformSources,
+        share: &Path,
+        deadline: &Deadline,
+        cancellation: &Cancellation,
+    ) -> anyhow::Result<Self> {
+        Self::allocate_checked(parent, platform, share, deadline, cancellation)
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "resolve staging parent and share before checking input-root containment"
+    )]
+    fn allocate_checked(
+        parent: &Path,
+        platform: &PlatformSources,
+        share: &Path,
+        deadline: &Deadline,
+        cancellation: &Cancellation,
+    ) -> anyhow::Result<Self> {
+        check(deadline, cancellation)?;
+        let parent = fs::canonicalize(parent).context("cannot resolve FVP staging parent")?;
+        let share_root = fs::canonicalize(share).context("cannot resolve prepared FVP share")?;
+        for input_root in [&platform.platform_root, &platform.package_root, &share_root] {
+            ensure!(
+                !parent.starts_with(input_root),
+                "FVP staging parent overlaps an input root"
+            );
+        }
+        check(deadline, cancellation)?;
+        Self::allocate(&parent, deadline)
+    }
+
+    /// Fill a registered workspace. Errors leave cleanup to its session.
+    pub(crate) fn populate_inputs(
+        &self,
+        platform: &PlatformSources,
+        payload: (&Path, &Path),
+        share: &Path,
+        additional: &[PathBuf],
+        deadline: &Deadline,
+        cancellation: &Cancellation,
+    ) -> anyhow::Result<()> {
+        check(deadline, cancellation)?;
+        platform.revalidate_sources(deadline)?;
+        for (source, relative) in platform.sources().zip([
+            "package/cca-3world.yaml",
+            "config/kvm_cca_planes.yaml",
+            "inputs/bl1.bin",
+            "inputs/fip.bin",
+            "inputs/dt_bootargs.dtb",
+        ]) {
+            check(deadline, cancellation)?;
+            source.revalidate(deadline)?;
+            copy_verified(
+                source.path(),
+                &self.root.join(relative),
+                Some(source.sha256()),
+                deadline,
+                cancellation,
+            )?;
+            source.verify_snapshot(&self.root, Path::new(relative), deadline)?;
+        }
+        for (source, relative) in platform.fixture_sources() {
+            let relative = Path::new("package").join(relative);
+            let destination = self.root.join(&relative);
+            fs::create_dir_all(destination.parent().context("missing fixture parent")?)?;
+            source.revalidate(deadline)?;
+            copy_verified(
+                source.path(),
+                &destination,
+                Some(source.sha256()),
+                deadline,
+                cancellation,
+            )?;
+            source.verify_snapshot(&self.root, &relative, deadline)?;
+        }
+        if !platform.realm_vfio.is_empty() {
+            let fixture = self.root.join("package/cca-3world");
+            let template = fs::read_to_string(fixture.join("pci.json"))?;
+            let relocated = Self::relocate_fixture(&template, &fixture)?;
+            fs::write(fixture.join("pci_fixedup.json"), relocated)?;
+        }
+        for (source, relative) in [(payload.0, "inputs/Image"), (payload.1, "inputs/initrd")] {
+            copy_verified(
+                source,
+                &self.root.join(relative),
+                None,
+                deadline,
+                cancellation,
+            )?;
+        }
+        snapshot_share_with_inputs(share, &self.share(), additional, deadline, cancellation)?;
+        let release = platform.overlay.path().file_name()
+            == Some(std::ffi::OsStr::new("runtime-overlay.yaml"));
+        self.release_package.set(release);
+        if release && platform.realm_vfio.is_empty() {
+            self.prepare_non_assignment_package()?;
+        }
+        let overlay = if release {
+            self.prepare_release_semihost()?;
+            INITRD_OVERLAY.replace("$${SEMIHOSTDIR}", "${rtvar:SEMIHOSTDIR}")
+        } else {
+            INITRD_OVERLAY.to_owned()
+        };
+        fs::write(self.root.join("config/openvmm-initrd.yaml"), overlay)?;
+        check(deadline, cancellation)?;
+        Ok(())
+    }
+
+    fn prepare_release_semihost(&self) -> anyhow::Result<()> {
+        // Shrinkwrap mounts path rtvars before running the package's mkdir.
+        // Docker creates absent mount sources as root, which its mapped user
+        // cannot write. Allocate this mutable directory ourselves, not inputs.
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(self.root.join("build/semihost"))
+            .context("cannot create owned writable FVP semihost directory")
+    }
+
+    fn prepare_non_assignment_package(&self) -> anyhow::Result<()> {
+        let path = self.root.join("package/cca-3world.yaml");
+        let mut package: serde_yaml::Value = serde_yaml::from_slice(&fs::read(&path)?)?;
+        let params = package["run"]["params"]
+            .as_mapping_mut()
+            .context("FVP package has no runtime parameters")?;
+        let parameter = params
+            .remove(serde_yaml::Value::String(
+                "-C pci.hierarchy_file_name".into(),
+            ))
+            .context("FVP release has no removable PCI hierarchy parameter")?;
+        ensure!(
+            parameter.as_str() == Some("${rtvar:PCI_HIERARCHY_FILE_FIXED}"),
+            "FVP release has an unexpected PCI hierarchy parameter"
+        );
+        package["run"]["rtvars"]
+            .as_mapping_mut()
+            .context("FVP package has no runtime variables")?
+            .remove(serde_yaml::Value::String("PCI_HIERARCHY_FILE_FIXED".into()))
+            .context("FVP release has no removable PCI hierarchy variable")?;
+        fs::write(path, serde_yaml::to_string(&package)?)?;
+        Ok(())
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the workspace must have a canonical shell-safe parent"
+    )]
+    pub(super) fn allocate(parent: &Path, deadline: &Deadline) -> anyhow::Result<Self> {
+        let parent = fs::canonicalize(parent).context("cannot resolve FVP staging parent")?;
+        ensure!(safe_path(&parent), "FVP staging parent is not shell-safe");
+        let directory = tempfile::Builder::new()
+            .prefix("openvmm-fvp-")
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir_in(parent)
+            .context("cannot create owned FVP workspace")?;
+        ensure!(
+            safe_path(directory.path()),
+            "FVP workspace is not shell-safe"
+        );
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))?;
+        for relative in ["build", "package", "config", "inputs", "share", "logs"] {
+            fs::create_dir(directory.path().join(relative))?;
+        }
+        let allocation =
+            super::lifecycle::WorkspaceAllocation::capture(directory.path(), deadline)?;
+        // From here onward, no automatic TempDir removal can race live mounts.
+        Ok(Self {
+            root: directory.keep(),
+            cleaned: false,
+            allocation,
+            release_package: std::cell::Cell::new(false),
+        })
+    }
+
+    /// Canonical safe path to the owned per-run workspace.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Canonical safe workspace path for owned-process state and diagnostics.
+    pub fn workspace_path(&self) -> &Path {
+        self.root()
+    }
+
+    /// Owned 9P share. Guest output remains here until the caller saves it.
+    pub fn share(&self) -> PathBuf {
+        self.root.join("share")
+    }
+
+    /// Owned 9P share directory, including the per-session endpoint identity.
+    pub fn share_dir(&self) -> PathBuf {
+        self.share()
+    }
+
+    /// Durable per-run logs. Save these before explicit workspace cleanup.
+    pub fn logs(&self) -> PathBuf {
+        self.root.join("logs")
+    }
+
+    /// Log directory to save after process cleanup and before workspace removal.
+    pub fn logs_dir(&self) -> PathBuf {
+        self.logs()
+    }
+
+    /// Bind the guest share to the session before starting any owned process.
+    ///
+    /// The runtime reads `/share/.incubator-run-id` over pipette and compares the
+    /// exact bytes with its session ID before accepting readiness. Existing files
+    /// fail closed, including identities supplied by the share manifest.
+    pub fn set_run_identity(&self, run_id: &str) -> anyhow::Result<()> {
+        ensure!(
+            run_id.len() == 64
+                && run_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "invalid FVP run identity"
+        );
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o444)
+            .open(self.share().join(RUN_ID_FILE))
+            .context("cannot create owned FVP run identity")?;
+        file.write_all(run_id.as_bytes())?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    /// Named UART log for one launch attempt, never reused after a collision.
+    pub fn console_log(&self, console: FvpConsole, attempt: u32) -> PathBuf {
+        self.logs()
+            .join(format!("attempt-{attempt}"))
+            .join(format!("{}.log", console.name()))
+    }
+
+    /// Add only controlled paths to an isolated Shrinkwrap command.
+    ///
+    /// The caller creates `command` with the validated platform's isolated
+    /// interpreter builder and applies its pinned Docker binding and ownership
+    /// labels. This method neither starts a process nor depends on a session.
+    /// Call again with a fresh command for a port-collision retry.
+    pub fn populate_command(
+        &self,
+        command: &mut Command,
+        port: u16,
+        config: &FvpCcaConfig,
+        attempt: u32,
+    ) -> anyhow::Result<()> {
+        config.validate()?;
+        ensure!(port != 0, "FVP pipette forwarding port must be nonzero");
+        ensure!(attempt != 0, "FVP launch attempt must be nonzero");
+        fs::create_dir(self.logs().join(format!("attempt-{attempt}")))
+            .context("cannot create fresh FVP attempt logs")?;
+        let generated = self
+            .root
+            .join(format!("config/generated-run-{attempt}.yaml"));
+        let params = BTreeMap::from([(
+            "-C bp.hostbridge.userNetPorts".to_owned(),
+            format!("127.0.0.1:{port}={}", pipette_client::PIPETTE_PORT),
+        )]);
+        let mut terminals = BTreeMap::new();
+        for console in [
+            FvpConsole::Host,
+            FvpConsole::Edk2,
+            FvpConsole::Secure,
+            FvpConsole::Rmm,
+        ] {
+            terminals.insert(
+                console.terminal(),
+                serde_json::json!({
+                    "type": if config.consoles.contains(&console) { "stdout" } else { "null" },
+                    "friendly": console.name(),
+                    "logfile": self.console_log(console, attempt),
+                }),
+            );
+        }
+        fs::write(
+            &generated,
+            serde_yaml::to_string(&serde_json::json!({
+                "run": { "params": params, "terminals": terminals }
+            }))?,
+        )
+        .context("failed to write generated FVP overlay")?;
+        command
+            .current_dir(&self.root)
+            .env("SHRINKWRAP_BUILD", self.root.join("build"))
+            .env("SHRINKWRAP_PACKAGE", self.root.join("package"))
+            .env("SHRINKWRAP_CONFIG", self.root.join("config"))
+            .env("TMPDIR", self.root.join("build"))
+            .args([
+                "--runtime=docker-local",
+                &format!(
+                    "--image={}",
+                    PlatformManifest::for_platform(config.platform)?
+                        .shrinkwrap
+                        .container
+                        .digest
+                ),
+                "run",
+                "--no-color",
+            ]);
+        for overlay in [
+            self.root.join("config/kvm_cca_planes.yaml"),
+            self.root.join("config/openvmm-initrd.yaml"),
+            generated,
+        ] {
+            command.arg("--overlay").arg(overlay);
+        }
+        command.arg(self.root.join("package/cca-3world.yaml"));
+        for (name, relative) in [
+            ("BL1", "inputs/bl1.bin"),
+            ("FIP", "inputs/fip.bin"),
+            ("DTB", "inputs/dt_bootargs.dtb"),
+            ("KERNEL", "inputs/Image"),
+            ("INITRD", "inputs/initrd"),
+            ("SHARE", "share"),
+        ] {
+            command
+                .arg("--rtvar")
+                .arg(format!("{name}={}", self.root.join(relative).display()));
+        }
+        command.args(["--rtvar", "CMDLINE="]);
+        if self.release_package.get() {
+            command.arg("--rtvar").arg(format!(
+                "SEMIHOSTDIR={}",
+                self.root.join("build/semihost").display()
+            ));
+        }
+        if config.platform.has_realm_vfio() {
+            command.arg("--rtvar").arg(format!(
+                "PCI_HIERARCHY_FILE_FIXED={}",
+                self.root
+                    .join("package/cca-3world/pci_fixedup.json")
+                    .display()
+            ));
+        }
+        Ok(())
+    }
+
+    fn relocate_fixture(template: &str, root: &Path) -> anyhow::Result<String> {
+        ensure!(safe_path(root), "unsafe FVP fixture path");
+        ensure!(
+            template.matches("@FIXTURE_ROOT@").count() == 4,
+            "unexpected FVP fixture paths"
+        );
+        let relocated = template.replace(
+            "@FIXTURE_ROOT@",
+            root.to_str().context("non-UTF8 fixture root")?,
+        );
+        let _: serde_json::Value = serde_json::from_str(&relocated)?;
+        Ok(relocated)
+    }
+
+    /// Remove snapshots only after the caller has proved owned-process cleanup.
+    ///
+    /// Save diagnostics and guest output first. On failure this object preserves
+    /// the remaining workspace and warns; the caller must retain its state.
+    pub fn cleanup(mut self) -> anyhow::Result<()> {
+        fs::remove_dir_all(&self.root).context("failed to remove owned FVP workspace")?;
+        self.cleaned = true;
+        Ok(())
+    }
+
+    /// Check the original allocation before handing its path to registration.
+    pub(crate) fn verify_unregistered(&self, deadline: &Deadline) -> anyhow::Result<()> {
+        self.allocation.verify(deadline)
+    }
+
+    /// Discard only the original empty scaffold, never replacement data.
+    pub(crate) fn cleanup_unregistered(mut self, deadline: &Deadline) -> anyhow::Result<()> {
+        self.allocation.discard(deadline)?;
+        self.cleaned = true;
+        Ok(())
+    }
+
+    /// Acknowledge lifecycle retirement without performing a second deletion.
+    pub(crate) fn confirm_retired(mut self) -> anyhow::Result<()> {
+        match fs::symlink_metadata(&self.root) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.cleaned = true;
+                Ok(())
+            }
+            Err(error) => Err(error).context("cannot confirm FVP workspace retirement"),
+            Ok(_) => anyhow::bail!("FVP session did not retire its workspace"),
+        }
+    }
+}
+
+impl Drop for PreparedFvpRun {
+    fn drop(&mut self) {
+        if !self.cleaned {
+            tracing::warn!(
+                workspace = %self.root.display(),
+                "preserving FVP workspace: owned-process cleanup was not confirmed"
+            );
+        }
+    }
+}
+
+fn safe_path(path: &Path) -> bool {
+    path.is_absolute()
+        && path.to_str().is_some_and(|text| {
+            text.bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._/-".contains(&byte))
+        })
+}
+
+fn check(deadline: &Deadline, cancellation: &Cancellation) -> anyhow::Result<()> {
+    cancellation.check()?;
+    deadline.remaining()?;
+    Ok(())
+}
+
+fn open_regular(path: &Path) -> anyhow::Result<File> {
+    // Nonblocking prevents a file replaced by a FIFO from hanging the caller.
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)
+        .context("cannot open regular FVP snapshot input")?;
+    ensure!(
+        file.metadata()?.is_file(),
+        "FVP snapshot input is not a regular file"
+    );
+    Ok(file)
+}
+
+fn digest(
+    file: &mut File,
+    deadline: &Deadline,
+    cancellation: &Cancellation,
+) -> anyhow::Result<String> {
+    check(deadline, cancellation)?;
+    file.seek(SeekFrom::Start(0))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        check(deadline, cancellation)?;
+        let length = file.read(&mut buffer)?;
+        if length == 0 {
+            break;
+        }
+        digest.update(&buffer[..length]);
+    }
+    check(deadline, cancellation)?;
+    Ok(hex::encode(digest.finalize()))
+}
+
+fn copy_verified(
+    source: &Path,
+    destination: &Path,
+    expected: Option<&str>,
+    deadline: &Deadline,
+    cancellation: &Cancellation,
+) -> anyhow::Result<()> {
+    copy_verified_with_progress(source, destination, expected, deadline, cancellation, || {})
+}
+
+fn copy_verified_with_progress(
+    source: &Path,
+    destination: &Path,
+    expected: Option<&str>,
+    deadline: &Deadline,
+    cancellation: &Cancellation,
+    mut progress: impl FnMut(),
+) -> anyhow::Result<()> {
+    check(deadline, cancellation)?;
+    let mut input = open_regular(source)?;
+    let before = digest(&mut input, deadline, cancellation)?;
+    if let Some(expected) = expected {
+        ensure!(before == expected, "FVP source changed before snapshot");
+    }
+    input.seek(SeekFrom::Start(0))?;
+    let mut output = tempfile::Builder::new().prefix(".fvp-copy-").tempfile_in(
+        destination
+            .parent()
+            .context("FVP snapshot destination has no parent")?,
+    )?;
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        check(deadline, cancellation)?;
+        let length = input.read(&mut buffer)?;
+        if length == 0 {
+            break;
+        }
+        output.write_all(&buffer[..length])?;
+        progress();
+    }
+    output
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(
+            input.metadata()?.permissions().mode() & 0o777,
+        ))?;
+    output.as_file().sync_all()?;
+    ensure!(
+        digest(&mut open_regular(output.path())?, deadline, cancellation)? == before,
+        "FVP snapshot changed while copying"
+    );
+    ensure!(
+        digest(&mut open_regular(source)?, deadline, cancellation)? == before,
+        "FVP source changed while copying"
+    );
+    check(deadline, cancellation)?;
+    output
+        .persist_noclobber(destination)
+        .map_err(|error| error.error)
+        .context("cannot publish verified FVP snapshot without replacing existing data")?;
+    check(deadline, cancellation)?;
+    Ok(())
+}
+
+fn share_input(root: &Path, relative: &Path) -> anyhow::Result<(PathBuf, fs::Metadata)> {
+    ensure!(
+        !relative.as_os_str().is_empty()
+            && relative
+                .components()
+                .all(|part| matches!(part, Component::Normal(_))),
+        "FVP share inventory must contain relative paths without traversal"
+    );
+    let mut path = root.to_owned();
+    for part in relative.components() {
+        path.push(part);
+        ensure!(
+            !fs::symlink_metadata(&path)?.file_type().is_symlink(),
+            "FVP share inventory contains a symlink"
+        );
+    }
+    let metadata = fs::symlink_metadata(&path)?;
+    ensure!(
+        metadata.is_file() || metadata.is_dir(),
+        "FVP share inventory entry must be a regular file or directory"
+    );
+    Ok((path, metadata))
+}
+
+fn create_share_directory(
+    root: &Path,
+    relative: &Path,
+    deadline: &Deadline,
+    cancellation: &Cancellation,
+) -> anyhow::Result<()> {
+    ensure!(
+        fs::symlink_metadata(root)?.is_dir(),
+        "FVP share snapshot root must be a directory, not a symlink"
+    );
+    let mut path = root.to_owned();
+    for part in relative.components() {
+        check(deadline, cancellation)?;
+        ensure!(
+            matches!(part, Component::Normal(_)),
+            "invalid FVP share directory path"
+        );
+        path.push(part);
+        match fs::create_dir(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error).context("cannot create FVP share directory"),
+        }
+        ensure!(
+            fs::symlink_metadata(&path)?.is_dir(),
+            "FVP share snapshot directory must not be a symlink or file"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn snapshot_share(
+    source: &Path,
+    destination: &Path,
+    deadline: &Deadline,
+    cancellation: &Cancellation,
+) -> anyhow::Result<()> {
+    snapshot_share_with_inputs(source, destination, &[], deadline, cancellation)
+}
+
+/// Snapshot one explicitly required regular file, including a selected runner
+/// under a temporary directory. No siblings are copied and output paths remain
+/// forbidden. Uses the same checks as manifest and additional runner inputs.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "resolve the source share before checking relative input containment"
+)]
+pub fn snapshot_additional_share_input(
+    source: &Path,
+    destination: &Path,
+    relative: &Path,
+    deadline: &Deadline,
+    cancellation: &Cancellation,
+) -> anyhow::Result<()> {
+    let root =
+        fs::canonicalize(source).context("cannot resolve additional FVP share input root")?;
+    ensure!(
+        root.is_dir(),
+        "additional FVP share input root must be a directory"
+    );
+    snapshot_share_input(&root, destination, relative, true, deadline, cancellation)
+}
+
+fn snapshot_share_input(
+    root: &Path,
+    destination: &Path,
+    relative: &Path,
+    require_file: bool,
+    deadline: &Deadline,
+    cancellation: &Cancellation,
+) -> anyhow::Result<()> {
+    check(deadline, cancellation)?;
+    ensure!(
+        relative != Path::new(SHARE_MANIFEST),
+        "FVP share inventory cannot include itself"
+    );
+    ensure!(
+        !relative.starts_with("test_results"),
+        "FVP share inputs cannot include the guest output directory"
+    );
+    let (input, metadata) = share_input(root, relative)?;
+    let output = destination.join(relative);
+    ensure!(
+        !require_file || metadata.is_file(),
+        "additional FVP share inputs must be regular files"
+    );
+    if metadata.is_dir() {
+        create_share_directory(destination, relative, deadline, cancellation)?;
+    } else {
+        create_share_directory(
+            destination,
+            relative.parent().context("invalid FVP share path")?,
+            deadline,
+            cancellation,
+        )?;
+        copy_verified(&input, &output, None, deadline, cancellation)?;
+    }
+    let (current, after) = share_input(root, relative)?;
+    ensure!(
+        current == input
+            && after.dev() == metadata.dev()
+            && after.ino() == metadata.ino()
+            && after.file_type() == metadata.file_type(),
+        "FVP share path changed while copying"
+    );
+    Ok(())
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "resolve the input root before checking share path containment"
+)]
+fn snapshot_share_with_inputs(
+    source: &Path,
+    destination: &Path,
+    additional: &[PathBuf],
+    deadline: &Deadline,
+    cancellation: &Cancellation,
+) -> anyhow::Result<()> {
+    let root = fs::canonicalize(source).context("cannot resolve prepared FVP share")?;
+    ensure!(root.is_dir(), "prepared FVP share must be a directory");
+    check(deadline, cancellation)?;
+    let manifest_path = root.join(SHARE_MANIFEST);
+    let mut text = Vec::new();
+    open_regular(&manifest_path)
+        .context("required FVP share inventory is missing or invalid")?
+        .take(MAX_MANIFEST_SIZE + 1)
+        .read_to_end(&mut text)?;
+    ensure!(
+        text.len() as u64 <= MAX_MANIFEST_SIZE,
+        "FVP share inventory is too large"
+    );
+    let mut entries: Vec<PathBuf> =
+        serde_json::from_slice(&text).context("invalid FVP share inventory")?;
+    let manifest_digest = hex::encode(Sha256::digest(&text));
+    ensure!(!entries.is_empty(), "FVP share inventory is empty");
+    let mut seen = BTreeSet::new();
+    for relative in &entries {
+        ensure!(
+            seen.insert(relative.clone()),
+            "duplicate FVP share inventory entry"
+        );
+    }
+    for relative in additional {
+        if seen.insert(relative.clone()) {
+            entries.push(relative.clone());
+        }
+    }
+    for relative in entries {
+        snapshot_share_input(
+            &root,
+            destination,
+            &relative,
+            additional.contains(&relative),
+            deadline,
+            cancellation,
+        )?;
+    }
+    ensure!(
+        digest(&mut open_regular(&manifest_path)?, deadline, cancellation)? == manifest_digest,
+        "FVP share inventory changed while copying"
+    );
+    let results = destination.join("test_results");
+    fs::create_dir(&results).context("cannot create fresh FVP guest output directory")?;
+    fs::set_permissions(&results, fs::Permissions::from_mode(0o700))
+        .context("cannot make FVP guest output directory writable")?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::process::run_command_cancellable;
+    use super::*;
+    use serde_yaml::Value;
+    use std::time::Duration;
+    use test_with_tracing::test;
+
+    #[test]
+    fn nested_results_publish_outside_the_seal_without_duplicate_test_reports() {
+        let directory = directory();
+        let prepared = PreparedFvpRun::allocate(directory.path(), &deadline()).unwrap();
+        prepared
+            .set_nested_test_parent("module::outer_on_fvp")
+            .unwrap();
+        let nested = prepared.share().join("test_results/module__outer_on_fvp");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("petri.jsonl"), b"inner trace").unwrap();
+        fs::write(nested.join("petri.test"), b"module::outer_on_fvp").unwrap();
+        fs::write(nested.join("petri.passed"), b"").unwrap();
+        fs::create_dir(nested.join("attachments")).unwrap();
+        fs::write(nested.join("attachments/guest.log"), b"guest log").unwrap();
+        let outer = directory.path().join("results/module__outer_on_fvp");
+        let sealed = outer.join("fvp-current-run");
+        fs::create_dir_all(&sealed).unwrap();
+        fs::write(outer.join("l1_petri.jsonl"), b"outer trace").unwrap();
+        persist_outputs(prepared.root(), &sealed, &deadline()).unwrap();
+        persist_outputs(prepared.root(), &sealed, &deadline()).unwrap();
+        assert!(sealed.join("nested-results/petri.jsonl.sealed").is_file());
+        assert!(sealed.join("nested-results/petri.passed.sealed").is_file());
+        assert!(!sealed.join("l1_petri.jsonl").exists());
+        assert!(!sealed.join("test_results/module__outer_on_fvp").exists());
+        let before = output_contents(&sealed);
+        publish_nested_results(&sealed, &outer, &deadline()).unwrap();
+        assert_eq!(fs::read(outer.join("petri.jsonl")).unwrap(), b"inner trace");
+        assert_eq!(
+            fs::read(outer.join("petri.test")).unwrap(),
+            b"module::outer_on_fvp"
+        );
+        assert_eq!(
+            fs::read(outer.join("l1_petri.jsonl")).unwrap(),
+            b"outer trace"
+        );
+        assert_eq!(
+            fs::read(outer.join("attachments/guest.log")).unwrap(),
+            b"guest log"
+        );
+        assert!(outer.join("petri.passed").is_file());
+        assert_eq!(output_contents(&sealed), before);
+        let all = output_contents(&outer);
+        for report in ["petri.jsonl", "petri.passed", "petri.test"] {
+            assert_eq!(
+                all.keys()
+                    .filter(|path| path.file_name() == Some(std::ffi::OsStr::new(report)))
+                    .count(),
+                1,
+                "{report}"
+            );
+        }
+        fs::write(outer.join("petri.jsonl"), b"conflicting trace").unwrap();
+        assert!(publish_nested_results(&sealed, &outer, &deadline()).is_err());
+        assert_eq!(
+            fs::read(outer.join("petri.jsonl")).unwrap(),
+            b"conflicting trace"
+        );
+        assert_eq!(output_contents(&sealed), before);
+        prepared.cleanup().unwrap();
+    }
+
+    fn output_contents(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn collect(root: &Path, path: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            for entry in fs::read_dir(path).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    collect(root, &path, files);
+                } else {
+                    files.insert(
+                        path.strip_prefix(root).unwrap().to_owned(),
+                        fs::read(path).unwrap(),
+                    );
+                }
+            }
+        }
+        let mut files = BTreeMap::new();
+        collect(root, root, &mut files);
+        files
+    }
+
+    #[test]
+    fn nested_publication_rejects_traversal_symlinks_and_existing_files() {
+        let directory = directory();
+        let outer = directory.path().join("outer");
+        let sealed = outer.join("fvp-current-run");
+        let archive = sealed.join(NESTED_RESULTS);
+        fs::create_dir_all(&archive).unwrap();
+        for name in [
+            "",
+            ".",
+            "..",
+            "../petri.jsonl",
+            "/petri.jsonl",
+            "petri.jsonl/",
+            r"dir\petri.jsonl",
+        ] {
+            assert!(
+                output_name(std::ffi::OsStr::new(name), ReportNames::Publish).is_err(),
+                "{name}"
+            );
+        }
+        for parent in ["..", "../outside", "/outside", "module::outer/../outside"] {
+            assert!(nested_parent_name(parent).is_err(), "{parent}");
+        }
+        fs::write(archive.join("petri.jsonl"), b"not archived").unwrap();
+        assert!(publish_nested_results(&sealed, &outer, &deadline()).is_err());
+        fs::remove_file(archive.join("petri.jsonl")).unwrap();
+        let outside = directory.path().join("outside");
+        fs::write(&outside, b"private").unwrap();
+        std::os::unix::fs::symlink(&outside, archive.join("petri.jsonl.sealed")).unwrap();
+        assert!(publish_nested_results(&sealed, &outer, &deadline()).is_err());
+        assert!(!outer.join("petri.jsonl").exists());
+        fs::remove_file(archive.join("petri.jsonl.sealed")).unwrap();
+        fs::write(archive.join("petri.jsonl.sealed"), b"inner").unwrap();
+        std::os::unix::fs::symlink(&outside, outer.join("petri.jsonl")).unwrap();
+        assert!(publish_nested_results(&sealed, &outer, &deadline()).is_err());
+        assert_eq!(fs::read(&outside).unwrap(), b"private");
+        fs::remove_file(outer.join("petri.jsonl")).unwrap();
+        fs::write(outer.join("petri.jsonl"), b"inner").unwrap();
+        assert!(publish_nested_results(&sealed, &outer, &deadline()).is_err());
+        assert_eq!(fs::read(outer.join("petri.jsonl")).unwrap(), b"inner");
+    }
+
+    #[test]
+    fn nested_publication_never_writes_back_into_the_sealed_run() {
+        let directory = directory();
+        let outer = directory.path().join("outer");
+        let sealed = outer.join("fvp-current-run");
+        let archive = sealed.join(NESTED_RESULTS);
+        fs::create_dir_all(archive.join("fvp-current-run")).unwrap();
+        fs::write(archive.join("fvp-current-run/injected"), b"guest input").unwrap();
+        fs::write(archive.join("petri.jsonl.sealed"), b"inner trace").unwrap();
+        let before = output_contents(&sealed);
+        assert!(publish_nested_results(&sealed, &outer, &deadline()).is_err());
+        assert_eq!(output_contents(&sealed), before);
+        assert!(!sealed.join("injected").exists());
+        assert!(!outer.join("petri.jsonl").exists());
+    }
+
+    #[test]
+    fn interrupted_copy_leaves_no_final_file_and_can_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let target = directory.path().join("target");
+        fs::write(&source, vec![7u8; 128 * 1024]).unwrap();
+        let cancellation = Cancellation::default();
+        assert!(
+            copy_verified_with_progress(&source, &target, None, &deadline(), &cancellation, || {
+                cancellation.cancel()
+            },)
+            .is_err()
+        );
+        assert!(!target.exists());
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+        copy_verified(
+            &source,
+            &target,
+            None,
+            &deadline(),
+            &Cancellation::default(),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&source).unwrap(), fs::read(&target).unwrap());
+    }
+
+    #[test]
+    fn output_collection_obeys_deadlines_and_rejects_symlinks() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let output = directory.path().join("output");
+        fs::create_dir_all(workspace.join("logs")).unwrap();
+        fs::write(workspace.join("logs/host.log"), b"complete").unwrap();
+        assert!(
+            persist_outputs(&workspace, &output, &Deadline::new(Duration::ZERO).unwrap()).is_err()
+        );
+        assert!(!output.exists());
+        persist_outputs(&workspace, &output, &deadline()).unwrap();
+        persist_outputs(&workspace, &output, &deadline()).unwrap();
+        assert_eq!(
+            fs::read(output.join("consoles/host.log")).unwrap(),
+            b"complete"
+        );
+        // A dangling output root must not be silently treated as absent.
+        fs::create_dir(workspace.join("share")).unwrap();
+        std::os::unix::fs::symlink(
+            directory.path().join("absent"),
+            workspace.join("share/test_results"),
+        )
+        .unwrap();
+        assert!(persist_outputs(&workspace, &output, &deadline()).is_err());
+    }
+
+    const PACKAGED: &str =
+        include_str!("../../../incubator/platforms/fvp-packaged-run.fixture.yaml");
+    const EFFECTIVE: &str =
+        include_str!("../../../incubator/platforms/fvp-effective-run.fixture.yaml");
+
+    fn directory() -> tempfile::TempDir {
+        let parent = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/fvp-staging-tests");
+        fs::create_dir_all(&parent).unwrap();
+        tempfile::Builder::new()
+            .prefix("test-")
+            .tempdir_in(parent)
+            .unwrap()
+    }
+
+    fn deadline() -> Deadline {
+        Deadline::new(Duration::from_secs(15)).unwrap()
+    }
+
+    fn merge(base: &mut Value, overlay: Value) {
+        match (base, overlay) {
+            (Value::Mapping(base), Value::Mapping(overlay)) => {
+                for (key, value) in overlay {
+                    match base.get_mut(&key) {
+                        Some(existing) => merge(existing, value),
+                        None => {
+                            base.insert(key, value);
+                        }
+                    }
+                }
+            }
+            (Value::Sequence(base), Value::Sequence(overlay)) => base.extend(overlay),
+            (base, overlay) => *base = overlay,
+        }
+    }
+
+    fn effective() -> Value {
+        let mut base = serde_yaml::from_str(PACKAGED).unwrap();
+        merge(&mut base, serde_yaml::from_str(INITRD_OVERLAY).unwrap());
+        assert_eq!(base, serde_yaml::from_str::<Value>(EFFECTIVE).unwrap());
+        base
+    }
+
+    fn render(value: &str, variables: &BTreeMap<&str, String>) -> String {
+        let mut output = value.to_owned();
+        for (key, value) in variables {
+            output = output.replace(&format!("${{rtvar:{key}}}"), value);
+        }
+        assert!(!output.contains("${rtvar:"));
+        output.replace("$$", "$")
+    }
+
+    #[test]
+    fn release_prerun_uses_preallocated_writable_semihost_without_changing_inputs() {
+        let directory = directory();
+        let prepared = PreparedFvpRun::allocate(directory.path(), &deadline()).unwrap();
+        let semihost = prepared.root().join("build/semihost");
+        assert!(!semihost.exists());
+        prepared.prepare_release_semihost().unwrap();
+        let metadata = fs::symlink_metadata(&semihost).unwrap();
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.uid(), prepared.root().metadata().unwrap().uid());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+
+        let mut variables = BTreeMap::from([
+            ("SEMIHOSTDIR", semihost.display().to_string()),
+            ("CMDLINE", String::new()),
+        ]);
+        for (name, file, contents) in [
+            ("KERNEL", "Image", "kernel"),
+            ("DTB", "fdt.dtb", "device tree"),
+            ("INITRD", "initrd", "patched archive"),
+        ] {
+            let source = prepared.root().join("inputs").join(file);
+            fs::write(&source, contents).unwrap();
+            fs::set_permissions(&source, fs::Permissions::from_mode(0o444)).unwrap();
+            variables.insert(name, source.display().to_string());
+        }
+        // These are the admitted portable package's prerun commands. The
+        // append-only Petri overlay supplies the initrd and final startup line.
+        let mut prerun = [
+            "SEMIHOSTDIR=\"${rtvar:SEMIHOSTDIR}\"",
+            "test -n \"$$SEMIHOSTDIR\"",
+            "mkdir -p \"$$SEMIHOSTDIR\"",
+            "cp \"${rtvar:KERNEL}\" \"$$SEMIHOSTDIR/Image\"",
+            "cp \"${rtvar:DTB}\" \"$$SEMIHOSTDIR/fdt.dtb\"",
+            "printf '%s\\n' 'Image dtb=fdt.dtb' > \"$$SEMIHOSTDIR/startup.nsh\"",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        let overlay: Value = serde_yaml::from_str(
+            &INITRD_OVERLAY.replace("$${SEMIHOSTDIR}", "${rtvar:SEMIHOSTDIR}"),
+        )
+        .unwrap();
+        prerun.extend(
+            overlay["run"]["prerun"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_str().unwrap().to_owned()),
+        );
+        let script = format!(
+            "set -eu\n{}",
+            prerun
+                .iter()
+                .map(|line| render(line, &variables))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let output = run_command_cancellable(
+            Command::new("/bin/sh").arg("-c").arg(script),
+            &deadline(),
+            &Cancellation::default(),
+        )
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for (file, contents) in [
+            ("Image", "kernel"),
+            ("fdt.dtb", "device tree"),
+            ("initrd", "patched archive"),
+        ] {
+            let source = prepared.root().join("inputs").join(file);
+            assert_eq!(fs::read_to_string(&source).unwrap(), contents);
+            assert_eq!(
+                source.metadata().unwrap().permissions().mode() & 0o777,
+                0o444
+            );
+            assert_eq!(fs::read_to_string(semihost.join(file)).unwrap(), contents);
+        }
+        assert_eq!(
+            fs::read_to_string(semihost.join("startup.nsh")).unwrap(),
+            "Image dtb=fdt.dtb initrd=initrd rdinit=/cca-init.sh console=ttyAMA0 earlycon=pl011,0x1c090000 ip=off\n"
+        );
+        prepared.release_package.set(true);
+        let config = FvpCcaConfig {
+            platform: FvpPlatform::RealmVfio,
+            consoles: vec![FvpConsole::Host],
+            primary_console: FvpConsole::Host,
+            capabilities: vec!["cca".into()],
+            deadlines: Default::default(),
+            port_retries: 20,
+        };
+        let mut command = Command::new("isolated-python");
+        prepared
+            .populate_command(&mut command, 12345, &config, 1)
+            .unwrap();
+        assert!(
+            command
+                .get_args()
+                .any(|arg| arg
+                    == std::ffi::OsStr::new(&format!("SEMIHOSTDIR={}", semihost.display())))
+        );
+        prepared.cleanup().unwrap();
+    }
+
+    #[test]
+    fn non_assignment_release_does_not_mount_a_pci_fixture() {
+        let directory = directory();
+        let prepared = PreparedFvpRun::allocate(directory.path(), &deadline()).unwrap();
+        prepared.release_package.set(true);
+        fs::write(
+            prepared.root().join("package/cca-3world.yaml"),
+            serde_json::to_vec(&serde_json::json!({
+                "run": {
+                    "params": {
+                        "-C pci.hierarchy_file_name": "${rtvar:PCI_HIERARCHY_FILE_FIXED}",
+                        "-C keep": 42,
+                    },
+                    "rtvars": {
+                        "PCI_HIERARCHY_FILE_FIXED": { "type": "path", "value": "fixture" },
+                        "KEEP": { "type": "string", "value": "unchanged" },
+                    },
+                },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        prepared.prepare_non_assignment_package().unwrap();
+        let config = FvpCcaConfig::from_toml(include_str!(
+            "../../../incubator/profiles/aarch64-fvp-cca-guest-memfd-in-place.toml"
+        ))
+        .unwrap();
+        let mut command = Command::new("isolated-python");
+        prepared
+            .populate_command(&mut command, 12345, &config, 1)
+            .unwrap();
+        let package: Value = serde_yaml::from_slice(
+            &fs::read(prepared.root().join("package/cca-3world.yaml")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            package["run"]["rtvars"]["KEEP"]["value"].as_str(),
+            Some("unchanged")
+        );
+        assert_eq!(package["run"]["params"]["-C keep"].as_u64(), Some(42));
+        assert!(package["run"]["params"]["-C pci.hierarchy_file_name"].is_null());
+        assert!(package["run"]["rtvars"]["PCI_HIERARCHY_FILE_FIXED"].is_null());
+        assert!(!command.get_args().any(|arg| {
+            arg.to_string_lossy()
+                .starts_with("PCI_HIERARCHY_FILE_FIXED=")
+        }));
+        prepared.cleanup().unwrap();
+    }
+
+    #[test]
+    fn release_semihost_rejects_existing_paths_instead_of_changing_permissions() {
+        let directory = directory();
+        let external = directory.path().join("external");
+        fs::create_dir(&external).unwrap();
+        fs::write(external.join("Image"), "unchanged").unwrap();
+        for kind in ["directory", "file", "symlink"] {
+            let prepared = PreparedFvpRun::allocate(directory.path(), &deadline()).unwrap();
+            let semihost = prepared.root().join("build/semihost");
+            match kind {
+                "directory" => fs::create_dir(&semihost).unwrap(),
+                "file" => fs::write(&semihost, "unchanged").unwrap(),
+                "symlink" => std::os::unix::fs::symlink(&external, &semihost).unwrap(),
+                _ => unreachable!(),
+            }
+            let before = fs::symlink_metadata(&semihost)
+                .unwrap()
+                .permissions()
+                .mode();
+            assert!(prepared.prepare_release_semihost().is_err());
+            assert_eq!(
+                fs::symlink_metadata(&semihost)
+                    .unwrap()
+                    .permissions()
+                    .mode(),
+                before
+            );
+            assert_eq!(
+                fs::read_to_string(external.join("Image")).unwrap(),
+                "unchanged"
+            );
+            prepared.cleanup().unwrap();
+        }
+    }
+
+    #[test]
+    fn rendered_prerun_preserves_setup_order_and_cleanup() {
+        let directory = directory();
+        let prepared = PreparedFvpRun::allocate(directory.path(), &deadline()).unwrap();
+        let input = directory
+            .path()
+            .join("input ' \" $HOME $(touch EVALUATED) ; `false`");
+        fs::create_dir(&input).unwrap();
+        let mut variables = BTreeMap::from([
+            ("CMDLINE", String::new()),
+            ("ROOTFS", "legacy-image-must-not-be-used".to_owned()),
+        ]);
+        for (name, filename, contents) in [
+            ("KERNEL", "Image", "kernel"),
+            ("DTB", "fdt.dtb", "device tree"),
+            ("INITRD", "initrd", "patched archive"),
+        ] {
+            let source = input.join(format!("{filename} ' $()"));
+            fs::write(&source, contents).unwrap();
+            let target = prepared.root.join("inputs").join(filename);
+            copy_verified(
+                &source,
+                &target,
+                None,
+                &deadline(),
+                &Cancellation::default(),
+            )
+            .unwrap();
+            assert!(safe_path(&target));
+            variables.insert(name, target.display().to_string());
+        }
+        let effective = effective();
+        assert_eq!(
+            render(
+                effective["run"]["params"]["-C bp.virtioblockdevice.image_path"]
+                    .as_str()
+                    .unwrap(),
+                &variables,
+            ),
+            ""
+        );
+        assert_eq!(effective["run"]["rtvars"]["ROOTFS"]["type"], "string");
+        let prerun = effective["run"]["prerun"].as_sequence().unwrap();
+        let rendered = prerun
+            .iter()
+            .map(|value| render(value.as_str().unwrap(), &variables))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let semihost = prepared.root.join("fake-semihost");
+        let capture = prepared.root.join("startup-captured");
+        let trace = prepared.root.join("copies");
+        // Fake only directory allocation. The recorded package's setup, copies,
+        // and EXIT trap execute unchanged, without using the host temp directory.
+        let script = format!(
+            r#"set -euo pipefail
+function mktemp {{ mkdir "$FAKE_SEMIHOST"; printf '%s\n' "$FAKE_SEMIHOST"; }}
+function cp {{ printf '%s\n' "$2" >> "$TRACE"; command cp "$@"; }}
+{rendered}
+test "$(cat "$SEMIHOSTDIR/Image")" = kernel
+test "$(cat "$SEMIHOSTDIR/fdt.dtb")" = "device tree"
+test "$(cat "$SEMIHOSTDIR/initrd")" = "patched archive"
+command cp "$SEMIHOSTDIR/startup.nsh" "$CAPTURE"
+"#
+        );
+        let output = run_command_cancellable(
+            Command::new("bash")
+                .args(["-c", &script])
+                .current_dir(&prepared.root)
+                .env("FAKE_SEMIHOST", &semihost)
+                .env("CAPTURE", &capture)
+                .env("TRACE", &trace),
+            &deadline(),
+            &Cancellation::default(),
+        )
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !semihost.exists(),
+            "inherited EXIT trap must remove semihost files"
+        );
+        assert!(!prepared.root.join("EVALUATED").exists());
+        let copies = fs::read_to_string(&trace).unwrap();
+        assert_eq!(
+            copies
+                .lines()
+                .map(|path| Path::new(path).file_name().unwrap().to_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["Image", "fdt.dtb", "initrd"],
+        );
+        let startup = fs::read_to_string(&capture).unwrap();
+        assert_eq!(
+            startup,
+            "Image dtb=fdt.dtb initrd=initrd rdinit=/cca-init.sh console=ttyAMA0 earlycon=pl011,0x1c090000 ip=off\n"
+        );
+        for argument in ["dtb=", "initrd=", "rdinit=", "console=", "earlycon=", "ip="] {
+            assert_eq!(startup.matches(argument).count(), 1, "{argument}");
+        }
+        assert!(!startup.contains("root=/dev/"));
+
+        fs::remove_file(&variables["INITRD"]).unwrap();
+        let output = run_command_cancellable(
+            Command::new("bash")
+                .args(["-c", &script])
+                .current_dir(&prepared.root)
+                .env("FAKE_SEMIHOST", &semihost)
+                .env("CAPTURE", &capture)
+                .env("TRACE", &trace),
+            &deadline(),
+            &Cancellation::default(),
+        )
+        .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            !semihost.exists(),
+            "failed initrd lookup must run inherited cleanup"
+        );
+        prepared.cleanup().unwrap();
+    }
+
+    #[test]
+    fn share_inventory_copies_only_explicit_regular_files() {
+        let directory = directory();
+        let source = directory.path().join("source $() '");
+        let target = directory.path().join("snapshot");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::create_dir(source.join("bin")).unwrap();
+        fs::write(source.join("bin/pipette"), "source matched").unwrap();
+        for unwanted in ["output.log", "download.tar.gz", "nextest-cache"] {
+            fs::write(source.join(unwanted), "not an input").unwrap();
+        }
+        fs::write(source.join(SHARE_MANIFEST), r#"["bin/pipette"]"#).unwrap();
+        snapshot_share(&source, &target, &deadline(), &Cancellation::default()).unwrap();
+        assert_eq!(
+            fs::read_to_string(target.join("bin/pipette")).unwrap(),
+            "source matched"
+        );
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 2);
+        fs::write(source.join("bin/pipette"), "changed live source").unwrap();
+        assert_eq!(
+            fs::read_to_string(target.join("bin/pipette")).unwrap(),
+            "source matched"
+        );
+    }
+
+    #[test]
+    fn share_rejects_traversal_symlinks_missing_and_nonregular_files() {
+        let directory = directory();
+        let source = directory.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(directory.path().join("foreign"), "foreign").unwrap();
+        std::os::unix::fs::symlink(directory.path().join("foreign"), source.join("escape"))
+            .unwrap();
+        nix::unistd::mkfifo(&source.join("fifo"), nix::sys::stat::Mode::S_IRUSR).unwrap();
+        for entry in ["../foreign", "/foreign", "escape", "missing", "fifo"] {
+            let output = tempfile::Builder::new()
+                .tempdir_in(directory.path())
+                .unwrap();
+            fs::write(
+                source.join(SHARE_MANIFEST),
+                serde_json::to_vec(&[entry]).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                snapshot_share(
+                    &source,
+                    output.path(),
+                    &deadline(),
+                    &Cancellation::default()
+                )
+                .is_err(),
+                "{entry}"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(directory.path().join("foreign")).unwrap(),
+            "foreign"
+        );
+    }
+
+    #[test]
+    fn additional_share_inputs_are_explicit_checked_and_deduplicated() {
+        let directory = directory();
+        let source = directory.path().join("source");
+        let target = directory.path().join("snapshot");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&target).unwrap();
+        for name in ["pipette", "runner", "unlisted"] {
+            fs::write(source.join(name), name).unwrap();
+        }
+        fs::write(source.join(SHARE_MANIFEST), r#"["pipette"]"#).unwrap();
+        snapshot_share_with_inputs(
+            &source,
+            &target,
+            &["pipette".into(), "runner".into(), "runner".into()],
+            &deadline(),
+            &Cancellation::default(),
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(target.join("runner")).unwrap(), "runner");
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 3);
+        assert!(!target.join("unlisted").exists());
+        let invalid = directory.path().join("invalid");
+        fs::create_dir(&invalid).unwrap();
+        assert!(
+            snapshot_share_with_inputs(
+                &source,
+                &invalid,
+                &["../foreign".into()],
+                &deadline(),
+                &Cancellation::default(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn explicit_nested_runner_survives_both_snapshot_stages_without_temp_siblings() {
+        let directory = directory();
+        let content = directory.path().join("content");
+        let producer = directory.path().join("producer");
+        let target = directory.path().join("snapshot");
+        fs::create_dir_all(content.join("temp/cache")).unwrap();
+        fs::create_dir_all(producer.join("testcontent")).unwrap();
+        fs::create_dir(&target).unwrap();
+        let relative = Path::new("temp/.tmp-selected-runner");
+        fs::write(content.join(relative), "selected").unwrap();
+        fs::set_permissions(content.join(relative), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(content.join("temp/cache/unrelated"), "unlisted").unwrap();
+        snapshot_additional_share_input(
+            &content,
+            &producer.join("testcontent"),
+            relative,
+            &deadline(),
+            &Cancellation::default(),
+        )
+        .unwrap();
+        let entry = Path::new("testcontent").join(relative);
+        fs::write(
+            producer.join(SHARE_MANIFEST),
+            serde_json::to_vec(&[PathBuf::from("testcontent"), entry.clone()]).unwrap(),
+        )
+        .unwrap();
+        snapshot_share(&producer, &target, &deadline(), &Cancellation::default()).unwrap();
+        assert_eq!(fs::read(target.join(&entry)).unwrap(), b"selected");
+        assert_eq!(
+            target.join(entry).metadata().unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert!(!producer.join("testcontent/temp/cache").exists());
+        assert!(!target.join("testcontent/temp/cache").exists());
+    }
+
+    #[test]
+    fn explicit_runner_copy_preserves_containment_and_no_overwrite_guards() {
+        let directory = directory();
+        let source = directory.path().join("source");
+        let target = directory.path().join("target");
+        fs::create_dir_all(source.join("temp")).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(source.join("temp/runner"), "runner").unwrap();
+        fs::write(source.join(SHARE_MANIFEST), "inventory").unwrap();
+        fs::create_dir_all(source.join("test_results")).unwrap();
+        fs::write(source.join("test_results/log"), "output").unwrap();
+        std::os::unix::fs::symlink(source.join("temp/runner"), source.join("temp/link")).unwrap();
+        std::os::unix::fs::symlink(source.join("temp"), source.join("alias")).unwrap();
+        for relative in [
+            "../foreign",
+            "/foreign",
+            SHARE_MANIFEST,
+            "test_results/log",
+            "temp",
+            "temp/link",
+            "alias/runner",
+        ] {
+            assert!(
+                snapshot_additional_share_input(
+                    &source,
+                    &target,
+                    Path::new(relative),
+                    &deadline(),
+                    &Cancellation::default()
+                )
+                .is_err(),
+                "{relative}"
+            );
+        }
+        let relative = Path::new("temp/runner");
+        snapshot_additional_share_input(
+            &source,
+            &target,
+            relative,
+            &deadline(),
+            &Cancellation::default(),
+        )
+        .unwrap();
+        fs::write(source.join(relative), "changed").unwrap();
+        assert!(
+            snapshot_additional_share_input(
+                &source,
+                &target,
+                relative,
+                &deadline(),
+                &Cancellation::default()
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(target.join(relative)).unwrap(), b"runner");
+    }
+
+    #[test]
+    fn flowey_share_requires_manifest_and_adds_only_invoked_binary() {
+        let directory = directory();
+        let source = directory.path().join("source");
+        let target = directory.path().join("snapshot");
+        fs::create_dir(&target).unwrap();
+        let runner = PathBuf::from("nextest-archive-tmp/target/tests");
+        let files = ["pipette", "openvmm", "aarch64/Image", "aarch64/initrd"];
+        for relative in files.iter().map(PathBuf::from).chain([runner.clone()]) {
+            let path = source.join(&relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, relative.as_os_str().as_encoded_bytes()).unwrap();
+        }
+        for relative in [
+            "download.tar.gz",
+            "nextest-archive-tmp/cache",
+            "test_results/previous.log",
+        ] {
+            let path = source.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "unlisted").unwrap();
+        }
+        assert!(
+            snapshot_share_with_inputs(
+                &source,
+                &target,
+                std::slice::from_ref(&runner),
+                &deadline(),
+                &Cancellation::default(),
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
+        fs::write(
+            source.join(SHARE_MANIFEST),
+            serde_json::to_vec(&files).unwrap(),
+        )
+        .unwrap();
+        snapshot_share_with_inputs(
+            &source,
+            &target,
+            std::slice::from_ref(&runner),
+            &deadline(),
+            &Cancellation::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(target.join(&runner)).unwrap(),
+            runner.to_str().unwrap()
+        );
+        for relative in files {
+            assert!(target.join(relative).is_file());
+        }
+        assert!(!target.join("download.tar.gz").exists());
+        assert!(!target.join("nextest-archive-tmp/cache").exists());
+        let results = target.join("test_results");
+        assert!(results.is_dir());
+        assert_eq!(
+            results.metadata().unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(fs::read_dir(&results).unwrap().count(), 0);
+        fs::write(results.join("new.log"), "guest output").unwrap();
+        assert!(!source.join("test_results/new.log").exists());
+        assert_eq!(
+            fs::read_to_string(source.join("test_results/previous.log")).unwrap(),
+            "unlisted"
+        );
+        assert!(!target.join(SHARE_MANIFEST).exists());
+        let invalid = directory.path().join("invalid");
+        fs::create_dir(&invalid).unwrap();
+        assert!(
+            snapshot_share_with_inputs(
+                &source,
+                &invalid,
+                &["test_results/previous.log".into()],
+                &deadline(),
+                &Cancellation::default(),
+            )
+            .is_err()
+        );
+        assert!(!invalid.join("test_results").exists());
+    }
+
+    #[test]
+    fn share_snapshot_preserves_empty_tag_roots_without_copying_unlisted_children() {
+        let directory = directory();
+        let source = directory.path().join("source");
+        let target = directory.path().join("snapshot");
+        fs::create_dir_all(source.join("testimages")).unwrap();
+        fs::create_dir_all(source.join("testcontent/empty/nested")).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(source.join("testcontent/runner"), "runner").unwrap();
+        fs::write(source.join("testcontent/unlisted"), "private").unwrap();
+        fs::write(
+            source.join(SHARE_MANIFEST),
+            serde_json::to_vec(&[
+                "testimages",
+                "testcontent",
+                "testcontent/empty",
+                "testcontent/empty/nested",
+                "testcontent/runner",
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        snapshot_share(&source, &target, &deadline(), &Cancellation::default()).unwrap();
+        for relative in ["testimages", "testcontent/empty/nested"] {
+            assert!(target.join(relative).is_dir());
+            assert_eq!(fs::read_dir(target.join(relative)).unwrap().count(), 0);
+        }
+        assert_eq!(
+            fs::read_to_string(target.join("testcontent/runner")).unwrap(),
+            "runner"
+        );
+        assert!(!target.join("testcontent/unlisted").exists());
+        assert!(!target.join(SHARE_MANIFEST).exists());
+        assert!(target.join("test_results").is_dir());
+    }
+
+    #[test]
+    fn directory_share_entries_reject_traversal_links_and_special_files() {
+        let directory = directory();
+        let source = directory.path().join("source");
+        let external = directory.path().join("external");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir_all(external.join("nested")).unwrap();
+        std::os::unix::fs::symlink(&external, source.join("link")).unwrap();
+        nix::unistd::mkfifo(&source.join("fifo"), nix::sys::stat::Mode::S_IRUSR).unwrap();
+        for (index, relative) in [
+            "",
+            "../external",
+            "/external",
+            "link",
+            "link/nested",
+            "fifo",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let target = directory.path().join(format!("snapshot-{index}"));
+            fs::create_dir(&target).unwrap();
+            fs::write(
+                source.join(SHARE_MANIFEST),
+                serde_json::to_vec(&[relative]).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                snapshot_share(&source, &target, &deadline(), &Cancellation::default()).is_err()
+            );
+            assert_eq!(fs::read_dir(target).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn share_snapshot_rejects_destination_directory_links_and_additional_directories() {
+        let directory = directory();
+        let source = directory.path().join("source");
+        let target = directory.path().join("snapshot");
+        let external = directory.path().join("external");
+        fs::create_dir_all(source.join("testimages/empty")).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::create_dir(&external).unwrap();
+        std::os::unix::fs::symlink(&external, target.join("testimages")).unwrap();
+        fs::write(source.join(SHARE_MANIFEST), r#"["testimages/empty"]"#).unwrap();
+        assert!(snapshot_share(&source, &target, &deadline(), &Cancellation::default()).is_err());
+        assert_eq!(fs::read_dir(&external).unwrap().count(), 0);
+        let other = directory.path().join("other");
+        fs::create_dir(&other).unwrap();
+        fs::write(source.join(SHARE_MANIFEST), r#"["testimages"]"#).unwrap();
+        assert!(
+            snapshot_share_with_inputs(
+                &source,
+                &other,
+                &["testimages".into()],
+                &deadline(),
+                &Cancellation::default(),
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read_dir(other).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn snapshot_rejects_changed_identity_and_preserves_executable_mode() {
+        let directory = directory();
+        let input = directory.path().join("input");
+        fs::write(&input, "source").unwrap();
+        fs::set_permissions(&input, fs::Permissions::from_mode(0o755)).unwrap();
+        let target = directory.path().join("snapshot");
+        assert!(
+            copy_verified(
+                &input,
+                &target,
+                Some(&"0".repeat(64)),
+                &deadline(),
+                &Cancellation::default()
+            )
+            .is_err()
+        );
+        assert!(!target.exists());
+        copy_verified(&input, &target, None, &deadline(), &Cancellation::default()).unwrap();
+        assert_eq!(
+            target.metadata().unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&input, &link).unwrap();
+        assert!(
+            copy_verified(
+                &link,
+                &directory.path().join("bad"),
+                None,
+                &deadline(),
+                &Cancellation::default()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn snapshot_failure_checks_are_bounded_and_do_not_create_outputs() {
+        let directory = directory();
+        let input = directory.path().join("input");
+        fs::write(&input, "source").unwrap();
+        let output = directory.path().join("output");
+        let cancellation = Cancellation::default();
+        cancellation.cancel();
+        assert!(copy_verified(&input, &output, None, &deadline(), &cancellation).is_err());
+        assert!(!output.exists());
+        for invalid in [
+            directory.path().join("missing"),
+            directory.path().to_path_buf(),
+        ] {
+            assert!(
+                copy_verified(
+                    &invalid,
+                    &output,
+                    None,
+                    &deadline(),
+                    &Cancellation::default()
+                )
+                .is_err()
+            );
+            assert!(!output.exists());
+        }
+        let fifo = directory.path().join("fifo");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRUSR).unwrap();
+        assert!(
+            copy_verified(&fifo, &output, None, &deadline(), &Cancellation::default()).is_err()
+        );
+        assert!(!output.exists());
+        assert_eq!(fs::read_to_string(input).unwrap(), "source");
+    }
+
+    #[test]
+    fn workspace_drop_preserves_until_explicit_cleanup() {
+        let directory = directory();
+        let prepared = PreparedFvpRun::allocate(directory.path(), &deadline()).unwrap();
+        let preserved = prepared.root.clone();
+        fs::write(prepared.share().join("guest-output"), "keep").unwrap();
+        drop(prepared);
+        assert_eq!(
+            fs::read_to_string(preserved.join("share/guest-output")).unwrap(),
+            "keep"
+        );
+        fs::remove_dir_all(&preserved).unwrap();
+        assert!(!preserved.exists());
+    }
+
+    #[test]
+    fn run_identity_is_exact_owned_and_write_once() {
+        let directory = directory();
+        let prepared = PreparedFvpRun::allocate(directory.path(), &deadline()).unwrap();
+        assert_eq!(prepared.workspace_path(), prepared.root());
+        assert!(safe_path(prepared.root()));
+        assert_eq!(
+            prepared.root().metadata().unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(prepared.share_dir(), prepared.share());
+        assert_eq!(prepared.logs_dir(), prepared.logs());
+        let path = prepared.share_dir().join(RUN_ID_FILE);
+        for invalid in ["", "short", &"A".repeat(64), &"../".repeat(22)] {
+            assert!(prepared.set_run_identity(invalid).is_err());
+            assert!(!path.exists());
+        }
+        let run_id = super::super::lifecycle::RunId::new().unwrap();
+        prepared.set_run_identity(run_id.as_str()).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), run_id.as_str());
+        assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o444);
+        assert!(prepared.set_run_identity(run_id.as_str()).is_err());
+        assert!(prepared.set_run_identity(&"f".repeat(64)).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), run_id.as_str());
+        prepared.cleanup().unwrap();
+    }
+
+    #[test]
+    fn command_uses_only_owned_paths_and_generated_overlay_last() {
+        let directory = directory();
+        let prepared = PreparedFvpRun::allocate(directory.path(), &deadline()).unwrap();
+        let config = FvpCcaConfig {
+            platform: Default::default(),
+            consoles: vec![FvpConsole::Host, FvpConsole::Rmm],
+            primary_console: FvpConsole::Host,
+            capabilities: vec!["cca".into()],
+            deadlines: Default::default(),
+            port_retries: 20,
+        };
+        let mut command = Command::new("isolated-python");
+        command.args(["-I", "-B", "-u", "/trusted/shrinkwrap"]);
+        // Poisoned ambient/default workspace values must be replaced, not used.
+        command.env("SHRINKWRAP_PACKAGE", "/not-the-approved-package");
+        prepared
+            .populate_command(&mut command, 12345, &config, 1)
+            .unwrap();
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(command.get_program(), "isolated-python");
+        assert_eq!(&args[..4], ["-I", "-B", "-u", "/trusted/shrinkwrap"]);
+        assert!(args.contains(&"--runtime=docker-local"));
+        let expected_image = format!(
+            "--image={}",
+            PlatformManifest::for_platform(config.platform)
+                .unwrap()
+                .shrinkwrap
+                .container
+                .digest
+        );
+        assert!(args.contains(&expected_image.as_str()));
+        let overlays = args
+            .windows(2)
+            .filter(|pair| pair[0] == "--overlay")
+            .map(|pair| pair[1])
+            .collect::<Vec<_>>();
+        assert_eq!(overlays.len(), 3);
+        assert!(overlays[2].ends_with("/config/generated-run-1.yaml"));
+        assert!(
+            args.contains(
+                &prepared
+                    .root
+                    .join("package/cca-3world.yaml")
+                    .to_str()
+                    .unwrap()
+            )
+        );
+        assert_eq!(
+            args.windows(2)
+                .filter(|pair| pair[0] == "--rtvar")
+                .map(|pair| pair[1].split_once('=').unwrap().0)
+                .collect::<Vec<_>>(),
+            ["BL1", "FIP", "DTB", "KERNEL", "INITRD", "SHARE", "CMDLINE"]
+        );
+        for pair in args.windows(2).filter(|pair| pair[0] == "--rtvar") {
+            let (name, path) = pair[1].split_once('=').unwrap();
+            assert_ne!(name, "ROOTFS");
+            if name != "CMDLINE" {
+                assert!(safe_path(Path::new(path)));
+                assert!(Path::new(path).starts_with(&prepared.root));
+            } else {
+                assert!(path.is_empty());
+            }
+        }
+        for (name, value) in command.get_envs() {
+            if name.to_string_lossy().starts_with("SHRINKWRAP_") {
+                assert!(Path::new(value.unwrap()).starts_with(&prepared.root));
+            }
+        }
+        let generated: Value = serde_yaml::from_str(
+            &fs::read_to_string(prepared.root.join("config/generated-run-1.yaml")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            generated["run"]["params"]["-C bp.hostbridge.userNetPorts"],
+            format!("127.0.0.1:12345={}", pipette_client::PIPETTE_PORT)
+        );
+        assert_eq!(
+            generated["run"]["terminals"]["bp.terminal_0"]["type"],
+            "stdout"
+        );
+        assert_eq!(
+            generated["run"]["terminals"]["bp.terminal_3"]["friendly"],
+            "rmm"
+        );
+        prepared.cleanup().unwrap();
+    }
+
+    #[test]
+    fn retries_keep_prior_logs_out_of_current_readiness() {
+        let directory = directory();
+        let prepared = PreparedFvpRun::allocate(directory.path(), &deadline()).unwrap();
+        let config = FvpCcaConfig {
+            platform: Default::default(),
+            consoles: vec![FvpConsole::Host],
+            primary_console: FvpConsole::Host,
+            capabilities: vec!["cca".into()],
+            deadlines: Default::default(),
+            port_retries: 20,
+        };
+        prepared
+            .populate_command(&mut Command::new("python"), 12345, &config, 1)
+            .unwrap();
+        let first = prepared.console_log(FvpConsole::Host, 1);
+        let stale = "Failed to load initrd\nINCUBATOR DHCP START\nPIPETTE READY\n";
+        fs::write(&first, stale).unwrap();
+        prepared
+            .populate_command(&mut Command::new("python"), 12346, &config, 2)
+            .unwrap();
+        let second = prepared.console_log(FvpConsole::Host, 2);
+        assert_ne!(first, second);
+        assert!(!second.exists());
+        assert_eq!(fs::read_to_string(&first).unwrap(), stale);
+        for attempt in [1, 2] {
+            let generated: Value = serde_yaml::from_str(
+                &fs::read_to_string(
+                    prepared
+                        .root
+                        .join(format!("config/generated-run-{attempt}.yaml")),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                generated["run"]["terminals"]["bp.terminal_0"]["logfile"]
+                    .as_str()
+                    .unwrap(),
+                prepared
+                    .console_log(FvpConsole::Host, attempt)
+                    .to_str()
+                    .unwrap(),
+            );
+        }
+        assert!(
+            prepared
+                .populate_command(&mut Command::new("python"), 12347, &config, 2)
+                .is_err()
+        );
+        prepared.cleanup().unwrap();
+    }
+    #[test]
+    fn realm_vfio_json_relocation_is_owned_and_exact() {
+        let template = include_str!("../../../incubator/platforms/fvp-realm-vfio-pci.json");
+        let root = Path::new("/owned/package/cca-3world");
+        let text = PreparedFvpRun::relocate_fixture(template, root).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let bridges = value.as_object().unwrap();
+        assert_eq!(bridges.len(), 1);
+        let devices = bridges["rootport/rootport0"]["__downstream__"]
+            .as_object()
+            .unwrap();
+        assert_eq!(devices.len(), 1);
+        assert!(devices.contains_key("ahci/ahci1"));
+        assert_eq!(
+            devices["ahci/ahci1"]["image_path"],
+            "/owned/package/cca-3world/ahci-disk.img"
+        );
+        assert!(!text.contains("@FIXTURE_ROOT@"));
+        assert!(PreparedFvpRun::relocate_fixture(template, Path::new("/unsafe path")).is_err());
+        assert!(PreparedFvpRun::relocate_fixture("{}", root).is_err());
+    }
+}

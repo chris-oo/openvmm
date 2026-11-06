@@ -8,7 +8,30 @@ use crate::TempOrPersistentPath;
 use anyhow::Context;
 use std::io::Write;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
+
+/// Locate the explicit host trust bundle to inject into a test initrd.
+pub fn host_ca_certificates_path() -> anyhow::Result<PathBuf> {
+    if let Some(path) = std::env::var_os("SSL_CERT_FILE").filter(|path| !path.is_empty()) {
+        let path = PathBuf::from(path);
+        anyhow::ensure!(
+            path.is_file(),
+            "SSL_CERT_FILE is not a file: {}",
+            path.display()
+        );
+        return Ok(path);
+    }
+    [
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/ca-bundle.pem",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .find(|path| path.is_file())
+    .context("could not find a host CA certificate bundle for the guest")
+}
 
 /// A file to append to a base initrd, replacing any earlier entry of that name.
 pub struct InitrdFile<'a> {
