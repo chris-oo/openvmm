@@ -45,6 +45,7 @@ impl RunContext<'_> {
                 vmtime: self.vmtime_source,
                 isolation: virt::ProtoPartitionIsolation::None,
                 nested_virt: false,
+                guest_memfd_in_place: false,
                 #[cfg(guest_arch = "aarch64")]
                 device_assignment_msi_iova_range: None,
             })

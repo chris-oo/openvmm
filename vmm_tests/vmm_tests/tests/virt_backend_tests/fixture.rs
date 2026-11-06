@@ -61,6 +61,7 @@ impl Fixture {
             vmtime: &self.time_source,
             isolation: virt::ProtoPartitionIsolation::None,
             nested_virt: false,
+            guest_memfd_in_place: false,
         })?;
         let (partition, binders) = proto.build(virt::PartitionConfig {
             mem_layout: &self.memory_layout,

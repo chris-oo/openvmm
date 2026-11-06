@@ -162,6 +162,11 @@ impl virt::Hypervisor for Kvm {
         &mut self,
         config: ProtoPartitionConfig<'a>,
     ) -> Result<Self::ProtoPartition<'a>, Self::Error> {
+        if config.guest_memfd_in_place {
+            return Err(KvmError::UnsupportedIsolationConfiguration(
+                "experimental guest_memfd in-place RAM requires Arm KVM",
+            ));
+        }
         match config.isolation.isolation_type() {
             virt::IsolationType::None => {}
             virt::IsolationType::Snp => {
@@ -572,15 +577,18 @@ impl ProtoPartition for KvmProtoPartition<'_> {
             .collect();
         let memory_backing_mode = match self.config.isolation.isolation_type() {
             virt::IsolationType::None => KvmMemoryBackingMode::Userspace,
-            virt::IsolationType::Snp => {
-                KvmMemoryBackingMode::guest_memfd(&self.vm, ram_ranges.iter().copied(), true)?
-            }
+            virt::IsolationType::Snp => KvmMemoryBackingMode::guest_memfd(
+                &self.vm,
+                ram_ranges.iter().copied(),
+                crate::memory::KvmGuestMemfdPrivateState::VmAttributes,
+            )?,
             virt::IsolationType::Vbs | virt::IsolationType::Tdx | virt::IsolationType::Cca => {
                 unreachable!()
             }
         };
 
         let partition = Arc::new(KvmPartitionInner {
+            vfio_device: Mutex::new(None),
             kvm: self.vm,
             sev: self.sev,
             snp_config: self.snp_config,
@@ -780,6 +788,10 @@ impl ResetPartition for KvmPartition {
 impl Partition for KvmPartition {
     fn initial_vp_state_source(&self) -> virt::InitialVpStateSource {
         virt::InitialVpStateSource::Registers
+    }
+
+    fn vfio_assignment_provider(&self) -> Option<Arc<dyn pci_core::vfio::VfioVmProvider>> {
+        Some(crate::vfio::provider(self.inner.clone()))
     }
 
     fn supports_reset(&self) -> Option<&dyn ResetPartition<Error = Self::Error>> {
@@ -1847,6 +1859,11 @@ impl<'p> Processor for KvmProcessor<'p> {
                                 KvmRunVpError::UnhandledHypercall { nr, flags }.into(),
                             ));
                         }
+                    }
+                    kvm::Exit::MemoryFault { flags, gpa, size } => {
+                        return Err(dev.fatal_error(
+                            KvmRunVpError::UnsupportedMemoryFault { flags, gpa, size }.into(),
+                        ));
                     }
                     kvm::Exit::Debug {
                         exception: _,

@@ -67,6 +67,8 @@ pub struct PlatformInfo {
     /// How the physical SMMU implementation selects the IOVA range reserved
     /// for device-assignment MSI writes.
     pub device_assignment_msi_iova: DeviceAssignmentMsiIova,
+    /// The CCA shared IPA bit, if available.
+    pub shared_gpa_bit: Option<u64>,
 }
 
 /// Selection policy for the device-assignment MSI IOVA reservation.
@@ -114,6 +116,11 @@ pub trait Hypervisor: 'static {
     /// virtualization (VMX/SVM) to the guest so it can run its own hypervisor.
     /// See the [`Hypervisor`] trait docs on recognized features.
     fn recognizes_nested_virt(&self) -> bool {
+        false
+    }
+
+    /// Whether the backend recognizes experimental guest_memfd in-place RAM.
+    fn recognizes_guest_memfd_in_place(&self) -> bool {
         false
     }
 
@@ -355,6 +362,9 @@ pub struct ProtoPartitionConfig<'a> {
     /// backend recognizes it via [`Hypervisor::recognizes_nested_virt`]; a
     /// backend that receives an unrecognized request may silently ignore it.
     pub nested_virt: bool,
+    /// Explicitly select experimental guest_memfd in-place RAM, without fallback.
+    /// Callers must check [`Hypervisor::recognizes_guest_memfd_in_place`].
+    pub guest_memfd_in_place: bool,
     /// Device-assignment MSI IOVA reservation selected for this partition.
     #[cfg(guest_arch = "aarch64")]
     pub device_assignment_msi_iova_range: Option<MemoryRange>,
@@ -439,6 +449,25 @@ pub trait ProtoPartition {
     /// the memory backing uses it to select a lazy commit strategy.
     fn supports_memory_fault_resolution(&self) -> bool {
         false
+    }
+
+    /// Prepares backend-owned RAM for the final layout, before userspace maps it.
+    ///
+    /// `None` leaves userspace backing allocation to the caller. A backend can
+    /// still retain separate private backing in this case. `Some` supplies the
+    /// exclusive userspace RAM backing; the caller must not allocate another
+    /// backing or combine it with restored memory.
+    ///
+    /// The backend must retain the corresponding backing through `build` and
+    /// partition destruction, and reject later preparations or builds with a
+    /// different RAM layout. Backends that require preparation must also define
+    /// their behavior for callers that invoke `build` without this step.
+    #[cfg(target_os = "linux")]
+    fn prepare_ram_backing(
+        &mut self,
+        _layout: &MemoryLayout,
+    ) -> Result<Option<crate::MappableRamBacking>, Self::Error> {
+        Ok(None)
     }
 
     /// Constructs the full partition.
@@ -588,6 +617,14 @@ pub trait Partition: 'static + Hv1 + Inspect + Send + Sync {
     ///
     /// Not all partitions support this.
     fn irqfd(&self) -> Option<Arc<dyn IrqFd>> {
+        None
+    }
+
+    /// Returns lazy, owning VFIO association access, if the backend supports it.
+    ///
+    /// Obtaining the provider performs no kernel device allocation.
+    #[cfg(target_os = "linux")]
+    fn vfio_assignment_provider(&self) -> Option<Arc<dyn pci_core::vfio::VfioVmProvider>> {
         None
     }
 

@@ -140,6 +140,20 @@ the backing file persists guest memory to disk so it can be saved and
 restored. It is a form of shared memory and cannot be combined with private
 memory or explicit huge pages.
 
+## Partition-supplied RAM on Linux
+
+The prototype partition's `prepare_ram_backing` method can return a
+[`MappableRamBacking`](https://openvmm.dev/rustdoc/linux/virt/struct.MappableRamBacking.html)
+to supply its own shared-writable file. The file packs the memory layout's
+RAM ranges in order, followed by VTL2 RAM, without space for GPA holes.
+
+Returning no file leaves ordinary userspace RAM allocation unchanged.
+Supplied offset imports, including offset zero, cannot be exported for restart.
+
+The shared/private backing choice on this page is not the same as Realm
+page visibility. Sharing a file handle does not establish permission to read
+Realm-private pages or map them for ordinary host DMA.
+
 ## Choosing a backing
 
 | Goal | Backing |

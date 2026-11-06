@@ -1068,6 +1068,7 @@ mod tests {
             vnode: None,
             preserve_bars: false,
             preserve_boot_config: true,
+            cca_private_mmio: false,
         }
     }
 

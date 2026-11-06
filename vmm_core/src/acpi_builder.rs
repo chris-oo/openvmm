@@ -1652,6 +1652,7 @@ mod test {
                 vnode: None,
                 preserve_bars: false,
                 preserve_boot_config: false,
+                cca_private_mmio: false,
             },
             PcieHostBridge {
                 index: 1,
@@ -1665,6 +1666,7 @@ mod test {
                 vnode: None,
                 preserve_bars: false,
                 preserve_boot_config: false,
+                cca_private_mmio: false,
             },
         ];
 
@@ -1765,6 +1767,7 @@ mod test {
                 vnode: None,
                 preserve_bars: false,
                 preserve_boot_config: false,
+                cca_private_mmio: false,
             },
             PcieHostBridge {
                 index: 7,
@@ -1778,6 +1781,7 @@ mod test {
                 vnode: None,
                 preserve_bars: false,
                 preserve_boot_config: false,
+                cca_private_mmio: false,
             },
         ];
         let builder = new_aarch64_builder(&mem, &topology, &pcie_host_bridges);
@@ -1840,6 +1844,7 @@ mod test {
             vnode: None,
             preserve_bars: false,
             preserve_boot_config: false,
+            cca_private_mmio: false,
         }];
         let builder = new_builder(&mem, &topology, &pcie_host_bridges);
         assert!(builder.build_iort().is_none());
@@ -1873,6 +1878,7 @@ mod test {
             vnode: None,
             preserve_bars: false,
             preserve_boot_config: false,
+            cca_private_mmio: false,
         }];
         let builder = new_aarch64_builder(&mem, &topology, &pcie_host_bridges);
 
@@ -1938,6 +1944,7 @@ mod test {
             vnode: None,
             preserve_bars: false,
             preserve_boot_config: false,
+            cca_private_mmio: false,
         }];
         let builder = new_builder(&mem, &topology, &pcie_host_bridges);
 
@@ -1964,6 +1971,7 @@ mod test {
             vnode: None,
             preserve_bars: false,
             preserve_boot_config: false,
+            cca_private_mmio: false,
         }];
         let builder = new_aarch64_builder_with_smmu(&mem, &topology, &pcie_host_bridges, smmu_base);
 
@@ -2044,6 +2052,7 @@ mod test {
                 vnode: None,
                 preserve_bars: false,
                 preserve_boot_config: false,
+                cca_private_mmio: false,
             },
             PcieHostBridge {
                 index: 1,
@@ -2057,6 +2066,7 @@ mod test {
                 vnode: None,
                 preserve_bars: false,
                 preserve_boot_config: false,
+                cca_private_mmio: false,
             },
         ];
         let builder = new_aarch64_builder_with_smmu(&mem, &topology, &pcie_host_bridges, smmu_base);
@@ -2111,6 +2121,7 @@ mod test {
                 vnode: None,
                 preserve_bars: false,
                 preserve_boot_config: false,
+                cca_private_mmio: false,
             },
             PcieHostBridge {
                 index: 4,
@@ -2124,6 +2135,7 @@ mod test {
                 vnode: None,
                 preserve_bars: false,
                 preserve_boot_config: false,
+                cca_private_mmio: false,
             },
             PcieHostBridge {
                 index: 12,
@@ -2137,6 +2149,7 @@ mod test {
                 vnode: None,
                 preserve_bars: false,
                 preserve_boot_config: false,
+                cca_private_mmio: false,
             },
         ];
         let mut builder = new_aarch64_builder(&mem, &topology, &pcie_host_bridges);
@@ -2207,6 +2220,7 @@ mod test {
             vnode: None,
             preserve_bars: false,
             preserve_boot_config: false,
+            cca_private_mmio: false,
         }];
         let builder = new_aarch64_builder(&mem, &topology, &pcie_host_bridges);
 
@@ -2243,6 +2257,7 @@ mod test {
             vnode: None,
             preserve_bars: false,
             preserve_boot_config: false,
+            cca_private_mmio: false,
         }];
         let builder = new_aarch64_builder_with_smmu(&mem, &topology, &pcie_host_bridges, smmu_base);
 

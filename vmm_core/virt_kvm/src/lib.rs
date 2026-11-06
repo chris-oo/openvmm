@@ -10,15 +10,23 @@
 #![expect(clippy::undocumented_unsafe_blocks)]
 
 mod arch;
+#[cfg(guest_arch = "aarch64")]
+mod cca;
+#[cfg(any(guest_arch = "aarch64", test))]
+mod cca_in_place;
 mod gsi;
 mod memory;
+#[cfg(any(guest_arch = "aarch64", test))]
+mod rhi;
 #[cfg(guest_arch = "x86_64")]
 mod snp;
+mod vfio;
 
 pub use arch::Kvm;
 pub use memory::MemoryError;
 #[cfg(guest_arch = "x86_64")]
 pub use snp::SnpError;
+pub use vfio::KvmVfioAssignment;
 
 use guestmem::GuestMemory;
 use inspect::Inspect;
@@ -40,6 +48,8 @@ pub fn is_available() -> Result<bool, KvmError> {
 }
 
 use arch::KvmVpInner;
+#[cfg(guest_arch = "aarch64")]
+use cca::CcaLaunchState;
 #[cfg(guest_arch = "x86_64")]
 use snp::SnpLaunchState;
 use std::sync::atomic::Ordering;
@@ -48,6 +58,9 @@ use vmcore::vmtime::VmTimeAccess;
 
 #[derive(Error, Debug)]
 pub enum KvmError {
+    #[cfg(any(guest_arch = "aarch64", test))]
+    #[error(transparent)]
+    CcaInPlace(#[from] cca_in_place::CcaInPlaceError),
     #[error("operation not supported")]
     NotSupported,
     #[error("vtl2 is not supported on this hypervisor")]
@@ -69,6 +82,31 @@ pub enum KvmError {
     InvalidState(&'static str),
     #[error("unsupported isolation configuration: {0}")]
     UnsupportedIsolationConfiguration(&'static str),
+    #[error("missing KVM CCA capability: {0}")]
+    MissingCcaCapability(&'static str),
+    #[error("CCA realm VMs require GICv3")]
+    CcaRequiresGicV3,
+    #[error("unsupported CCA initial page import type: {0:?}")]
+    UnsupportedCcaPageImportType(virt::InitialPageImportType),
+    #[error("CCA initial page population is already in progress")]
+    CcaPopulateInProgress,
+    #[error("CCA initial page population previously failed")]
+    CcaPopulateFailed,
+    #[error("CCA initial population range is not page aligned")]
+    UnalignedCcaPopulateRange,
+    #[error("CCA initial population range is not contained in guest_memfd private memory")]
+    InvalidCcaPopulateRange,
+    #[error("KVM_ARM_RMI_POPULATE returned without making progress")]
+    CcaPopulateNoProgress,
+    #[cfg(guest_arch = "aarch64")]
+    #[error("invalid CCA memory fault")]
+    InvalidCcaMemoryFault,
+    #[cfg(guest_arch = "aarch64")]
+    #[error("unsupported CCA memory fault flags: {0:#x}")]
+    UnsupportedCcaMemoryFaultFlags(u64),
+    #[cfg(guest_arch = "aarch64")]
+    #[error("CCA device-assignment operation failed")]
+    CcaAssignment(#[from] tdisp::host::EvidenceError),
     #[error("misaligned gic base address")]
     Misaligned,
     #[error("host does not support GICv2 or GICv3")]
@@ -81,6 +119,22 @@ pub enum KvmError {
         vp_index: u32,
         #[source]
         err: kvm::Error,
+    },
+    #[cfg(guest_arch = "aarch64")]
+    #[error("failed to read MPIDR_EL1 for Realm VP {vp_index}")]
+    ReadRealmMpidr {
+        vp_index: u32,
+        #[source]
+        err: kvm::Error,
+    },
+    #[cfg(guest_arch = "aarch64")]
+    #[error(
+        "Realm VP {vp_index} MPIDR_EL1 {actual:#x} does not match requested topology {expected:#x}"
+    )]
+    RealmMpidrMismatch {
+        vp_index: u32,
+        expected: u64,
+        actual: u64,
     },
     #[cfg(guest_arch = "x86_64")]
     #[error("nested virtualization was requested but the host does not support it")]
@@ -106,6 +160,10 @@ pub struct KvmPartition {
 
 #[derive(Inspect)]
 struct KvmPartitionInner {
+    // Release the bridge's kernel-held file associations before other partition
+    // resources. Assignment owners must stop DMA before releasing their handles.
+    #[inspect(skip)]
+    vfio_device: Mutex<Option<kvm::VfioDevice>>,
     #[inspect(skip)]
     kvm: kvm::Partition,
     #[cfg(guest_arch = "x86_64")]
@@ -117,6 +175,19 @@ struct KvmPartitionInner {
     #[cfg(guest_arch = "x86_64")]
     #[inspect(skip)]
     snp_launch_state: Mutex<SnpLaunchState>,
+    #[cfg(guest_arch = "aarch64")]
+    #[inspect(skip)]
+    cca_launch_state: Mutex<CcaLaunchState>,
+    #[cfg(guest_arch = "aarch64")]
+    cca_fatal: std::sync::atomic::AtomicBool,
+    #[cfg(guest_arch = "aarch64")]
+    shared_gpa_bit: Option<u64>,
+    #[cfg(guest_arch = "aarch64")]
+    #[inspect(skip)]
+    rhi: Mutex<rhi::Registry>,
+    #[cfg(guest_arch = "aarch64")]
+    #[inspect(skip)]
+    cca_assignment_service: std::sync::OnceLock<std::sync::Weak<dyn tdisp::host::EvidenceService>>,
     memory: Mutex<KvmMemoryRangeState>,
     memory_backing_mode: KvmMemoryBackingMode,
     #[inspect(iter_by_index)]
@@ -172,6 +243,22 @@ enum KvmRunVpError {
     InvalidVpState,
     #[error("failed to run VP")]
     Run(#[source] kvm::Error),
+    #[error(
+        "unsupported successful KVM memory-fault exit: flags={flags:#x}, gpa={gpa:#x}, size={size:#x}"
+    )]
+    UnsupportedMemoryFault { flags: u64, gpa: u64, size: u64 },
+    #[cfg(guest_arch = "aarch64")]
+    #[error("unhandled KVM exit: {0}")]
+    UnhandledExit(String),
+    #[cfg(guest_arch = "aarch64")]
+    #[error("CCA initial page population has not completed")]
+    CcaNotPopulated,
+    #[cfg(guest_arch = "aarch64")]
+    #[error("CCA initial page population failed")]
+    CcaPopulationFailed,
+    #[cfg(guest_arch = "aarch64")]
+    #[error("CCA partition is in a fatal memory-cleanup state")]
+    CcaMemoryCleanupFailed,
     #[error("unhandled system event type: {0:#x}")]
     UnhandledSystemEvent(u32),
     #[cfg(guest_arch = "x86_64")]
@@ -194,6 +281,26 @@ enum KvmRunVpError {
     ExtintNotInjectable,
 }
 
+impl KvmRunVpError {
+    /// Preserves CCA memory-fault details when converting a KVM run error.
+    #[cfg(guest_arch = "aarch64")]
+    fn from_kvm_run_error(err: kvm::Error) -> Self {
+        if let kvm::Error::RunMemoryFault {
+            flags, gpa, size, ..
+        } = &err
+        {
+            tracelimit::warn_ratelimited!(
+                flags,
+                gpa,
+                size,
+                error = &err as &dyn std::error::Error,
+                "unsupported KVM memory fault/RIPAS change"
+            );
+        }
+        KvmRunVpError::Run(err)
+    }
+}
+
 pub struct KvmProcessorBinder {
     partition: Arc<KvmPartitionInner>,
     vpindex: VpIndex,
@@ -201,6 +308,21 @@ pub struct KvmProcessorBinder {
 }
 
 impl KvmPartitionInner {
+    #[cfg(guest_arch = "aarch64")]
+    fn mark_cca_fatal(&self) {
+        self.cca_fatal.store(true, Ordering::Release);
+        if let Some(service) = self
+            .cca_assignment_service
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+        {
+            service.close_admission();
+        }
+        for vp in &self.vps {
+            self.kvm.vp(vp.vp_info().base.vp_index.index()).force_exit();
+        }
+    }
+
     #[cfg(guest_arch = "x86_64")]
     fn bsp(&self) -> &KvmVpInner {
         &self.vps[0]

@@ -1234,6 +1234,7 @@ impl InitializedVm {
                 vmtime: &vmtime_source,
                 isolation: proto_partition_isolation,
                 nested_virt: cfg.hypervisor.nested_virt,
+                guest_memfd_in_place: false,
                 #[cfg(guest_arch = "aarch64")]
                 device_assignment_msi_iova_range,
             })
@@ -2367,6 +2368,7 @@ impl InitializedVm {
                     // and transiently overlap BAR mappings.
                     preserve_boot_config: rc.preserve_bars
                         || matches!(&cfg.load_mode, LoadMode::Uefi { .. }),
+                    cca_private_mmio: false,
                 });
 
                 pcie_root_complexes.push(root_complex.clone());
