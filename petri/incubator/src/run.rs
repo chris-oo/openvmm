@@ -50,6 +50,121 @@ pub struct IncubatorConfig {
     pub allocate_pty: bool,
 }
 
+/// Configuration for the diagnostic QEMU CCA launcher.
+pub struct QemuCcaIncubatorConfig {
+    /// QEMU CCA hardware profile with Linux-direct boot.
+    pub profile: IncubatorProfile,
+    /// CCA host kernel.
+    pub kernel: PathBuf,
+    /// CCA platform firmware.
+    pub firmware: PathBuf,
+    /// Base host initrd.
+    pub initrd: PathBuf,
+    /// Host directory mounted at `/share`.
+    pub share_dir: PathBuf,
+    /// Host directory for persistent logs.
+    pub output_dir: PathBuf,
+    /// Guest Pipette path under `/share`.
+    pub guest_pipette_path: String,
+    /// Program and arguments to execute.
+    pub guest_command: Vec<String>,
+    /// Guest environment overrides.
+    pub guest_env: BTreeMap<String, String>,
+    /// Guest working directory.
+    pub guest_current_dir: Option<String>,
+    /// Boot and agent connection timeout.
+    pub timeout: Duration,
+    /// Override the QEMU executable.
+    pub qemu_binary_override: Option<PathBuf>,
+    /// Allocate a guest PTY.
+    pub allocate_pty: bool,
+}
+
+/// Runtime inputs for an opt-in licensed FVP CCA incubator.
+pub struct FvpCcaIncubatorConfig {
+    /// Validated typed FVP profile.
+    pub profile: IncubatorProfile,
+    /// Unified official CCA kernel used by the L1 host.
+    pub kernel: PathBuf,
+    /// Immutable official base initrd.
+    pub initrd: PathBuf,
+    /// Prepared guest input tree; snapshotted before launch.
+    pub share_dir: PathBuf,
+    /// Durable host-side results directory, not a Shrinkwrap workspace.
+    pub output_dir: PathBuf,
+    /// Optional fresh direct child of the canonical output directory.
+    pub result_file: Option<PathBuf>,
+    /// Pipette location under the guest share.
+    pub guest_pipette_path: String,
+    /// Guest command and arguments; host programs are mapped under `/share`.
+    pub guest_command: Vec<String>,
+    /// Mapped per-command guest environment.
+    pub guest_env: BTreeMap<String, String>,
+    /// Guest working directory.
+    pub guest_current_dir: Option<String>,
+    /// User-provisioned Shrinkwrap checkout and overlay root.
+    pub platform_root: PathBuf,
+    /// User-provisioned pinned FVP firmware package root.
+    pub shrinkwrap_package_root: PathBuf,
+}
+
+impl TryFrom<FvpCcaIncubatorConfig> for petri::fvp::FvpRunConfig {
+    type Error = anyhow::Error;
+
+    fn try_from(config: FvpCcaIncubatorConfig) -> anyhow::Result<Self> {
+        config.profile.validate()?;
+        let IncubatorBackend::FvpCca(profile) = config.profile.incubator else {
+            anyhow::bail!("run_in_fvp_cca_incubator requires an FVP CCA profile");
+        };
+        Ok(Self {
+            profile,
+            kernel: config.kernel,
+            initrd: config.initrd,
+            share_dir: config.share_dir,
+            output_dir: config.output_dir,
+            result_file: config.result_file,
+            guest_pipette_path: config.guest_pipette_path,
+            guest_command: config.guest_command,
+            guest_env: config.guest_env,
+            guest_current_dir: config.guest_current_dir,
+            platform_root: config.platform_root,
+            shrinkwrap_package_root: config.shrinkwrap_package_root,
+            nested_test_parent: None,
+        })
+    }
+}
+
+/// Run a command through Petri's checked FVP lifecycle.
+pub fn run_in_fvp_cca_incubator(config: FvpCcaIncubatorConfig) -> anyhow::Result<IncubatorOutput> {
+    let config = petri::fvp::FvpRunConfig::try_from(config)?;
+    #[cfg(target_os = "linux")]
+    {
+        let output = petri::fvp::runtime::run(config)?;
+        Ok(IncubatorOutput {
+            exit_code: output.exit_code,
+            elapsed: output.elapsed,
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = config;
+        anyhow::bail!("FVP CCA incubators require a Linux host")
+    }
+}
+
+/// Run the diagnostic QEMU CCA platform without changing the general launcher.
+pub fn run_in_qemu_cca_incubator(
+    config: QemuCcaIncubatorConfig,
+) -> anyhow::Result<IncubatorOutput> {
+    config.profile.validate()?;
+    anyhow::ensure!(
+        matches!(config.profile.incubator, IncubatorBackend::QemuCca(_)),
+        "run_in_qemu_cca_incubator requires a QEMU CCA profile"
+    );
+    anyhow::ensure!(!config.guest_command.is_empty(), "empty guest command");
+    crate::qemu_cca::run(config)
+}
+
 /// Guest command result.
 pub struct IncubatorOutput {
     /// Guest exit code, including `128 + signal` for signal termination.
@@ -61,9 +176,16 @@ pub struct IncubatorOutput {
 /// Cold-boot a VM, execute the command through Pipette, and tear down the VM.
 pub fn run_in_incubator(config: IncubatorConfig) -> anyhow::Result<IncubatorOutput> {
     let start = Instant::now();
+    config.profile.validate()?;
+    anyhow::ensure!(
+        matches!(
+            config.profile.incubator,
+            IncubatorBackend::QemuTcg(_) | IncubatorBackend::Openvmm(_)
+        ),
+        "CCA profiles require their dedicated launcher"
+    );
     let signals = TerminationSignals::new()?;
     anyhow::ensure!(!config.guest_command.is_empty(), "empty guest command");
-    config.profile.validate()?;
     if matches!(config.profile.incubator, IncubatorBackend::Openvmm(_)) {
         anyhow::ensure!(
             config.qemu_binary_override.is_none(),
@@ -181,6 +303,9 @@ pub fn run_in_incubator(config: IncubatorConfig) -> anyhow::Result<IncubatorOutp
                 });
             execute(builder, &driver, &config, &signals, bound_command).await
         }
+        IncubatorBackend::QemuCca(_) | IncubatorBackend::FvpCca(_) => {
+            anyhow::bail!("CCA profiles require their dedicated launcher")
+        }
     })?;
     Ok(IncubatorOutput {
         exit_code: Some(code),
@@ -282,7 +407,7 @@ async fn execute<T: PetriVmmBackend>(
     Ok(code)
 }
 
-struct TerminationSignals {
+pub(crate) struct TerminationSignals {
     #[cfg(unix)]
     signal: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(unix)]
@@ -290,7 +415,7 @@ struct TerminationSignals {
 }
 
 impl TerminationSignals {
-    fn check(&self) -> anyhow::Result<()> {
+    pub(crate) fn check(&self) -> anyhow::Result<()> {
         #[cfg(unix)]
         {
             let signal = self.signal.load(std::sync::atomic::Ordering::Relaxed);
@@ -299,7 +424,7 @@ impl TerminationSignals {
         Ok(())
     }
 
-    fn new() -> anyhow::Result<Self> {
+    pub(crate) fn new() -> anyhow::Result<Self> {
         #[cfg(unix)]
         {
             let mut guard = Self {
@@ -319,7 +444,10 @@ impl TerminationSignals {
         Ok(Self {})
     }
 
-    async fn cancelled<T>(&self, driver: &pal_async::DefaultDriver) -> anyhow::Result<T> {
+    pub(crate) async fn cancelled<T>(
+        &self,
+        driver: &pal_async::DefaultDriver,
+    ) -> anyhow::Result<T> {
         #[cfg(unix)]
         loop {
             self.check()?;
@@ -344,7 +472,7 @@ impl Drop for TerminationSignals {
     }
 }
 
-async fn timeout<T>(
+pub(crate) async fn timeout<T>(
     driver: &pal_async::DefaultDriver,
     duration: Duration,
     phase: &str,
@@ -355,10 +483,10 @@ async fn timeout<T>(
     anyhow::bail!("incubator {phase} timed out after {duration:?}")
 }
 
-struct RawModeGuard;
+pub(crate) struct RawModeGuard;
 
 impl RawModeGuard {
-    fn enter() -> anyhow::Result<Self> {
+    pub(crate) fn enter() -> anyhow::Result<Self> {
         crossterm::terminal::enable_raw_mode().context("failed to enable raw mode")?;
         Ok(Self)
     }
@@ -368,6 +496,78 @@ impl Drop for RawModeGuard {
     fn drop(&mut self) {
         if let Err(error) = crossterm::terminal::disable_raw_mode() {
             tracing::warn!(%error, "failed to restore terminal mode");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    fn fvp_config(text: &str) -> FvpCcaIncubatorConfig {
+        FvpCcaIncubatorConfig {
+            profile: IncubatorProfile::from_toml(text).unwrap(),
+            kernel: "kernel".into(),
+            initrd: "initrd".into(),
+            share_dir: "share".into(),
+            output_dir: "output".into(),
+            result_file: Some("output/result.json".into()),
+            guest_pipette_path: "/share/pipette".into(),
+            guest_command: vec!["/share/command".into()],
+            guest_env: BTreeMap::from([("TEST".into(), "value".into())]),
+            guest_current_dir: Some("/share/work".into()),
+            platform_root: "platform".into(),
+            shrinkwrap_package_root: "package".into(),
+        }
+    }
+
+    #[test]
+    fn fvp_adapter_preserves_runtime_inputs_and_rejects_other_backends() {
+        let input = fvp_config(include_str!("../profiles/aarch64-fvp-cca.toml"));
+        let output = petri::fvp::FvpRunConfig::try_from(input).unwrap();
+        assert_eq!(output.profile.capabilities, ["cca"]);
+        assert_eq!(output.result_file, Some("output/result.json".into()));
+        assert_eq!(output.guest_command, ["/share/command"]);
+        assert_eq!(output.guest_env["TEST"], "value");
+        assert_eq!(output.guest_current_dir.as_deref(), Some("/share/work"));
+        assert_eq!(output.platform_root, PathBuf::from("platform"));
+        assert_eq!(output.shrinkwrap_package_root, PathBuf::from("package"));
+        let input = fvp_config(include_str!("../profiles/aarch64-qemu-cca.toml"));
+        assert!(petri::fvp::FvpRunConfig::try_from(input).is_err());
+    }
+
+    #[test]
+    fn general_bootstrap_rejects_cca_before_reading_artifacts() {
+        for text in [
+            include_str!("../profiles/aarch64-fvp-cca.toml"),
+            include_str!("../profiles/aarch64-qemu-cca.toml"),
+        ] {
+            let fvp = fvp_config(text);
+            let config = IncubatorConfig {
+                profile: fvp.profile,
+                kernel: fvp.kernel,
+                initrd: fvp.initrd,
+                share_dir: fvp.share_dir,
+                output_dir: fvp.output_dir,
+                guest_pipette_path: fvp.guest_pipette_path,
+                guest_command: fvp.guest_command,
+                guest_env: fvp.guest_env,
+                guest_current_dir: fvp.guest_current_dir,
+                timeout: Duration::from_secs(300),
+                qemu_binary_override: None,
+                allocate_pty: false,
+            };
+            let error = match crate::bootstrap::prepare_initrd(&config) {
+                Ok(_) => panic!("CCA used the general bootstrap"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("CCA host bootstrap"));
+            let error = match run_in_incubator(config) {
+                Ok(_) => panic!("CCA used the general runner"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("dedicated launcher"));
         }
     }
 }

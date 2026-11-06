@@ -4139,6 +4139,7 @@ dependencies = [
  "petri_artifacts_common",
  "pipette_client",
  "serde",
+ "serde_json",
  "signal-hook",
  "tempfile",
  "test_with_tracing",

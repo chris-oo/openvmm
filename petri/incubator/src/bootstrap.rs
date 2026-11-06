@@ -10,7 +10,6 @@ use crate::profile::IncubatorBoot;
 use anyhow::Context;
 use petri::PetriInitrd;
 use petri::initrd::InitrdFile;
-use std::path::PathBuf;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
@@ -36,6 +35,9 @@ pub(crate) fn prepare_initrd(config: &IncubatorConfig) -> anyhow::Result<PetriIn
             AgentLocation::Share(&config.guest_pipette_path),
         ),
         IncubatorBackend::Openvmm(_) => (GuestNetwork::Consomme, AgentLocation::Initrd),
+        IncubatorBackend::QemuCca(_) | IncubatorBackend::FvpCca(_) => {
+            anyhow::bail!("CCA profiles require the CCA host bootstrap");
+        }
     };
     let pipette = if matches!(agent, AgentLocation::Initrd) {
         let relative = std::path::Path::new(&config.guest_pipette_path)
@@ -51,7 +53,7 @@ pub(crate) fn prepare_initrd(config: &IncubatorConfig) -> anyhow::Result<PetriIn
     } else {
         None
     };
-    let ca_path = host_ca_certificates_path()?;
+    let ca_path = petri::initrd::host_ca_certificates_path()?;
     let certificates = fs_err::read(&ca_path)
         .with_context(|| format!("reading host CA bundle {}", ca_path.display()))?;
     let epoch = SystemTime::now()
@@ -142,35 +144,6 @@ fn build_init_script(
     script
 }
 
-fn host_ca_certificates_path() -> anyhow::Result<PathBuf> {
-    select_ca_bundle(
-        std::env::var_os("SSL_CERT_FILE")
-            .filter(|path| !path.is_empty())
-            .map(PathBuf::from),
-        &[
-            "/etc/ssl/certs/ca-certificates.crt".into(),
-            "/etc/pki/tls/certs/ca-bundle.crt".into(),
-            "/etc/ssl/ca-bundle.pem".into(),
-        ],
-    )
-}
-
-fn select_ca_bundle(explicit: Option<PathBuf>, defaults: &[PathBuf]) -> anyhow::Result<PathBuf> {
-    if let Some(path) = explicit {
-        anyhow::ensure!(
-            path.is_file(),
-            "SSL_CERT_FILE is not a file: {}",
-            path.display()
-        );
-        return Ok(path);
-    }
-    defaults
-        .iter()
-        .find(|path| path.is_file())
-        .cloned()
-        .context("could not find a host CA certificate bundle for the incubator")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,23 +185,5 @@ mod tests {
                 matches!(network, GuestNetwork::QemuUser)
             );
         }
-    }
-
-    #[test]
-    fn ca_selection_honors_explicit_bundle_and_reports_errors() -> anyhow::Result<()> {
-        let temp = tempfile::tempdir()?;
-        let explicit = temp.path().join("explicit");
-        let default = temp.path().join("default");
-        fs_err::write(&explicit, b"explicit")?;
-        fs_err::write(&default, b"default")?;
-        let defaults = [default.clone()];
-        assert_eq!(
-            select_ca_bundle(Some(explicit.clone()), &defaults)?,
-            explicit
-        );
-        assert_eq!(select_ca_bundle(None, &defaults)?, default);
-        assert!(select_ca_bundle(Some(temp.path().join("missing")), &defaults).is_err());
-        assert!(select_ca_bundle(None, &[]).is_err());
-        Ok(())
     }
 }
