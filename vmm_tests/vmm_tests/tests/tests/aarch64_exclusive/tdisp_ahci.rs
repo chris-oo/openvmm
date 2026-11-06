@@ -1,0 +1,174 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+//! Run the unchanged Linux guest and sysfs/I/O script qualified with kvmtool.
+
+use super::super::nested::vm_host_fvp_realm_vfio;
+use super::emulator_vfio_bdf;
+use super::open_pinned_cca_payload as open_pinned;
+use super::open_vfio_cdev;
+use anyhow::Context;
+use openvmm_defs::config::LinuxDirectBootMode;
+use openvmm_defs::config::LoadMode;
+use openvmm_defs::config::PcieDeviceConfig;
+use openvmm_defs::config::PcieMmioRangeConfig;
+use petri::IsolationType;
+use petri::PetriVmBuilder;
+use petri::ResolvedArtifact;
+use petri::openvmm::OpenVmmPetriBackend;
+use petri_artifacts_common::artifacts::FVP_CCA_PAYLOAD_AARCH64;
+use petri_artifacts_vmm_test::artifacts::host_tools::NEXTEST_VMM_TESTS_ARCHIVE_LINUX_AARCH64_MUSL;
+use std::fs::File;
+use std::path::Path;
+use vfio_assigned_device_resources::BarAddressConfig;
+use vfio_assigned_device_resources::VfioRealmDeviceHandle;
+use vm_resource::IntoResource;
+use vmm_test_macros::vmm_test_with;
+
+use petri_artifacts_common::cca_payload::tdisp_guest::INITRD_SHA256 as GUEST_INITRD_SHA256;
+use petri_artifacts_common::cca_payload::tdisp_guest::LINUX_IMAGE_SHA256 as GUEST_IMAGE_SHA256;
+const DISK_SHA256: &str = "281e519df3077b557c6b03f5da83c4e8d397219259615dd7c3308f89cae8f2a6";
+
+/// The unchanged initrd owns the guest driver, TSM lock/accept, direct disk
+/// read, hash verification, unlock and poweroff sequence. No pipette is added.
+#[vmm_test_with(
+    openvmm,
+    noagent,
+    requires(cca, guest_memfd_in_place, cca_realm_vfio),
+    configs(
+        linux_direct_aarch64[FVP_CCA_PAYLOAD_AARCH64],
+        nested(
+            (vm_host_fvp_realm_vfio, fvp_linux_direct_aarch64),
+            (NEXTEST_VMM_TESTS_ARCHIVE_LINUX_AARCH64_MUSL, "tests", "aarch64_exclusive::tdisp_ahci", linux_direct_aarch64[FVP_CCA_PAYLOAD_AARCH64]),
+        ),
+    )
+)]
+async fn boot_linux_direct_cca_tdisp_ahci(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+    (payload,): (ResolvedArtifact<FVP_CCA_PAYLOAD_AARCH64>,),
+) -> anyhow::Result<()> {
+    let output_dir = config.log_source().output_dir().to_path_buf();
+    let guest = payload.get().join("guest");
+    let (kernel_hash, initrd_hash) = match std::env::var_os("PETRI_FVP_PAYLOAD").as_deref() {
+        None => (GUEST_IMAGE_SHA256, GUEST_INITRD_SHA256),
+        Some(value) if value == "reference" => (GUEST_IMAGE_SHA256, GUEST_INITRD_SHA256),
+        Some(value) if value == "source-built" => (
+            petri_artifacts_common::cca_payload::source_built_in_place::LINUX_IMAGE_SHA256,
+            petri_artifacts_common::cca_payload::source_built_tdisp::INITRD_SHA256,
+        ),
+        Some(_) => anyhow::bail!("PETRI_FVP_PAYLOAD must be reference or source-built"),
+    };
+    let kernel = open_pinned(&guest.join("Image"), kernel_hash)?;
+    let initrd = open_pinned(&guest.join("initrd"), initrd_hash)?;
+    let bdf = emulator_vfio_bdf("cca-realm-vfio")?;
+    let sysfs = Path::new("/sys/bus/pci/devices").join(&bdf);
+    for (field, expected) in [
+        ("vendor", "0x0abc"),
+        ("device", "0xaced"),
+        ("class", "0x010601"),
+    ] {
+        let actual = std::fs::read_to_string(sysfs.join(field))?;
+        anyhow::ensure!(
+            actual.trim() == expected,
+            "unexpected fixture {field}: {actual}"
+        );
+    }
+    let cdev = open_vfio_cdev(&bdf)?;
+    let iommufd = File::options().read(true).write(true).open("/dev/iommu")?;
+    let resource = VfioRealmDeviceHandle {
+        pci_id: bdf,
+        cdev,
+        iommufd,
+        requester_id: 0x100,
+        bar_addresses: [
+            0x5000_0000,
+            0x5000_2000,
+            0x5000_8000,
+            0x5000_4000,
+            0x5000_9000,
+            0x5000_6000,
+        ]
+        .map(BarAddressConfig::Fixed),
+    }
+    .into_resource();
+
+    let vm = config
+        .with_isolation(IsolationType::Cca)
+        .with_memory(petri::MemoryConfig {
+            startup_bytes: 256 * 1024 * 1024,
+            transparent_hugepages: false,
+            ..Default::default()
+        })
+        .with_processor_topology(petri::ProcessorTopology {
+            vp_count: 1,
+            ..Default::default()
+        })
+        .modify_backend(move |backend| {
+            backend
+                .with_pcie_root_topology(2, 1, 1)
+                .with_custom_config(move |config| {
+                    config.hypervisor.guest_memfd_in_place = true;
+                    for root in &mut config.pcie_root_complexes {
+                        root.end_bus = 1;
+                        for port in &mut root.ports {
+                            port.hotplug = false;
+                            port.devfn = Some(0);
+                        }
+                        if root.segment == 0 {
+                            root.preserve_bars = true;
+                            root.low_mmio = PcieMmioRangeConfig::Fixed(
+                                memory_range::MemoryRange::new(0x5000_0000..0x5010_0000),
+                            );
+                        }
+                    }
+                    for device in &mut config.pcie_devices {
+                        if device.resource.id() == "virtio" {
+                            device.port_name = "s1rc0rp0".into();
+                        }
+                    }
+                    config.pcie_devices.push(PcieDeviceConfig {
+                        port_name: "s0rc0rp0".into(),
+                        resource,
+                    });
+                    // Only console/platform arguments differ from kvmtool. Guest
+                    // Image, initrd, driver and test script remain byte-identical.
+                    config.load_mode = LoadMode::Linux {
+                        kernel,
+                        initrd: Some(initrd),
+                        cmdline:
+                            "rdinit=/da-guest-init.sh console=ttyAMA0 earlycon quiet da_phase=ahci"
+                                .into(),
+                        enable_serial: true,
+                        isolation: openvmm_defs::config::LinuxIsolationConfig::None,
+                        boot_mode: LinuxDirectBootMode::DeviceTree,
+                        smbios: Default::default(),
+                    };
+                })
+        })
+        .run_without_agent()
+        .await?;
+    let teardown = vm.wait_for_clean_teardown().await;
+    let console = std::fs::read_to_string(output_dir.join("linux.log"))
+        .context("read unchanged guest console")?;
+    let io_marker = format!("DA_STAGE_A_GUEST_AHCI_IO_PASS hash={DISK_SHA256}");
+    let mut cursor = 0;
+    for marker in [
+        "DA_STAGE_A_GUEST_READY",
+        "DA_STAGE_A_GUEST_LOCK_PASS",
+        "DA_STAGE_A_GUEST_ACCEPT_RETURNED",
+        io_marker.as_str(),
+        "DA_STAGE_A_GUEST_UNLOCK_RETURNED",
+    ] {
+        let offset = console[cursor..].find(marker).with_context(|| {
+            format!("unchanged guest did not report {marker}; teardown: {teardown:?}")
+        })?;
+        cursor += offset + marker.len();
+    }
+    anyhow::ensure!(
+        !console.contains("failed to enable DMA from the device"),
+        "guest reported failed RSI DMA enable"
+    );
+    tracing::info!("unchanged reference guest completed TDISP and AHCI I/O sequence");
+    teardown.context("guest sequence completed but OpenVMM teardown failed")?;
+    Ok(())
+}

@@ -64,6 +64,7 @@ vmgs_format.workspace = true
 
 anyhow.workspace = true
 fs-err.workspace = true
+sha2.workspace = true
 futures.workspace = true
 jiff.workspace = true
 tracing.workspace = true
@@ -88,6 +89,7 @@ vmcore.workspace = true
 x86defs.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
+vfio_assigned_device.workspace = true
 virt_kvm.workspace = true
 virt_mshv.workspace = true
 

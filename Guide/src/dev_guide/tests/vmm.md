@@ -240,6 +240,58 @@ To run a **specific test** (or set of tests), use `--filter` with a
 cargo xflowey vmm-tests-run --filter "test(my_test_name)" --dir /tmp/vmm-tests-run
 ```
 
+### Build without running
+
+Use `--build-only` to prepare the selected tests without running them.
+The generated target-side scripts use the prepared test content directory.
+When moving nested FVP tests to another machine, also provide the approved
+model and Shrinkwrap runtime there. These licensed runtime inputs are not
+included in the test archive.
+
+### Nested tests and prebuilt FVP firmware
+
+Petri nested tests boot an L1 machine, connect pipette, and run a selected
+inner test inside that machine. Select the outer test for the host target;
+Flowey discovers and cross-compiles the inner test archive and its required
+artifacts. Do not use the old `--incubator` cargo target runner.
+
+FVP firmware is a separate `openvmm-deps` package. It contains BL1, FIP,
+DTB, the packaged Shrinkwrap configuration, runtime overlay, and provenance.
+The package does not contain the licensed model or a Python virtualenv.
+The test runner calls `shrinkwrap run`, not `shrinkwrap build`.
+
+FVP package-dependent cases are opt-in. Without an explicit
+`--fvp-deps-version`, artifact discovery excludes them, including in
+`--build-only` mode. FVP execution also requires an available runtime root.
+
+During package development, provide a locally built archive and its exact
+release identity:
+
+```bash
+export PETRI_FVP_PLATFORM_ROOT=path/to/fvp-runtime
+FVP_PAYLOAD_ARCHIVE=path/to/openvmm-test-fvp-cca-payload.aarch64.<RELEASE>.tar.gz
+NEXTEST_TEST_THREADS=1 PYTHONDONTWRITEBYTECODE=1 \
+  cargo xflowey vmm-tests-run \
+  --filter 'test(cca_tdisp_ahci_on_fvp)' \
+  --fvp-deps-version <RELEASE> \
+  --fvp-package-archive path/to/openvmm-test-fvp-cca.aarch64.<RELEASE>.tar.gz \
+  --fvp-package-sha256 <ARCHIVE_SHA256> \
+  --fvp-payload-archive "$FVP_PAYLOAD_ARCHIVE" \
+  --fvp-payload-sha256 <PAYLOAD_ARCHIVE_SHA256>
+```
+
+The separate payload archive provides the approved host and reference-guest
+kernel and initrd pairs. The current payload recipe imports pinned reference
+binaries for local validation; it does not rebuild or publish them.
+Omit the local archive options only when the packages are available in the
+named `microsoft/openvmm-deps` release. Until packages are published and
+qualified, the release and both archive hashes must be explicit. A missing
+or mismatched package is an error; the runner does not rebuild firmware as a
+fallback.
+
+See [CCA and FVP tests](vmm/qemu_cca.md) for runtime prerequisites and
+qualification limits.
+
 ### Targeting a Platform
 
 By default, `vmm-tests-run` builds for the current host. Use `--target` to

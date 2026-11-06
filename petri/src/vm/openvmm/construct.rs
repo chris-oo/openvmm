@@ -126,6 +126,7 @@ impl PetriVmConfigOpenVmm {
             firmware,
             hibernation_enabled,
             ipmi_enabled,
+            isolation,
             memory,
             proc_topology,
             nested_virt_enabled,
@@ -148,6 +149,16 @@ impl PetriVmConfigOpenVmm {
         ) {
             anyhow::bail!("loading OpenHCL from VMGS is only supported by the Hyper-V backend");
         }
+
+        anyhow::ensure!(
+            !matches!(isolation, Some(IsolationType::Cca))
+                || (properties.no_hv && properties.no_vmbus),
+            "CCA isolation requires Hyper-V interfaces and VMBus to be disabled"
+        );
+        anyhow::ensure!(
+            !matches!(isolation, Some(IsolationType::Cca)) || vmbus_storage_controllers.is_empty(),
+            "CCA isolation does not support VMBus storage controllers"
+        );
 
         tracing::debug!(?firmware, ?arch, "Petri VM firmware configuration");
 
@@ -176,6 +187,7 @@ impl PetriVmConfigOpenVmm {
             firmware: &firmware,
             hibernation_enabled,
             ipmi_enabled,
+            isolation,
             driver,
             logger: log_source,
             vmgs: &vmgs,
@@ -555,8 +567,12 @@ impl PetriVmConfigOpenVmm {
             // - PCAT (Gen1) relies on x86 legacy support (the VGA hole and
             //   PAM registers), which toggles low RAM visibility in a way
             //   that requires shared, file-backed memory.
-            let private_incompatible =
-                firmware.is_openhcl() || firmware.is_pcat() || vhost_vsock_guest_cid.is_some();
+            // - CCA uses guest_memfd for private pages and requires the
+            //   userspace backing to remain shared for shared-GPA aliases.
+            let private_incompatible = firmware.is_openhcl()
+                || firmware.is_pcat()
+                || vhost_vsock_guest_cid.is_some()
+                || matches!(isolation, Some(IsolationType::Cca));
             let private_memory = match private_memory {
                 // An explicit request for private memory that the firmware
                 // cannot honor is an error, rather than a silent downgrade.
@@ -564,7 +580,7 @@ impl PetriVmConfigOpenVmm {
                     anyhow::bail!(
                         "private guest memory was explicitly requested but is \
                          not supported with this configuration (OpenHCL, \
-                         PCAT/Gen1, and kernel vhost-vsock require shared memory)"
+                         PCAT/Gen1, kernel vhost-vsock, and CCA require shared memory)"
                     );
                 }
                 Some(explicit) => explicit,
@@ -717,14 +733,7 @@ impl PetriVmConfigOpenVmm {
             hypervisor: HypervisorConfig {
                 with_hv: !properties.no_hv,
                 with_vtl2,
-                with_isolation: match firmware.isolation() {
-                    Some(IsolationType::Vbs) => Some(openvmm_defs::config::IsolationType::Vbs),
-                    Some(IsolationType::Snp) => {
-                        Some(openvmm_defs::config::IsolationType::Snp { host_data: None })
-                    }
-                    None => None,
-                    _ => anyhow::bail!("unsupported isolation type"),
-                },
+                with_isolation: isolation.map(openvmm_isolation_type).transpose()?,
                 nested_virt: nested_virt_enabled,
                 guest_memfd_in_place: false,
             },
@@ -851,6 +860,7 @@ struct PetriVmConfigSetupCore<'a> {
     firmware: &'a Firmware,
     hibernation_enabled: bool,
     ipmi_enabled: bool,
+    isolation: Option<IsolationType>,
     driver: &'a DefaultDriver,
     logger: &'a PetriLogSource,
     vmgs: &'a PetriVmgsResource,
@@ -865,6 +875,29 @@ struct PetriVmConfigSetupCore<'a> {
     use_virtio_vsock: bool,
     no_vmbus: bool,
     no_hv: bool,
+}
+
+fn openvmm_isolation_type(
+    isolation: IsolationType,
+) -> anyhow::Result<openvmm_defs::config::IsolationType> {
+    Ok(match isolation {
+        IsolationType::Vbs => openvmm_defs::config::IsolationType::Vbs,
+        IsolationType::Cca => openvmm_defs::config::IsolationType::Cca,
+        IsolationType::Snp => openvmm_defs::config::IsolationType::Snp { host_data: None },
+        IsolationType::Tdx => {
+            anyhow::bail!("{isolation:?} isolation is not supported by OpenVMM")
+        }
+    })
+}
+
+fn openvmm_linux_boot_mode(
+    isolation: Option<IsolationType>,
+) -> openvmm_defs::config::LinuxDirectBootMode {
+    if matches!(isolation, Some(IsolationType::Cca)) {
+        openvmm_defs::config::LinuxDirectBootMode::DeviceTree
+    } else {
+        openvmm_defs::config::LinuxDirectBootMode::Acpi
+    }
 }
 
 struct SerialData {
@@ -997,7 +1030,7 @@ impl PetriVmConfigSetupCore<'_> {
                     cmdline,
                     enable_serial: self.enable_serial,
                     isolation: openvmm_defs::config::LinuxIsolationConfig::None,
-                    boot_mode: openvmm_defs::config::LinuxDirectBootMode::Acpi,
+                    boot_mode: openvmm_linux_boot_mode(self.isolation),
                     smbios: Default::default(),
                 }
             }
@@ -1309,7 +1342,7 @@ impl PetriVmConfigSetupCore<'_> {
     fn config_video(
         &self,
     ) -> anyhow::Result<Option<(VideoDevice, Framebuffer, FramebufferAccess)>> {
-        if self.firmware.isolation().is_some() {
+        if self.isolation.is_some() {
             return Ok(None);
         }
 
@@ -1387,7 +1420,7 @@ impl PetriVmConfigSetupCore<'_> {
                         register_layout,
                         guest_secret_key: None,
                         logger: None,
-                        is_confidential_vm: self.firmware.isolation().is_some(),
+                        is_confidential_vm: self.isolation.is_some(),
                         // TODO: generate an actual BIOS GUID and put it here
                         bios_guid: Guid::ZERO,
                         nvram_size: None,
@@ -1667,5 +1700,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn maps_cca_isolation() {
+        assert_eq!(
+            openvmm_isolation_type(IsolationType::Cca).unwrap(),
+            openvmm_defs::config::IsolationType::Cca
+        );
+    }
+
+    #[test]
+    fn rejects_hardware_isolation_not_supported_by_openvmm() {
+        assert_eq!(
+            openvmm_isolation_type(IsolationType::Snp).unwrap(),
+            openvmm_defs::config::IsolationType::Snp { host_data: None },
+        );
+        assert!(openvmm_isolation_type(IsolationType::Tdx).is_err());
+    }
+
+    #[test]
+    fn cca_uses_device_tree_linux_boot() {
+        assert_eq!(
+            openvmm_linux_boot_mode(Some(IsolationType::Cca)),
+            openvmm_defs::config::LinuxDirectBootMode::DeviceTree
+        );
+        assert_eq!(
+            openvmm_linux_boot_mode(None),
+            openvmm_defs::config::LinuxDirectBootMode::Acpi
+        );
     }
 }

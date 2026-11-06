@@ -475,6 +475,7 @@ pub fn build_qemu_command(
         arch,
         host_log_levels,
         firmware,
+        isolation: _,
         hibernation_enabled,
         ipmi_enabled,
         memory:
@@ -663,6 +664,7 @@ mod tests {
             },
             hibernation_enabled: false,
             ipmi_enabled: false,
+            isolation: None,
             memory: Default::default(),
             proc_topology: Default::default(),
             nested_virt_enabled: true,

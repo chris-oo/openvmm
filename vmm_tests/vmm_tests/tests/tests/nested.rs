@@ -64,3 +64,71 @@ async fn shared_directory<T: PetriVmmBackend>(config: PetriVmBuilder<T>) -> anyh
     vm.wait_for_clean_teardown().await?;
     Ok(())
 }
+
+/// Keep the FVP fixture alive until the inner test exits and checked teardown.
+#[cfg(target_os = "linux")]
+pub(crate) async fn vm_host_fvp(
+    config: PetriVmBuilder<petri::fvp::FvpPetriBackend>,
+) -> anyhow::Result<()> {
+    run_fvp_nested(config, false).await
+}
+
+/// Run a nested Realm test with the explicit AHCI assignment fixture.
+#[cfg(target_os = "linux")]
+pub(crate) async fn vm_host_fvp_realm_vfio(
+    config: PetriVmBuilder<petri::fvp::FvpPetriBackend>,
+) -> anyhow::Result<()> {
+    run_fvp_nested(
+        config.modify_backend(|backend| backend.with_realm_vfio()),
+        true,
+    )
+    .await
+}
+
+#[cfg(target_os = "linux")]
+async fn run_fvp_nested(
+    config: PetriVmBuilder<petri::fvp::FvpPetriBackend>,
+    realm_vfio: bool,
+) -> anyhow::Result<()> {
+    let payload_mode = match std::env::var("PETRI_FVP_PAYLOAD") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => return Err(error.into()),
+    };
+    let (vm, agent) = config.with_nested_virt().run().await?;
+    let mut env = std::collections::BTreeMap::from([(
+        "PETRI_CAPABILITIES".into(),
+        if realm_vfio {
+            "cca,guest_memfd_in_place,cca_realm_vfio"
+        } else {
+            "cca,guest_memfd_in_place"
+        }
+        .into(),
+    )]);
+    if let Some(mode) = payload_mode {
+        env.insert("PETRI_FVP_PAYLOAD".into(), mode);
+    }
+    if realm_vfio {
+        env.insert(
+            "PETRI_VFIO_BDF_CCA_REALM_VFIO".into(),
+            "0000:01:00.0".into(),
+        );
+    }
+    let nested = vm.run_nested_test(&agent, env).await;
+    let completed = nested.is_ok()
+        || nested
+            .as_ref()
+            .is_err_and(|error| error.is::<petri::NestedTestFailure>());
+    let shutdown = if completed {
+        vm.wait_for_clean_teardown().await
+    } else {
+        vm.teardown().await
+    };
+    match (nested, shutdown) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(shutdown)) => {
+            Err(error.context(format!("FVP L1 cleanup also failed: {shutdown:#}")))
+        }
+    }
+}

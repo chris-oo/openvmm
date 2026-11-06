@@ -251,6 +251,22 @@ pub struct PetriVmBuilder<T: PetriVmmBackend> {
 /// How long to wait on a single inspect before giving up on it.
 const INSPECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+fn agent_disk_required(
+    linux_direct: bool,
+    pipette_as_init: bool,
+    image: Option<&AgentImage>,
+) -> bool {
+    image.is_some_and(|image| {
+        if pipette_as_init {
+            image.has_extras()
+        } else if linux_direct {
+            image.contains_pipette() || image.has_extras()
+        } else {
+            true
+        }
+    })
+}
+
 fn shutdown_ic_configured(supports_vmbus: bool, no_vmbus: bool, minimal_mode: bool) -> bool {
     supports_vmbus && !no_vmbus && !minimal_mode
 }
@@ -296,6 +312,8 @@ pub struct PetriVmConfig {
     pub hibernation_enabled: bool,
     /// Whether to expose an IPMI KCS interface to the guest.
     pub ipmi_enabled: bool,
+    /// Isolation applied to the VM partition.
+    pub isolation: Option<IsolationType>,
     /// The amount of memory, in bytes, to assign to the VM
     pub memory: MemoryConfig,
     /// The processor topology for the VM
@@ -714,6 +732,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
             _ => {}
         }
         let (guest_quirks, vmm_quirks) = T::quirks(&artifacts.firmware);
+        let isolation = artifacts.firmware.isolation();
         let expected_boot_event = artifacts.firmware.expected_boot_event();
         let boot_device_type = match artifacts.firmware {
             Firmware::LinuxDirect { .. } | Firmware::IgvmLinuxDirect { .. } => BootDeviceType::None,
@@ -742,6 +761,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
                 firmware: artifacts.firmware,
                 hibernation_enabled: false,
                 ipmi_enabled: false,
+                isolation,
                 memory: Default::default(),
                 proc_topology: Default::default(),
                 nested_virt_enabled: false,
@@ -1138,12 +1158,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
             ),
         };
 
-        // When using pipette-as-init, the VTL0 agent disk is only needed
-        // if it carries extra files (pipette itself is in the initrd).
-        if target_vtl == Vtl::Vtl0
-            && self.uses_pipette_as_init()
-            && !agent_image.is_some_and(|i| i.has_extras())
-        {
+        if target_vtl == Vtl::Vtl0 && !self.has_agent_disk() {
             return Ok(self);
         }
 
@@ -1343,21 +1358,21 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
 
     /// Whether the VTL0 agent disk will actually be added.
     ///
-    /// False when using pipette-as-init with no extra files (pipette is
-    /// in the initrd, so the CIDATA disk isn't needed).
+    /// Linux direct boot needs a disk only for a disk-based agent or extra
+    /// files. An unmodified, agent-free initrd does not need cloud-init media.
     fn has_agent_disk(&self) -> bool {
-        if self.uses_pipette_as_init() {
-            self.agent_image.as_ref().is_some_and(|i| i.has_extras())
-        } else {
-            self.agent_image.is_some()
-        }
+        agent_disk_required(
+            matches!(self.config.firmware, Firmware::LinuxDirect { .. }),
+            self.uses_pipette_as_init(),
+            self.agent_image.as_ref(),
+        )
     }
 
     /// Get properties about the vm for convenience
     pub fn properties(&self) -> PetriVmProperties {
         PetriVmProperties {
             is_openhcl: self.config.firmware.is_openhcl(),
-            is_isolated: self.config.firmware.isolation().is_some(),
+            is_isolated: self.config.isolation.is_some(),
             is_pcat: self.config.firmware.is_pcat(),
             is_linux_direct: self.config.firmware.is_linux_direct(),
             using_vtl0_pipette: self.using_vtl0_pipette(),
@@ -1687,6 +1702,36 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
     /// Set the VM to use the specified memory config.
     pub fn with_memory(mut self, memory: MemoryConfig) -> Self {
         self.config.memory = memory;
+        self
+    }
+
+    /// Set the VM partition isolation type.
+    pub fn with_isolation(mut self, isolation: IsolationType) -> Self {
+        if isolation == IsolationType::Cca {
+            assert_eq!(
+                self.config.arch,
+                MachineArch::Aarch64,
+                "CCA isolation requires an AArch64 VM"
+            );
+            assert!(
+                matches!(self.config.firmware, Firmware::LinuxDirect { .. }),
+                "CCA isolation requires Linux-direct firmware"
+            );
+            assert_ne!(
+                self.config.memory.private_memory,
+                Some(true),
+                "CCA isolation requires shared userspace memory backing"
+            );
+            self.config.memory.private_memory = Some(false);
+            self = self.with_no_hv();
+        } else {
+            assert_eq!(
+                self.config.firmware.isolation(),
+                Some(isolation),
+                "VM isolation must match firmware isolation"
+            );
+        }
+        self.config.isolation = Some(isolation);
         self
     }
 
@@ -2138,7 +2183,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
 
     /// Get the isolation type of the VM
     pub fn isolation(&self) -> Option<IsolationType> {
-        self.config.firmware.isolation()
+        self.config.isolation
     }
 
     /// Get the machine architecture
@@ -4052,7 +4097,7 @@ impl BootImageConfig<boot_image_type::Iso> {
 }
 
 /// Isolation type
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IsolationType {
     /// VBS
     Vbs,
@@ -4060,6 +4105,8 @@ pub enum IsolationType {
     Snp,
     /// TDX
     Tdx,
+    /// Arm CCA
+    Cca,
 }
 
 /// Flags controlling servicing behavior.
@@ -4713,6 +4760,15 @@ mod tests {
                 Duration::from_mins(10)
             );
         }
+    }
+
+    #[test_with_tracing::test]
+    fn agent_free_linux_direct_does_not_add_empty_cloud_init_media() {
+        let image = AgentImage::new(OsFlavor::Linux);
+        assert!(!agent_disk_required(true, false, Some(&image)));
+        assert!(!agent_disk_required(true, true, Some(&image)));
+        assert!(!agent_disk_required(true, false, None));
+        assert!(agent_disk_required(false, false, Some(&image)));
     }
 
     #[derive(Clone, Copy)]

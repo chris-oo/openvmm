@@ -3,9 +3,15 @@
 
 //! Integration tests for aarch64 guests.
 
+#[cfg(target_os = "linux")]
+use super::nested::vm_host_fvp;
 use anyhow::Context;
+use futures::AsyncReadExt;
+use futures::AsyncWriteExt;
 use pal_async::DefaultDriver;
+use pal_async::socket::PolledSocket;
 use pal_async::timer::PolledTimer;
+use petri::IsolationType;
 use petri::PetriVmBuilder;
 use petri::PetriVmmBackend;
 use petri::ProcessorTopology;
@@ -18,6 +24,8 @@ use petri::qemu::devices::DeviceConfig;
 use petri::qemu::devices::EduDeviceConfig;
 use petri::qemu::devices::IvshmemPlainDeviceConfig;
 use petri::qemu::devices::VirtioBlkDeviceConfig;
+#[cfg(target_os = "linux")]
+use petri_artifacts_common::artifacts::FVP_CCA_PAYLOAD_AARCH64;
 use petri_artifacts_common::tags::IsLoadable;
 use petri_artifacts_vmm_test::artifacts::host_tools::NEXTEST_VMM_TESTS_ARCHIVE_LINUX_AARCH64_MUSL;
 use petri_artifacts_vmm_test::artifacts::loadable::LINUX_DIRECT_TEST_KERNEL_CCA_AARCH64;
@@ -28,6 +36,613 @@ use vm_resource::IntoResource;
 use vmm_test_macros::openvmm_test;
 use vmm_test_macros::vmm_test;
 use vmm_test_macros::vmm_test_with;
+
+#[cfg(target_os = "linux")]
+mod tdisp_ahci;
+
+/// Boot a Linux-direct CCA Realm and verify the pipette agent over virtio-vsock.
+#[vmm_test_with(openvmm, requires(cca), configs(linux_direct_aarch64))]
+async fn boot_linux_direct_cca(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Result<()> {
+    boot_linux_direct_cca_with_backing(config, false, None).await
+}
+
+/// Run the same CCA Virtio-vsock test with in-place guest_memfd backing.
+#[vmm_test_with(
+    openvmm,
+    requires(cca, guest_memfd_in_place),
+    configs(linux_direct_aarch64)
+)]
+async fn boot_linux_direct_cca_in_place(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+) -> anyhow::Result<()> {
+    boot_linux_direct_cca_with_backing(config, true, None).await
+}
+
+/// Boot an in-place Realm with the packaged kernel and the standard pipette initrd.
+#[cfg(target_os = "linux")]
+#[vmm_test_with(
+    openvmm,
+    requires(cca, guest_memfd_in_place),
+    configs(
+        nested(
+            (vm_host_fvp, fvp_linux_direct_aarch64),
+            (NEXTEST_VMM_TESTS_ARCHIVE_LINUX_AARCH64_MUSL, "tests", "aarch64_exclusive", linux_direct_aarch64[FVP_CCA_PAYLOAD_AARCH64]),
+        ),
+    )
+)]
+async fn boot_linux_direct_cca_in_place_smoke(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+    (payload,): (ResolvedArtifact<FVP_CCA_PAYLOAD_AARCH64>,),
+) -> anyhow::Result<()> {
+    let kernel = open_pinned_cca_payload_one_of(
+        &payload.get().join("host/Image"),
+        &[
+            petri_artifacts_common::cca_payload::guest_memfd_in_place::LINUX_IMAGE_SHA256,
+            petri_artifacts_common::cca_payload::source_built_in_place::LINUX_IMAGE_SHA256,
+        ],
+    )?;
+    boot_linux_direct_cca_with_backing(config, true, Some(kernel)).await
+}
+
+#[cfg(target_os = "linux")]
+fn open_pinned_cca_payload(
+    path: &std::path::Path,
+    expected: &str,
+) -> anyhow::Result<std::fs::File> {
+    open_pinned_cca_payload_one_of(path, &[expected])
+}
+
+#[cfg(target_os = "linux")]
+fn open_pinned_cca_payload_one_of(
+    path: &std::path::Path,
+    expected: &[&str],
+) -> anyhow::Result<std::fs::File> {
+    use sha2::Digest;
+    use std::io::Read;
+    use std::io::Seek;
+
+    let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut digest = sha2::Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    let actual: String = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    anyhow::ensure!(
+        expected.contains(&actual.as_str()),
+        "CCA payload hash mismatch for {}: {actual}",
+        path.display()
+    );
+    file.rewind()?;
+    Ok(file)
+}
+
+async fn boot_linux_direct_cca_with_backing(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+    in_place: bool,
+    kernel: Option<std::fs::File>,
+) -> anyhow::Result<()> {
+    let (vm, agent) = cca_config(config, in_place, None, kernel).run().await?;
+    agent.ping().await?;
+    agent.power_off().await?;
+    vm.wait_for_clean_teardown().await?;
+
+    Ok(())
+}
+
+fn cca_config(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+    in_place: bool,
+    device: Option<openvmm_defs::config::PcieDeviceConfig>,
+    kernel: Option<std::fs::File>,
+) -> PetriVmBuilder<OpenVmmPetriBackend> {
+    let root_ports = if device.is_some() { 2 } else { 1 };
+    config
+        .with_isolation(IsolationType::Cca)
+        .with_memory(petri::MemoryConfig {
+            startup_bytes: 256 * 1024 * 1024,
+            transparent_hugepages: false,
+            ..Default::default()
+        })
+        .with_processor_topology(ProcessorTopology {
+            vp_count: 1,
+            ..Default::default()
+        })
+        // FVP traps each emulated UART access; disabling the diagnostic console
+        // cuts Realm boot time substantially while pipette remains on virtio-vsock.
+        .without_serial_output()
+        .modify_backend(move |backend| {
+            backend
+                .with_pcie_root_topology(1, 1, root_ports)
+                .with_custom_config(move |config| {
+                    config.hypervisor.guest_memfd_in_place = in_place;
+                    if let Some(kernel) = kernel {
+                        let openvmm_defs::config::LoadMode::Linux {
+                            kernel: guest_kernel,
+                            ..
+                        } = &mut config.load_mode
+                        else {
+                            unreachable!("CCA test requires Linux-direct boot");
+                        };
+                        *guest_kernel = kernel;
+                    }
+                    if let Some(device) = device {
+                        config.pcie_devices.push(device);
+                    }
+                    for root_complex in &mut config.pcie_root_complexes {
+                        for port in &mut root_complex.ports {
+                            port.hotplug = false;
+                        }
+                    }
+                })
+        })
+}
+
+const CCA_IO_BYTES: usize = 64 * 1024;
+
+fn cca_io_pattern(seed: u8) -> Vec<u8> {
+    (0..CCA_IO_BYTES)
+        .map(|i| ((i.wrapping_mul(31) ^ (i >> 8)) as u8).wrapping_add(seed))
+        .collect()
+}
+
+/// Exercise direct guest reads and writes on a PCIe Virtio disk in an in-place Realm.
+#[vmm_test_with(
+    openvmm,
+    requires(cca, guest_memfd_in_place),
+    configs(linux_direct_aarch64)
+)]
+async fn virtio_blk_cca_in_place(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+) -> anyhow::Result<()> {
+    use std::io::Read;
+    use std::io::Seek;
+    use std::io::SeekFrom;
+    use std::io::Write;
+
+    const DISK_BYTES: u64 = 8 * 1024 * 1024;
+    let regions = [(0, 17, 93), (DISK_BYTES - CCA_IO_BYTES as u64, 41, 119)];
+    let mut disk = tempfile::tempfile().context("create CCA scratch disk")?;
+    disk.set_len(DISK_BYTES)?;
+    for (offset, initial_seed, _) in regions {
+        disk.seek(SeekFrom::Start(offset))?;
+        disk.write_all(&cca_io_pattern(initial_seed))?;
+    }
+    disk.sync_all()?;
+    let disk_handle = disk_backend_resources::FileDiskHandle(disk.try_clone()?).into_resource();
+    // Pipette's independent Virtio-vsock device occupies root port 0.
+    let device = openvmm_defs::config::PcieDeviceConfig {
+        port_name: "s0rc0rp1".into(),
+        resource: virtio_resources::VirtioPciDeviceHandle(
+            virtio_resources::blk::VirtioBlkHandle {
+                disk: disk_handle,
+                read_only: false,
+                serial: None,
+            }
+            .into_resource(),
+        )
+        .into_resource(),
+    };
+    let (vm, agent) = cca_config(config, true, Some(device), None).run().await?;
+    agent.ping().await?;
+    let sh = agent.unix_shell();
+    let sectors: u64 = cmd!(sh, "cat /sys/block/vda/size")
+        .read()
+        .await?
+        .trim()
+        .parse()?;
+    anyhow::ensure!(
+        sectors == DISK_BYTES / 512,
+        "unexpected CCA scratch disk size"
+    );
+    let driver = cmd!(sh, "readlink -f /sys/block/vda/device/driver")
+        .read()
+        .await?;
+    anyhow::ensure!(
+        driver.trim().ends_with("/virtio_blk"),
+        "not a Virtio block device: {driver}"
+    );
+    let io_bytes = CCA_IO_BYTES.to_string();
+    for (offset, initial_seed, written_seed) in regions {
+        let initial = cca_io_pattern(initial_seed);
+        let written = cca_io_pattern(written_seed);
+        agent
+            .write_file("/tmp/cca-write", futures::io::Cursor::new(&written))
+            .await?;
+        let block = (offset / CCA_IO_BYTES as u64).to_string();
+        cmd!(sh, "timeout 120 dd if=/dev/vda of=/tmp/cca-read bs={io_bytes} count=1 skip={block} iflag=direct")
+            .run().await.context("initial direct Virtio disk read")?;
+        anyhow::ensure!(
+            agent.read_file("/tmp/cca-read").await? == initial,
+            "initial disk data mismatch at {offset}"
+        );
+        cmd!(sh, "timeout 120 dd if=/tmp/cca-write of=/dev/vda bs={io_bytes} count=1 seek={block} oflag=direct conv=notrunc,fsync")
+            .run().await.context("direct Virtio disk write")?;
+        cmd!(sh, "timeout 120 dd if=/dev/vda of=/tmp/cca-read bs={io_bytes} count=1 skip={block} iflag=direct")
+            .run().await.context("direct Virtio disk readback")?;
+        anyhow::ensure!(
+            agent.read_file("/tmp/cca-read").await? == written,
+            "disk readback mismatch at {offset}"
+        );
+    }
+    agent.power_off().await?;
+    vm.wait_for_clean_teardown().await?;
+    for (offset, _, written_seed) in regions {
+        let mut actual = vec![0; CCA_IO_BYTES];
+        disk.seek(SeekFrom::Start(offset))?;
+        disk.read_exact(&mut actual)?;
+        anyhow::ensure!(
+            actual == cca_io_pattern(written_seed),
+            "host disk data mismatch at {offset}"
+        );
+    }
+
+    Ok(())
+}
+
+/// Verify TCP payloads in both directions over Virtio-net, with vsock as control.
+#[vmm_test_with(
+    openvmm,
+    requires(cca, guest_memfd_in_place),
+    configs(linux_direct_aarch64)
+)]
+async fn virtio_net_cca_in_place(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+    _: (),
+    driver: DefaultDriver,
+) -> anyhow::Result<()> {
+    use net_backend_resources::consomme::ConsommeHandle;
+    use net_backend_resources::consomme::HostIpAddress;
+    use net_backend_resources::consomme::HostPort;
+    use net_backend_resources::consomme::HostPortConfig;
+    use net_backend_resources::consomme::HostPortProtocol;
+    use net_backend_resources::mac_address::MacAddress;
+    use std::net::Ipv4Addr;
+
+    const GUEST_PORT: u16 = 26000;
+    let mac = MacAddress::new([0x02, 0x15, 0x5d, 0x12, 0x12, 0x34]);
+    let (port_send, port_recv) = mesh::oneshot();
+    let endpoint = ConsommeHandle {
+        cidr: None,
+        params: Default::default(),
+        internal_dns: false,
+        ports: vec![HostPortConfig {
+            protocol: HostPortProtocol::Tcp,
+            host_address: Some(HostIpAddress::Ipv4(Ipv4Addr::LOCALHOST)),
+            host_port: HostPort::Dynamic(port_send),
+            guest_port: GUEST_PORT,
+        }],
+        recv: None,
+    }
+    .into_resource();
+    let device = openvmm_defs::config::PcieDeviceConfig {
+        port_name: "s0rc0rp1".into(),
+        resource: virtio_resources::VirtioPciDeviceHandle(
+            virtio_resources::net::VirtioNetHandle {
+                max_queues: Some(1),
+                enable_rx_gso: false,
+                mac_address: mac,
+                endpoint,
+            }
+            .into_resource(),
+        )
+        .into_resource(),
+    };
+    let (vm, agent) = cca_config(config, true, Some(device), None).run().await?;
+    agent.ping().await?;
+    let to_guest = cca_io_pattern(29);
+    let from_guest = cca_io_pattern(157);
+    let transfer = async {
+        let host_port = port_recv.await.context("receive Consomme port")?;
+        let sh = agent.unix_shell();
+        let address = cmd!(sh, "cat /sys/class/net/eth0/address").read().await?;
+        anyhow::ensure!(
+            address.trim().parse::<MacAddress>()? == mac,
+            "unexpected NIC MAC"
+        );
+        let nic_driver = cmd!(sh, "readlink -f /sys/class/net/eth0/device/driver")
+            .read()
+            .await?;
+        anyhow::ensure!(
+            nic_driver.trim().ends_with("/virtio_net"),
+            "not a Virtio NIC: {nic_driver}"
+        );
+        cmd!(sh, "ip address add 10.0.0.2/24 dev eth0")
+            .run()
+            .await?;
+        cmd!(sh, "ip link set eth0 up").run().await?;
+        agent
+            .write_file("/tmp/cca-net-send", futures::io::Cursor::new(&from_guest))
+            .await?;
+        // BusyBox otherwise chooses an IPv6 listener, absent from /proc/net/tcp.
+        let mut server = agent
+            .command("timeout")
+            .args(["120", "sh", "-c"])
+            .arg(format!(
+                "exec nc -l -s 10.0.0.2 -p {GUEST_PORT} < /tmp/cca-net-send > /tmp/cca-net-recv"
+            ))
+            .stdin(pipette_client::process::Stdio::null())
+            .spawn()
+            .await?;
+        let port_suffix = format!(":{GUEST_PORT:04X}");
+        let ready = async {
+            let mut retry = PolledTimer::new(&driver);
+            loop {
+                let sockets = String::from_utf8(agent.read_file("/proc/net/tcp").await?)?;
+                if sockets.lines().any(|line| {
+                    let fields: Vec<_> = line.split_whitespace().collect();
+                    fields
+                        .get(1)
+                        .is_some_and(|address| address.ends_with(&port_suffix))
+                        && fields.get(3) == Some(&"0A")
+                }) {
+                    return anyhow::Ok(());
+                }
+                retry.sleep(Duration::from_millis(500)).await;
+            }
+        };
+        match futures::future::select(std::pin::pin!(ready), std::pin::pin!(server.wait())).await {
+            futures::future::Either::Left((result, _)) => result?,
+            futures::future::Either::Right((status, _)) => {
+                anyhow::bail!("guest netcat exited before listening: {}", status?);
+            }
+        }
+        tracing::info!(host_port, "guest IPv4 TCP listener ready");
+        let socket =
+            PolledSocket::connect_tcp(&driver, (Ipv4Addr::LOCALHOST, host_port).into()).await?;
+        let (read, mut write) = socket.split();
+        let mut received = Vec::new();
+        futures::try_join!(
+            async {
+                write.write_all(&to_guest).await?;
+                write.close().await
+            },
+            async {
+                read.take((CCA_IO_BYTES + 1) as u64)
+                    .read_to_end(&mut received)
+                    .await?;
+                std::io::Result::Ok(())
+            },
+        )?;
+        anyhow::ensure!(
+            received == from_guest,
+            "Virtio-net guest-to-host payload mismatch"
+        );
+        let status = server.wait().await?;
+        anyhow::ensure!(status.success(), "guest netcat failed: {status}");
+        anyhow::ensure!(
+            agent.read_file("/tmp/cca-net-recv").await? == to_guest,
+            "Virtio-net host-to-guest payload mismatch"
+        );
+        tracing::info!(
+            bytes = CCA_IO_BYTES,
+            "verified Virtio-net payloads in both directions"
+        );
+        anyhow::Ok(())
+    };
+    let mut timer = PolledTimer::new(&driver);
+    let transfer = std::pin::pin!(transfer);
+    match futures::future::select(transfer, timer.sleep(Duration::from_secs(180))).await {
+        futures::future::Either::Left((result, _)) => result?,
+        futures::future::Either::Right(_) => anyhow::bail!("CCA Virtio-net transfer timed out"),
+    }
+    agent.power_off().await?;
+    vm.wait_for_clean_teardown().await?;
+
+    Ok(())
+}
+
+/// Exercise real Realm host-object allocation and teardown without guest access.
+///
+/// The partition is dormant: backing is prepared, but no RAM is mapped or
+/// populated and no VP runs. The synthetic requester ID exercises only the
+/// host namespace. This does not qualify PCI enumeration, interrupts, or DMA.
+// This preflight calls native Arm KVM, not a cross-architecture guest backend.
+// xtask-fmt allow-target-arch oneoff-petri-native-test-deps
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#[vmm_test_with(
+    openvmm,
+    requires(cca, guest_memfd_in_place, cca_realm_vfio),
+    configs(linux_direct_aarch64)
+)]
+async fn realm_vfio_objects_cca_in_place(
+    _config: PetriVmBuilder<OpenVmmPetriBackend>,
+    _: (),
+    driver: DefaultDriver,
+) -> anyhow::Result<()> {
+    use guestmem::GuestMemory;
+    use memory_range::MemoryRange;
+    use vfio_assigned_device::realm::RealmDevice;
+    use vfio_assigned_device::realm::RealmPhase;
+    use virt::Hypervisor;
+    use virt::Partition;
+    use virt::ProtoPartition;
+    use vm_topology::memory::MemoryLayout;
+    use vm_topology::memory::MemoryRangeWithNode;
+    use vm_topology::processor::TopologyBuilder;
+    use vm_topology::processor::aarch64::Aarch64PlatformConfig;
+    use vm_topology::processor::aarch64::GicItsInfo;
+    use vm_topology::processor::aarch64::GicMsiController;
+    use vm_topology::processor::aarch64::GicVersion;
+    use vmcore::vmtime::VmTime;
+    use vmcore::vmtime::VmTimeKeeper;
+
+    const RID: u32 = 0x100;
+    let bdf = emulator_vfio_bdf("cca-realm-vfio")?;
+    // This preflight is restricted to the single modeled AHCI fixture.
+    anyhow::ensure!(bdf == "0000:01:00.0", "unexpected Realm fixture BDF: {bdf}");
+    let sysfs = std::path::Path::new("/sys/bus/pci/devices").join(&bdf);
+    let class = fs_err::read_to_string(sysfs.join("class"))?;
+    anyhow::ensure!(
+        class.trim() == "0x010601",
+        "Realm fixture is not an AHCI controller"
+    );
+    let vendor = fs_err::read_to_string(sysfs.join("vendor"))?;
+    let device = fs_err::read_to_string(sysfs.join("device"))?;
+    anyhow::ensure!(
+        vendor.trim() == "0x0abc" && device.trim() == "0xaced",
+        "Realm fixture PCI identity does not match the pinned model"
+    );
+    let driver_path = fs_err::read_link(sysfs.join("driver"))?;
+    anyhow::ensure!(
+        driver_path.file_name() == Some(std::ffi::OsStr::new("vfio-pci")),
+        "Realm fixture is not bound to vfio-pci"
+    );
+
+    let mut hypervisor = virt_kvm::Kvm::new().context("open KVM for Realm preflight")?;
+    anyhow::ensure!(
+        hypervisor.recognizes_guest_memfd_in_place(),
+        "in-place backing is not recognized"
+    );
+    let topology = TopologyBuilder::new_aarch64(Aarch64PlatformConfig {
+        gic_distributor_base: 0xff000000,
+        gic_version: GicVersion::V3 {
+            redistributors_base: 0xff020000,
+        },
+        gic_msi: GicMsiController::Its(GicItsInfo {
+            its_base: 0xff040000,
+        }),
+        pmu_gsiv: None,
+        virt_timer_ppi: 20,
+        gic_nr_irqs: 256,
+    })
+    .build(1)?;
+    let layout = MemoryLayout::new_from_ranges(
+        &[MemoryRangeWithNode {
+            range: MemoryRange::new(0x40000000..0x40100000),
+            vnode: 0,
+        }],
+        &[],
+    )?;
+    let time_keeper = VmTimeKeeper::new(&driver, VmTime::from_100ns(0));
+    let time_source = time_keeper.builder().build(&driver).await?;
+    let mut proto = hypervisor
+        .new_partition(virt::ProtoPartitionConfig {
+            processor_topology: &topology,
+            hv_config: None,
+            vmtime: &time_source,
+            isolation: virt::ProtoPartitionIsolation::Cca,
+            nested_virt: false,
+            guest_memfd_in_place: true,
+            device_assignment_msi_iova_range: None,
+        })
+        .context("create dormant Realm prototype")?;
+    let backing = proto
+        .prepare_ram_backing(&layout)?
+        .context("Realm preflight requires in-place backing")?;
+    let memory = GuestMemory::empty();
+    let (partition, binders) = proto
+        .build(virt::PartitionConfig {
+            mem_layout: &layout,
+            guest_memory: &memory,
+            cpuid: &[],
+            vtl0_alias_map: None,
+            fault_resolver: None,
+        })
+        .context("build dormant Realm with GIC")?;
+    drop(binders);
+    anyhow::ensure!(
+        partition.caps().isolation == virt::IsolationType::Cca,
+        "preflight partition is not a Realm"
+    );
+    let provider = partition
+        .vfio_assignment_provider()
+        .context("KVM association provider is unavailable")?;
+
+    for cycle in 0..2 {
+        let cdev = open_vfio_cdev(&bdf)?;
+        let iommufd = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/iommu")
+            .context("open IOMMUFD for Realm preflight")?;
+        let mut objects =
+            RealmDevice::prepare(Some(provider.as_ref()), cdev, iommufd).map_err(|error| {
+                tracing::error!(cycle, error = ?error, "Realm object preparation failed");
+                anyhow::Error::new(error)
+            })?;
+        let prepared = objects.state();
+        tracing::info!(cycle, ?prepared, "Realm host objects prepared");
+        let prepared_ids = [
+            prepared.device,
+            prepared.ioas,
+            prepared.parent,
+            prepared.viommu,
+            prepared.child,
+        ];
+        anyhow::ensure!(
+            prepared.phase == RealmPhase::Prepared
+                && prepared.associated
+                && prepared_ids.iter().all(Option::is_some)
+                && std::collections::BTreeSet::from(prepared_ids).len() == prepared_ids.len()
+                && prepared.vdevice.is_none()
+                && !prepared.attach_attempted,
+            "unexpected prepared Realm object state"
+        );
+        objects.attach(RID).map_err(|error| {
+            tracing::error!(cycle, error = ?error, state = ?objects.state(), "Realm attachment failed");
+            anyhow::Error::new(error)
+        })?;
+        let attached = objects.state();
+        tracing::info!(cycle, ?attached, "Realm child HWPT attached");
+        anyhow::ensure!(
+            attached.phase == RealmPhase::Attached
+                && attached.vdevice.is_some()
+                && !prepared_ids.contains(&attached.vdevice)
+                && [
+                    attached.device,
+                    attached.ioas,
+                    attached.parent,
+                    attached.viommu,
+                    attached.child,
+                ] == prepared_ids
+                && attached.requester_id == Some(RID)
+                && attached.attach_attempted,
+            "unexpected attached Realm object state"
+        );
+        objects.close().map_err(|error| {
+            tracing::error!(cycle, error = ?error, state = ?objects.state(), "Realm cleanup failed");
+            anyhow::Error::new(error)
+        })?;
+        let closed = objects.state();
+        anyhow::ensure!(
+            closed.phase == RealmPhase::Closed
+                && !closed.associated
+                && !closed.attach_attempted
+                && [
+                    closed.device,
+                    closed.ioas,
+                    closed.parent,
+                    closed.viommu,
+                    closed.child,
+                    closed.vdevice,
+                    closed.requester_id,
+                ]
+                .iter()
+                .all(Option::is_none),
+            "Realm owner did not close completely"
+        );
+        tracing::info!(
+            cycle,
+            ?closed,
+            "Realm host-object lifecycle completed without guest execution"
+        );
+    }
+    drop(provider);
+    drop(partition);
+    drop(backing);
+    drop(time_source);
+    drop(time_keeper);
+    Ok(())
+}
 
 /// Boot Linux and verify the PMU interrupt is available.
 ///

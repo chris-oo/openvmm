@@ -74,6 +74,8 @@ Supply `--kernel`, `--initrd`, and `--firmware` explicitly. You can override
 its executable with `--qemu-binary`. This platform is not qualified; launch,
 boot, and agent failures return an error with the log directory.
 
+Registered CCA VMM tests use Petri directly, not the standalone Incubator CLI.
+
 ### Provision an FVP environment
 
 On an x64 Linux model host, prepare the licensed runtime and qualified
