@@ -9,6 +9,11 @@ mod intel_vtd_wiring;
 mod ioapic_iommu_wiring;
 mod pcie_topology;
 mod pcie_wiring;
+mod ram_backing;
+#[cfg(target_os = "linux")]
+mod realm_retention;
+#[cfg(target_os = "linux")]
+mod realm_shutdown;
 mod smmu_wiring;
 
 use self::device_removal::DeviceRemovalState;
@@ -75,6 +80,7 @@ use openvmm_defs::config::DeviceVtl;
 use openvmm_defs::config::GicConfig;
 use openvmm_defs::config::HypervisorConfig;
 use openvmm_defs::config::LoadMode;
+use openvmm_defs::config::MemoryConfig;
 use openvmm_defs::config::NumaTopology;
 use openvmm_defs::config::PcieDeviceConfig;
 use openvmm_defs::config::PcieIommuConfig;
@@ -452,8 +458,11 @@ pub(crate) struct InitializedVm {
     vps: Vec<Box<dyn BindHvliteVp>>,
     vmtime_keeper: VmTimeKeeper,
     vmtime_source: VmTimeSource,
-    memory_manager: GuestMemoryManager,
+    memory_manager: Arc<GuestMemoryManager>,
     gm: GuestMemory,
+    device_gm: GuestMemory,
+    #[cfg(guest_arch = "aarch64")]
+    shared_gpa_bit: Option<u64>,
     cfg: Manifest,
     mem_layout: MemoryLayout,
     resolved_pcie_root_complex_ranges: Vec<ResolvedPcieRootComplexRanges>,
@@ -882,8 +891,11 @@ struct LoadedVmInner {
     partition: Arc<dyn HvlitePartition>,
     chipset_devices: ChipsetDevices,
     _vmtime: SpawnedUnit<VmTimeKeeper>,
-    memory_manager: GuestMemoryManager,
+    memory_manager: Arc<GuestMemoryManager>,
     gm: GuestMemory,
+    _device_gm: GuestMemory,
+    #[cfg(guest_arch = "aarch64")]
+    shared_gpa_bit: Option<u64>,
     vtl0_hvsock_relay: Option<HvsockRelay>,
     vtl2_hvsock_relay: Option<HvsockRelay>,
     vmbus_server: Option<VmbusServerHandle>,
@@ -928,6 +940,8 @@ struct LoadedVmInner {
     /// VFIO cdev + iommufd manager inspect handle (Linux only).
     #[cfg(target_os = "linux")]
     vfio_cdev_inspect: Option<vfio_assigned_device::manager::VfioCdevManagerClient>,
+    #[cfg(target_os = "linux")]
+    _realm_teardown: vfio_assigned_device::resolver::RealmTeardownHandle,
 
     // relay halt messages to the client, which decides what to do about them.
     halt_recv: mesh::Receiver<HaltReason>,
@@ -1084,6 +1098,162 @@ struct GenericInitiatorSource {
     vnode: u32,
 }
 
+fn validate_cca_memory_config(vnode: usize, memory: &MemoryConfig) -> anyhow::Result<()> {
+    if memory.hugepages {
+        anyhow::bail!("node {vnode}: KVM CCA guest_memfd does not support hugetlb memory");
+    }
+    if memory.private_memory {
+        anyhow::bail!("node {vnode}: KVM CCA guest_memfd requires shared userspace memory backing");
+    }
+    Ok(())
+}
+
+fn validate_cca_pcie_resource(resource_id: &str) -> anyhow::Result<()> {
+    if !matches!(resource_id, "virtio" | "vfio-realm") {
+        anyhow::bail!(
+            "KVM CCA guest_memfd requires in-process Virtio or the distinct Realm PCI resource"
+        );
+    }
+    Ok(())
+}
+
+fn validate_guest_memfd_in_place_config(
+    config: &HypervisorConfig,
+    recognized: bool,
+) -> anyhow::Result<()> {
+    if !config.guest_memfd_in_place {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        recognized,
+        "the selected hypervisor does not support experimental guest_memfd in-place RAM"
+    );
+    anyhow::ensure!(
+        config.with_isolation == Some(openvmm_defs::config::IsolationType::Cca),
+        "experimental guest_memfd in-place RAM requires CCA isolation"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn select_realm_vfio_provider<T>(
+    config: &HypervisorConfig,
+    get_provider: impl FnOnce() -> Option<T>,
+) -> Option<T> {
+    if config.guest_memfd_in_place
+        && config.with_isolation == Some(openvmm_defs::config::IsolationType::Cca)
+    {
+        get_provider()
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod cca_validation_tests {
+    use super::validate_cca_memory_config;
+    use super::validate_cca_pcie_resource;
+    use openvmm_defs::config::MemoryConfig;
+    use test_with_tracing::test;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn realm_provider_is_requested_only_for_in_place_cca() {
+        use openvmm_defs::config::HypervisorConfig;
+        use openvmm_defs::config::IsolationType;
+        for isolation in [
+            None,
+            Some(IsolationType::Cca),
+            Some(IsolationType::Snp { host_data: None }),
+        ] {
+            for in_place in [false, true] {
+                let config = HypervisorConfig {
+                    with_isolation: isolation,
+                    guest_memfd_in_place: in_place,
+                    ..Default::default()
+                };
+                let mut calls = 0;
+                let provider = super::select_realm_vfio_provider(&config, || {
+                    calls += 1;
+                    Some(17)
+                });
+                let selected = isolation == Some(IsolationType::Cca) && in_place;
+                assert_eq!(calls, usize::from(selected));
+                assert_eq!(provider, selected.then_some(17));
+                assert_eq!(
+                    super::select_realm_vfio_provider::<u32>(&config, || None),
+                    None
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn guest_memfd_in_place_is_explicit_and_rejects_unsupported_backends() {
+        let mut config = openvmm_defs::config::HypervisorConfig::default();
+        super::validate_guest_memfd_in_place_config(&config, false).unwrap();
+        config.guest_memfd_in_place = true;
+        assert!(super::validate_guest_memfd_in_place_config(&config, true).is_err());
+        config.with_isolation = Some(openvmm_defs::config::IsolationType::Cca);
+        assert!(super::validate_guest_memfd_in_place_config(&config, false).is_err());
+        super::validate_guest_memfd_in_place_config(&config, true).unwrap();
+    }
+
+    #[test]
+    fn both_cca_backings_use_the_same_pcie_resource_policy() {
+        for in_place in [false, true] {
+            let config = openvmm_defs::config::HypervisorConfig {
+                with_isolation: Some(openvmm_defs::config::IsolationType::Cca),
+                guest_memfd_in_place: in_place,
+                ..Default::default()
+            };
+            super::validate_guest_memfd_in_place_config(&config, true).unwrap();
+            validate_cca_pcie_resource("virtio").unwrap();
+            assert!(validate_cca_pcie_resource("vfio").is_err());
+            assert!(validate_cca_pcie_resource("vfio-cdev").is_err());
+        }
+    }
+
+    fn memory_config() -> MemoryConfig {
+        MemoryConfig {
+            mem_size: 1024 * 1024,
+            prefetch_memory: false,
+            private_memory: false,
+            transparent_hugepages: false,
+            hugepages: false,
+            hugepage_size: None,
+            host_numa_node: None,
+        }
+    }
+
+    #[test]
+    fn cca_memory_rejects_hugetlb_and_private_backing() {
+        let mut memory = memory_config();
+        memory.hugepages = true;
+        assert!(
+            validate_cca_memory_config(0, &memory)
+                .unwrap_err()
+                .to_string()
+                .contains("hugetlb")
+        );
+
+        memory.hugepages = false;
+        memory.private_memory = true;
+        assert!(
+            validate_cca_memory_config(0, &memory)
+                .unwrap_err()
+                .to_string()
+                .contains("shared userspace memory")
+        );
+    }
+
+    #[test]
+    fn cca_pcie_rejects_non_virtio_resources() {
+        validate_cca_pcie_resource("virtio").unwrap();
+        assert!(validate_cca_pcie_resource("vfio").is_err());
+    }
+}
+
 impl InitializedVm {
     /// Creates and initializes a VM using the given backend.
     async fn new(
@@ -1222,6 +1392,10 @@ impl InitializedVm {
         if cfg.hypervisor.nested_virt && !hypervisor.recognizes_nested_virt() {
             anyhow::bail!("the selected hypervisor does not support nested virtualization");
         }
+        validate_guest_memfd_in_place_config(
+            &cfg.hypervisor,
+            hypervisor.recognizes_guest_memfd_in_place(),
+        )?;
 
         #[cfg(guest_arch = "aarch64")]
         let device_assignment_msi_iova_range =
@@ -1234,11 +1408,13 @@ impl InitializedVm {
                 vmtime: &vmtime_source,
                 isolation: proto_partition_isolation,
                 nested_virt: cfg.hypervisor.nested_virt,
-                guest_memfd_in_place: false,
+                guest_memfd_in_place: cfg.hypervisor.guest_memfd_in_place,
                 #[cfg(guest_arch = "aarch64")]
                 device_assignment_msi_iova_range,
             })
             .context("failed to create the prototype partition")?;
+        #[cfg(target_os = "linux")]
+        let mut proto = proto;
 
         let physical_address_size = proto.max_physical_address_size();
 
@@ -1400,9 +1576,133 @@ impl InitializedVm {
             }
         }
 
-        // Build per-node RAM backing requests. Each NUMA node with memory
-        // gets its own backing (memfd), enabling per-node hugepage settings
-        // and host NUMA binding.
+        if cfg.hypervisor.with_isolation == Some(openvmm_defs::config::IsolationType::Cca) {
+            if shared_memory.is_some() {
+                anyhow::bail!("KVM CCA guest_memfd does not support restart memory backing");
+            }
+            if !matches!(
+                cfg.load_mode,
+                LoadMode::Linux {
+                    boot_mode: openvmm_defs::config::LinuxDirectBootMode::DeviceTree,
+                    ..
+                }
+            ) {
+                anyhow::bail!(
+                    "KVM CCA guest_memfd currently only supports device tree Linux direct boot"
+                );
+            }
+            if cfg.hypervisor.with_hv {
+                anyhow::bail!("KVM CCA guest_memfd does not support Hyper-V enlightenments");
+            }
+            if cfg.hypervisor.with_vtl2.is_some() {
+                anyhow::bail!("KVM CCA guest_memfd does not support VTL2");
+            }
+            if cfg.chipset.with_hyperv_vga {
+                anyhow::bail!("KVM CCA guest_memfd does not support Hyper-V VGA");
+            }
+            if cfg.chipset_capabilities.with_i440bx_host_pci_bridge {
+                anyhow::bail!("KVM CCA guest_memfd does not support the i440BX host PCI bridge");
+            }
+            let only_supported_chipset_devices = cfg
+                .chipset_devices
+                .iter()
+                .all(|device| matches!(device.resource.id(), "serial_pl011" | "missing-dev"));
+            if !only_supported_chipset_devices {
+                anyhow::bail!("KVM CCA guest_memfd only supports PL011 serial chipset devices");
+            }
+            if cfg.vmbus.is_some() || cfg.vtl2_vmbus.is_some() || !cfg.vmbus_devices.is_empty() {
+                anyhow::bail!("KVM CCA guest_memfd does not support VMBus");
+            }
+            if !cfg.virtio_devices.is_empty() {
+                anyhow::bail!(
+                    "KVM CCA guest_memfd only supports virtio devices on PCIe root ports"
+                );
+            }
+            if !cfg.pcie_switches.is_empty() {
+                anyhow::bail!("KVM CCA guest_memfd does not support PCIe switches");
+            }
+            if !cfg.pcie_generic_initiators.is_empty() {
+                anyhow::bail!("KVM CCA guest_memfd does not support PCIe generic initiators");
+            }
+            if !cfg.vpci_devices.is_empty() {
+                anyhow::bail!("KVM CCA guest_memfd does not support VPCI devices");
+            }
+            if !cfg.pci_chipset_devices.is_empty() || cfg.isa_dma_controller.is_some() {
+                anyhow::bail!("KVM CCA guest_memfd does not support legacy PCI or ISA DMA devices");
+            }
+            if cfg.framebuffer.is_some() || cfg.vga_firmware.is_some() || cfg.debugger_rpc.is_some()
+            {
+                anyhow::bail!("KVM CCA guest_memfd does not support this VM configuration");
+            }
+            let unsupported_pcie_root_complex =
+                cfg.pcie_root_complexes.iter().any(|root_complex| {
+                    root_complex.cxl.is_some()
+                        || root_complex.iommu.is_some()
+                        || root_complex
+                            .ports
+                            .iter()
+                            .any(|port| port.hotplug || port.cxl)
+                });
+            if unsupported_pcie_root_complex {
+                anyhow::bail!(
+                    "KVM CCA guest_memfd does not support PCIe hotplug, CXL, or IOMMU root ports"
+                );
+            }
+            for device in &cfg.pcie_devices {
+                validate_cca_pcie_resource(device.resource.id())?;
+            }
+            for (vnode, node) in cfg.numa.nodes.iter().enumerate() {
+                if let Some(memory) = &node.mem {
+                    validate_cca_memory_config(vnode, memory)?;
+                }
+            }
+            if !cfg.floppy_disks.is_empty()
+                || !cfg.ide_disks.is_empty()
+                || !cfg.virtio_devices.is_empty()
+            {
+                anyhow::bail!("KVM CCA guest_memfd does not support disks");
+            }
+            if matches!(
+                cfg.vmgs,
+                Some(
+                    VmgsResource::Disk(_)
+                        | VmgsResource::ReprovisionOnFailure(_)
+                        | VmgsResource::ReprovisionSingle(_)
+                )
+            ) {
+                anyhow::bail!("KVM CCA guest_memfd does not support VMGS disks");
+            }
+        }
+
+        let max_addr = mem_layout
+            .end_of_layout()
+            .max(mem_layout.vtl2_range().map_or(0, |r| r.end()));
+        #[cfg(guest_arch = "aarch64")]
+        let shared_gpa_bit =
+            if cfg.hypervisor.with_isolation == Some(openvmm_defs::config::IsolationType::Cca) {
+                let shared_bit = platform_info
+                    .shared_gpa_bit
+                    .context("missing CCA shared GPA bit")?;
+                anyhow::ensure!(
+                    shared_bit.is_power_of_two(),
+                    "CCA shared GPA bit must be a power of two"
+                );
+                anyhow::ensure!(
+                    max_addr <= shared_bit,
+                    "guest memory layout overlaps CCA shared GPA alias region"
+                );
+                Some(shared_bit)
+            } else {
+                None
+            };
+
+        #[cfg(target_os = "linux")]
+        let partition_backing = proto
+            .prepare_ram_backing(&mem_layout)
+            .context("failed to prepare partition RAM backing")?;
+
+        // Ordinary RAM gets one backing per NUMA node. Partition-supplied RAM
+        // instead uses slices of the backend's file, with the same node policy.
         let num_nodes = cfg.numa.nodes.len();
 
         // Group RAM ranges by vnode.
@@ -1422,19 +1722,15 @@ impl InitializedVm {
             ranges_by_node[first_mem_node].push(vtl2_range);
         }
 
-        // For restore, an existing mappable can only be applied to
-        // single-node configurations.
         let nodes_with_ranges = ranges_by_node.iter().filter(|r| !r.is_empty()).count();
-        let mut existing_mappable = if let Some(smb) = shared_memory {
-            if nodes_with_ranges > 1 {
-                anyhow::bail!(
-                    "shared memory restore not supported with {nodes_with_ranges} memory nodes"
-                );
-            }
-            Some(smb.into_mappable())
-        } else {
-            None
-        };
+        let mut backing_source = ram_backing::RamBackingSource::new(
+            shared_memory,
+            nodes_with_ranges,
+            #[cfg(target_os = "linux")]
+            partition_backing,
+            #[cfg(target_os = "linux")]
+            &mem_layout,
+        )?;
 
         let mut memory_builder = GuestMemoryBuilder::new();
         memory_builder = memory_builder
@@ -1454,25 +1750,7 @@ impl InitializedVm {
                 .as_ref()
                 .with_context(|| format!("node {vnode} has RAM ranges but no memory config"))?;
 
-            if let Some(size) = mem.hugepage_size
-                && !mem.hugepages
-            {
-                anyhow::bail!("node {vnode}: hugepage_size={size} requires hugepages=on");
-            }
-
-            let mut backing = membacking::RamBackingRequest::new(ranges)
-                .prefetch(mem.prefetch_memory)
-                .private_memory(mem.private_memory)
-                .transparent_hugepages(mem.transparent_hugepages)
-                .host_numa_node(mem.host_numa_node);
-            if mem.hugepages {
-                backing = backing.hugepages(mem.hugepage_size);
-            }
-            if let Some(mappable) = existing_mappable.take() {
-                backing = backing.existing_mappable(mappable);
-            }
-
-            memory_builder = memory_builder.add_backing(backing);
+            memory_builder = backing_source.add_node(memory_builder, vnode, ranges, mem)?;
         }
 
         #[cfg(all(windows, feature = "virt_whp"))]
@@ -1494,10 +1772,6 @@ impl InitializedVm {
             _ => None,
         };
 
-        let max_addr = mem_layout
-            .end_of_layout()
-            .max(mem_layout.vtl2_range().map_or(0, |r| r.end()));
-
         let mut memory_manager = memory_builder
             .build(max_addr)
             .await
@@ -1508,6 +1782,27 @@ impl InitializedVm {
             .guest_memory()
             .await
             .context("failed to get guest memory")?;
+        let device_gm = {
+            #[cfg(guest_arch = "aarch64")]
+            {
+                if let Some(shared_bit) = shared_gpa_bit {
+                    // TODO: Confirm Arm CCA pSMMU semantics for whether devices
+                    // should accept low IPAs, high/shared IPAs, or both, then
+                    // update this aliasing behavior to match.
+                    memory_manager
+                        .client()
+                        .aliased_guest_memory("shared-ram", shared_bit)
+                        .await
+                        .context("failed to get CCA device guest memory")?
+                } else {
+                    gm.clone()
+                }
+            }
+            #[cfg(not(guest_arch = "aarch64"))]
+            {
+                gm.clone()
+            }
+        };
         let mut cpuid = Vec::new();
 
         // Add in Hyper-V VMM CPUID leaves.
@@ -1563,8 +1858,11 @@ impl InitializedVm {
             vps,
             vmtime_keeper,
             vmtime_source,
-            memory_manager,
+            memory_manager: Arc::new(memory_manager),
             gm,
+            device_gm,
+            #[cfg(guest_arch = "aarch64")]
+            shared_gpa_bit,
             cfg,
             mem_layout,
             resolved_pcie_root_complex_ranges,
@@ -1596,6 +1894,9 @@ impl InitializedVm {
             vmtime_source,
             memory_manager,
             gm,
+            device_gm,
+            #[cfg(guest_arch = "aarch64")]
+            shared_gpa_bit,
             cfg,
             mem_layout,
             resolved_pcie_root_complex_ranges,
@@ -2203,6 +2504,16 @@ impl InitializedVm {
         }
         let mut deferred_msi_conns: Vec<DeferredMsiConn> = Vec::new();
 
+        let cca_realm_root_index = pcie_topology::realm_root_index(
+            &cfg.pcie_root_complexes,
+            &cfg.pcie_devices
+                .iter()
+                .map(|device| (device.port_name.as_str(), device.resource.id()))
+                .collect::<Vec<_>>(),
+            cfg.hypervisor.guest_memfd_in_place
+                && cfg.hypervisor.with_isolation == Some(openvmm_defs::config::IsolationType::Cca),
+        )?;
+
         let (mut pcie_host_bridges, pcie_root_complexes) = {
             pcie_topology::validate_pcie_root_complexes(&cfg.pcie_root_complexes)?;
             let mut pcie_host_bridges = Vec::new();
@@ -2362,13 +2673,13 @@ impl InitializedVm {
                     cxl,
                     vnode: rc.vnode,
                     preserve_bars: rc.preserve_bars,
+                    cca_private_mmio: cca_realm_root_index == Some(rc.index),
                     // Pinned BARs require the guest to preserve their assigned
                     // addresses. UEFI also consumes OpenVMM's preassigned PCI
                     // configuration, so tell the guest OS not to reallocate it
                     // and transiently overlap BAR mappings.
                     preserve_boot_config: rc.preserve_bars
                         || matches!(&cfg.load_mode, LoadMode::Uefi { .. }),
-                    cca_private_mmio: false,
                 });
 
                 pcie_root_complexes.push(root_complex.clone());
@@ -2519,7 +2830,22 @@ impl InitializedVm {
         // Register the VFIO resolver, which spawns a container manager task
         // internally to share containers across assigned devices.
         #[cfg(target_os = "linux")]
-        let (vfio_inspect, vfio_cdev_inspect) = {
+        let (vfio_inspect, vfio_cdev_inspect, realm_teardown) = {
+            let realm_provider = select_realm_vfio_provider(&cfg.hypervisor, || {
+                partition.vfio_assignment_provider()
+            })
+            .map(|provider| realm_retention::retain_provider(provider, memory_manager.clone()));
+            let realm_resolver = vfio_assigned_device::resolver::VfioRealmDeviceResolver::new(
+                realm_provider.clone(),
+                tdisp::host::SnapshotBudget::new(64 * 1024 * 1024),
+            );
+            let realm_teardown = realm_resolver.teardown_handle();
+            resolver.add_async_resolver::<
+                vm_resource::kind::PciDeviceHandleKind,
+                _,
+                vfio_assigned_device_resources::VfioRealmDeviceHandle,
+                _,
+            >(realm_resolver);
             let dma_mapper_client = memory_manager.dma_mapper_client();
             let vfio_resolver = vfio_assigned_device::resolver::VfioDeviceResolver::new(
                 driver_source.builder().build("vfio-container-mgr"),
@@ -2542,7 +2868,8 @@ impl InitializedVm {
             let cdev_resolver = vfio_assigned_device::resolver::VfioCdevDeviceResolver::new(
                 driver_source.builder().build("vfio-cdev-mgr"),
                 dma_mapper_client,
-            );
+            )
+            .with_realm_assignment_provider(realm_provider);
             let cdev_handle = cdev_resolver.inspect_handle();
             resolver.add_async_resolver::<
                 vm_resource::kind::PciDeviceHandleKind,
@@ -2551,7 +2878,7 @@ impl InitializedVm {
                 _,
             >(cdev_resolver);
 
-            (Some(handle), Some(cdev_handle))
+            (Some(handle), Some(cdev_handle), realm_teardown)
         };
 
         // Instantiate SMMU devices and build port-level lookup maps.
@@ -2688,7 +3015,7 @@ impl InitializedVm {
             let chipset_builder = &chipset_builder;
             let driver_source = &driver_source;
             let resolver = &resolver;
-            let gm = &gm;
+            let gm = &device_gm;
             let partition = &partition;
             let mapper = &mapper;
             let port_info = &port_info;
@@ -2802,16 +3129,17 @@ impl InitializedVm {
                 .vmbus_max_version
                 .map(vmbus_core::MaxVersionInfo::new);
             let vmbus_driver = driver_source.simple();
-            let vmbus = VmbusServer::builder(vmbus_driver.clone(), synic.clone(), gm.clone())
-                .hvsock_notify(Some(hvsock_channel.server_half))
-                .external_server(vtl2_request_send)
-                .use_message_redirect(vmbus_cfg.vtl2_redirect)
-                .max_version(vmbus_max_version)
-                .max_restore_version(vmbus_max_version)
-                .delay_max_version(matches!(cfg.load_mode, LoadMode::Uefi { .. }))
-                .enable_mnf(true)
-                .build()
-                .context("failed to create vmbus server")?;
+            let vmbus =
+                VmbusServer::builder(vmbus_driver.clone(), synic.clone(), device_gm.clone())
+                    .hvsock_notify(Some(hvsock_channel.server_half))
+                    .external_server(vtl2_request_send)
+                    .use_message_redirect(vmbus_cfg.vtl2_redirect)
+                    .max_version(vmbus_max_version)
+                    .max_restore_version(vmbus_max_version)
+                    .delay_max_version(matches!(cfg.load_mode, LoadMode::Uefi { .. }))
+                    .enable_mnf(true)
+                    .build()
+                    .context("failed to create vmbus server")?;
 
             // Start the vmbus kernel proxy if it's in use.
             #[cfg(windows)]
@@ -2826,7 +3154,7 @@ impl InitializedVm {
                         .vtl2_server(vtl2_vmbus.as_ref().map(|server| {
                             vmbus_server::ProxyServerInfo::new(server.control().clone())
                         }))
-                        .memory(Some(&gm))
+                        .memory(Some(&device_gm))
                         .build()
                         .await
                         .context("failed to start the vmbus proxy")?,
@@ -2927,7 +3255,7 @@ impl InitializedVm {
                                 .transpose()
                                 .context("vpci device vnode exceeds 65535")?,
                         },
-                        gm.clone(),
+                        device_gm.clone(),
                         |device_id| {
                             let hv_device = partition.new_virtual_device(
                                 match dev_cfg.vtl {
@@ -3058,7 +3386,7 @@ impl InitializedVm {
                     let mmio_start = virtio_mmio_region.start() + virtio_mmio_index as u64 * 0x1000;
                     virtio_mmio_index += 1;
                     let id = format!("{id}-{mmio_start}");
-                    let gm = gm.clone();
+                    let gm = device_gm.clone();
                     chipset_builder.arc_mutex_device(id).try_add(|services| {
                         VirtioMmioDevice::new(
                             device.0,
@@ -3092,7 +3420,7 @@ impl InitializedVm {
                             VirtioPciDevice::new(
                                 device.0,
                                 &driver_source.simple(),
-                                gm.clone(),
+                                device_gm.clone(),
                                 PciInterruptModel::IntX(
                                     PciInterruptPin::IntA,
                                     services.new_line(IRQ_LINE_SET, "interrupt", pci_inta_line),
@@ -3184,6 +3512,9 @@ impl InitializedVm {
                 _vmtime: vmtime,
                 memory_manager,
                 gm,
+                _device_gm: device_gm,
+                #[cfg(guest_arch = "aarch64")]
+                shared_gpa_bit,
                 vtl0_hvsock_relay,
                 vtl2_hvsock_relay,
                 vmbus_server,
@@ -3217,6 +3548,8 @@ impl InitializedVm {
                 vfio_inspect,
                 #[cfg(target_os = "linux")]
                 vfio_cdev_inspect,
+                #[cfg(target_os = "linux")]
+                _realm_teardown: realm_teardown,
                 halt_recv,
                 client_notify_send,
                 chipset: chipset.chipset.clone(),
@@ -3408,6 +3741,7 @@ impl LoadedVmInner {
                     mem_layout: &self.mem_layout,
                     isolation,
                     smbios,
+                    shared_gpa_bit: None,
                 };
                 super::vm_loaders::linux::load_linux_x86(
                     &kernel_config,
@@ -3451,14 +3785,37 @@ impl LoadedVmInner {
                 if isolation != openvmm_defs::config::LinuxIsolationConfig::None {
                     anyhow::bail!("SNP Linux loader configuration is not supported on aarch64");
                 }
+                let shared_gpa_bit = if self.hypervisor_cfg.with_isolation
+                    == Some(openvmm_defs::config::IsolationType::Cca)
+                {
+                    Some(self.shared_gpa_bit.context("missing CCA shared GPA bit")?)
+                } else {
+                    None
+                };
                 let kernel_config = super::vm_loaders::linux::KernelConfig {
                     kernel,
                     initrd,
                     cmdline,
                     mem_layout: &self.mem_layout,
-                    isolation: super::vm_loaders::linux::KernelIsolationConfig::None,
+                    isolation: if self.hypervisor_cfg.with_isolation
+                        == Some(openvmm_defs::config::IsolationType::Cca)
+                    {
+                        super::vm_loaders::linux::KernelIsolationConfig::Cca
+                    } else {
+                        super::vm_loaders::linux::KernelIsolationConfig::None
+                    },
                     smbios,
+                    shared_gpa_bit,
                 };
+
+                if self.hypervisor_cfg.with_isolation
+                    == Some(openvmm_defs::config::IsolationType::Cca)
+                    && boot_mode == LinuxDirectBootMode::Acpi
+                {
+                    anyhow::bail!(
+                        "CCA isolation currently only supports device tree Linux direct boot"
+                    );
+                }
 
                 let build_acpi = if boot_mode == LinuxDirectBootMode::Acpi {
                     Some(|rsdp_gpa: u64| {
@@ -3812,6 +4169,11 @@ impl LoadedVm {
                         let mut stopped = false;
                         // First run the non-destructive operations.
                         let r = async {
+                            anyhow::ensure!(
+                                self.inner.hypervisor_cfg.with_isolation
+                                    != Some(openvmm_defs::config::IsolationType::Cca),
+                                "KVM CCA does not support restart"
+                            );
                             let shared_memory = self.inner.memory_manager.shared_memory_backing();
                             if shared_memory.is_none() {
                                 anyhow::bail!("restart is not supported with --private-memory");
@@ -3997,6 +4359,13 @@ impl LoadedVm {
                     }
                     VmRpc::AddPcieDevice(rpc) => {
                         rpc.handle_failable(async |(port_name, resource)| {
+                            if self.inner.hypervisor_cfg.with_isolation
+                                == Some(openvmm_defs::config::IsolationType::Cca)
+                            {
+                                anyhow::bail!(
+                                    "KVM CCA guest_memfd does not support runtime PCI device addition"
+                                );
+                            }
                             // Find the root complex and its index for the named port.
                             let (rc_idx, rc) = self.inner.pcie_root_complexes.iter()
                                 .enumerate()
@@ -4245,6 +4614,11 @@ impl LoadedVm {
         }
 
         device_removal.drain().await;
+        #[cfg(target_os = "linux")]
+        if self.inner._realm_teardown.has_assignments() {
+            self = realm_shutdown::shutdown(self, rpc_recv, worker_rpc).await;
+        }
+
         self.pause().await;
         self.teardown_chipset_devices().await;
         self.inner.partition_unit.teardown().await;
@@ -4360,6 +4734,11 @@ impl LoadedVm {
     ///
     /// TODO: virtio & vmbus unsupported.
     async fn save(&mut self) -> anyhow::Result<SavedState> {
+        anyhow::ensure!(
+            self.inner.hypervisor_cfg.with_isolation
+                != Some(openvmm_defs::config::IsolationType::Cca),
+            "KVM CCA does not support snapshot or saved state"
+        );
         Ok(SavedState {
             units: self.state_units.save().await?,
         })
@@ -4367,6 +4746,11 @@ impl LoadedVm {
 
     /// Restore state on the VM.
     async fn restore(&mut self, state: SavedState) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.inner.hypervisor_cfg.with_isolation
+                != Some(openvmm_defs::config::IsolationType::Cca),
+            "KVM CCA does not support restore"
+        );
         self.state_units.restore(state.units).await?;
         Ok(())
     }

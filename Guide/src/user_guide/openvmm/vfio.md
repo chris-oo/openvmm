@@ -8,6 +8,63 @@ VFIO device assignment lets a guest VM directly access a physical PCI device (su
 VFIO device assignment is experimental. PCI config space, BAR MMIO passthrough, MSI-X interrupts (via irqfd), and DMA are functional. Devices such as NVMe controllers work end-to-end.
 ```
 
+```admonish note
+Arm CCA trusted device assignment is not yet enabled. The `vfio_sys` crate
+has low-level helpers for IOAS page-size policy, Realm vIOMMU allocation,
+and S1-bypass descriptors. A lazy, partition-owned KVM association provider
+is passed to the cdev resolver for in-place CCA. The separate Realm object
+owner prepares the IOAS/page-table graph, attaches only after receiving a
+final requester ID, and retains partial state if rollback fails.
+This path does not expose a PCI device, register DMA mappings, or perform
+TDISP LOCK/RUN. Private/shared DMA coordination and the device lifecycle
+remain incomplete. Explicit cleanup is required; abandoned cleanup failures
+retain their resource bundle until process exit and are not clean teardown.
+Do not use the unsafe-interrupt workaround below for trusted assignment.
+```
+
+The experimental CCA TSM bindings in `vfio_sys::iommufd::tsm` encode native
+state, evidence, and MMIO-validation requests for the pinned integration
+kernel. They borrow host buffers for each synchronous ioctl and preserve
+syscall errors, unused-byte counts, and TSM result codes separately. Object
+reads always use backend offset zero; the device coordinator must fetch a
+bounded whole object before serving guest slices. These bindings alone do
+not enable guest requests or make state changes safe. Access revocation,
+request serialization, and uncertain-completion handling belong to the
+device coordinator.
+
+The additive `tdisp::host` core provides native lifecycle bookkeeping and
+evidence snapshots without changing the existing protobuf emulator. It
+serializes backend calls, quarantines uncertain mutations, and bounds both
+individual objects and the shared snapshot budget. Invalid state requests
+do not implicitly unlock a device.
+
+`RealmDevice::into_tdisp` verifies the CCA TDI binding with a read-only
+certificate-size request before transferring an attached assignment into
+this core. Attachment alone does not prove a TSM is configured. Failed
+verification returns the original owner for explicit recovery.
+The evidence owner retains the VFIO/IOMMUFD/KVM bundle, checks complete size
+replies and read lengths, and uses the existing ordered cleanup on teardown.
+It exposes no raw backend or state-changing request. Its asynchronous evidence
+service admits one blocking operation per device at a time and borrows the
+budgeted snapshot for delivery, rather than making another object copy.
+Explicit teardown closes admission and drains accepted operations.
+
+Native RHI evidence routing is an explicit, pre-run opt-in through
+`VfioVm::register_evidence`. The caller keeps the service alive; the partition
+stores only a weak reference for its final requester ID. Registration freezes
+before the first VP run. No filters are installed for ordinary VMs.
+
+Registered CCA guests can request evidence sizes and reads. Buffer writes
+require selector-clear addresses, current RAM-slot coverage, and shared
+in-place backing. Validation and copying hold the same lock as memory
+conversion. Full function IDs, object IDs, offsets, and result counts are
+checked. An abandoned request or register-I/O failure stops the partition.
+
+Only the two evidence feature bits are advertised. The pinned Linux driver
+requires the full DA feature set, so an ordinary guest boot does not exercise
+this partial interface. Regeneration, LOCK/RUN, protected MMIO acceptance, and
+private DMA remain disabled. Trusted-I/O exits still default to rejection.
+
 ## Overview
 
 OpenVMM running on a Linux host can assign physical PCI devices to guest VMs using VFIO. The device is bound to the `vfio-pci` kernel driver, then OpenVMM opens it via VFIO and presents it to the guest as a PCIe endpoint.

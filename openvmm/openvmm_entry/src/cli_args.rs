@@ -386,6 +386,11 @@ Examples:
     #[clap(long)]
     pub snp_restricted_injection: bool,
 
+    /// Use experimental guest_memfd in-place RAM (requires --isolation cca and
+    /// 4 KiB host pages; no assigned devices, snapshot, restore, or automatic ABI fallback)
+    #[clap(long)]
+    pub guest_memfd_in_place: bool,
+
     /// the hybrid vsock listener path
     #[clap(long, value_name = "PATH", alias = "vsock-path")]
     pub vmbus_vsock_path: Option<String>,
@@ -1537,6 +1542,14 @@ impl Options {
         {
             anyhow::bail!("--snp-restricted-injection requires Linux direct boot");
         }
+        if self.guest_memfd_in_place {
+            #[cfg(not(guest_arch = "aarch64"))]
+            anyhow::bail!("--guest-memfd-in-place requires an aarch64 KVM CCA guest");
+            #[cfg(guest_arch = "aarch64")]
+            if !matches!(self.isolation, Some(IsolationCli::Cca)) {
+                anyhow::bail!("--guest-memfd-in-place requires --isolation cca");
+            }
+        }
         if matches!(self.isolation, Some(IsolationCli::Snp)) {
             if self.uefi.is_some() {
                 anyhow::bail!("SNP isolation currently only supports Linux direct boot");
@@ -1548,6 +1561,29 @@ impl Options {
                     .is_some_and(|nodes| nodes.iter().any(|node| node.memory.hugepages))
             {
                 anyhow::bail!("SNP isolation currently does not support hugetlb memory");
+            }
+        }
+        #[cfg(guest_arch = "aarch64")]
+        if matches!(self.isolation, Some(IsolationCli::Cca)) {
+            if self.memory.hugepages
+                || self
+                    .numa
+                    .as_ref()
+                    .is_some_and(|nodes| nodes.iter().any(|node| node.memory.hugepages))
+            {
+                anyhow::bail!("CCA isolation currently does not support hugetlb memory");
+            }
+            if self.private_memory()
+                || self
+                    .numa
+                    .as_ref()
+                    .is_some_and(|nodes| nodes.iter().any(|node| node.memory.shared == Some(false)))
+            {
+                anyhow::bail!("CCA isolation requires shared userspace memory backing");
+            }
+            #[cfg(target_os = "linux")]
+            if !self.vhost_user.is_empty() {
+                anyhow::bail!("CCA isolation currently does not support vhost-user devices");
             }
         }
         Ok(())
@@ -3289,6 +3325,8 @@ pub enum GicMsiCli {
 pub enum IsolationCli {
     Vbs,
     Snp,
+    #[cfg(guest_arch = "aarch64")]
+    Cca,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, ValueEnum)]
@@ -5823,6 +5861,42 @@ mod tests {
     }
 
     #[test]
+    fn guest_memfd_in_place_defaults_off_and_requires_cca() {
+        let default = Options::try_parse_from(["openvmm"]).unwrap();
+        assert!(!default.guest_memfd_in_place);
+        default.validate_isolation_options().unwrap();
+        let opt = Options::try_parse_from(["openvmm", "--guest-memfd-in-place"]).unwrap();
+        assert!(opt.guest_memfd_in_place);
+        assert!(opt.validate_isolation_options().is_err());
+        let opt =
+            Options::try_parse_from(["openvmm", "--guest-memfd-in-place", "--isolation", "vbs"])
+                .unwrap();
+        assert!(opt.validate_isolation_options().is_err());
+    }
+
+    #[test]
+    fn guest_memfd_in_place_rejects_old_flag() {
+        assert!(matches!(
+            Options::try_parse_from(["openvmm", "--cca-v7"]),
+            Err(err) if err.kind() == clap::error::ErrorKind::UnknownArgument
+        ));
+    }
+
+    #[cfg(guest_arch = "aarch64")]
+    #[test]
+    fn guest_memfd_in_place_is_opt_in_without_changing_cca_defaults() {
+        for enabled in [false, true] {
+            let mut args = vec!["openvmm", "--isolation", "cca"];
+            if enabled {
+                args.push("--guest-memfd-in-place");
+            }
+            let opt = Options::try_parse_from(args).unwrap();
+            assert_eq!(opt.guest_memfd_in_place, enabled);
+            opt.validate_isolation_options().unwrap();
+        }
+    }
+
+    #[test]
     fn test_isolation_options_allow_vbs_hugepages() {
         let opt = Options::try_parse_from([
             "openvmm",
@@ -5834,6 +5908,69 @@ mod tests {
         .unwrap();
 
         opt.validate_isolation_options().unwrap();
+    }
+
+    #[cfg(guest_arch = "aarch64")]
+    #[test]
+    fn test_isolation_options_reject_cca_hugepages() {
+        for args in [
+            vec![
+                "openvmm",
+                "--isolation",
+                "cca",
+                "--memory",
+                "size=1G,hugepages=on",
+            ],
+            vec![
+                "openvmm",
+                "--isolation",
+                "cca",
+                "--numa",
+                "size=1G,hugepages=on",
+            ],
+        ] {
+            let opt = Options::try_parse_from(args).unwrap();
+            assert_eq!(
+                opt.validate_isolation_options().unwrap_err().to_string(),
+                "CCA isolation currently does not support hugetlb memory"
+            );
+        }
+    }
+
+    #[cfg(guest_arch = "aarch64")]
+    #[test]
+    fn test_isolation_options_reject_cca_private_memory() {
+        let opt = Options::try_parse_from([
+            "openvmm",
+            "--isolation",
+            "cca",
+            "--memory",
+            "size=1G,shared=off",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            opt.validate_isolation_options().unwrap_err().to_string(),
+            "CCA isolation requires shared userspace memory backing"
+        );
+    }
+
+    #[cfg(all(guest_arch = "aarch64", target_os = "linux"))]
+    #[test]
+    fn test_isolation_options_reject_cca_vhost_user() {
+        let opt = Options::try_parse_from([
+            "openvmm",
+            "--isolation",
+            "cca",
+            "--vhost-user",
+            "/tmp/vhost.sock,type=blk,pcie_port=port0",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            opt.validate_isolation_options().unwrap_err().to_string(),
+            "CCA isolation currently does not support vhost-user devices"
+        );
     }
 
     #[test]

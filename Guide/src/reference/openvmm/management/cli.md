@@ -89,8 +89,8 @@ describes the source definitions.
   --hypervisor kvm
   ```
 * `--isolation <MODE>`: Enable a confidential or isolated VM mode.
-  Supported modes include `vbs` and, for `x86_64` guests on KVM or MSHV,
-  `snp`.
+  Supported modes include `vbs`, `snp` for `x86_64` guests on KVM or MSHV,
+  and `cca` for `aarch64` KVM guests.
 
   SNP support is currently limited to Linux direct boot and is intended for
   bring-up. It supports either loader-based kernel/initrd boot or an SNP IGVM
@@ -122,6 +122,34 @@ describes the source definitions.
   SNP GHCB CPUID requests so they are forwarded to OpenVMM. The default is
   offloading enabled. This diagnostic parameter is meaningful only with
   `--isolation snp`.
+
+  CCA support requires device-tree Linux direct boot with shared userspace RAM
+  backing. It does not support Hyper-V enlightenments, VTL2, VMBus, hugetlb
+  memory, assigned devices, vhost-user devices, PCIe hotplug, or CXL.
+* `--guest-memfd-in-place`: Explicitly select experimental Arm KVM CCA
+  guest_memfd in-place memory mode.
+  Requires `--isolation cca` and device-tree Linux direct boot. It supports
+  the same in-process Virtio devices on PCIe as separate backing, plus PL011
+  serial. The default is off: CCA
+  continues to use the v15 separate-backing path unless you set this flag.
+  The host must use 4 KiB pages; 16 KiB and 64 KiB hosts are not supported.
+  The host must support mmap and initially shared guestmemfd, guestmemfd
+  private attributes, `KVM_SET_MEMORY_ATTRIBUTES2`, and
+  `KVM_ARM_RMI_INIT_RIPAS`. Missing support or a conversion failure stops
+  the VM; OpenVMM does not detect an ABI and switch modes.
+
+  RAM and its host-visible aliases use the same partition-owned guestmemfd.
+  Private pages are not readable through these aliases. This mode does not
+  support snapshots, restore, restart, assigned devices, or host DMA sharing.
+  Virtio uses fault-contained copies instead of raw page-lock fast paths.
+  All other CCA restrictions still apply. This is not a trusted device
+  assignment option.
+
+  ```bash
+  openvmm --hypervisor kvm --isolation cca --guest-memfd-in-place \
+    --kernel path/to/Image --initrd path/to/initrd --device-tree \
+    --memory size=1G,shared=on,thp=off --no-vmbus
+  ```
 * `--nested-virt`: Expose hardware virtualization (VMX/SVM) to the guest so it
   can run its own hypervisor (Hyper-V, KVM, etc.). Only supported on `x86_64`,
   and only by backends that support nested virtualization (currently WHP,

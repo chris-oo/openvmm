@@ -142,13 +142,47 @@ memory or explicit huge pages.
 
 ## Partition-supplied RAM on Linux
 
-The prototype partition's `prepare_ram_backing` method can return a
+Before the memory manager allocates RAM, OpenVMM calls the prototype
+partition's `prepare_ram_backing` method. A backend can return a
 [`MappableRamBacking`](https://openvmm.dev/rustdoc/linux/virt/struct.MappableRamBacking.html)
 to supply its own shared-writable file. The file packs the memory layout's
 RAM ranges in order, followed by VTL2 RAM, without space for GPA holes.
+OpenVMM imports each range at its recorded file offset and preserves the
+node's memory policy. A supplied file cannot be combined with restored
+backing, anonymous private memory or explicit huge pages.
 
-Returning no file leaves ordinary userspace RAM allocation unchanged.
-Supplied offset imports, including offset zero, cannot be exported for restart.
+Returning no file leaves ordinary userspace RAM allocation unchanged. The
+Arm KVM backend's default CCA v15 mode retains a private-only guestmemfd and
+uses separate userspace RAM. The experimental
+[`--guest-memfd-in-place`](../../openvmm/management/cli.md) mode instead
+returns a clone of an mmap-enabled, initially shared guestmemfd. The
+partition retains the original file. Loader writes and host-visible shared
+aliases refer to that same file, including across NUMA ranges.
+
+In-place guest_memfd requires 4 KiB host pages. Preparation rejects
+other page sizes before creating guestmemfd or exporting RAM backing;
+imports are not rounded up.
+
+Before conversion, OpenVMM copies every initial import into separate aligned
+storage for Realm population and measurement. It then populates the imports
+and initializes RIPAS for each RAM slot before vCPU entry. In-place
+conversions never discard either alias. Failures stop the partition; there
+is no fallback to the v15 ABI. All host views are eagerly mapped, so access
+to a revoked private page fails instead of retrying a lazy mapping. Supplied
+offset imports, including offset zero, cannot be exported for restart.
+
+Runtime conversion tracks actual guestmemfd visibility under the partition
+memory lock and changes only subranges whose attributes differ. A request
+that already matches does not convert backing or wait for a completion exit.
+Repeated identical shared no-op faults without an intervening guest exit or
+different request cannot be distinguished from backing failures and stop the
+VM. Interrupts and stop/re-entry do not clear this guard.
+
+In-place backing uses the same CCA in-process Virtio PCIe device policy as
+separate backing. Revocable host views do not support raw page locks or
+file-based DMA sharing: device backends must use fault-contained copying
+paths instead of zero-copy pointers that could become inaccessible during
+conversion. This does not enable trusted device assignment or host DMA.
 
 The shared/private backing choice on this page is not the same as Realm
 page visibility. Sharing a file handle does not establish permission to read
