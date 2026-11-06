@@ -3,6 +3,8 @@
 
 //! Licensed Arm FVP configuration, guest bootstrap, and checked VM lifecycle.
 
+#[cfg(target_os = "linux")]
+mod backend;
 mod cca_init;
 #[cfg(target_os = "linux")]
 pub mod lifecycle;
@@ -16,6 +18,8 @@ pub mod runtime;
 #[cfg(target_os = "linux")]
 pub mod staging;
 
+#[cfg(target_os = "linux")]
+pub use backend::*;
 pub use cca_init::CcaHostNetwork;
 pub use cca_init::CcaInitConfig;
 pub use cca_init::prepare_cca_initrd;

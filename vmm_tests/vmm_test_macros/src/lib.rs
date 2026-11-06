@@ -64,6 +64,7 @@ enum Vmm {
     OpenVmm,
     HyperV,
     Qemu,
+    Fvp,
 }
 
 /// Host CPU vendor that a test can be restricted to via macro overrides.
@@ -150,6 +151,7 @@ impl ResolvedConfig {
             Vmm::OpenVmm => "openvmm",
             Vmm::HyperV => "hyperv",
             Vmm::Qemu => "qemu",
+            Vmm::Fvp => "fvp",
         };
 
         let firmware_prefix = match &self.firmware {
@@ -324,7 +326,7 @@ impl Parse for ArgsWithOverrides {
                         overrides.add_capability(capability.span, capability.name)?;
                     }
                 }
-                "openvmm" | "hyperv" | "qemu" => {
+                "openvmm" | "hyperv" | "qemu" | "fvp" => {
                     if position != 0 {
                         return Err(Error::new(
                             ident.span(),
@@ -335,6 +337,7 @@ impl Parse for ArgsWithOverrides {
                         "openvmm" => Some(Vmm::OpenVmm),
                         "hyperv" => Some(Vmm::HyperV),
                         "qemu" => Some(Vmm::Qemu),
+                        "fvp" => Some(Vmm::Fvp),
                         _ => unreachable!(),
                     };
                 }
@@ -485,6 +488,9 @@ impl Config {
                 (Some(Vmm::Qemu), Some(Vmm::Qemu))
                 | (Some(Vmm::Qemu), None)
                 | (None, Some(Vmm::Qemu)) => Vmm::Qemu,
+                (Some(Vmm::Fvp), Some(Vmm::Fvp))
+                | (Some(Vmm::Fvp), None)
+                | (None, Some(Vmm::Fvp)) => Vmm::Fvp,
                 (None, None) => {
                     return Err(Error::new(self.span, "vmm must be specified"));
                 }
@@ -661,6 +667,8 @@ fn parse_config(input: ParseStream<'_>, word: Ident) -> syn::Result<Config> {
         (Some(Vmm::OpenVmm), remainder)
     } else if let Some(remainder) = word_string.strip_prefix("qemu_") {
         (Some(Vmm::Qemu), remainder)
+    } else if let Some(remainder) = word_string.strip_prefix("fvp_") {
+        (Some(Vmm::Fvp), remainder)
     } else {
         (None, word_string.as_str())
     };
@@ -1099,6 +1107,7 @@ fn parse_nested(input: ParseStream<'_>) -> syn::Result<MaybeNestedConfig> {
 /// - openvmm
 /// - hyperv
 /// - qemu
+/// - fvp (Linux host, AArch64 Linux-direct L1)
 ///
 /// Valid architectures are:
 /// - x64
@@ -1392,12 +1401,17 @@ fn make_vmm_test_config(
         ),
         Vmm::OpenVmm => (quote!(), quote!(::petri::openvmm::OpenVmmPetriBackend)),
         Vmm::Qemu => (quote!(), quote!(::petri::qemu::QemuPetriBackend)),
+        Vmm::Fvp => (
+            quote!(#[cfg(target_os = "linux")]),
+            quote!(::petri::fvp::FvpPetriBackend),
+        ),
     };
 
     let remote_access = match config.vmm {
         Vmm::HyperV => quote!(::petri::RemoteAccess::LocalOnly),
         Vmm::OpenVmm => quote!(::petri::RemoteAccess::Allow),
         Vmm::Qemu => quote!(::petri::RemoteAccess::LocalOnly),
+        Vmm::Fvp => quote!(::petri::RemoteAccess::LocalOnly),
     };
 
     let petri_vm_config =
@@ -1482,6 +1496,14 @@ fn build_requirements(
 
     let is_hyperv = resolved_vmm == Vmm::HyperV;
 
+    if resolved_vmm == Vmm::Fvp {
+        requirement_expr = quote!(#requirement_expr.and(
+            ::petri::requirements::TestRequirement::VmmAvailable(
+                ::petri::requirements::VmmType::Fvp
+            )
+        ));
+    }
+
     if is_hyperv && is_vbs {
         requirement_expr = quote!(#requirement_expr.and(
             ::petri::requirements::TestRequirement::ExecutionEnvironment(
@@ -1505,6 +1527,7 @@ fn build_requirements(
             Vmm::OpenVmm => quote!(::petri::requirements::VmmType::OpenVmm),
             Vmm::HyperV => quote!(::petri::requirements::VmmType::HyperV),
             Vmm::Qemu => quote!(::petri::requirements::VmmType::Qemu),
+            Vmm::Fvp => quote!(::petri::requirements::VmmType::Fvp),
         };
         requirement_expr = quote!(#requirement_expr.and(
             ::petri::requirements::TestRequirement::RequiresCapability {

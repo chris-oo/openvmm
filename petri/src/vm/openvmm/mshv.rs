@@ -244,14 +244,16 @@ mod tests {
         fs_err::write(&prepared, b"prepared initrd")?;
         pal_async::DefaultPool::run_with(async |driver| {
             // Legacy serial bootstrap requires 16550 wait-for-RTS, unavailable on PL011.
-            for (arch, external, prebuilt) in [
-                (MachineArch::X86_64, false, false),
-                (MachineArch::X86_64, false, true),
-                (MachineArch::X86_64, true, false),
-                (MachineArch::X86_64, true, true),
-                (MachineArch::Aarch64, false, true),
-                (MachineArch::Aarch64, true, false),
-                (MachineArch::Aarch64, true, true),
+            for (arch, external, prebuilt, agent_disabled) in [
+                (MachineArch::X86_64, false, false, false),
+                (MachineArch::X86_64, false, true, false),
+                (MachineArch::X86_64, true, false, false),
+                (MachineArch::X86_64, true, true, false),
+                (MachineArch::Aarch64, false, true, false),
+                (MachineArch::Aarch64, true, false, false),
+                (MachineArch::Aarch64, true, true, false),
+                (MachineArch::X86_64, false, false, true),
+                (MachineArch::Aarch64, false, false, true),
             ] {
                 let mut builder = PetriVmBuilder::minimal(
                     "direct",
@@ -271,6 +273,7 @@ mod tests {
                     &driver,
                 )?
                 .with_serial_output();
+                builder.agent_disabled = agent_disabled;
                 if external {
                     builder = builder.with_external_pipette();
                 }
@@ -283,7 +286,7 @@ mod tests {
                 let backend = configure(builder).await?;
                 assert_eq!(
                     backend.resources.linux_direct_serial_agent.is_some(),
-                    !external && !prebuilt
+                    !external && !prebuilt && !agent_disabled
                 );
                 let openvmm_defs::config::LoadMode::Linux {
                     initrd: Some(mut file),

@@ -184,6 +184,13 @@ impl PetriVmConfigOpenVmm {
             openvmm_path,
             pipette_rdinit_param: prebuilt_initrd.as_ref().map(|x| x.rdinit_param.clone()),
             external_pipette: properties.external_pipette,
+            needs_serial_agent: needs_linux_serial_agent(
+                firmware.is_linux_direct(),
+                properties.uses_pipette_as_init || prebuilt_initrd.is_some(),
+                !properties.agent_disabled,
+            ) && !properties.external_pipette
+                && !properties.use_virtio_console
+                && !firmware.is_isolated_without_paravisor(),
             enable_serial: properties.enable_serial,
             use_virtio_console: properties.use_virtio_console,
             use_virtio_vsock: properties.use_virtio_vsock,
@@ -398,10 +405,7 @@ impl PetriVmConfigOpenVmm {
             // Set so that we don't pull serial data until the guest is
             // ready. Otherwise, Linux will drop the input serial data
             // on the floor during boot.
-            if matches!(firmware, Firmware::LinuxDirect { .. })
-                && prebuilt_initrd.is_none()
-                && !properties.external_pipette
-            {
+            if matches!(firmware, Firmware::LinuxDirect { .. }) && setup.needs_serial_agent {
                 chipset = chipset.with_serial_wait_for_rts();
             }
         }
@@ -833,6 +837,14 @@ impl PetriVmConfigOpenVmm {
     }
 }
 
+fn needs_linux_serial_agent(
+    linux_direct: bool,
+    pipette_as_init: bool,
+    using_pipette: bool,
+) -> bool {
+    linux_direct && using_pipette && !pipette_as_init
+}
+
 struct PetriVmConfigSetupCore<'a> {
     arch: MachineArch,
     firmware: &'a Firmware,
@@ -846,6 +858,7 @@ struct PetriVmConfigSetupCore<'a> {
     openvmm_path: &'a ResolvedArtifact,
     pipette_rdinit_param: Option<String>,
     external_pipette: bool,
+    needs_serial_agent: bool,
     enable_serial: bool,
     use_virtio_console: bool,
     use_virtio_vsock: bool,
@@ -900,12 +913,7 @@ impl PetriVmConfigSetupCore<'_> {
             None
         };
 
-        if self.firmware.is_linux_direct()
-            && !self.firmware.is_isolated_without_paravisor()
-            && !self.external_pipette
-            && !self.use_virtio_console
-            && self.pipette_rdinit_param.is_none()
-        {
+        if self.needs_serial_agent {
             // Non-pipette-as-init Linux direct: create serial1 and a serial
             // agent so we can send shell commands to launch pipette.
             let (serial1_host, serial1) = self.create_serial_stream()?;
@@ -1639,4 +1647,24 @@ async fn vmbus_storage_controllers_to_openvmm(
     }
 
     Ok((vmbus_devices, vpci_devices))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    #[test]
+    fn serial_handshake_is_only_for_disk_based_linux_agents() {
+        for linux_direct in [false, true] {
+            for pipette_as_init in [false, true] {
+                for using_pipette in [false, true] {
+                    assert_eq!(
+                        needs_linux_serial_agent(linux_direct, pipette_as_init, using_pipette),
+                        linux_direct && !pipette_as_init && using_pipette,
+                    );
+                }
+            }
+        }
+    }
 }

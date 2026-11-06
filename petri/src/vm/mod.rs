@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-/// Licensed Arm FVP configuration and lifecycle.
+/// Licensed Arm FVP CCA host management.
 pub mod fvp;
 /// Hyper-V VM management
 #[cfg(windows)]
@@ -241,14 +241,19 @@ pub struct PetriVmBuilder<T: PetriVmmBackend> {
     no_hv: bool,
     // Capture the VM's inspect output on test failure.
     capture_inspect_on_failure: bool,
-    watchdog_timeout: Option<Duration>,
+    watchdog_timeout: Option<Option<Duration>>,
     external_pipette: bool,
+    agent_disabled: bool,
 
     nested_test: Option<ResolvedNestedTestDeps>,
 }
 
 /// How long to wait on a single inspect before giving up on it.
 const INSPECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn shutdown_ic_configured(supports_vmbus: bool, no_vmbus: bool, minimal_mode: bool) -> bool {
+    supports_vmbus && !no_vmbus && !minimal_mode
+}
 
 impl<T: PetriVmmBackend> Debug for PetriVmBuilder<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -370,6 +375,8 @@ pub struct PetriVmProperties {
     pub using_vtl0_pipette: bool,
     /// Pipette is supplied and started by the guest rather than Petri.
     pub external_pipette: bool,
+    /// The caller selected execution without Petri's agent startup.
+    pub agent_disabled: bool,
     /// Whether this VM is using VPCI
     pub using_vpci: bool,
     /// The OS flavor of the guest in the VM
@@ -393,6 +400,11 @@ pub struct PetriVmProperties {
     pub no_vmbus: bool,
     /// The hypervisor (HV#1) enlightenments are entirely disabled
     pub no_hv: bool,
+    /// Resolved nested runner that snapshotting backends must include explicitly.
+    /// The VM retains its temporary source until teardown.
+    pub nested_test_binary: Option<PathBuf>,
+    /// Resolved inputs required by the selected nested test, excluding its runner.
+    pub nested_test_artifacts: Vec<PathBuf>,
 }
 
 /// VM configuration that can be changed after the VM is created
@@ -426,6 +438,8 @@ pub trait PetriVmmBackend: Debug {
     type VmRuntime: PetriVmRuntime;
 
     /// Whether the backend supports VMBus.
+    ///
+    /// Backends without VMBus start with HV#1 enlightenments disabled.
     const SUPPORTS_VMBUS: bool;
 
     /// Whether the backend supports full CPU emulation
@@ -436,6 +450,9 @@ pub trait PetriVmmBackend: Debug {
 
     /// Whether this backend supports sharing host directories with Linux guests.
     const SUPPORTS_FILE_SHARING: bool = false;
+
+    /// Whether the backend mounts its shares before publishing the agent.
+    const MOUNTS_GUEST_SHARES: bool = false;
 
     /// Whether this guest can use the backend's Linux 9p shares.
     fn supports_file_sharing(firmware: &Firmware) -> bool {
@@ -528,6 +545,16 @@ const NESTED_TEST_BINARY: &str = "nested_test";
 const NESTED_TEMP_DIR: &str = "temp";
 const NESTED_CONTENT_TAG: &str = "testcontent";
 const NESTED_IMAGES_TAG: &str = "testimages";
+
+/// A nested test process exited with a confirmed unsuccessful status.
+///
+/// Other errors from `run_nested_test` do not establish process completion.
+#[derive(Debug, thiserror::Error)]
+#[error("nested test exited with status {status}: {stderr}")]
+pub struct NestedTestFailure {
+    status: String,
+    stderr: String,
+}
 
 /// A constructed Petri VM
 pub struct PetriVm<T: PetriVmmBackend> {
@@ -755,13 +782,19 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
             no_vmbus: !T::SUPPORTS_VMBUS || isolated_without_paravisor,
             no_hv: false,
             capture_inspect_on_failure: false,
-            watchdog_timeout: Some(Duration::from_mins(10)),
+            watchdog_timeout: None,
             external_pipette: false,
+            agent_disabled: false,
 
             nested_test: artifacts
                 .nested_test
-                .map(|t| t.resolve(!supports_file_sharing))
+                .map(|t| t.resolve(!supports_file_sharing || T::MOUNTS_GUEST_SHARES))
                 .transpose()?,
+        };
+        let builder = if builder.no_vmbus {
+            builder.with_no_vmbus()
+        } else {
+            builder
         };
         Ok(if external_pipette {
             builder.with_external_pipette()
@@ -829,7 +862,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
     /// Set the diagnostic watchdog deadline. A standalone runner that owns its
     /// own cancellation policy can disable the test watchdog with `None`.
     pub fn with_watchdog_timeout(mut self, timeout: Option<Duration>) -> Self {
-        self.watchdog_timeout = timeout;
+        self.watchdog_timeout = Some(timeout);
         self
     }
 
@@ -985,14 +1018,14 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
 
     /// Disable VMBus entirely.
     ///
-    /// This removes all VMBus storage controllers. For Linux guests,
-    /// virtio-vsock is used for pipette communication. For Windows guests,
+    /// This removes all VMBus storage controllers. For Linux guests with
+    /// pipette enabled, virtio-vsock is used for communication. For Windows guests,
     /// the caller must also configure TCP pipette transport via
     /// `modify_backend(|b| b.with_tcp_pipette_nic(port, mac_address))`. The
     /// guest must boot from a non-VMBus device (e.g. PCIe NVMe).
     pub fn with_no_vmbus(mut self) -> Self {
         self.no_vmbus = true;
-        if self.config.firmware.os_flavor() != OsFlavor::Windows {
+        if self.config.firmware.os_flavor() != OsFlavor::Windows && self.using_vtl0_pipette() {
             self.use_virtio_vsock = true;
         }
         self.config.vmbus_storage_controllers.clear();
@@ -1329,6 +1362,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
             is_linux_direct: self.config.firmware.is_linux_direct(),
             using_vtl0_pipette: self.using_vtl0_pipette(),
             external_pipette: self.external_pipette,
+            agent_disabled: self.agent_disabled,
             using_vpci: self.boot_device_type.requires_vpci_boot(),
             os_flavor: self.config.firmware.os_flavor(),
             minimal_mode: self.minimal_mode,
@@ -1341,6 +1375,15 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
             vhost_vsock_guest_cid: self.vhost_vsock_guest_cid,
             no_vmbus: self.no_vmbus,
             no_hv: self.no_hv,
+            nested_test_binary: self
+                .nested_test
+                .as_ref()
+                .map(|nested| nested.test_binary.to_path_buf()),
+            nested_test_artifacts: self
+                .nested_test
+                .iter()
+                .flat_map(|nested| nested.artifacts.iter().map(|(_, path)| path.clone()))
+                .collect(),
         }
     }
 
@@ -1368,7 +1411,8 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
     /// Build and run the VM, then wait for the VM to emit the expected boot
     /// event (if configured). Does not configure and start pipette. Should
     /// only be used for testing platforms that pipette does not support.
-    pub async fn run_without_agent(self) -> anyhow::Result<PetriVm<T>> {
+    pub async fn run_without_agent(mut self) -> anyhow::Result<PetriVm<T>> {
+        self.agent_disabled = true;
         self.run_core().await
     }
 
@@ -1480,10 +1524,11 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
         resources: &PetriVmResources,
         runtime: &mut T::VmRuntime,
         enable_screenshots: bool,
-        watchdog_timeout: Option<Duration>,
+        watchdog_timeout: Option<Option<Duration>>,
     ) -> anyhow::Result<Vec<Task<()>>> {
         let mut tasks = Vec::new();
 
+        let watchdog_timeout = watchdog_timeout.unwrap_or_else(|| Some(runtime.watchdog_timeout()));
         if let Some(timeout) = watchdog_timeout {
             // The panic unwinds out of the task pool, which drops the VM and
             // triggers the same inspect capture as any other failure.
@@ -2397,9 +2442,17 @@ impl<T: PetriVmmBackend> PetriVm<T> {
         //
         // This is a no-op when the shutdown IC is not configured (e.g.,
         // no VMBus or minimal mode).
-        self.runtime.wait_for_enlightened_shutdown_ready().await?;
+        if shutdown_ic_configured(
+            T::SUPPORTS_VMBUS,
+            self.properties.no_vmbus,
+            self.properties.minimal_mode,
+        ) {
+            self.runtime.wait_for_enlightened_shutdown_ready().await?;
+        }
         let client = self.runtime.wait_for_agent(false).await?;
-        self.mount_guest_shares(&client).await?;
+        if !T::MOUNTS_GUEST_SHARES {
+            self.mount_guest_shares(&client).await?;
+        }
         Ok(client)
     }
 
@@ -2509,6 +2562,14 @@ impl<T: PetriVmmBackend> PetriVm<T> {
     /// Wait for the Hyper-V shutdown IC to be ready and use it to instruct
     /// the guest to shutdown.
     pub async fn send_enlightened_shutdown(&mut self, kind: ShutdownKind) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            shutdown_ic_configured(
+                T::SUPPORTS_VMBUS,
+                self.properties.no_vmbus,
+                self.properties.minimal_mode,
+            ),
+            "Hyper-V shutdown IC is not configured for this VM"
+        );
         tracing::info!("Waiting for enlightened shutdown to be ready");
         self.runtime.wait_for_enlightened_shutdown_ready().await?;
 
@@ -2747,6 +2808,12 @@ impl<T: PetriVmmBackend> PetriVm<T> {
             .detach();
 
         let output = child.wait_with_output().await?;
+        let exit_code = output
+            .status
+            .code()
+            .or_else(|| output.status.signal().map(|signal| 128 + signal))
+            .context("nested test returned no exit status")?;
+        self.runtime.record_nested_test_exit(exit_code)?;
 
         // copy the files if we aren't sharing the results folder directly
         if !self.guest_shares.contains_key(NESTED_CONTENT_TAG) {
@@ -2769,11 +2836,11 @@ impl<T: PetriVmmBackend> PetriVm<T> {
         }
 
         if !output.status.success() {
-            anyhow::bail!(
-                "nested test exited with status {}: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
-            );
+            return Err(NestedTestFailure {
+                status: output.status.to_string(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            }
+            .into());
         }
 
         Ok(())
@@ -2787,6 +2854,16 @@ pub trait PetriVmRuntime: Send + Sync + 'static {
     type VmInspector: PetriVmInspector;
     /// Interface for accessing the framebuffer
     type VmFramebufferAccess: PetriVmFramebufferAccess;
+
+    /// Whole-lifecycle watchdog budget, including backend startup and cleanup.
+    fn watchdog_timeout(&self) -> Duration {
+        Duration::from_mins(10)
+    }
+
+    /// Record confirmed nested process completion for backend lifecycle reports.
+    fn record_nested_test_exit(&self, _exit_code: i32) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     /// Cleanly tear down the VM immediately.
     async fn teardown(self) -> anyhow::Result<()>;
@@ -4599,6 +4676,44 @@ mod tests {
     use crate::VmbusStorageController;
     use crate::VmbusStorageType;
     use crate::Vtl;
+    mod nested_completion {
+        use super::*;
+        use test_with_tracing::test;
+
+        #[test]
+        fn nested_exit_failure_distinguishes_confirmed_completion() {
+            let failure = anyhow::Error::new(NestedTestFailure {
+                status: "1".into(),
+                stderr: "inner test failed".into(),
+            })
+            .context("running nested test");
+            assert!(failure.is::<NestedTestFailure>());
+            assert!(format!("{failure:#}").contains("inner test failed"));
+            assert!(!anyhow::anyhow!("guest connection closed").is::<NestedTestFailure>());
+        }
+
+        #[test]
+        fn shutdown_ic_readiness_requires_backend_and_configured_devices() {
+            assert!(shutdown_ic_configured(true, false, false));
+            assert!(!shutdown_ic_configured(false, false, false));
+            assert!(!shutdown_ic_configured(true, true, false));
+            assert!(!shutdown_ic_configured(true, false, true));
+            #[cfg(target_os = "linux")]
+            assert!(!shutdown_ic_configured(
+                fvp::FvpPetriBackend::SUPPORTS_VMBUS,
+                false,
+                false,
+            ));
+        }
+
+        #[test]
+        fn default_backend_watchdog_remains_ten_minutes() {
+            assert_eq!(
+                TestRuntime(TestInspectBehavior::Success).watchdog_timeout(),
+                Duration::from_mins(10)
+            );
+        }
+    }
 
     #[derive(Clone, Copy)]
     enum TestInspectBehavior {
