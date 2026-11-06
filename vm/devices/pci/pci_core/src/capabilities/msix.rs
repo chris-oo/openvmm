@@ -140,6 +140,7 @@ struct MsiInterruptInner {
     route: Option<MsiRoute>,
     pending: bool,
     enabled: bool,
+    released: bool,
     #[inspect(hex)]
     address: u64,
     #[inspect(hex)]
@@ -151,6 +152,7 @@ impl Debug for MsiInterruptInner {
         f.debug_struct("MsiInterruptInner")
             .field("pending", &self.pending)
             .field("enabled", &self.enabled)
+            .field("released", &self.released)
             .field("address", &self.address)
             .field("data", &self.data)
             .field("has_route", &self.route.is_some())
@@ -175,6 +177,7 @@ impl MsiInterrupt {
             route: None,
             pending: false,
             enabled: false,
+            released: false,
             address: 0,
             data: 0,
         })))
@@ -182,6 +185,9 @@ impl MsiInterrupt {
 
     pub fn enable(&self, address: u64, data: u32, set_pending: bool) {
         let mut state = self.0.lock();
+        if state.released {
+            return;
+        }
         state.pending |= set_pending;
         state.address = address;
         state.data = data;
@@ -203,6 +209,17 @@ impl MsiInterrupt {
         state.enabled = false;
         if let Some(route) = &state.route {
             route.disable();
+        }
+    }
+
+    fn release_route(&self) {
+        let mut state = self.0.lock();
+        state.released = true;
+        state.enabled = false;
+        state.pending = false;
+        if let Some(route) = state.route.take() {
+            route.disable();
+            drop(route);
         }
     }
 
@@ -228,6 +245,9 @@ struct MsiInterruptTarget(Arc<Mutex<MsiInterruptInner>>);
 impl InterruptTarget for MsiInterruptTarget {
     fn deliver(&self) {
         let mut state = self.0.lock();
+        if state.released {
+            return;
+        }
         if state.enabled {
             state.signal_msi();
         } else {
@@ -237,6 +257,9 @@ impl InterruptTarget for MsiInterruptTarget {
 
     fn event(&self) -> Option<Arc<Event>> {
         let mut state = self.0.lock();
+        if state.released {
+            return None;
+        }
         if let Some(route) = &state.route {
             return Some(Arc::new(route.event().clone()));
         }
@@ -368,6 +391,23 @@ pub struct MsixEmulator {
 }
 
 impl MsixEmulator {
+    /// Permanently release all kernel route owners, including routes reachable
+    /// through cloned interrupt targets or cloned MSI-X capability state.
+    ///
+    /// Stop the physical interrupt source first. This synchronously runs the
+    /// route destructors and prevents later aliases from recreating routes.
+    /// It does not itself prove backend success: native assignment callers must
+    /// then check their VM's interrupt-route failure latch before releasing the
+    /// frontend owner. Do not use this operation for a resumable device stop.
+    pub fn release_interrupt_routes(&self) {
+        let mut state = self.state.lock();
+        state.enabled = false;
+        for vector in &mut state.vectors {
+            vector.state.is_pending = false;
+            vector.msi.release_route();
+        }
+    }
+
     /// Create a new [`MsixEmulator`] instance, along with with its associated
     /// [`PciCapability`] structure.
     ///
@@ -621,6 +661,7 @@ mod tests {
     use crate::test_helpers::TestPciInterruptController;
     use crate::test_helpers::read_cap_u32;
     use crate::test_helpers::write_cap_u32;
+    use test_with_tracing::test;
 
     #[test]
     fn msix_check() {
@@ -687,12 +728,19 @@ mod tests {
     enum RouteCall {
         SetMsi { address: u64, data: u32 },
         ClearMsi,
+        Dropped,
     }
 
     /// Mock IrqFdRoute implementation that records calls.
     struct MockIrqFdRoute {
         event: Event,
         calls: Arc<Mutex<Vec<RouteCall>>>,
+    }
+
+    impl Drop for MockIrqFdRoute {
+        fn drop(&mut self) {
+            self.calls.lock().push(RouteCall::Dropped);
+        }
     }
 
     impl vmcore::irqfd::IrqFdRoute for MockIrqFdRoute {
@@ -707,6 +755,33 @@ mod tests {
         fn disable(&self) {
             self.calls.lock().push(RouteCall::ClearMsi);
         }
+    }
+
+    #[test]
+    fn permanent_route_release_reaches_backend_destructors_despite_interrupt_aliases() {
+        let (irqfd, calls) = mock_irqfd(1);
+        let msi_conn = MsiConnection::new();
+        msi_conn.connect_irqfd(irqfd);
+        let (mut msix, mut cap) = MsixEmulator::new(2, 1, &msi_conn.target());
+        let alias = msix.clone();
+        let interrupt = msix.interrupt(0).unwrap();
+        let event = interrupt.event().unwrap().clone();
+        write_cap_u32(&mut cap, 0, 0x8000_0000);
+        msix.write_u32(0, 0xfee0_0000);
+        msix.write_u32(8, 0x42);
+        msix.write_u32(12, 0);
+        calls[0].lock().clear();
+
+        msix.release_interrupt_routes();
+        assert_eq!(*calls[0].lock(), [RouteCall::ClearMsi, RouteCall::Dropped]);
+        assert!(alias.interrupt(0).unwrap().event().is_none());
+        let after_release = calls[0].lock().clone();
+        cap.reset();
+        write_cap_u32(&mut cap, 0, 0x8000_0000);
+        msix.write_u32(12, 0);
+        alias.release_interrupt_routes();
+        assert_eq!(*calls[0].lock(), after_release);
+        drop(event);
     }
 
     /// Build a mock IrqFd and shared call logs.
