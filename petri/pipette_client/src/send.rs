@@ -11,6 +11,7 @@ use mesh::rpc::RpcSend;
 use pipette_protocol::PipetteRequest;
 use std::time::Duration;
 
+#[derive(Clone)]
 pub(crate) struct PipetteSender(mesh::Sender<PipetteRequest>);
 
 impl PipetteSender {
