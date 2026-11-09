@@ -23,6 +23,30 @@ pub(crate) async fn vm_host(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyh
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) async fn vm_host_fvp_basic(
+    config: PetriVmBuilder<petri::fvp::FvpPetriBackend>,
+) -> anyhow::Result<()> {
+    let (vm, agent) = config.with_nested_virt().run().await?;
+    let nested = vm.run_nested_test(&agent, Default::default()).await;
+    let completed = nested.is_ok()
+        || nested
+            .as_ref()
+            .is_err_and(|error| error.is::<petri::NestedTestFailure>());
+    let shutdown = if completed {
+        vm.wait_for_clean_teardown().await
+    } else {
+        vm.teardown().await
+    };
+    match (nested, shutdown) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(shutdown)) => {
+            Err(error.context(format!("FVP L1 cleanup also failed: {shutdown:#}")))
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 #[vmm_test_macros::vmm_test(
     qemu_linux_direct_aarch64,
     openvmm_linux_direct_x64,
@@ -90,11 +114,6 @@ async fn run_fvp_nested(
     config: PetriVmBuilder<petri::fvp::FvpPetriBackend>,
     realm_vfio: bool,
 ) -> anyhow::Result<()> {
-    let payload_mode = match std::env::var("PETRI_FVP_PAYLOAD") {
-        Ok(value) => Some(value),
-        Err(std::env::VarError::NotPresent) => None,
-        Err(error) => return Err(error.into()),
-    };
     let (vm, agent) = config.with_nested_virt().run().await?;
     let mut env = std::collections::BTreeMap::from([(
         "PETRI_CAPABILITIES".into(),
@@ -105,9 +124,6 @@ async fn run_fvp_nested(
         }
         .into(),
     )]);
-    if let Some(mode) = payload_mode {
-        env.insert("PETRI_FVP_PAYLOAD".into(), mode);
-    }
     if realm_vfio {
         env.insert(
             "PETRI_VFIO_BDF_CCA_REALM_VFIO".into(),

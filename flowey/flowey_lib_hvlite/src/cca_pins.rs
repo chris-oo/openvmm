@@ -1,18 +1,16 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Source and runtime identities for the qualified CCA v15 platform.
+//! Current CCA kernel and diagnostic platform identities.
 
 pub use petri_artifacts_vmm_test::cca_payload::BASE_INITRD_SHA256;
 pub use petri_artifacts_vmm_test::cca_payload::INITRD_ARCHIVE_SHA256;
-pub use petri_artifacts_vmm_test::cca_payload::KERNEL_ARCHIVE_SHA256;
 pub use petri_artifacts_vmm_test::cca_payload::LINUX_IMAGE_SHA256;
 pub use petri_artifacts_vmm_test::cca_payload::OPENVMM_DEPS_RELEASE;
 
-pub const LINUX_REVISION: &str = "4ddbc65b5b408c37605110166a8da19f4dd0e180";
-pub const LINUX_RELEASE: &str = "7.2.0-rc1";
-pub const LINUX_CONFIG_SHA256: &str =
-    "51fe0612694c51f19b548cc4efe5ed8bc1d486e3f7299f158d01bdd3e43afdea";
+pub use petri_artifacts_vmm_test::cca_payload::LINUX_CONFIG_SHA256;
+pub use petri_artifacts_vmm_test::cca_payload::LINUX_RELEASE;
+pub use petri_artifacts_vmm_test::cca_payload::LINUX_REVISION;
 pub const TF_RMM_REVISION: &str = "f00eac344b6f7c18abc6dad1948b07e9a82ff9f0";
 pub const TF_RMM_IMAGE_SHA256: &str =
     "d8e1b42ec5b995400c7d37bdfcd3d1249dc397fe55642bda088064cec98a09d4";

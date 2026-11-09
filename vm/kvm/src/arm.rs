@@ -191,9 +191,7 @@ pub struct UnsupportedArmTioExit {
 }
 
 impl ArmTioExit<'_> {
-    /// Permits kernel/RMM mapping validation on re-entry, not device DMA.
-    ///
-    /// Unknown reasons and flags remain rejected.
+    /// Permit KVM/RMM validation on re-entry, not device DMA.
     pub fn accept(&mut self) -> std::result::Result<(), UnsupportedArmTioExit> {
         self.reject();
         if self.nr != ArmTioExitReason::VDEV_VALIDATE_MAPPING || self.flags != 0 {
@@ -202,13 +200,13 @@ impl ArmTioExit<'_> {
                 flags: self.flags,
             });
         }
-        *self.response = 0;
+        *self.response = 1;
         Ok(())
     }
 
-    /// Rejects on re-entry. The kernel treats any nonzero response as rejection.
+    /// Reject using the canonical zero-valued response.
     pub fn reject(&mut self) {
-        *self.response = u64::MAX;
+        *self.response = 0;
     }
 }
 
@@ -227,9 +225,8 @@ pub(crate) fn tio_exit(run: &mut kvm_run) -> Exit<'_> {
     // at the start of the run union, whose size and alignment cover the packet.
     // This exclusive run reference also prevents re-entry while it is borrowed.
     let tio = unsafe { &mut *std::ptr::from_mut(&mut run.__bindgen_anon_1).cast::<KvmArm64Tio>() };
-    // The kernel initializes this to success. Require explicit acceptance even
-    // for known reasons; an unhandled exit must not authorize a mapping.
-    tio.response = u64::MAX;
+    // Require explicit acceptance even for known reasons.
+    tio.response = 0;
     Exit::ArmTio(ArmTioExit {
         flags: tio.flags,
         nr: ArmTioExitReason(tio.nr),
@@ -250,6 +247,26 @@ mod tests {
     use std::mem::size_of;
     use std::os::fd::AsFd;
     use test_with_tracing::test;
+
+    #[test]
+    fn candidate_tio_approval_is_one_and_unknown_requests_stay_rejected() {
+        let mut run = tio_run(8, 0);
+        {
+            let Exit::ArmTio(mut exit) = tio_exit(&mut run) else {
+                panic!("expected TIO");
+            };
+            exit.accept().unwrap();
+        }
+        assert_eq!(tio_response(&run), 1);
+        let mut run = tio_run(8, 1);
+        {
+            let Exit::ArmTio(mut exit) = tio_exit(&mut run) else {
+                panic!("expected TIO");
+            };
+            assert!(exit.accept().is_err());
+        }
+        assert_eq!(tio_response(&run), 0);
+    }
 
     #[test]
     fn function_register_preserves_bits_the_exit_number_can_lose() {
@@ -565,7 +582,7 @@ mod tests {
             assert_eq!(*exit.gpa_top, 0x6000);
             assert_eq!(exit.pa_base, 0xa000);
         }
-        assert_ne!(tio_response(&run), 0);
+        assert_eq!(tio_response(&run), 0);
         {
             let Exit::ArmTio(mut exit) = tio_exit(&mut run) else {
                 panic!("expected TIO exit");
@@ -573,7 +590,7 @@ mod tests {
             *exit.gpa_top = 0x5000;
             exit.accept().unwrap();
         }
-        assert_eq!(tio_response(&run), 0);
+        assert_eq!(tio_response(&run), 1);
         // SAFETY: Read back the gpa_top input/output field from the raw packet.
         let bytes = unsafe { run.__bindgen_anon_1.padding };
         assert_eq!(
@@ -587,7 +604,7 @@ mod tests {
             exit.accept().unwrap();
             exit.reject();
         }
-        assert_ne!(tio_response(&run), 0);
+        assert_eq!(tio_response(&run), 0);
     }
 
     #[test]
@@ -604,7 +621,7 @@ mod tests {
                 assert_eq!(error.nr.0, nr);
                 assert_eq!(error.flags, flags);
             }
-            assert_ne!(tio_response(&run), 0);
+            assert_eq!(tio_response(&run), 0);
         }
     }
 }

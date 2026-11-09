@@ -49,17 +49,8 @@ async fn boot_linux_direct_cca_tdisp_ahci(
 ) -> anyhow::Result<()> {
     let output_dir = config.log_source().output_dir().to_path_buf();
     let guest = payload.get().join("guest");
-    let (kernel_hash, initrd_hash) = match std::env::var_os("PETRI_FVP_PAYLOAD").as_deref() {
-        None => (GUEST_IMAGE_SHA256, GUEST_INITRD_SHA256),
-        Some(value) if value == "reference" => (GUEST_IMAGE_SHA256, GUEST_INITRD_SHA256),
-        Some(value) if value == "source-built" => (
-            petri_artifacts_common::cca_payload::source_built_in_place::LINUX_IMAGE_SHA256,
-            petri_artifacts_common::cca_payload::source_built_tdisp::INITRD_SHA256,
-        ),
-        Some(_) => anyhow::bail!("PETRI_FVP_PAYLOAD must be reference or source-built"),
-    };
-    let kernel = open_pinned(&guest.join("Image"), kernel_hash)?;
-    let initrd = open_pinned(&guest.join("initrd"), initrd_hash)?;
+    let kernel = open_pinned(&guest.join("Image"), GUEST_IMAGE_SHA256)?;
+    let initrd = open_pinned(&guest.join("initrd"), GUEST_INITRD_SHA256)?;
     let bdf = emulator_vfio_bdf("cca-realm-vfio")?;
     let sysfs = Path::new("/sys/bus/pci/devices").join(&bdf);
     for (field, expected) in [

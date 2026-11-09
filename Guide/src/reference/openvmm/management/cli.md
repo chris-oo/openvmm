@@ -81,6 +81,10 @@ describes the source definitions.
     in-hypervisor APIC
   * `no_enlightenments` — disable in-hypervisor Hyper-V enlightenment support
 
+  Arm KVM uses the current Linux cb45796 CCA ABI. CCA guests require
+  `--guest-memfd-in-place`; ordinary guests keep their normal backing.
+  The retired `cca-abi` parameter is an error. There is no old-ABI fallback.
+
   Examples:
   ```bash
   --hypervisor whp
@@ -123,15 +127,14 @@ describes the source definitions.
   offloading enabled. This diagnostic parameter is meaningful only with
   `--isolation snp`.
 
-  CCA support requires device-tree Linux direct boot with shared userspace RAM
+  CCA support requires device-tree Linux direct boot and guest_memfd in-place
   backing. It does not support Hyper-V enlightenments, VTL2, VMBus, hugetlb
-  memory, assigned devices, vhost-user devices, PCIe hotplug, or CXL.
+  memory, vhost-user devices, PCIe hotplug, or CXL.
 * `--guest-memfd-in-place`: Explicitly select experimental Arm KVM CCA
-  guest_memfd in-place memory mode.
+  guest_memfd in-place memory mode, required for CCA.
   Requires `--isolation cca` and device-tree Linux direct boot. It supports
-  the same in-process Virtio devices on PCIe as separate backing, plus PL011
-  serial. The default is off: CCA
-  continues to use the v15 separate-backing path unless you set this flag.
+  in-process Virtio devices on PCIe and PL011 serial. The flag defaults to
+  off, but a CCA configuration without it is an error.
   The host must use 4 KiB pages; 16 KiB and 64 KiB hosts are not supported.
   The host must support mmap and initially shared guestmemfd, guestmemfd
   private attributes, `KVM_SET_MEMORY_ATTRIBUTES2`, and
@@ -140,10 +143,10 @@ describes the source definitions.
 
   RAM and its host-visible aliases use the same partition-owned guestmemfd.
   Private pages are not readable through these aliases. This mode does not
-  support snapshots, restore, restart, assigned devices, or host DMA sharing.
+  support snapshots, restore, restart, or generic host DMA sharing.
   Virtio uses fault-contained copies instead of raw page-lock fast paths.
-  All other CCA restrictions still apply. This is not a trusted device
-  assignment option.
+  Trusted device assignment also requires the matched TDISP host, guest,
+  firmware, and fixture. This memory option alone does not provide it.
 
   ```bash
   openvmm --hypervisor kvm --isolation cca --guest-memfd-in-place \

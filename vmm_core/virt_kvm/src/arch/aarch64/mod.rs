@@ -648,7 +648,8 @@ impl virt::Processor for KvmProcessor<'_> {
                         ));
                     }
                     kvm::Exit::ArmHypercall { nr, flags } => {
-                        let rhi_enabled = self.partition.rhi.lock().enabled();
+                        let rhi_enabled = self.partition.rhi.lock().enabled()
+                            || self.partition.caps.isolation == virt::IsolationType::Cca;
                         if !rhi_enabled {
                             if self.partition.memory_backing_mode.is_in_place() {
                                 self.partition.mark_cca_fatal();
@@ -1481,6 +1482,11 @@ impl virt::Hypervisor for Kvm {
         config: ProtoPartitionConfig<'a>,
     ) -> Result<Self::ProtoPartition<'a>, Self::Error> {
         let isolation = config.isolation.isolation_type();
+        if isolation == virt::IsolationType::Cca && !config.guest_memfd_in_place {
+            return Err(KvmError::UnsupportedIsolationConfiguration(
+                "CCA requires guest_memfd in-place backing",
+            ));
+        }
         if config.guest_memfd_in_place && isolation != virt::IsolationType::Cca {
             return Err(KvmError::UnsupportedIsolationConfiguration(
                 "experimental guest_memfd in-place RAM requires CCA isolation",
@@ -1533,6 +1539,7 @@ impl virt::Hypervisor for Kvm {
                     crate::memory::KvmGuestMemfdPrivateState::GuestMemfdDefault,
                 )
                 .map_err(map_cca_capability_error)?;
+                vm.set_arm_rhi_da_filters()?;
                 vm
             }
             virt::IsolationType::Vbs | virt::IsolationType::Snp | virt::IsolationType::Tdx => {

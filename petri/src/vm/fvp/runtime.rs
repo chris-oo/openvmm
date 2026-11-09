@@ -516,17 +516,10 @@ pub fn validate_native_payload(root: &Path, platform: FvpPlatform) -> anyhow::Re
     let (kernel, initrd) = platform.payload_hashes();
     let mut inputs = vec![("host/Image", kernel), ("host/initrd", initrd)];
     if platform.has_realm_vfio() {
-        let (guest_kernel, guest_initrd) = if platform == FvpPlatform::RealmVfioSourceBuilt {
-            (
-                cca_payload::source_built_in_place::LINUX_IMAGE_SHA256,
-                cca_payload::source_built_tdisp::INITRD_SHA256,
-            )
-        } else {
-            (
-                cca_payload::tdisp_guest::LINUX_IMAGE_SHA256,
-                cca_payload::tdisp_guest::INITRD_SHA256,
-            )
-        };
+        let (guest_kernel, guest_initrd) = (
+            cca_payload::tdisp_guest::LINUX_IMAGE_SHA256,
+            cca_payload::tdisp_guest::INITRD_SHA256,
+        );
         inputs.extend([
             ("guest/Image", guest_kernel),
             ("guest/initrd", guest_initrd),

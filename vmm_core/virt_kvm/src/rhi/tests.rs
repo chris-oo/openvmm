@@ -410,7 +410,7 @@ fn native_mutations_share_one_service_and_own_measurement_input() {
                     bytes[..8].copy_from_slice(&1u64.to_le_bytes());
                     bytes[0x100..].fill(0x42);
                     Ok(())
-                }
+                },
             )),
             (response(SUCCESS, 0), false)
         );
@@ -443,6 +443,26 @@ fn native_mutation_failure_requires_vm_quarantine() {
         )),
         (response(DEVICE, 0), true)
     );
+}
+
+#[test]
+fn candidate_measurement_padding_is_rejected_without_device_mutation() {
+    let service = Arc::new(Service::new());
+    assert_eq!(
+        ready(dispatch_assignment(
+            AssignmentRequest::Measurements {
+                rid: 7,
+                gpa: 0x2000
+            },
+            |_| Some(service.clone()),
+            |_, bytes| {
+                bytes[8] = 1;
+                Ok(())
+            },
+        )),
+        (response(INPUT, 0), false)
+    );
+    assert!(service.regenerations.lock().is_empty());
 }
 
 #[test]

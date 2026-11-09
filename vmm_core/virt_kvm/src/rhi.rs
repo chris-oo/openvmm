@@ -395,6 +395,9 @@ async fn dispatch_assignment(
                 Ok(parameters) => parameters,
                 Err(status) => return (response(status, 0), false),
             };
+            if bytes[8..0x100].iter().any(|&value| value != 0) {
+                return (response(INPUT, 0), false);
+            }
             service
                 .regenerate(Regenerate::Measurements(parameters))
                 .await
@@ -505,7 +508,7 @@ impl crate::KvmPartitionInner {
         if self.cca_fatal.load(Ordering::Acquire) {
             return Err(crate::cca_in_place::CcaInPlaceError::AmbiguousFault.into());
         }
-        // Zero only permits KVM's independent RMM validation on re-entry.
+        // Approval only permits KVM's independent RMM validation on re-entry.
         // The attempted mapping remains retained, even after later exits.
         *tio.gpa_top = request.range.end();
         tio.accept()
@@ -528,8 +531,7 @@ impl crate::KvmPartitionInner {
             return Err(RegistrationError::Failed);
         }
         let mut registry = self.rhi.lock();
-        let result = registry
-            .register_assignment(rid, service.clone(), || self.kvm.set_arm_rhi_da_filters());
+        let result = registry.register_assignment(rid, service.clone(), || Ok(()));
         if registry.failed {
             self.mark_cca_fatal();
         }
@@ -556,7 +558,7 @@ impl crate::KvmPartitionInner {
             return Err(RegistrationError::Failed);
         }
         let mut registry = self.rhi.lock();
-        let result = registry.register(rid, service, || self.kvm.set_arm_rhi_da_filters());
+        let result = registry.register(rid, service, || Ok(()));
         if registry.failed {
             self.mark_cca_fatal();
         }

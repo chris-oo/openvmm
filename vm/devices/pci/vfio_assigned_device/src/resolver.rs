@@ -231,6 +231,7 @@ impl AsyncResolveResource<PciDeviceHandleKind, VfioRealmDeviceHandle> for VfioRe
             bar_addresses,
         )
         .await?;
+        frontend.attach_realm_provider(association.as_ref())?;
         let service = owner
             .into_tdisp(self.budget.clone())?
             .into_evidence_service();

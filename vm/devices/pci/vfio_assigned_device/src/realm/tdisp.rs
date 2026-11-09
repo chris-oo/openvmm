@@ -34,9 +34,8 @@ use tdisp::host::Regenerate;
 use tdisp::host::SnapshotBudget;
 use vfio_sys::iommufd::tsm::CcaObject;
 use vfio_sys::iommufd::tsm::CcaTdiState;
-use vfio_sys::iommufd::tsm::CcaTsmRequest;
-use vfio_sys::iommufd::tsm::TsmCompletion;
-use vfio_sys::iommufd::tsm::TsmRequestError;
+use vfio_sys::iommufd::tsm::Error as TsmRequestError;
+use vfio_sys::iommufd::tsm::Request as CcaTsmRequest;
 
 /// Native evidence operation, for error reporting without protocol casts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,8 +44,6 @@ pub enum EvidenceOperation {
     SetState(ConfirmedState),
     /// Regenerate an evidence object.
     Regenerate,
-    /// Install protected device memory.
-    ValidateMmio,
     /// Query the whole object's size.
     ObjectSize(Object),
     /// Read the whole object at offset zero.
@@ -67,27 +64,27 @@ pub enum BackendError {
     Request {
         /// Requested evidence operation.
         operation: EvidenceOperation,
-        /// Original typed ioctl failure, including errno and raw TSM code.
+        /// Original typed ioctl failure.
         #[source]
         source: TsmRequestError,
     },
-    /// The ioctl returned a nonzero TSM code or an invalid/short completion.
+    /// The backend returned an invalid or short response.
     #[error("{operation:?} returned {completion:?} for capacity {capacity}")]
     Completion {
         /// Requested evidence operation.
         operation: EvidenceOperation,
-        /// Both nonnegative residue and raw TSM code.
-        completion: TsmCompletion,
+        /// Actual response bytes.
+        completion: usize,
         /// Offered response bytes.
         capacity: usize,
     },
-    /// The size reply is absent, empty, or not a positive Linux `int`.
+    /// The size reply is absent or empty.
     #[error("invalid {object:?} size {size}")]
     ObjectSize {
         /// Requested object.
         object: Object,
-        /// Raw signed size field.
-        size: i32,
+        /// Raw unsigned size field.
+        size: u64,
     },
     /// No mutation was issued because the owner has no live frontend gate.
     #[error("native Realm TDISP mutations require a coordinated frontend")]
@@ -216,9 +213,9 @@ trait EvidenceDevice {
     fn request(
         &mut self,
         operation: EvidenceOperation,
-        request: CcaTsmRequest<'_>,
+        request: CcaTsmRequest,
         response: &mut [u8],
-    ) -> Result<TsmCompletion, BackendError>;
+    ) -> Result<usize, BackendError>;
     fn close(&mut self) -> Result<(), BackendError>;
 }
 
@@ -418,13 +415,16 @@ impl EvidenceDevice for RealmDevice {
     fn request(
         &mut self,
         operation: EvidenceOperation,
-        request: CcaTsmRequest<'_>,
+        request: CcaTsmRequest,
         response: &mut [u8],
-    ) -> Result<TsmCompletion, BackendError> {
+    ) -> Result<usize, BackendError> {
         self.owner
-            .with_attached(|ops, vdevice| ops.context.cca_tsm_request(vdevice, request, response))
+            .with_attached(|ops, vdevice| {
+                ops.context
+                    .cca_tsm_request(vdevice, request, response)
+                    .map_err(|source| BackendError::Request { operation, source })
+            })
             .map_err(BackendError::InvalidPhase)?
-            .map_err(|source| BackendError::Request { operation, source })
     }
 
     fn close(&mut self) -> Result<(), BackendError> {
@@ -491,13 +491,11 @@ fn kernel_object(object: Object) -> CcaObject {
 
 fn completed_bytes(
     operation: EvidenceOperation,
-    completion: TsmCompletion,
+    completion: usize,
     capacity: usize,
 ) -> Result<usize, BackendError> {
-    if completion.tsm_code == 0 {
-        if let Some(bytes) = capacity.checked_sub(completion.residue as usize) {
-            return Ok(bytes);
-        }
+    if completion <= capacity {
+        return Ok(completion);
     }
     Err(BackendError::Completion {
         operation,
@@ -557,6 +555,13 @@ impl<D: EvidenceDevice> Backend for EvidenceBackend<D> {
             ));
         }
         let operation = EvidenceOperation::SetState(target);
+        if target == ConfirmedState::Locked {
+            if let Some(provider) = &state.provider {
+                provider
+                    .prepare_lock()
+                    .map_err(|error| BackendError::Assignment(error.into()))?;
+            }
+        }
         let target = match target {
             ConfirmedState::Unlocked => CcaTdiState::Unlocked,
             ConfirmedState::Locked => CcaTdiState::Locked,
@@ -593,7 +598,10 @@ impl<D: EvidenceDevice> Backend for EvidenceBackend<D> {
         checked_evidence_read(&mut self.device, |device| {
             let completion = device.request(
                 operation,
-                CcaTsmRequest::ReadObject(kernel_object(object)),
+                CcaTsmRequest::ReadObject {
+                    object: kernel_object(object),
+                    offset: 0,
+                },
                 buffer,
             )?;
             let actual = completed_bytes(operation, completion, buffer.len())?;
@@ -621,8 +629,8 @@ impl<D: EvidenceDevice> Backend for EvidenceBackend<D> {
         let request = match request {
             Regenerate::InterfaceReport => CcaTsmRequest::RegenerateInterfaceReport,
             Regenerate::Measurements(request) => CcaTsmRequest::RegenerateMeasurements {
-                flags: u64::from(request.raw),
-                nonce: &request.nonce,
+                raw: request.raw,
+                nonce: request.nonce,
             },
         };
         let completion = self
@@ -659,16 +667,8 @@ fn validate_mmio(
     // this conservative record and any record already made by the platform.
     state.protected.push(range.clone());
     gate.record_protected_mapping(range, host)?;
-    let completion = device.request(
-        EvidenceOperation::ValidateMmio,
-        CcaTsmRequest::ValidateMmio {
-            gpa_base: base,
-            gpa_top: top,
-            pa_base: host,
-        },
-        &mut [],
-    )?;
-    mutation_complete(EvidenceOperation::ValidateMmio, completion)?;
+    // The VM callback installed the checked provider mapping. KVM owns the
+    // subsequent RMM validation on re-entry.
     Ok(())
 }
 
@@ -695,11 +695,8 @@ fn checked_evidence_read<D: EvidenceDevice, R>(
     result
 }
 
-fn mutation_complete(
-    operation: EvidenceOperation,
-    completion: TsmCompletion,
-) -> Result<(), BackendError> {
-    if completion.residue != 0 || completion.tsm_code != 0 {
+fn mutation_complete(operation: EvidenceOperation, completion: usize) -> Result<(), BackendError> {
+    if completion != 0 {
         return Err(BackendError::Completion {
             operation,
             completion,
@@ -711,12 +708,10 @@ fn mutation_complete(
 
 fn object_size(device: &mut impl EvidenceDevice, object: Object) -> Result<u64, BackendError> {
     let operation = EvidenceOperation::ObjectSize(object);
-    // A zero-length object can return zero without writing the size field
-    // in the pinned kernel. Never accept an untouched response as evidence.
-    let mut response = (-1i32).to_ne_bytes();
+    let mut response = u64::MAX.to_ne_bytes();
     let completion = device.request(
         operation,
-        CcaTsmRequest::ObjectSize(kernel_object(object)),
+        CcaTsmRequest::ObjectInfo(kernel_object(object)),
         &mut response,
     )?;
     if completed_bytes(operation, completion, response.len())? != response.len() {
@@ -726,11 +721,12 @@ fn object_size(device: &mut impl EvidenceDevice, object: Object) -> Result<u64, 
             capacity: response.len(),
         });
     }
-    let size = i32::from_ne_bytes(response);
-    if size <= 0 {
+
+    let size = u64::from_ne_bytes(response);
+    if size == 0 || size == u64::MAX {
         return Err(BackendError::ObjectSize { object, size });
     }
-    Ok(size as u64)
+    Ok(size)
 }
 
 #[cfg(test)]

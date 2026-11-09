@@ -726,7 +726,7 @@ impl PreparedFvpRun {
                 .arg("--rtvar")
                 .arg(format!("{name}={}", self.root.join(relative).display()));
         }
-        command.args(["--rtvar", "CMDLINE="]);
+        command.args(["--rtvar", "CMDLINE=kvm-arm.mode=rmm"]);
         if self.release_package.get() {
             command.arg("--rtvar").arg(format!(
                 "SEMIHOSTDIR={}",
@@ -2229,7 +2229,7 @@ command cp "$SEMIHOSTDIR/startup.nsh" "$CAPTURE"
                 assert!(safe_path(Path::new(path)));
                 assert!(Path::new(path).starts_with(&prepared.root));
             } else {
-                assert!(path.is_empty());
+                assert_eq!(path, "kvm-arm.mode=rmm");
             }
         }
         for (name, value) in command.get_envs() {
@@ -2254,6 +2254,82 @@ command cp "$SEMIHOSTDIR/startup.nsh" "$CAPTURE"
             "rmm"
         );
         prepared.cleanup().unwrap();
+    }
+
+    #[test]
+    fn supported_hosts_select_rmm_mode() {
+        for (platform, expected) in [
+            (FvpPlatform::GuestMemfdInPlace, "CMDLINE=kvm-arm.mode=rmm"),
+            (FvpPlatform::RealmVfio, "CMDLINE=kvm-arm.mode=rmm"),
+        ] {
+            let directory = directory();
+            let prepared = PreparedFvpRun::allocate(directory.path(), &deadline()).unwrap();
+            let config = FvpCcaConfig {
+                platform,
+                consoles: vec![FvpConsole::Host],
+                primary_console: FvpConsole::Host,
+                capabilities: vec!["cca".into()],
+                deadlines: Default::default(),
+                port_retries: 20,
+            };
+            let mut command = Command::new("isolated-python");
+            prepared
+                .populate_command(&mut command, 12345, &config, 1)
+                .unwrap();
+            let args = command
+                .get_args()
+                .map(|arg| arg.to_str().unwrap())
+                .collect::<Vec<_>>();
+            let cmdlines = args
+                .windows(2)
+                .filter(|pair| pair[0] == "--rtvar" && pair[1].starts_with("CMDLINE="))
+                .map(|pair| pair[1])
+                .collect::<Vec<_>>();
+            assert_eq!(cmdlines, [expected], "{platform:?}");
+            let semihost = prepared.root().join("build/semihost");
+            prepared.prepare_release_semihost().unwrap();
+            let initrd = prepared.root().join("inputs/initrd");
+            fs::write(&initrd, "patched archive").unwrap();
+            let bootargs = expected.strip_prefix("CMDLINE=").unwrap();
+            let variables = BTreeMap::from([
+                ("CMDLINE", bootargs.to_owned()),
+                ("SEMIHOSTDIR", semihost.display().to_string()),
+                ("INITRD", initrd.display().to_string()),
+            ]);
+            let overlay: Value = serde_yaml::from_str(
+                &INITRD_OVERLAY.replace("$${SEMIHOSTDIR}", "${rtvar:SEMIHOSTDIR}"),
+            )
+            .unwrap();
+            let script = overlay["run"]["prerun"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .map(|line| render(line.as_str().unwrap(), &variables))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let output = run_command_cancellable(
+                Command::new("/bin/sh").args(["-eu", "-c", &script]),
+                &deadline(),
+                &Cancellation::default(),
+            )
+            .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let startup = fs::read_to_string(semihost.join("startup.nsh")).unwrap();
+            let actual = startup
+                .split_ascii_whitespace()
+                .filter(|arg| arg.starts_with("kvm-arm.mode="))
+                .collect::<Vec<_>>();
+            let expected = (!bootargs.is_empty())
+                .then_some(bootargs)
+                .into_iter()
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "{platform:?}");
+            prepared.cleanup().unwrap();
+        }
     }
 
     #[test]

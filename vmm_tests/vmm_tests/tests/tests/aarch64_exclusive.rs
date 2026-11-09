@@ -41,21 +41,35 @@ use vmm_test_macros::vmm_test_with;
 mod tdisp_ahci;
 
 /// Boot a Linux-direct CCA Realm and verify the pipette agent over virtio-vsock.
-#[vmm_test_with(openvmm, requires(cca), configs(linux_direct_aarch64))]
-async fn boot_linux_direct_cca(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Result<()> {
-    boot_linux_direct_cca_with_backing(config, false, None).await
+#[cfg(target_os = "linux")]
+#[vmm_test_with(openvmm, requires(cca, guest_memfd_in_place), configs(linux_direct_aarch64[FVP_CCA_PAYLOAD_AARCH64]))]
+async fn boot_linux_direct_cca(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+    (payload,): (ResolvedArtifact<FVP_CCA_PAYLOAD_AARCH64>,),
+) -> anyhow::Result<()> {
+    let kernel = open_pinned_cca_payload(
+        &payload.get().join("host/Image"),
+        petri_artifacts_common::cca_payload::LINUX_IMAGE_SHA256,
+    )?;
+    boot_linux_direct_cca_with_backing(config, true, Some(kernel)).await
 }
 
 /// Run the same CCA Virtio-vsock test with in-place guest_memfd backing.
+#[cfg(target_os = "linux")]
 #[vmm_test_with(
     openvmm,
     requires(cca, guest_memfd_in_place),
-    configs(linux_direct_aarch64)
+    configs(linux_direct_aarch64[FVP_CCA_PAYLOAD_AARCH64])
 )]
 async fn boot_linux_direct_cca_in_place(
     config: PetriVmBuilder<OpenVmmPetriBackend>,
+    (payload,): (ResolvedArtifact<FVP_CCA_PAYLOAD_AARCH64>,),
 ) -> anyhow::Result<()> {
-    boot_linux_direct_cca_with_backing(config, true, None).await
+    let kernel = open_pinned_cca_payload(
+        &payload.get().join("host/Image"),
+        petri_artifacts_common::cca_payload::LINUX_IMAGE_SHA256,
+    )?;
+    boot_linux_direct_cca_with_backing(config, true, Some(kernel)).await
 }
 
 /// Boot an in-place Realm with the packaged kernel and the standard pipette initrd.
@@ -74,13 +88,8 @@ async fn boot_linux_direct_cca_in_place_smoke(
     config: PetriVmBuilder<OpenVmmPetriBackend>,
     (payload,): (ResolvedArtifact<FVP_CCA_PAYLOAD_AARCH64>,),
 ) -> anyhow::Result<()> {
-    let kernel = open_pinned_cca_payload_one_of(
-        &payload.get().join("host/Image"),
-        &[
-            petri_artifacts_common::cca_payload::guest_memfd_in_place::LINUX_IMAGE_SHA256,
-            petri_artifacts_common::cca_payload::source_built_in_place::LINUX_IMAGE_SHA256,
-        ],
-    )?;
+    let hash = petri_artifacts_common::cca_payload::LINUX_IMAGE_SHA256;
+    let kernel = open_pinned_cca_payload(&payload.get().join("host/Image"), hash)?;
     boot_linux_direct_cca_with_backing(config, true, Some(kernel)).await
 }
 
@@ -130,7 +139,7 @@ async fn boot_linux_direct_cca_with_backing(
     in_place: bool,
     kernel: Option<std::fs::File>,
 ) -> anyhow::Result<()> {
-    let (vm, agent) = cca_config(config, in_place, None, kernel).run().await?;
+    let (vm, agent) = cca_config(config, in_place, None, kernel)?.run().await?;
     agent.ping().await?;
     agent.power_off().await?;
     vm.wait_for_clean_teardown().await?;
@@ -143,9 +152,14 @@ fn cca_config(
     in_place: bool,
     device: Option<openvmm_defs::config::PcieDeviceConfig>,
     kernel: Option<std::fs::File>,
-) -> PetriVmBuilder<OpenVmmPetriBackend> {
+) -> anyhow::Result<PetriVmBuilder<OpenVmmPetriBackend>> {
+    anyhow::ensure!(
+        in_place && kernel.is_some(),
+        "CCA tests require the matched packaged kernel and in-place backing"
+    );
     let root_ports = if device.is_some() { 2 } else { 1 };
-    config
+    let config = config.with_serial_output();
+    Ok(config
         .with_isolation(IsolationType::Cca)
         .with_memory(petri::MemoryConfig {
             startup_bytes: 256 * 1024 * 1024,
@@ -156,9 +170,6 @@ fn cca_config(
             vp_count: 1,
             ..Default::default()
         })
-        // FVP traps each emulated UART access; disabling the diagnostic console
-        // cuts Realm boot time substantially while pipette remains on virtio-vsock.
-        .without_serial_output()
         .modify_backend(move |backend| {
             backend
                 .with_pcie_root_topology(1, 1, root_ports)
@@ -167,12 +178,15 @@ fn cca_config(
                     if let Some(kernel) = kernel {
                         let openvmm_defs::config::LoadMode::Linux {
                             kernel: guest_kernel,
+                            cmdline,
                             ..
                         } = &mut config.load_mode
                         else {
                             unreachable!("CCA test requires Linux-direct boot");
                         };
                         *guest_kernel = kernel;
+                        // The small guest's default bounce pool cannot fill the vsock queues.
+                        cmdline.push_str(" swiotlb=8192");
                     }
                     if let Some(device) = device {
                         config.pcie_devices.push(device);
@@ -183,7 +197,7 @@ fn cca_config(
                         }
                     }
                 })
-        })
+        }))
 }
 
 const CCA_IO_BYTES: usize = 64 * 1024;
@@ -195,13 +209,15 @@ fn cca_io_pattern(seed: u8) -> Vec<u8> {
 }
 
 /// Exercise direct guest reads and writes on a PCIe Virtio disk in an in-place Realm.
+#[cfg(target_os = "linux")]
 #[vmm_test_with(
     openvmm,
     requires(cca, guest_memfd_in_place),
-    configs(linux_direct_aarch64)
+    configs(linux_direct_aarch64[FVP_CCA_PAYLOAD_AARCH64])
 )]
 async fn virtio_blk_cca_in_place(
     config: PetriVmBuilder<OpenVmmPetriBackend>,
+    (payload,): (ResolvedArtifact<FVP_CCA_PAYLOAD_AARCH64>,),
 ) -> anyhow::Result<()> {
     use std::io::Read;
     use std::io::Seek;
@@ -231,7 +247,13 @@ async fn virtio_blk_cca_in_place(
         )
         .into_resource(),
     };
-    let (vm, agent) = cca_config(config, true, Some(device), None).run().await?;
+    let kernel = open_pinned_cca_payload(
+        &payload.get().join("host/Image"),
+        petri_artifacts_common::cca_payload::LINUX_IMAGE_SHA256,
+    )?;
+    let (vm, agent) = cca_config(config, true, Some(device), Some(kernel))?
+        .run()
+        .await?;
     agent.ping().await?;
     let sh = agent.unix_shell();
     let sectors: u64 = cmd!(sh, "cat /sys/block/vda/size")
@@ -289,14 +311,15 @@ async fn virtio_blk_cca_in_place(
 }
 
 /// Verify TCP payloads in both directions over Virtio-net, with vsock as control.
+#[cfg(target_os = "linux")]
 #[vmm_test_with(
     openvmm,
     requires(cca, guest_memfd_in_place),
-    configs(linux_direct_aarch64)
+    configs(linux_direct_aarch64[FVP_CCA_PAYLOAD_AARCH64])
 )]
 async fn virtio_net_cca_in_place(
     config: PetriVmBuilder<OpenVmmPetriBackend>,
-    _: (),
+    (payload,): (ResolvedArtifact<FVP_CCA_PAYLOAD_AARCH64>,),
     driver: DefaultDriver,
 ) -> anyhow::Result<()> {
     use net_backend_resources::consomme::ConsommeHandle;
@@ -336,7 +359,13 @@ async fn virtio_net_cca_in_place(
         )
         .into_resource(),
     };
-    let (vm, agent) = cca_config(config, true, Some(device), None).run().await?;
+    let kernel = open_pinned_cca_payload(
+        &payload.get().join("host/Image"),
+        petri_artifacts_common::cca_payload::LINUX_IMAGE_SHA256,
+    )?;
+    let (vm, agent) = cca_config(config, true, Some(device), Some(kernel))?
+        .run()
+        .await?;
     agent.ping().await?;
     let to_guest = cca_io_pattern(29);
     let from_guest = cca_io_pattern(157);
@@ -574,7 +603,6 @@ async fn realm_vfio_objects_cca_in_place(
         let prepared_ids = [
             prepared.device,
             prepared.ioas,
-            prepared.parent,
             prepared.viommu,
             prepared.child,
         ];
@@ -600,7 +628,6 @@ async fn realm_vfio_objects_cca_in_place(
                 && [
                     attached.device,
                     attached.ioas,
-                    attached.parent,
                     attached.viommu,
                     attached.child,
                 ] == prepared_ids
@@ -620,7 +647,6 @@ async fn realm_vfio_objects_cca_in_place(
                 && [
                     closed.device,
                     closed.ioas,
-                    closed.parent,
                     closed.viommu,
                     closed.child,
                     closed.vdevice,

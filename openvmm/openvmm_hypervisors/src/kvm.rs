@@ -29,9 +29,7 @@ impl hypervisor_resources::HypervisorProbe for KvmProbe {
     }
 
     fn new_resource(&self, params: &[(&str, &str)]) -> anyhow::Result<Resource<HypervisorKind>> {
-        if let Some(&(key, _val)) = params.first() {
-            anyhow::bail!("unknown kvm parameter: {key}");
-        }
+        validate_parameters(params)?;
         let kvm = open_kvm().context("KVM is not available")?;
         Ok(KvmHandle { kvm: kvm.into() }.into_resource())
     }
@@ -42,4 +40,36 @@ fn open_kvm() -> std::io::Result<fs_err::File> {
         .read(true)
         .write(true)
         .open("/dev/kvm")
+}
+
+fn validate_parameters(params: &[(&str, &str)]) -> anyhow::Result<()> {
+    if let Some(&(key, value)) = params.first() {
+        if key == "cca-abi" {
+            anyhow::bail!(
+                "KVM parameter cca-abi is retired; only the current CCA ABI is supported"
+            );
+        }
+        anyhow::bail!("unsupported KVM parameter {key}={value}");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    #[test]
+    fn retired_abi_selectors_fail_before_opening_kvm() {
+        validate_parameters(&[]).unwrap();
+        for value in ["linux-cca74", "legacy", "latest"] {
+            assert!(
+                validate_parameters(&[("cca-abi", value)])
+                    .unwrap_err()
+                    .to_string()
+                    .contains("retired")
+            );
+        }
+        assert!(validate_parameters(&[("unknown", "true")]).is_err());
+    }
 }

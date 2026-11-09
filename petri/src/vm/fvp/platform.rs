@@ -37,7 +37,7 @@ use std::process::Command;
 use std::process::Output;
 
 /// The approved manifest, not an override mechanism.
-pub const PINNED_MANIFEST: &str = include_str!("../../../incubator/platforms/fvp-cca-v15.yaml");
+pub const PINNED_MANIFEST: &str = IN_PLACE_MANIFEST;
 /// Explicit local in-place memory tuple; not an arbitrary manifest override.
 pub const IN_PLACE_MANIFEST: &str =
     include_str!("../../../incubator/platforms/fvp-cca-guest-memfd-in-place.yaml");
@@ -186,21 +186,16 @@ impl PlatformManifest {
     /// Select a complete built-in tuple without reading user roots.
     pub fn for_platform(platform: FvpPlatform) -> anyhow::Result<Self> {
         match platform {
-            FvpPlatform::CcaV15 => Self::pinned(),
-            FvpPlatform::GuestMemfdInPlace | FvpPlatform::GuestMemfdInPlaceSourceBuilt => {
-                serde_yaml::from_str(IN_PLACE_MANIFEST)
-                    .context("invalid built-in in-place FVP platform manifest")
-            }
-            FvpPlatform::RealmVfio | FvpPlatform::RealmVfioSourceBuilt => {
-                serde_yaml::from_str(REALM_VFIO_MANIFEST)
-                    .context("invalid built-in Realm VFIO FVP platform manifest")
-            }
+            FvpPlatform::GuestMemfdInPlace => serde_yaml::from_str(IN_PLACE_MANIFEST)
+                .context("invalid built-in in-place FVP platform manifest"),
+            FvpPlatform::RealmVfio => serde_yaml::from_str(REALM_VFIO_MANIFEST)
+                .context("invalid built-in Realm VFIO FVP platform manifest"),
         }
     }
 
-    /// Parse the default v15 inventory and reject every tuple deviation.
+    /// Parse the current host inventory and reject every tuple deviation.
     pub fn parse(text: &str) -> anyhow::Result<Self> {
-        Self::parse_for_platform(text, FvpPlatform::CcaV15)
+        Self::parse_for_platform(text, FvpPlatform::GuestMemfdInPlace)
     }
 
     /// Parse an inventory for an explicitly selected complete platform tuple.
@@ -1084,15 +1079,9 @@ fn checkout_overlay_path(
             || *manifest == PlatformManifest::for_platform(FvpPlatform::RealmVfio)?,
         "FVP overlay must be inside the pinned Shrinkwrap checkout"
     );
-    // The in-place tuple uses a separately hashed overlay but shares the
-    // unchanged toolchain checkout with v15. Keep only its original exact
-    // untracked-overlay allowance; do not allow arbitrary external inputs.
-    let legacy = PlatformManifest::pinned()?;
-    Ok(legacy
-        .overlay
-        .relative_path
-        .strip_prefix(&legacy.shrinkwrap.root_relative_path)?
-        .to_owned())
+    // The approved checkout can retain this original untracked configuration.
+    // Runtime inputs still come from the separately hashed current overlay.
+    Ok(PathBuf::from("config/kvm_cca_planes.yaml"))
 }
 
 fn verify_checkout_status(status: &[u8], overlay: &Path) -> anyhow::Result<()> {
@@ -1458,9 +1447,9 @@ mod tests {
             .unwrap(),
             in_place
         );
-        assert!(PlatformManifest::parse(IN_PLACE_MANIFEST).is_err());
+        assert!(PlatformManifest::parse(IN_PLACE_MANIFEST).is_ok());
         let mut mixed = in_place.clone();
-        mixed.runtime.fip_sha256 = PlatformManifest::pinned().unwrap().runtime.fip_sha256;
+        mixed.runtime.fip_sha256 = "0".repeat(64);
         assert!(mixed.require_pinned().is_err());
         let overlay =
             include_str!("../../../incubator/platforms/fvp-guest-memfd-in-place-overlay.yaml");
@@ -1558,13 +1547,14 @@ mod tests {
     }
 
     fn platform_fixture(platform: &Path, package: &Path) -> PlatformSources {
-        fs::create_dir_all(platform.join("shrinkwrap/venv/bin")).unwrap();
-        fs::create_dir_all(platform.join("shrinkwrap/config")).unwrap();
+        let mut manifest = PlatformManifest::pinned().unwrap();
+        let checkout = platform.join(&manifest.shrinkwrap.root_relative_path);
+        fs::create_dir_all(checkout.join("venv/bin")).unwrap();
+        fs::create_dir_all(checkout.join("config")).unwrap();
         fs::create_dir_all(package.join("cca-3world")).unwrap();
-        let executable = platform.join("shrinkwrap/venv/bin/shrinkwrap");
+        let executable = platform.join(&manifest.shrinkwrap.executable_relative_path);
         fs::write(&executable, b"fixture").unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
-        let mut manifest = PlatformManifest::pinned().unwrap();
         let digest = hex::encode(Sha256::digest(b"fixture"));
         manifest.package.sha256 = digest.clone();
         manifest.overlay.sha256 = digest.clone();
@@ -1579,6 +1569,7 @@ mod tests {
             package.join(&manifest.runtime.dtb_relative_path),
         ];
         for path in &paths {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, b"fixture").unwrap();
         }
         PlatformSources::resolve_sources(&manifest, platform, package, None, &deadline()).unwrap()
@@ -1980,11 +1971,12 @@ mod tests {
     fn external_in_place_overlay_keeps_exact_legacy_checkout_allowance() {
         let checkout = Path::new("/platform/shrinkwrap");
         let external = Path::new("/platform/in-place/overlay.yaml");
-        let legacy = PlatformManifest::pinned().unwrap();
-        assert!(checkout_overlay_path(&legacy, external, checkout).is_err());
+        let mut unsupported = PlatformManifest::pinned().unwrap();
+        unsupported.overlay.sha256 = "0".repeat(64);
+        assert!(checkout_overlay_path(&unsupported, external, checkout).is_err());
         let internal = checkout.join("config/kvm_cca_planes.yaml");
         assert_eq!(
-            checkout_overlay_path(&legacy, &internal, checkout).unwrap(),
+            checkout_overlay_path(&unsupported, &internal, checkout).unwrap(),
             Path::new("config/kvm_cca_planes.yaml")
         );
         let in_place = PlatformManifest::for_platform(FvpPlatform::GuestMemfdInPlace).unwrap();

@@ -43,6 +43,7 @@ pub(crate) struct AccessGate {
 
 #[derive(Debug)]
 pub(crate) struct AccessState {
+    pub provider: Option<std::sync::Arc<dyn pci_core::vfio::VfioDeviceMemory>>,
     pub deny_all: bool,
     pub stopped: bool,
     pub irq_error: Option<std::sync::Arc<dyn std::error::Error + Send + Sync>>,
@@ -91,6 +92,7 @@ impl AccessGate {
             vm: interrupts,
             service: std::sync::OnceLock::new(),
             state: Mutex::new(AccessState {
+                provider: None,
                 deny_all: false,
                 stopped: false,
                 irq_error: None,

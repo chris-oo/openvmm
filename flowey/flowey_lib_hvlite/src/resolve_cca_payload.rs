@@ -21,7 +21,7 @@ pub struct CcaPayloadOutput {
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CcaPayloadKind {
     #[default]
-    CcaV15,
+    Imported,
     GuestMemfdInPlace,
 }
 
@@ -109,12 +109,12 @@ impl FlowNodeWithConfig for Node {
             local_kernel_archive,
             local_initrd_archive,
         } = config;
-        let version = version.unwrap_or_else(|| crate::cca_pins::OPENVMM_DEPS_RELEASE.into());
-        let kernel_hash =
-            kernel_archive_sha256.unwrap_or_else(|| crate::cca_pins::KERNEL_ARCHIVE_SHA256.into());
-        let initrd_hash =
-            initrd_archive_sha256.unwrap_or_else(|| crate::cca_pins::INITRD_ARCHIVE_SHA256.into());
-        let kernel_name = format!("openvmm-test-linux-cca-v15.aarch64.{version}.tar.gz");
+        let version = version.ok_or_else(|| anyhow::anyhow!("the old default CCA kernel archive is retired; supply current pinned archives or a local current payload"))?;
+        let kernel_hash = kernel_archive_sha256
+            .ok_or_else(|| anyhow::anyhow!("current CCA kernel archive SHA-256 is required"))?;
+        let initrd_hash = initrd_archive_sha256
+            .ok_or_else(|| anyhow::anyhow!("CCA initrd archive SHA-256 is required"))?;
+        let kernel_name = format!("openvmm-test-linux-cca.aarch64.{version}.tar.gz");
         let initrd_name = format!("openvmm-test-initrd.aarch64.{version}.tar.gz");
         crate::cca_artifacts::validate_local_archives(
             &[
@@ -166,7 +166,7 @@ impl FlowNodeWithConfig for Node {
                     "CCA initrd archive",
                 )?;
                 let output = CcaPayloadOutput {
-                    kind: CcaPayloadKind::CcaV15,
+                    kind: CcaPayloadKind::Imported,
                     host_kernel: kernel_dir.join("Image"),
                     realm_kernel: kernel_dir.join("Image"),
                     kernel_config: kernel_dir.join("config"),
@@ -194,7 +194,7 @@ impl CcaPayloadOutput {
     pub fn validate(&self) -> anyhow::Result<()> {
         let manifest = crate::cca_artifacts::parse_manifest(&self.kernel_manifest)?;
         let (image_hash, config_hash) = match self.kind {
-            CcaPayloadKind::CcaV15 => {
+            CcaPayloadKind::Imported => {
                 validate_kernel_manifest(&manifest)?;
                 (
                     crate::cca_pins::LINUX_IMAGE_SHA256,
@@ -202,7 +202,7 @@ impl CcaPayloadOutput {
                 )
             }
             CcaPayloadKind::GuestMemfdInPlace => {
-                use petri_artifacts_vmm_test::cca_payload::guest_memfd_in_place as pins;
+                use petri_artifacts_vmm_test::cca_payload as pins;
                 for (key, expected) in [
                     ("architecture", "aarch64"),
                     ("revision", pins::LINUX_REVISION),
@@ -302,7 +302,7 @@ mod tests {
 
     #[test]
     fn in_place_payload_rejects_changed_files_and_v15_manifest() {
-        use petri_artifacts_vmm_test::cca_payload::guest_memfd_in_place as pins;
+        use petri_artifacts_vmm_test::cca_payload as pins;
         let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
         let root = directory.path();
         fs_err::write(root.join("manifest.txt"), format!(
@@ -326,7 +326,12 @@ mod tests {
                 .to_string()
                 .contains("SHA-256 mismatch")
         );
-        payload.kind = CcaPayloadKind::CcaV15;
+        fs_err::write(
+            root.join("manifest.txt"),
+            "architecture=aarch64\nrevision=4ddbc65b5b408c37605110166a8da19f4dd0e180\n",
+        )
+        .unwrap();
+        payload.kind = CcaPayloadKind::Imported;
         assert!(
             payload
                 .validate_fvp()
@@ -352,7 +357,7 @@ mod tests {
         ).unwrap();
         fs_err::write(root.join("Image"), b"modified cached Image").unwrap();
         let payload = CcaPayloadOutput {
-            kind: CcaPayloadKind::CcaV15,
+            kind: CcaPayloadKind::Imported,
             host_kernel: root.join("Image"),
             realm_kernel: root.join("Image"),
             kernel_config: root.join("config"),

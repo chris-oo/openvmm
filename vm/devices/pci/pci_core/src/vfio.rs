@@ -8,6 +8,32 @@ use std::sync::Arc;
 use std::sync::Weak;
 use tdisp::host::EvidenceService;
 
+/// Fixed resource-provider backing in the VFIO region namespace.
+#[derive(Debug, Clone)]
+pub struct VfioDeviceBar {
+    /// Guest physical interval.
+    pub guest: std::ops::Range<u64>,
+    /// Matching host physical base.
+    pub host: u64,
+    /// VFIO region byte offset.
+    pub file_offset: u64,
+}
+
+/// Owns device guest_memfd backing, its host mappings and KVM memslots.
+pub trait VfioDeviceMemory: Send + Sync + std::fmt::Debug {
+    /// Fault-safe shared BAR access through the provider, never VFIO BAR I/O.
+    fn read(&self, offset: u64, data: &mut [u8]) -> std::io::Result<usize>;
+    /// Fault-safe shared BAR access through the provider, never VFIO BAR I/O.
+    fn write(&self, offset: u64, data: &[u8]) -> std::io::Result<usize>;
+    /// Share private MMIO, release the provider, perform a real command write
+    /// and reinstall shared backing. No failure may be retried or masked.
+    fn write_command(&self, byte_offset: u8, data: &[u8]) -> Result<(), VfioVmError>;
+    /// Establish real Memory Enable/BME before TDISP LOCK, with no private MMIO.
+    fn prepare_lock(&self) -> Result<(), VfioVmError>;
+    /// Release only after private mappings and the frontend are gone.
+    fn close(&self) -> Result<(), VfioVmError>;
+}
+
 /// A backend failure while creating or using the VM association service.
 #[derive(Debug, thiserror::Error)]
 #[error("VFIO VM association failed")]
@@ -30,6 +56,20 @@ impl VfioVmError {
 /// The allocation owner must retain this service and the VFIO open file
 /// description until DMA is stopped and dependent IOMMUFD objects are gone.
 pub trait VfioVm: Send + Sync {
+    /// Attach only after binding the matching vDEVICE/VM.
+    fn create_device_memory(
+        &self,
+        _rid: u32,
+        _file: BorrowedFd<'_>,
+        _config_offset: u64,
+        _bars: Vec<VfioDeviceBar>,
+        _nonsecure: Vec<std::ops::Range<u64>>,
+    ) -> Result<Arc<dyn VfioDeviceMemory>, VfioVmError> {
+        Err(VfioVmError::new(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "device guest_memfd is not supported by this VM",
+        )))
+    }
     /// Record a protected mapping attempt for a registered full assignment.
     ///
     /// Called synchronously under device admission and its access gate, before

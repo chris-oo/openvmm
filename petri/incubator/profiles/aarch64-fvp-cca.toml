@@ -7,4 +7,4 @@
 type = "fvp-cca"
 consoles = ["host", "edk2", "rmm"]
 primary-console = "host"
-capabilities = ["cca"]
+capabilities = ["cca", "guest_memfd_in_place"]

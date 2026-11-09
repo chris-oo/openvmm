@@ -472,8 +472,8 @@ mod tests {
         let IncubatorBackend::FvpCca(config) = profile.incubator else {
             panic!("expected FVP profile");
         };
-        assert_eq!(config.capabilities, ["cca"]);
-        assert_eq!(config.platform, FvpPlatform::CcaV15);
+        assert_eq!(config.capabilities, ["cca", "guest_memfd_in_place"]);
+        assert_eq!(config.platform, FvpPlatform::GuestMemfdInPlace);
         assert_eq!(config.primary_console, FvpConsole::Host);
         assert_eq!(config.deadlines.model_start, 120);
         assert_eq!(config.deadlines.validation, 300);

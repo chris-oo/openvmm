@@ -28,10 +28,7 @@ use std::os::fd::AsFd;
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use vfio_sys::cdev::CdevDevice;
-use vfio_sys::iommufd::IOMMU_HWPT_ALLOC_NEST_PARENT;
-use vfio_sys::iommufd::IOMMU_HWPT_DATA_ARM_SMMUV3;
 use vfio_sys::iommufd::IOMMU_HWPT_DATA_NONE;
-use vfio_sys::iommufd::IommuHwptArmSmmuv3;
 use vfio_sys::iommufd::IommufdCtx;
 
 /// Preparation failure, including the owner needed to retry failed rollback.
@@ -155,6 +152,13 @@ impl RealmDevice {
                     source: error.into(),
                 });
             }
+            if let Some(provider) = &state.provider {
+                provider.close().map_err(|source| OperationError {
+                    operation: RealmOperation::RevokeAccess,
+                    source: source.into(),
+                })?;
+                state.provider = None;
+            }
         }
         self.owner.close()
     }
@@ -209,28 +213,13 @@ impl Operations for LinuxOperations {
         Ok(())
     }
 
-    fn allocate_parent(&mut self, device: u32, ioas: u32) -> anyhow::Result<u32> {
-        self.context.hwpt_alloc(
-            IOMMU_HWPT_ALLOC_NEST_PARENT,
-            device,
-            ioas,
-            IOMMU_HWPT_DATA_NONE,
-            None,
-        )
+    fn allocate_viommu(&mut self, device: u32) -> anyhow::Result<u32> {
+        Ok(self.context.viommu_alloc_realm(device)?)
     }
 
-    fn allocate_viommu(&mut self, device: u32, parent: u32) -> anyhow::Result<u32> {
-        Ok(self.context.viommu_alloc_realm(device, parent)?)
-    }
-
-    fn allocate_child(&mut self, device: u32, viommu: u32) -> anyhow::Result<u32> {
-        self.context.hwpt_alloc(
-            0,
-            device,
-            viommu,
-            IOMMU_HWPT_DATA_ARM_SMMUV3,
-            Some(&IommuHwptArmSmmuv3::s1_bypass()),
-        )
+    fn allocate_child(&mut self, device: u32, ioas: u32) -> anyhow::Result<u32> {
+        self.context
+            .hwpt_alloc(0, device, ioas, IOMMU_HWPT_DATA_NONE, None)
     }
 
     fn allocate_vdevice(&mut self, device: u32, viommu: u32, rid: u32) -> anyhow::Result<u32> {

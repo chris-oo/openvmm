@@ -37,10 +37,9 @@ also records source and build identities, file hashes, and license notices.
 QEMU firmware is not interchangeable with this FVP firmware.
 
 The firmware package is separate from Linux payloads and the licensed model.
-Use the kernel and initrd qualified for the selected CCA configuration. In
-particular, the guest_memfd in-place tuple is not the older CCA v15 kernel
-tuple. Device-assignment tests also need their approved fixture and guest
-payloads.
+Use the current matched Linux CCA kernel and initrd. Old CCA v15 payloads
+are not supported. Device-assignment tests also need their approved fixture
+and guest payloads.
 
 To test a locally built firmware package:
 
@@ -62,11 +61,10 @@ NEXTEST_TEST_THREADS=1 PYTHONDONTWRITEBYTECODE=1 \
 The separate payload archive supplies `host/Image` and `host/initrd`, with
 its own manifest and checksums. TDISP tests also require the qualified
 `guest/Image` and `guest/initrd`; the basic CCA smoke test does not.
-Reference payload packages import pinned qualification binaries and remain
-local-only inputs, not rebuilt or publishable outputs. The separate
-source-built host-payload recipe uses the pinned integration kernel source
-and a verified standard test initrd. Its configuration and licenses travel
-with the package; a successful build is not runtime qualification.
+The host-only payload recipe uses the pinned integration kernel source and
+a verified standard test initrd. The full TDISP recipe also supplies the
+matched guest kernel and initrd. Configuration and licenses travel with
+each package; a successful build is not runtime qualification.
 Use an exact outer-test filter when checking one case. Omit the local
 archive options only when both packages are available in the named
 `microsoft/openvmm-deps` release. Until packages are published and qualified,
@@ -88,16 +86,11 @@ Virtio-vsock, powers off, and requires clean OpenVMM teardown. It does not
 assign a device to the Realm or prepare an AHCI host fixture. TDISP tests
 explicitly select the Realm-VFIO platform and its fixture lifecycle.
 
-For source-built host-payload qualification, set
-`PETRI_FVP_PAYLOAD=source-built` and supply the matching host-only payload
-package. This selects the pinned
-`aarch64-fvp-cca-source-built.toml` platform; it does not accept arbitrary
-kernel rebuilds or silently fall back to reference binaries.
-`PETRI_FVP_PAYLOAD=reference` preserves the reference tuple. Other values
-are errors. Source-built TDISP qualification additionally needs its
-source-built guest kernel and initrd package, and selects the separate
-`aarch64-fvp-cca-realm-vfio-source-built.toml` profile. A host-only package
-cannot satisfy that test.
+The ordinary `aarch64-fvp-cca.toml` profile uses the current host-only
+payload. TDISP selects `aarch64-fvp-cca-realm-vfio.toml` and requires the
+full payload. A host-only package cannot satisfy that test.
+Do not set `PETRI_FVP_PAYLOAD`: the old selector is an error. There is no
+runtime ABI selection or fallback to older binaries.
 
 The source-built guest uses the hash-pinned standard initrd from
 `openvmm-deps` release `0.3.0-139`, not a rolling local userspace rebuild.
@@ -203,6 +196,34 @@ guest paths rather than assuming QEMU's multiple-9P-device implementation.
 EDK2 loads the Linux initrd through SemihostFs and `startup.nsh`.
 
 ## Qualification limits
+
+### Current Linux CCA ABI
+
+The supported host and guest use immutable Linux
+`cb45796cb3a9483202dce8c24735fc135bb9b675`. Supply the matched payload
+archive explicitly until it is published. Use the packaged FVP smoke and
+TDISP cases for CCA qualification. Every CCA case requires the current
+kernel payload; it cannot run with an old guest image.
+
+For a standalone in-place Realm, select
+`--hypervisor kvm` with `--isolation cca` and
+`--guest-memfd-in-place`. Required capabilities are checked before boot.
+OpenVMM does not detect or fall back to the old ioctl layout.
+
+TDISP uses device guest_memfd backing. Memory Enable and Bus Master
+Enable stay stable during protected device use. Normal AHCI unbind performs
+a real bus-master disable after checked MMIO sharing and provider release;
+it does not report a virtual disable while DMA stays enabled.
+Host teardown checks that PCI/TSM device contexts are gone before unbinding
+VFIO. The host does not use the removed legacy `tsm/bound` attribute.
+
+The new-only cleanup and consolidated payload need fresh qualification.
+Require normal boot, CCA smoke,
+TDISP/AHCI I/O and hash verification, successful checked teardown, and the
+ordinary KVM regressions before promoting it. Initialization rollback,
+failed device/pSMMU teardown and shared-DMA failure recovery are not qualified
+by these tests. Do not inject those failures as migration gates or ignore
+unexpected operation or teardown errors.
 
 ### Source-built validation on 2026-11-05
 

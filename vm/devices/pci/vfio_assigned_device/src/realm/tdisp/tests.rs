@@ -28,12 +28,13 @@ enum Call {
 struct Model {
     calls: Vec<Call>,
     phase: RealmPhase,
-    size: i32,
+    size: u64,
     write_size: bool,
     contents: Vec<u8>,
-    size_result: TsmCompletion,
-    read_result: TsmCompletion,
-    request_error: Option<(Errno, u64)>,
+    size_result: usize,
+    read_result: Option<usize>,
+    request_error: Option<Errno>,
+    bad_return: Option<i32>,
     close_failures: usize,
     released: bool,
     kernel_state: CcaTdiState,
@@ -87,15 +88,10 @@ impl Fake {
             size: 8,
             write_size: true,
             contents: (0..8).collect(),
-            size_result: TsmCompletion {
-                residue: 0,
-                tsm_code: 0,
-            },
-            read_result: TsmCompletion {
-                residue: 0,
-                tsm_code: 0,
-            },
+            size_result: 8,
+            read_result: None,
             request_error: None,
+            bad_return: None,
             close_failures: 0,
             released: false,
             kernel_state: CcaTdiState::Unlocked,
@@ -144,21 +140,19 @@ impl EvidenceDevice for Fake {
     fn request(
         &mut self,
         operation: EvidenceOperation,
-        request: CcaTsmRequest<'_>,
+        request: CcaTsmRequest,
         response: &mut [u8],
-    ) -> Result<TsmCompletion, BackendError> {
+    ) -> Result<usize, BackendError> {
         if let Some(gate) = &self.1 {
-            if matches!(
-                operation,
-                EvidenceOperation::SetState(_) | EvidenceOperation::ValidateMmio
-            ) {
+            if matches!(operation, EvidenceOperation::SetState(_)) {
                 assert!(gate.state.try_lock().is_none());
             }
         }
         let mut model = self.0.lock();
         match &request {
-            CcaTsmRequest::ObjectSize(object) => model.calls.push(Call::Size(*object)),
-            CcaTsmRequest::ReadObject(object) => {
+            CcaTsmRequest::ObjectInfo(object) => model.calls.push(Call::Size(*object)),
+            CcaTsmRequest::ReadObject { object, offset } => {
+                assert_eq!(*offset, 0);
                 model.calls.push(Call::Read(*object, response.len()))
             }
             CcaTsmRequest::SetState(state) if self.1.is_some() => {
@@ -168,19 +162,13 @@ impl EvidenceDevice for Fake {
                     model.kernel_state = *state;
                 }
             }
-            CcaTsmRequest::ValidateMmio {
-                gpa_base,
-                gpa_top,
-                pa_base,
-            } if self.1.is_some() => {
-                assert!(model.vm_ledger.contains(&(*gpa_base..*gpa_top)));
-                model.calls.push(Call::Map(*gpa_base, *gpa_top, *pa_base));
-            }
             CcaTsmRequest::RegenerateInterfaceReport if self.1.is_some() => {
                 model.calls.push(Call::Report)
             }
-            CcaTsmRequest::RegenerateMeasurements { flags, nonce } if self.1.is_some() => {
-                model.calls.push(Call::Measurements(*flags, **nonce));
+            CcaTsmRequest::RegenerateMeasurements { raw, nonce } if self.1.is_some() => {
+                model
+                    .calls
+                    .push(Call::Measurements(u64::from(*raw), *nonce));
             }
             _ => panic!("evidence backend issued a mutation"),
         }
@@ -198,29 +186,35 @@ impl EvidenceDevice for Fake {
             pause.wait();
         }
         let model = &mut *self.0.lock();
-        if let Some((errno, tsm_code)) = model.request_error {
+        if let Some(errno) = model.request_error {
             return Err(BackendError::Request {
                 operation,
-                source: TsmRequestError::Ioctl { errno, tsm_code },
+                source: TsmRequestError::Ioctl(errno),
+            });
+        }
+        if let Some(value) = model.bad_return {
+            return Err(BackendError::Request {
+                operation,
+                source: TsmRequestError::Return(value),
             });
         }
         match request {
-            CcaTsmRequest::ObjectSize(_) => {
-                assert_eq!(response, (-1i32).to_ne_bytes());
+            CcaTsmRequest::ObjectInfo(_) => {
+                assert_eq!(response, u64::MAX.to_ne_bytes());
                 if model.write_size {
                     response.copy_from_slice(&model.size.to_ne_bytes());
                 }
                 Ok(model.size_result)
             }
-            CcaTsmRequest::ReadObject(_) => {
+            CcaTsmRequest::ReadObject { .. } => {
                 assert!(response.iter().all(|&byte| byte == 0));
                 let len = response.len().min(model.contents.len());
                 response[..len].copy_from_slice(&model.contents[..len]);
-                Ok(model.read_result)
+                Ok(model.read_result.unwrap_or(response.len()))
             }
             _ if self.1.is_some() => {
                 assert!(self.1.as_ref().unwrap().state.try_lock().is_none());
-                Ok(model.read_result)
+                Ok(model.read_result.unwrap_or(0))
             }
             _ => panic!("evidence backend issued a mutation"),
         }
@@ -238,7 +232,6 @@ impl EvidenceDevice for Fake {
                     associated: true,
                     device: Some(10),
                     ioas: Some(20),
-                    parent: Some(30),
                     viommu: Some(40),
                     child: Some(50),
                     vdevice: Some(60),
@@ -297,16 +290,19 @@ fn native_mutations_hold_access_gate_and_preserve_nonce_format() {
 
 #[test]
 fn every_native_mutation_failure_quarantines_frontend_access() {
-    for (residue, tsm_code, syscall) in
-        [(1, 0, None), (0, 9, None), (0, 0, Some((Errno::EFAULT, 7)))]
-    {
+    for (length, bad_return, syscall) in [
+        (Some(1), None, None),
+        (None, Some(9), None),
+        (None, None, Some(Errno::EFAULT)),
+    ] {
         let (mut fake, model) = Fake::new();
         let gate = Arc::new(AccessGate::new(8));
         gate.state.lock().private_ready = true;
         fake.1 = Some(gate.clone());
         let mut owner = prepare_backend(fake, SnapshotBudget::new(8))
             .unwrap_or_else(|(error, _)| panic!("{error}"));
-        model.lock().read_result = TsmCompletion { residue, tsm_code };
+        model.lock().read_result = length;
+        model.lock().bad_return = bad_return;
         model.lock().request_error = syscall;
         assert!(owner.set_state(ConfirmedState::Locked).is_err());
         assert!(gate.state.lock().deny_all);
@@ -364,12 +360,26 @@ impl pci_core::vfio::VfioVm for LedgerVm {
         model.calls.push(Call::Record(rid, range.clone(), host));
         if model.record_failure != Some(false) {
             assert!(!model.vm_ledger.iter().any(|old| overlaps(old, &range)));
-            model.vm_ledger.push(range);
+            model.vm_ledger.push(range.clone());
         }
         if model.record_failure.is_some() {
             return Err(pci_core::vfio::VfioVmError::new(std::io::Error::other(
                 "record failure",
             )));
+        }
+        model.calls.push(Call::Map(range.start, range.end, host));
+        let pause = if model
+            .pause
+            .as_ref()
+            .is_some_and(|(call, _)| Some(call) == model.calls.last())
+        {
+            model.pause.take().map(|(_, pause)| pause)
+        } else {
+            None
+        };
+        drop(model);
+        if let Some(pause) = pause {
+            pause.wait();
         }
         Ok(())
     }
@@ -495,12 +505,12 @@ fn failed_unlock_never_retires_ledgers_even_after_kernel_state_changed() {
         owner.set_state(ConfirmedState::Running).unwrap();
         match failure {
             0 => {
-                model.lock().request_error = Some((Errno::EIO, 0));
+                model.lock().request_error = Some(Errno::EIO);
                 model.lock().commit_state_before_error = false;
             }
-            1 => model.lock().request_error = Some((Errno::EFAULT, 17)),
-            2 => model.lock().read_result.residue = 1,
-            3 => model.lock().read_result.tsm_code = 9,
+            1 => model.lock().request_error = Some(Errno::EFAULT),
+            2 => model.lock().read_result = Some(1),
+            3 => model.lock().bad_return = Some(9),
             _ => model.lock().completion_failure = true,
         }
         let error = owner.set_state(ConfirmedState::Unlocked).unwrap_err();
@@ -508,26 +518,27 @@ fn failed_unlock_never_retires_ledgers_even_after_kernel_state_changed() {
             0 => assert!(matches!(
                 error,
                 Error::Backend(BackendError::Request {
-                    source: TsmRequestError::Ioctl {
-                        errno: Errno::EIO,
-                        tsm_code: 0
-                    },
+                    source: TsmRequestError::Ioctl(Errno::EIO),
                     ..
                 })
             )),
             1 => assert!(matches!(
                 error,
                 Error::Backend(BackendError::Request {
-                    source: TsmRequestError::Ioctl {
-                        errno: Errno::EFAULT,
-                        tsm_code: 17
-                    },
+                    source: TsmRequestError::Ioctl(Errno::EFAULT),
                     ..
                 })
             )),
-            2 | 3 => assert!(matches!(
+            2 => assert!(matches!(
                 error,
                 Error::Backend(BackendError::Completion { .. })
+            )),
+            3 => assert!(matches!(
+                error,
+                Error::Backend(BackendError::Request {
+                    source: TsmRequestError::Return(9),
+                    ..
+                })
             )),
             _ => assert!(matches!(error, Error::Backend(BackendError::Assignment(_)))),
         }
@@ -804,11 +815,11 @@ fn full_evidence_transport_errors_quarantine_before_returning() {
         {
             let mut model = model.lock();
             match failure {
-                0 => model.request_error = Some((Errno::EIO, 7)),
-                1 => model.size_result.tsm_code = 9,
-                2 => model.size_result.residue = 1,
-                3 => model.read_result.tsm_code = 11,
-                4 => model.read_result.residue = 1,
+                0 => model.request_error = Some(Errno::EIO),
+                1 => model.bad_return = Some(9),
+                2 => model.size_result = 7,
+                3 => model.bad_return = Some(11),
+                4 => model.read_result = Some(7),
                 _ => model.write_size = false,
             }
         }
@@ -839,7 +850,7 @@ fn full_evidence_failure_permanently_closes_service_admission() {
         .unwrap_or_else(|(error, _)| panic!("{error}"));
     let service = owner.into_evidence_service();
     gate.bind_service(Arc::downgrade(&service)).unwrap();
-    model.lock().read_result.residue = 1;
+    model.lock().read_result = Some(7);
     assert!(block_on(service.object_size(Object::Certificate)).is_err());
     assert!(matches!(
         block_on(service.set_state(ConfirmedState::Locked)),
@@ -1011,13 +1022,14 @@ fn all_native_objects_translate_explicitly_and_use_whole_snapshots() {
 }
 
 #[test]
-fn absent_empty_negative_and_oversized_objects_never_read() {
+fn absent_empty_and_oversized_objects_never_read() {
     for (write_size, size) in [
         (false, 8),
         (true, 0),
-        (true, -1),
-        (true, i32::MIN),
-        (true, tdisp::host::MAX_OBJECT_SIZE as i32 + 1),
+        (true, u64::MAX),
+        (true, u64::MAX - 1),
+        (true, tdisp::host::MAX_OBJECT_SIZE as u64 + 1),
+        (true, u64::from(u32::MAX) + 1),
     ] {
         let (device, model) = Fake::new();
         model.lock().write_size = write_size;
@@ -1025,7 +1037,7 @@ fn absent_empty_negative_and_oversized_objects_never_read() {
         let budget = SnapshotBudget::new(tdisp::host::MAX_OBJECT_SIZE);
         let mut coordinator = Coordinator::new(EvidenceBackend { device }, budget.clone()).unwrap();
         let error = coordinator.object_size(Object::Certificate).unwrap_err();
-        if size > tdisp::host::MAX_OBJECT_SIZE as i32 {
+        if size > tdisp::host::MAX_OBJECT_SIZE as u64 && size != u64::MAX {
             assert!(matches!(error, Error::Snapshot(SnapshotError::TooLarge(_))));
         } else {
             assert!(matches!(
@@ -1039,25 +1051,8 @@ fn absent_empty_negative_and_oversized_objects_never_read() {
 }
 
 #[test]
-fn size_requires_complete_reply_and_zero_tsm_status() {
-    for completion in [
-        TsmCompletion {
-            residue: 1,
-            tsm_code: 0,
-        },
-        TsmCompletion {
-            residue: 4,
-            tsm_code: 0,
-        },
-        TsmCompletion {
-            residue: 5,
-            tsm_code: 0,
-        },
-        TsmCompletion {
-            residue: 0,
-            tsm_code: 9,
-        },
-    ] {
+fn size_requires_a_complete_64_bit_reply() {
+    for completion in [0, 4, 7, 9] {
         let (device, model) = Fake::new();
         model.lock().size_result = completion;
         let mut backend = EvidenceBackend { device };
@@ -1072,36 +1067,19 @@ fn size_requires_complete_reply_and_zero_tsm_status() {
         };
         assert_eq!(operation, EvidenceOperation::ObjectSize(Object::Vca));
         assert_eq!(actual, completion);
-        assert_eq!(capacity, 4);
+        assert_eq!(capacity, 8);
     }
 }
 
 #[test]
 fn short_or_failed_reads_never_produce_a_snapshot() {
-    for completion in [
-        TsmCompletion {
-            residue: 3,
-            tsm_code: 0,
-        },
-        TsmCompletion {
-            residue: 8,
-            tsm_code: 0,
-        },
-        TsmCompletion {
-            residue: 9,
-            tsm_code: 0,
-        },
-        TsmCompletion {
-            residue: 0,
-            tsm_code: 5,
-        },
-    ] {
+    for completion in [0, 3, 7, 9] {
         let (device, model) = Fake::new();
-        model.lock().read_result = completion;
+        model.lock().read_result = Some(completion);
         let budget = SnapshotBudget::new(32);
         let mut coordinator = Coordinator::new(EvidenceBackend { device }, budget.clone()).unwrap();
         let error = coordinator.object_size(Object::Vca).unwrap_err();
-        if completion.tsm_code == 0 && completion.residue <= 8 {
+        if completion <= 8 {
             assert!(matches!(
                 error,
                 Error::Snapshot(SnapshotError::IncoherentRead { .. })
@@ -1122,10 +1100,10 @@ fn failed_acquisition_invalidates_previous_objects() {
     let budget = SnapshotBudget::new(32);
     let mut coordinator = Coordinator::new(EvidenceBackend { device }, budget.clone()).unwrap();
     coordinator.object_size(Object::Vca).unwrap();
-    model.lock().size_result.residue = 1;
+    model.lock().size_result = 7;
     assert!(coordinator.object_size(Object::Certificate).is_err());
     assert_eq!(budget.used(), 0);
-    model.lock().size_result.residue = 0;
+    model.lock().size_result = 8;
     model.lock().contents.fill(0xa5);
     assert_eq!(
         coordinator.read_object(Object::Vca, 0, 2).unwrap(),
@@ -1135,29 +1113,28 @@ fn failed_acquisition_invalidates_previous_objects() {
 }
 
 #[test]
-fn ioctl_errno_and_tsm_code_survive_the_native_coordinator() {
+fn ioctl_errno_survives_the_native_coordinator() {
     let (device, model) = Fake::new();
-    model.lock().request_error = Some((Errno::EFAULT, 17));
+    model.lock().request_error = Some(Errno::EFAULT);
     let budget = SnapshotBudget::new(32);
     let mut coordinator = Coordinator::new(EvidenceBackend { device }, budget.clone()).unwrap();
     let error = coordinator.object_size(Object::Vca).unwrap_err();
     let Error::Backend(BackendError::Request {
         operation,
-        source: TsmRequestError::Ioctl { errno, tsm_code },
+        source: TsmRequestError::Ioctl(errno),
     }) = error
     else {
         panic!("lost typed syscall failure")
     };
     assert_eq!(operation, EvidenceOperation::ObjectSize(Object::Vca));
     assert_eq!(errno, Errno::EFAULT);
-    assert_eq!(tsm_code, 17);
     assert_eq!(budget.used(), 0);
 }
 
 #[test]
 fn attached_without_cca_binding_retains_owner_instead_of_claiming_unlocked() {
     let (device, model) = Fake::new();
-    model.lock().request_error = Some((Errno::ENXIO, 0));
+    model.lock().request_error = Some(Errno::ENXIO);
     let budget = SnapshotBudget::new(8);
     let (error, device) = match prepare_backend(device, budget.clone()) {
         Err(failure) => failure,
@@ -1167,10 +1144,7 @@ fn attached_without_cca_binding_retains_owner_instead_of_claiming_unlocked() {
         error,
         BackendError::Request {
             operation: EvidenceOperation::ObjectSize(Object::Certificate),
-            source: TsmRequestError::Ioctl {
-                errno: Errno::ENXIO,
-                tsm_code: 0
-            },
+            source: TsmRequestError::Ioctl(Errno::ENXIO),
         }
     ));
     assert_eq!(device.phase(), RealmPhase::Attached);
@@ -1222,46 +1196,11 @@ fn ownership_transfer_rejects_other_phases_without_io() {
 #[test]
 fn binding_verification_requires_a_complete_present_object_size() {
     for (write_size, size, completion) in [
-        (
-            false,
-            8,
-            TsmCompletion {
-                residue: 0,
-                tsm_code: 0,
-            },
-        ),
-        (
-            true,
-            0,
-            TsmCompletion {
-                residue: 0,
-                tsm_code: 0,
-            },
-        ),
-        (
-            true,
-            -1,
-            TsmCompletion {
-                residue: 0,
-                tsm_code: 0,
-            },
-        ),
-        (
-            true,
-            8,
-            TsmCompletion {
-                residue: 1,
-                tsm_code: 0,
-            },
-        ),
-        (
-            true,
-            8,
-            TsmCompletion {
-                residue: 0,
-                tsm_code: 5,
-            },
-        ),
+        (false, 8, 8),
+        (true, 0, 8),
+        (true, u64::MAX, 8),
+        (true, 8, 7),
+        (true, 8, 9),
     ] {
         let (device, model) = Fake::new();
         model.lock().write_size = write_size;

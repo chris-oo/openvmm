@@ -1,77 +1,16 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Typed CCA TSM requests for the experimental Linux device-assignment ABI.
-//!
-//! These synchronous bindings retain host buffers for the entire ioctl. They
-//! provide no device ownership, access policy, or state machine. Callers must
-//! serialize requests with teardown and revoke access before changing state.
-//! A state-changing ioctl error can follow a completed device operation.
+//! Typed operations for the supported Linux CCA device-assignment ABI.
+//! Errors can follow completed state changes; never blindly retry mutations.
 
-use super::IommufdCtx;
+use crate::iommufd::IommufdCtx;
 use nix::errno::Errno;
 use std::os::fd::AsRawFd;
 use zerocopy::Immutable;
 use zerocopy::IntoBytes;
 
-const IOMMU_VDEVICE_TSM_REQ: u32 = 0x3b96;
-const TVM_ARCH_CCA: u32 = 1;
-
-mod ioctl {
-    nix::ioctl_readwrite_bad!(
-        vdevice_tsm_req,
-        super::IOMMU_VDEVICE_TSM_REQ,
-        super::TsmRequest
-    );
-}
-
-// Linux integration 2b68f486fdbc: include/uapi/linux/iommufd.h and
-// arch/arm64/include/uapi/asm/rmi-da.h. Explicit alignment matches __aligned_u64.
-#[repr(C, align(8))]
-struct TsmRequest {
-    size: u32,
-    vdevice_id: u32,
-    op: u32,
-    tvm_arch: u32,
-    req_len: u32,
-    resp_len: u32,
-    req_uptr: u64,
-    resp_uptr: u64,
-    tsm_code: u64,
-}
-
-#[repr(C, align(8))]
-#[derive(IntoBytes, Immutable)]
-struct ValidateMmio {
-    gpa_base: u64,
-    gpa_top: u64,
-    pa_base: u64,
-}
-
-#[repr(C)]
-#[derive(IntoBytes, Immutable)]
-struct ScalarRequest {
-    value: u32,
-}
-
-#[repr(C, align(8))]
-#[derive(IntoBytes, Immutable)]
-struct ReadObject {
-    object_type: u32,
-    reserved: u32,
-    offset: u64,
-}
-
-#[repr(C, align(8))]
-#[derive(IntoBytes, Immutable)]
-struct RegenerateObject {
-    object_type: u32,
-    reserved: u32,
-    flags: u64,
-    nonce: u64,
-}
-
-/// Objects implemented by the pinned CCA host kernel.
+/// Evidence objects supported by the CCA vDEVICE backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CcaObject {
     /// Virtual component attestation evidence.
@@ -95,10 +34,10 @@ impl CcaObject {
     }
 }
 
-/// Native CCA state targets, not protobuf TDISP state numbers.
+/// Native TDISP state targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CcaTdiState {
-    /// Release device assignment.
+    /// Release assignment.
     Unlocked,
     /// Lock device resources.
     Locked,
@@ -116,254 +55,288 @@ impl CcaTdiState {
     }
 }
 
-/// A CCA request with host-owned parameters, never raw guest pointers.
+#[repr(C, align(8))]
+struct Envelope {
+    size: u32,
+    vdevice_id: u32,
+    op: u32,
+    req_len: u32,
+    resp_len: u32,
+    reserved: u32,
+    req_uptr: u64,
+    resp_uptr: u64,
+}
+
+mod ioctl {
+    nix::ioctl_readwrite_bad!(vdevice_op, 0x3b96, super::Envelope);
+}
+
+#[repr(C)]
+#[derive(IntoBytes, Immutable)]
+struct Scalar {
+    value: u32,
+    reserved: u32,
+}
+
+#[repr(C, align(8))]
+#[derive(IntoBytes, Immutable)]
+struct Read {
+    object_type: u32,
+    reserved: u32,
+    offset: u64,
+}
+
+#[repr(C)]
+#[derive(IntoBytes, Immutable)]
+struct Regen {
+    object_type: u32,
+    flags: u32,
+    nonce: [u8; 32],
+}
+
+/// Host-owned operation parameters. No guest pointers reach the kernel.
 #[derive(Debug)]
-pub enum CcaTsmRequest<'a> {
-    /// Validate a protected MMIO interval. Policy and address validation belong
-    /// to the device coordinator; `gpa_top` is exclusive.
-    ValidateMmio {
-        /// First guest physical address.
-        gpa_base: u64,
-        /// Exclusive last guest physical address.
-        gpa_top: u64,
-        /// First host physical address.
-        pa_base: u64,
-    },
-    /// Change device state after the caller has stopped conflicting access.
+pub enum Request {
+    /// Change state. An error does not prove the state stayed unchanged.
     SetState(CcaTdiState),
-    /// Query an object's size into an exactly four-byte response.
-    ObjectSize(CcaObject),
-    /// Read a whole object into the response, always at backend offset zero.
-    /// The caller must query and bound the allocation first, and reject any
-    /// returned length that differs from the queried size.
-    ReadObject(CcaObject),
-    /// Refresh the interface report.
+    /// Query the object's length as a native eight-byte unsigned integer.
+    ObjectInfo(CcaObject),
+    /// Read the complete remaining object at this offset.
+    ReadObject {
+        /// Evidence object.
+        object: CcaObject,
+        /// Byte offset in the current kernel snapshot.
+        offset: u64,
+    },
+    /// Refresh the report without flags or a nonce.
     RegenerateInterfaceReport,
-    /// Refresh measurements. The nonce is borrowed host storage; it is not a
-    /// guest address. The backend validates the native measurement flags.
+    /// Refresh measurements with an inline nonce.
     RegenerateMeasurements {
-        /// Native measurement format flags.
-        flags: u64,
-        /// The guest nonce copied into host storage.
-        nonce: &'a [u8; 32],
+        /// Request the raw format rather than hashes.
+        raw: bool,
+        /// Host-owned nonce.
+        nonce: [u8; 32],
     },
 }
 
 enum Payload {
-    Validate(ValidateMmio),
-    Scalar(ScalarRequest),
-    Read(ReadObject),
-    Regenerate(RegenerateObject),
+    Scalar(Scalar),
+    Read(Read),
+    Regen(Regen),
 }
 
 impl Payload {
-    fn as_bytes(&self) -> &[u8] {
+    fn bytes(&self) -> &[u8] {
         match self {
-            Self::Validate(value) => value.as_bytes(),
             Self::Scalar(value) => value.as_bytes(),
             Self::Read(value) => value.as_bytes(),
-            Self::Regenerate(value) => value.as_bytes(),
+            Self::Regen(value) => value.as_bytes(),
         }
     }
 }
 
-impl CcaTsmRequest<'_> {
-    fn encode(&self) -> (u32, Payload) {
-        match *self {
-            Self::ValidateMmio {
-                gpa_base,
-                gpa_top,
-                pa_base,
-            } => (
-                1,
-                Payload::Validate(ValidateMmio {
-                    gpa_base,
-                    gpa_top,
-                    pa_base,
-                }),
-            ),
-            Self::SetState(state) => (
-                2,
-                Payload::Scalar(ScalarRequest {
-                    value: state.abi_value(),
-                }),
-            ),
-            Self::ReadObject(object) => (
-                5,
-                Payload::Read(ReadObject {
-                    object_type: object.abi_value(),
-                    reserved: 0,
-                    offset: 0,
-                }),
-            ),
-            Self::RegenerateInterfaceReport => (
-                6,
-                Payload::Regenerate(RegenerateObject {
-                    object_type: CcaObject::InterfaceReport.abi_value(),
-                    reserved: 0,
-                    flags: 0,
-                    nonce: 0,
-                }),
-            ),
-            Self::RegenerateMeasurements { flags, nonce } => (
-                6,
-                Payload::Regenerate(RegenerateObject {
-                    object_type: CcaObject::Measurement.abi_value(),
-                    reserved: 0,
-                    flags,
-                    nonce: nonce.as_ptr() as u64,
-                }),
-            ),
-            Self::ObjectSize(object) => (
-                7,
-                Payload::Scalar(ScalarRequest {
-                    value: object.abi_value(),
-                }),
-            ),
-        }
-    }
-}
-
-/// A nonnegative ioctl return, which is not by itself TSM success.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[must_use]
-pub struct TsmCompletion {
-    /// Unused response bytes, or unconsumed request bytes if there is no response.
-    pub residue: u32,
-    /// Raw TSM code. The pinned backend can leave this zero on failure paths.
-    pub tsm_code: u64,
-}
-
-/// Local validation, syscall failure, or an invalid kernel completion.
+/// Local validation or an uncertain kernel result.
 #[derive(Debug, thiserror::Error)]
-pub enum TsmRequestError {
-    /// Rejected before ioctl; only the two native measurement formats exist.
-    #[error("unsupported native measurement flags {0:#x}")]
-    MeasurementFlags(u64),
-    /// Rejected before issuing the ioctl.
-    #[error("invalid CCA TSM response length {length}")]
-    ResponseLength {
-        /// Offered response capacity.
-        length: usize,
-    },
-    /// The request was issued and can have changed device state. The TSM code
-    /// may be unchanged if failure happened before kernel copyback.
-    #[error("IOMMU_VDEVICE_TSM_REQ failed: {errno} (TSM code {tsm_code:#x})")]
-    Ioctl {
-        /// Original syscall errno.
-        #[source]
-        errno: Errno,
-        /// Raw output field, initialized to zero before the ioctl.
-        tsm_code: u64,
-    },
-    /// The ioctl completed, but its residue cannot describe the offered buffer.
-    #[error("invalid TSM residue {residue} for capacity {capacity} (TSM code {tsm_code:#x})")]
-    InvalidResidue {
-        /// Raw nonnegative return value.
-        residue: u32,
-        /// Response capacity, or request size when no response was offered.
+pub enum Error {
+    /// The response does not have the shape required by this operation.
+    #[error("invalid CCA response capacity {0}")]
+    Capacity(usize),
+    /// State-changing failures may occur after the operation completed.
+    #[error("IOMMU_VDEVICE_OP failed: {0}")]
+    Ioctl(#[source] Errno),
+    /// The new ABI only permits zero as a successful return.
+    #[error("unexpected IOMMU_VDEVICE_OP return {0}")]
+    Return(i32),
+    /// The kernel returned an invalid or incomplete response length.
+    #[error("invalid CCA response length {actual}, capacity {capacity}")]
+    Length {
+        /// Copied response length.
+        actual: u32,
+        /// Offered buffer length.
         capacity: u32,
-        /// Raw TSM output field.
-        tsm_code: u64,
-    },
-    /// A negative return without an errno. This is not a usable completion.
-    #[error("unexpected TSM ioctl return {value} (TSM code {tsm_code:#x})")]
-    InvalidReturn {
-        /// Raw return value.
-        value: i32,
-        /// Raw TSM output field.
-        tsm_code: u64,
     },
 }
 
 fn execute(
     vdevice_id: u32,
-    request: CcaTsmRequest<'_>,
+    request: Request,
     response: &mut [u8],
-    invoke: impl FnOnce(&mut TsmRequest) -> Result<libc::c_int, Errno>,
-) -> Result<TsmCompletion, TsmRequestError> {
-    if let CcaTsmRequest::RegenerateMeasurements { flags, .. } = &request {
-        if *flags > 1 {
-            return Err(TsmRequestError::MeasurementFlags(*flags));
-        }
+    invoke: impl FnOnce(&mut Envelope) -> Result<i32, Errno>,
+) -> Result<usize, Error> {
+    let info = matches!(request, Request::ObjectInfo(_));
+    let read = matches!(request, Request::ReadObject { .. });
+    if (info && response.len() != 8) || (!info && !read && !response.is_empty()) {
+        return Err(Error::Capacity(response.len()));
     }
-    let response_length_valid = match request {
-        CcaTsmRequest::ObjectSize(_) => response.len() == 4,
-        CcaTsmRequest::ReadObject(_) => !response.is_empty(),
-        _ => response.is_empty(),
+    let capacity = u32::try_from(response.len()).map_err(|_| Error::Capacity(response.len()))?;
+    let (op, payload) = match request {
+        Request::SetState(state) => (
+            0,
+            Payload::Scalar(Scalar {
+                value: state.abi_value(),
+                reserved: 0,
+            }),
+        ),
+        Request::ObjectInfo(object) => (
+            1,
+            Payload::Scalar(Scalar {
+                value: object.abi_value(),
+                reserved: 0,
+            }),
+        ),
+        Request::ReadObject { object, offset } => (
+            2,
+            Payload::Read(Read {
+                object_type: object.abi_value(),
+                reserved: 0,
+                offset,
+            }),
+        ),
+        Request::RegenerateInterfaceReport => (
+            3,
+            Payload::Regen(Regen {
+                object_type: CcaObject::InterfaceReport.abi_value(),
+                flags: 0,
+                nonce: [0; 32],
+            }),
+        ),
+        Request::RegenerateMeasurements { raw, nonce } => (
+            3,
+            Payload::Regen(Regen {
+                object_type: CcaObject::Measurement.abi_value(),
+                flags: u32::from(raw),
+                nonce,
+            }),
+        ),
     };
-    if !response_length_valid {
-        return Err(TsmRequestError::ResponseLength {
-            length: response.len(),
-        });
-    }
-    let resp_len = u32::try_from(response.len()).map_err(|_| TsmRequestError::ResponseLength {
-        length: response.len(),
-    })?;
-    let (op, payload) = request.encode();
-    let bytes = payload.as_bytes();
-    let mut cmd = TsmRequest {
-        size: size_of::<TsmRequest>() as u32,
+    let bytes = payload.bytes();
+    let mut envelope = Envelope {
+        size: size_of::<Envelope>() as u32,
         vdevice_id,
         op,
-        tvm_arch: TVM_ARCH_CCA,
         req_len: bytes.len() as u32,
-        resp_len,
+        resp_len: capacity,
+        reserved: 0,
         req_uptr: bytes.as_ptr() as u64,
         resp_uptr: if response.is_empty() {
             0
         } else {
             response.as_mut_ptr() as u64
         },
-        tsm_code: 0,
     };
-    let capacity = if resp_len != 0 { resp_len } else { cmd.req_len };
-    let result = invoke(&mut cmd);
-    let value = result.map_err(|errno| TsmRequestError::Ioctl {
-        errno,
-        tsm_code: cmd.tsm_code,
-    })?;
-    let residue = u32::try_from(value).map_err(|_| TsmRequestError::InvalidReturn {
-        value,
-        tsm_code: cmd.tsm_code,
-    })?;
-    if residue > capacity {
-        return Err(TsmRequestError::InvalidResidue {
-            residue,
+    let result = invoke(&mut envelope).map_err(Error::Ioctl)?;
+    if result != 0 {
+        return Err(Error::Return(result));
+    }
+    if envelope.resp_len > capacity || (info && envelope.resp_len != 8) {
+        return Err(Error::Length {
+            actual: envelope.resp_len,
             capacity,
-            tsm_code: cmd.tsm_code,
         });
     }
-    Ok(TsmCompletion {
-        residue,
-        tsm_code: cmd.tsm_code,
-    })
+    Ok(envelope.resp_len as usize)
 }
 
 impl IommufdCtx {
-    /// Issue a typed synchronous request for an existing CCA vdevice.
+    /// Issue an operation without retries or ABI fallback.
     ///
-    /// The caller owns the vdevice and must serialize requests with its entire
-    /// lifecycle. Do not retry state-changing errors: even a copyback `EFAULT`
-    /// can follow a completed state transition. Success requires checking both
-    /// residue and TSM status, plus operation-specific response contents.
-    ///
-    /// These bindings use the pinned experimental Linux ABI, not a capability
-    /// probe. They do not enable trusted PCI assignment in OpenVMM.
+    /// Serialize with the complete vDEVICE lifecycle. The response length does
+    /// not establish unchanged device state after a syscall/copyback error.
     pub fn cca_tsm_request(
         &self,
         vdevice_id: u32,
-        request: CcaTsmRequest<'_>,
+        request: Request,
         response: &mut [u8],
-    ) -> Result<TsmCompletion, TsmRequestError> {
-        execute(vdevice_id, request, response, |cmd| {
-            // SAFETY: the typed request, response, and optional 32-byte nonce
-            // point to live host storage for this synchronous call. The kernel
-            // receives the exact buffer lengths and retains no user pointers.
-            unsafe { ioctl::vdevice_tsm_req(self.as_raw_fd(), cmd) }
+    ) -> Result<usize, Error> {
+        execute(vdevice_id, request, response, |envelope| {
+            // SAFETY: all request and response storage remains live until this
+            // synchronous ioctl returns. The kernel retains no user pointers.
+            unsafe { ioctl::vdevice_op(self.as_raw_fd(), envelope) }
         })
     }
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    #[test]
+    fn rejects_legacy_completion_and_partial_info() {
+        for returned in [-1, 1, 8] {
+            assert!(matches!(
+                execute(
+                    1,
+                    Request::ObjectInfo(CcaObject::Certificate),
+                    &mut [0; 8],
+                    |_| Ok(returned)
+                ),
+                Err(Error::Return(_))
+            ));
+        }
+        assert!(matches!(
+            execute(
+                1,
+                Request::ObjectInfo(CcaObject::Certificate),
+                &mut [0; 8],
+                |cmd| {
+                    cmd.resp_len = 4;
+                    Ok(0)
+                }
+            ),
+            Err(Error::Length { .. })
+        ));
+        assert!(matches!(
+            execute(1, Request::SetState(CcaTdiState::Locked), &mut [], |cmd| {
+                cmd.resp_len = 1;
+                Ok(0)
+            }),
+            Err(Error::Length { .. })
+        ));
+    }
+
+    #[test]
+    fn regeneration_has_inline_nonce_and_no_padding() {
+        let request = Request::RegenerateMeasurements {
+            raw: true,
+            nonce: [0xa5; 32],
+        };
+        execute(2, request, &mut [], |cmd| {
+            assert_eq!(cmd.size, 40);
+            assert_eq!(cmd.req_len, 40);
+            assert_eq!(cmd.reserved, 0);
+            // SAFETY: execute owns the request for this callback.
+            let bytes = unsafe { std::slice::from_raw_parts(cmd.req_uptr as *const u8, 40) };
+            assert_eq!(&bytes[..8], &[2, 0, 0, 0, 1, 0, 0, 0]);
+            assert_eq!(&bytes[8..], &[0xa5; 32]);
+            Ok(0)
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn read_preserves_short_length_and_errno() {
+        assert_eq!(
+            execute(
+                1,
+                Request::ReadObject {
+                    object: CcaObject::Vca,
+                    offset: 3
+                },
+                &mut [0; 8],
+                |cmd| {
+                    cmd.resp_len = 3;
+                    Ok(0)
+                }
+            )
+            .unwrap(),
+            3
+        );
+        assert!(matches!(
+            execute(1, Request::SetState(CcaTdiState::Unlocked), &mut [], |_| {
+                Err(Errno::EBUSY)
+            }),
+            Err(Error::Ioctl(Errno::EBUSY))
+        ));
+    }
+}

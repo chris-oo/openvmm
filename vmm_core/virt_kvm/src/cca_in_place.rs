@@ -83,6 +83,60 @@ pub(crate) fn checked_range(gpa: u64, size: u64) -> Result<MemoryRange, CcaInPla
     Ok(MemoryRange::new(gpa..end))
 }
 
+pub(crate) fn validate_device_lease(
+    range: MemoryRange,
+    pa: u64,
+    bar: MemoryRange,
+    host: u64,
+    nonsecure: &[MemoryRange],
+    private: &[MemoryRange],
+) -> Result<(), CcaInPlaceError> {
+    checked_range(range.start(), range.len())?;
+    checked_range(pa, range.len())?;
+    if !bar.contains(&range)
+        || host.checked_add(range.start().saturating_sub(bar.start())) != Some(pa)
+        || nonsecure.iter().chain(private).any(|r| r.overlaps(&range))
+    {
+        return Err(CcaInPlaceError::InvalidProtectedMapping);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeviceCommandStage {
+    Share,
+    Release,
+    Write,
+    Attach,
+}
+
+pub(crate) fn device_command_needs_rebind(
+    old: u8,
+    new: u8,
+    private: bool,
+) -> Result<bool, CcaInPlaceError> {
+    let changes = (old ^ new) & 6;
+    if private && changes != 0 && (changes != 4 || new & 4 != 0) {
+        return Err(CcaInPlaceError::InvalidProtectedMapping);
+    }
+    Ok(changes != 0)
+}
+
+pub(crate) fn execute_device_command<E>(
+    rebind: bool,
+    mut stage: impl FnMut(DeviceCommandStage) -> Result<(), E>,
+) -> Result<(), E> {
+    if rebind {
+        stage(DeviceCommandStage::Share)?;
+        stage(DeviceCommandStage::Release)?;
+    }
+    stage(DeviceCommandStage::Write)?;
+    if rebind {
+        stage(DeviceCommandStage::Attach)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_imports(
     ranges: impl IntoIterator<Item = MemoryRange>,
 ) -> Result<(), CcaInPlaceError> {
@@ -195,8 +249,6 @@ pub(crate) struct Fault {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum FaultAction {
-    /// Re-enter only to identify a RIPAS completion. Do not change backing.
-    ProbeCompletion,
     Convert,
     /// Backing already matches. KVM may finish RIPAS and resume the guest.
     NoChange,
@@ -276,19 +328,8 @@ impl Visibility {
     }
 }
 
-/// The pinned kernel's arch/arm64/kvm/rmi-exit.c rec_exit_ripas_change returns
-/// EFAULT for each fresh request, even if its attributes already match.
-/// rmi.c kvm_complete_ripas_change returns a successful memory fault only when
-/// attributes differ; otherwise it can resume the guest within the same
-/// KVM_RUN. There is no completion marker or requirement for an intervening
-/// ordinary userspace exit.
-///
-/// mmu.c gmem_abort also returns EFAULT with PRIVATE clear for backing failures.
-/// Probe only shared requests that still need conversion: a matching success
-/// confirms RIPAS, whereas another EFAULT must not trigger conversion. For
-/// already-shared requests, allow one no-op without arming a completion probe.
-/// An identical shared EFAULT without intervening progress is indistinguishable
-/// from a persistent backing failure (including poison), so fail closed.
+/// RIPAS EFAULT exits require immediate guest_memfd attribute conversion.
+/// A repeated no-op shared fault without progress is ambiguous and fails closed.
 ///
 /// PRIVATE EFAULT needs no repeat guard: gmem_abort sets PRIVATE only for an
 /// attribute mismatch, never for a backing failure. If the ledger now matches,
@@ -297,7 +338,6 @@ impl Visibility {
 /// under the memory lock, including all-private INIT_RIPAS before first entry.
 #[derive(Debug, Default)]
 pub(crate) struct FaultTracker {
-    probe: Option<Fault>,
     unconfirmed_noop: Option<Fault>,
     device_probe: Option<Fault>,
 }
@@ -336,22 +376,6 @@ impl FaultTracker {
         }
         let private = fault.flags != 0;
         let needs_change = !visibility.changes(range, private)?.is_empty();
-        if let Some(probe) = self.probe {
-            // Another VP may have satisfied the pending request. In that
-            // case KVM can already have resumed this VP, too.
-            let still_pending = !visibility
-                .changes(checked_range(probe.gpa, probe.size)?, false)?
-                .is_empty();
-            if still_pending && (!successful_exit || probe != fault) {
-                return Err(CcaInPlaceError::AmbiguousFault);
-            }
-            self.probe = None;
-        }
-        if !successful_exit && !private && needs_change {
-            self.unconfirmed_noop = None;
-            self.probe = Some(fault);
-            return Ok(FaultAction::ProbeCompletion);
-        }
         let guard_noop = !needs_change && (!private || successful_exit);
         if guard_noop && self.unconfirmed_noop == Some(fault) {
             return Err(CcaInPlaceError::AmbiguousFault);
@@ -371,6 +395,60 @@ impl FaultTracker {
 mod tests {
     use super::*;
     use test_with_tracing::test;
+
+    #[test]
+    fn provider_command_change_never_writes_before_release_or_reattaches_after_error() {
+        use DeviceCommandStage::*;
+        for failure in [Share, Release, Write, Attach] {
+            let mut stages = Vec::new();
+            let result = execute_device_command(true, |stage| {
+                stages.push(stage);
+                if stage == failure {
+                    Err("operation failed")
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(result, Err("operation failed"));
+            assert_eq!(stages.last(), Some(&failure));
+            assert!(!stages[..stages.len() - 1].contains(&failure));
+            if failure == Share || failure == Release {
+                assert!(!stages.contains(&Write));
+            }
+        }
+        let mut stages = Vec::new();
+        execute_device_command(true, |stage| {
+            stages.push(stage);
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        assert_eq!(stages, [Share, Release, Write, Attach]);
+        assert!(device_command_needs_rebind(6, 2, true).unwrap());
+        assert!(device_command_needs_rebind(2, 6, true).is_err());
+        assert!(device_command_needs_rebind(6, 4, true).is_err());
+    }
+
+    #[test]
+    fn device_mapping_requires_the_current_bar_lease_and_excludes_msix() {
+        let bar = MemoryRange::new(0x1000..0x6000);
+        let range = MemoryRange::new(0x2000..0x3000);
+        let msix = [MemoryRange::new(0x4000..0x5000)];
+        validate_device_lease(range, 0x9000, bar, 0x8000, &msix, &[]).unwrap();
+        assert!(validate_device_lease(range, 0xa000, bar, 0x8000, &msix, &[]).is_err());
+        assert!(validate_device_lease(range, 0x9000, bar, 0x8000, &msix, &[range]).is_err());
+        assert!(validate_device_lease(msix[0], 0xb000, bar, 0x8000, &msix, &[]).is_err());
+        assert!(
+            validate_device_lease(
+                MemoryRange::new(0x6000..0x7000),
+                0xd000,
+                bar,
+                0x8000,
+                &[],
+                &[]
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn protected_attempts_cover_known_ranges_but_fault_completion_does_not_retire_them() {
@@ -462,7 +540,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_efault_requires_matching_successful_completion() {
+    fn shared_efault_converts_without_a_completion_probe() {
         let fault = Fault {
             gpa: 4096,
             size: 4096,
@@ -472,7 +550,28 @@ mod tests {
         let mut tracker = FaultTracker::default();
         assert_eq!(
             tracker.observe(fault, false, &visibility).unwrap(),
-            FaultAction::ProbeCompletion
+            FaultAction::Convert
+        );
+        visibility.record(MemoryRange::new(4096..8192), false);
+        assert_eq!(
+            tracker.observe(fault, false, &visibility).unwrap(),
+            FaultAction::NoChange
+        );
+        assert!(tracker.observe(fault, false, &visibility).is_err());
+    }
+
+    #[test]
+    fn shared_conversion_and_noop_guards_do_not_require_completion_markers() {
+        let fault = Fault {
+            gpa: 4096,
+            size: 4096,
+            flags: 0,
+        };
+        let mut visibility = Visibility::all_private(vec![MemoryRange::new(0..0x4000)]).unwrap();
+        let mut tracker = FaultTracker::default();
+        assert_eq!(
+            tracker.observe(fault, false, &visibility).unwrap(),
+            FaultAction::Convert
         );
         assert_eq!(
             tracker.observe(fault, true, &visibility).unwrap(),
@@ -485,17 +584,6 @@ mod tests {
             FaultAction::NoChange
         );
         assert!(tracker.observe(fault, true, &visibility).is_err());
-        visibility.record(MemoryRange::new(4096..8192), true);
-        let mut tracker = FaultTracker::default();
-        tracker.observe(fault, false, &visibility).unwrap();
-        assert!(tracker.observe(fault, false, &visibility).is_err());
-        let mut tracker = FaultTracker::default();
-        tracker.observe(fault, false, &visibility).unwrap();
-        assert!(
-            tracker
-                .observe(Fault { gpa: 8192, ..fault }, true, &visibility)
-                .is_err()
-        );
     }
 
     #[test]
@@ -544,11 +632,10 @@ mod tests {
             tracker.observe(fault, false, &visibility).unwrap(),
             FaultAction::NoChange
         );
-        assert_eq!(tracker.probe, None);
         let other = Fault { gpa: 8192, ..fault };
         assert_eq!(
             tracker.observe(other, false, &visibility).unwrap(),
-            FaultAction::ProbeCompletion
+            FaultAction::Convert
         );
         assert_eq!(
             tracker.observe(other, true, &visibility).unwrap(),
@@ -570,7 +657,7 @@ mod tests {
         );
         assert_eq!(
             tracker.observe(fault, false, &visibility).unwrap(),
-            FaultAction::ProbeCompletion
+            FaultAction::Convert
         );
         assert_eq!(
             tracker.observe(fault, true, &visibility).unwrap(),
@@ -592,19 +679,16 @@ mod tests {
         // Interrupted (including immediate_exit on stop) must not call
         // completed. Retain the VP-owned tracker when the run future exits.
         let mut rebound = tracker;
-        assert_eq!(rebound.probe, Some(fault));
         assert_eq!(
             rebound.observe(fault, true, &visibility).unwrap(),
             FaultAction::Convert
         );
         visibility.record(range, false);
         // After conversion, stop need not drive KVM_RUN to a completion exit.
-        assert_eq!(rebound.probe, None);
         assert_eq!(
             rebound.observe(fault, false, &visibility).unwrap(),
             FaultAction::NoChange
         );
-        assert_eq!(rebound.probe, None);
         assert!(rebound.observe(fault, false, &visibility).is_err());
         rebound.completed();
         assert_eq!(
@@ -614,7 +698,7 @@ mod tests {
     }
 
     #[test]
-    fn another_vp_can_complete_probe_but_cannot_authorize_new_shared_efault() {
+    fn a_different_shared_request_requires_its_own_conversion() {
         let fault = Fault {
             gpa: 0,
             size: 4096,
@@ -627,7 +711,12 @@ mod tests {
         let other = Fault { gpa: 4096, ..fault };
         assert_eq!(
             tracker.observe(other, false, &visibility).unwrap(),
-            FaultAction::ProbeCompletion
+            FaultAction::Convert
+        );
+        visibility.record(MemoryRange::new(4096..8192), false);
+        assert_eq!(
+            tracker.observe(other, false, &visibility).unwrap(),
+            FaultAction::NoChange
         );
         assert!(tracker.observe(other, false, &visibility).is_err());
     }
@@ -667,7 +756,7 @@ mod tests {
         };
         assert_eq!(
             tracker.observe(fault, false, &visibility).unwrap(),
-            FaultAction::ProbeCompletion
+            FaultAction::Convert
         );
         assert_eq!(
             tracker.observe(fault, true, &visibility).unwrap(),

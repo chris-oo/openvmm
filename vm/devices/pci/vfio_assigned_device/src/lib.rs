@@ -486,6 +486,75 @@ impl VfioPciDevice {
 }
 
 impl VfioAssignedPciDevice {
+    pub(crate) fn attach_realm_provider(
+        &mut self,
+        association: &dyn pci_core::vfio::VfioVm,
+    ) -> anyhow::Result<()> {
+        let gate = self
+            .realm_gate()
+            .context("candidate provider requires a Realm frontend")?;
+        let mut state = gate.state.lock();
+        anyhow::ensure!(state.provider.is_none(), "provider already attached");
+        if let Some(offset) = self.pm_csr_offset {
+            let mut pm = 0;
+            self.vfio_device.read_config(
+                offset,
+                ByteEnabledDwordRead::with_all_bytes_enabled(&mut pm),
+            )?;
+            anyhow::ensure!(pm & 3 == 0, "provider requires D0");
+        }
+        let mut command = 0;
+        self.vfio_device.read_config(
+            HeaderType00::STATUS_COMMAND.0,
+            ByteEnabledDwordRead::with_all_bytes_enabled(&mut command),
+        )?;
+        self.vfio_device.write_config(
+            HeaderType00::STATUS_COMMAND.0,
+            ByteEnabledDwordWrite::new(command | 6, PciConfigByteEnable::LOW_WORD),
+        )?;
+        self.vfio_device.read_config(
+            HeaderType00::STATUS_COMMAND.0,
+            ByteEnabledDwordRead::with_all_bytes_enabled(&mut command),
+        )?;
+        anyhow::ensure!(
+            command & 6 == 6,
+            "provider command enables were not acknowledged"
+        );
+        self.mmio_enabled = true;
+        let decoded = BarMappings::parse(&self.bar_reset_defaults, &self.bar_masks);
+        let descriptions = self
+            .bar_regions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, region)| {
+                let region = region.as_ref()?;
+                let guest = decoded.get(index as u8)?;
+                state
+                    .bars
+                    .iter()
+                    .find(|bar| bar.guest.start == guest)
+                    .map(|bar| pci_core::vfio::VfioDeviceBar {
+                        guest: bar.guest.clone(),
+                        host: bar.host,
+                        file_offset: region.vfio_offset,
+                    })
+            })
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            descriptions.len() == state.bars.len(),
+            "incomplete device BAR provider layout"
+        );
+        state.provider = Some(association.create_device_memory(
+            gate.requester_id,
+            self.vfio_device.device.as_fd(),
+            self.vfio_device.config_offset,
+            descriptions,
+            state.nonsecure.clone(),
+        )?);
+        drop(state);
+        self.update_bar_mappings();
+        Ok(())
+    }
     fn stop_realm_frontend(&mut self) -> anyhow::Result<()> {
         let Some(gate) = self.realm_gate() else {
             return Ok(());
@@ -2153,7 +2222,30 @@ impl PciConfigSpace for VfioAssignedPciDevice {
                     return IoResult::Err(IoError::NoResponse);
                 }
             } else {
-                if let Err(error) = self.vfio_device.write_config(offset, value) {
+                let result = if let Some(provider) = &access.provider {
+                    if access.protected_blocked {
+                        let mut command = 0;
+                        if let Err(error) = self.vfio_device.read_config(
+                            offset,
+                            ByteEnabledDwordRead::with_all_bytes_enabled(&mut command),
+                        ) {
+                            let error = gate.fail_io(access, error);
+                            tracelimit::error_ratelimited!(error = ?error, "Realm command read failed");
+                            return IoResult::Err(IoError::NoResponse);
+                        }
+                        let requested = value.merge(command);
+                        if (requested & !command) & 6 != 0 || (requested ^ command) & 2 != 0 {
+                            return IoResult::Err(IoError::InvalidRegister);
+                        }
+                    }
+                    let (byte_offset, _) = value.byte_enable().to_byte_offset_len();
+                    provider
+                        .write_command(byte_offset as u8, value.as_valid_byte_slice())
+                        .map_err(anyhow::Error::from)
+                } else {
+                    self.vfio_device.write_config(offset, value)
+                };
+                if let Err(error) = result {
                     let error = gate.fail_io(access, error);
                     tracelimit::error_ratelimited!(error = ?error, "Realm command write failed");
                     return IoResult::Err(IoError::NoResponse);
@@ -2380,11 +2472,16 @@ impl MmioIntercept for VfioAssignedPciDevice {
                     .checked_add(data.len() as u64)
                     .is_some_and(|end| end <= region.size)
                 {
-                    let result = self
-                        .vfio_device
-                        .device
-                        .file()
-                        .read_at(data, region.vfio_offset + offset);
+                    let result = if let Some(provider) =
+                        access.as_ref().and_then(|state| state.provider.as_ref())
+                    {
+                        provider.read(region.vfio_offset + offset, data)
+                    } else {
+                        self.vfio_device
+                            .device
+                            .file()
+                            .read_at(data, region.vfio_offset + offset)
+                    };
                     if let Some((gate, state)) = gate.as_deref().zip(access.as_deref_mut()) {
                         return complete_realm_bar_transfer(
                             gate,
@@ -2463,11 +2560,16 @@ impl MmioIntercept for VfioAssignedPciDevice {
                     .checked_add(data.len() as u64)
                     .is_some_and(|end| end <= region.size)
                 {
-                    let result = self
-                        .vfio_device
-                        .device
-                        .file()
-                        .write_at(data, region.vfio_offset + offset);
+                    let result = if let Some(provider) =
+                        access.as_ref().and_then(|state| state.provider.as_ref())
+                    {
+                        provider.write(region.vfio_offset + offset, data)
+                    } else {
+                        self.vfio_device
+                            .device
+                            .file()
+                            .write_at(data, region.vfio_offset + offset)
+                    };
                     if let Some((gate, state)) = gate.as_deref().zip(access.as_deref_mut()) {
                         return complete_realm_bar_transfer(
                             gate,

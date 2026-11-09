@@ -358,10 +358,9 @@ pub const IOMMU_VIOMMU_TYPE_ARM_REALM_SMMUV3: u32 = 3;
 /// for this type: it can also report a missing KVM association or invalid IRQ
 /// configuration. Callers must not treat it as permission to try another parent.
 #[derive(Debug, thiserror::Error)]
-#[error("IOMMU_VIOMMU_ALLOC failed for Realm device {dev_id}, parent HWPT {hwpt_id}")]
+#[error("IOMMU_VIOMMU_ALLOC failed for Realm device {dev_id}")]
 pub struct RealmViommuAllocError {
     pub dev_id: u32,
-    pub hwpt_id: u32,
     #[source]
     pub errno: nix::errno::Errno,
 }
@@ -817,22 +816,14 @@ impl IommufdCtx {
     /// Before binding the VFIO cdev to this IOMMUFD, associate it with the KVM
     /// VM using `KVM_DEV_VFIO_FILE_ADD`. The kernel obtains that KVM association
     /// from `dev_id` and creates the Realm if necessary. `hwpt_id` must be a
-    /// nesting parent for the device's physical SMMU.
+    /// Realm allocation has no parent HWPT. Shared DMA uses a separate ordinary HWPT.
     ///
     /// The caller owns the returned object ID and must destroy dependent
     /// objects before destroying it. This does not lock or accept a TDISP
     /// device, attach an HWPT, or enable DMA.
-    pub fn viommu_alloc_realm(
-        &self,
-        dev_id: u32,
-        hwpt_id: u32,
-    ) -> Result<u32, RealmViommuAllocError> {
-        self.viommu_alloc_raw(IOMMU_VIOMMU_TYPE_ARM_REALM_SMMUV3, dev_id, hwpt_id)
-            .map_err(|errno| RealmViommuAllocError {
-                dev_id,
-                hwpt_id,
-                errno,
-            })
+    pub fn viommu_alloc_realm(&self, dev_id: u32) -> Result<u32, RealmViommuAllocError> {
+        self.viommu_alloc_raw(IOMMU_VIOMMU_TYPE_ARM_REALM_SMMUV3, dev_id, 0)
+            .map_err(|errno| RealmViommuAllocError { dev_id, errno })
     }
 
     fn viommu_alloc_raw(
@@ -1024,10 +1015,9 @@ mod tests {
     #[test]
     fn realm_helpers_preserve_ioctl_errno() {
         let ctx = IommufdCtx::from_file(fs::File::open("/dev/null").unwrap());
-        let error = ctx.viommu_alloc_realm(17, 23).unwrap_err();
+        let error = ctx.viommu_alloc_realm(17).unwrap_err();
         assert_eq!(error.errno, Errno::ENOTTY);
         assert_eq!(error.dev_id, 17);
-        assert_eq!(error.hwpt_id, 23);
         let error = ctx.ioas_set_huge_pages(71, false).unwrap_err();
         assert_eq!(error.errno, Errno::ENOTTY);
         assert_eq!(error.ioas_id, 71);

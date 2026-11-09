@@ -33,8 +33,6 @@ pub enum RealmOperation {
     AllocateIoas,
     /// Disable IOAS huge-page combining.
     DisableHugePages,
-    /// Allocate the nesting-parent HWPT.
-    AllocateParent,
     /// Allocate the Realm SMMUv3 vIOMMU.
     AllocateViommu,
     /// Allocate the S1-bypass child HWPT.
@@ -51,8 +49,6 @@ pub enum RealmOperation {
     DestroyChild,
     /// Destroy the owned Realm vIOMMU.
     DestroyViommu,
-    /// Destroy the owned nesting parent.
-    DestroyParent,
     /// Destroy the owned IOAS.
     DestroyIoas,
     /// Remove the KVM file association.
@@ -71,8 +67,6 @@ pub struct RealmState {
     pub device: Option<u32>,
     /// Owned IOAS ID.
     pub ioas: Option<u32>,
-    /// Owned nesting-parent HWPT ID.
-    pub parent: Option<u32>,
     /// Owned Realm vIOMMU ID.
     pub viommu: Option<u32>,
     /// Owned S1-bypass child HWPT ID.
@@ -92,7 +86,6 @@ impl RealmState {
             associated: false,
             device: None,
             ioas: None,
-            parent: None,
             viommu: None,
             child: None,
             vdevice: None,
@@ -131,9 +124,8 @@ pub(super) trait Operations: Send + Sync {
     fn bind(&mut self) -> anyhow::Result<u32>;
     fn allocate_ioas(&mut self) -> anyhow::Result<u32>;
     fn disable_huge_pages(&mut self, ioas: u32) -> anyhow::Result<()>;
-    fn allocate_parent(&mut self, device: u32, ioas: u32) -> anyhow::Result<u32>;
-    fn allocate_viommu(&mut self, device: u32, parent: u32) -> anyhow::Result<u32>;
-    fn allocate_child(&mut self, device: u32, viommu: u32) -> anyhow::Result<u32>;
+    fn allocate_viommu(&mut self, device: u32) -> anyhow::Result<u32>;
+    fn allocate_child(&mut self, device: u32, ioas: u32) -> anyhow::Result<u32>;
     fn allocate_vdevice(&mut self, device: u32, viommu: u32, rid: u32) -> anyhow::Result<u32>;
     fn attach(&mut self, child: u32) -> anyhow::Result<u32>;
     fn detach(&mut self) -> anyhow::Result<()>;
@@ -212,11 +204,9 @@ impl<B: Operations> ObjectOwner<B> {
         let ioas = step(AllocateIoas, ops.allocate_ioas())?;
         state.ioas = Some(ioas);
         step(DisableHugePages, ops.disable_huge_pages(ioas))?;
-        let parent = step(AllocateParent, ops.allocate_parent(device, ioas))?;
-        state.parent = Some(parent);
-        let viommu = step(AllocateViommu, ops.allocate_viommu(device, parent))?;
+        let viommu = step(AllocateViommu, ops.allocate_viommu(device))?;
         state.viommu = Some(viommu);
-        let child = step(AllocateChild, ops.allocate_child(device, viommu))?;
+        let child = step(AllocateChild, ops.allocate_child(device, ioas))?;
         state.child = Some(child);
         state.phase = RealmPhase::Prepared;
         Ok(())
@@ -305,7 +295,6 @@ impl<B: Operations> ObjectOwner<B> {
             (DestroyVdevice, &mut state.vdevice),
             (DestroyChild, &mut state.child),
             (DestroyViommu, &mut state.viommu),
-            (DestroyParent, &mut state.parent),
             (DestroyIoas, &mut state.ioas),
         ] {
             if let Some(id) = *owned {

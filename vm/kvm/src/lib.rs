@@ -215,11 +215,35 @@ pub const KVM_CAP_GUEST_MEMFD_FLAGS_UAPI: u32 = 244;
 pub const GUEST_MEMFD_FLAG_MMAP_UAPI: u64 = 1 << 0;
 pub const GUEST_MEMFD_FLAG_INIT_SHARED_UAPI: u64 = 1 << 1;
 
+#[repr(C)]
+struct ResourceGuestMemfd {
+    size: u64,
+    flags: u64,
+    resource_fd: i32,
+    pad: u32,
+    reserved: [u64; 5],
+}
+
+fn device_guest_memfd_request(size: u64, resource_fd: i32) -> Result<ResourceGuestMemfd> {
+    if size == 0 || !size.is_multiple_of(4096) {
+        return Err(Error::CreateGuestMemfd(nix::errno::Errno::EINVAL));
+    }
+    Ok(ResourceGuestMemfd {
+        size,
+        flags: 15,
+        resource_fd,
+        pad: 0,
+        reserved: [0; 5],
+    })
+}
+
+mod resource_ioctl {
+    nix::ioctl_readwrite!(create, super::KVMIO, 0xd4, super::ResourceGuestMemfd);
+}
+
+pub const KVM_CAP_GUEST_MEMFD_MEMORY_ATTRIBUTES_UAPI: u32 = 252;
 #[cfg(target_arch = "aarch64")]
-pub const KVM_CAP_ARM_RMI_V14_UAPI: u32 = 249;
-pub const KVM_CAP_GUEST_MEMFD_MEMORY_ATTRIBUTES_UAPI: u32 = 250;
-#[cfg(target_arch = "aarch64")]
-pub const KVM_CAP_ARM_RMI_UAPI: u32 = 251;
+pub const KVM_CAP_ARM_RMI_UAPI: u32 = 253;
 #[cfg(target_arch = "aarch64")]
 pub const KVM_ARM_RMI_POPULATE_FLAGS_MEASURE_UAPI: u32 = 1 << 0;
 #[cfg(target_arch = "aarch64")]
@@ -347,8 +371,15 @@ pub fn set_guest_memfd_memory_attributes(
     attributes.error_offset = u64::MAX;
     // SAFETY: `attributes` is valid writable storage for the complete ioctl
     // request, and the borrowed fd remains open throughout the call.
-    unsafe { ioctl::kvm_set_memory_attributes2(guest_memfd.as_raw_fd(), attributes) }
+    let value = unsafe { ioctl::kvm_set_memory_attributes2(guest_memfd.as_raw_fd(), attributes) }
         .map_err(Error::SetGuestMemfdMemoryAttributes)?;
+    checked_guestmemfd_completion(value)
+}
+
+fn checked_guestmemfd_completion(value: i32) -> Result<()> {
+    if value != 0 {
+        return Err(Error::GuestMemfdCompletion(value));
+    }
     Ok(())
 }
 
@@ -364,6 +395,8 @@ pub enum Error {
     SetMemoryAttributes(#[source] nix::Error),
     #[error("SetGuestMemfdMemoryAttributes")]
     SetGuestMemfdMemoryAttributes(#[source] nix::Error),
+    #[error("unexpected KVM_SET_MEMORY_ATTRIBUTES2 completion {0}")]
+    GuestMemfdCompletion(i32),
     #[error("PreFaultMemory")]
     PreFaultMemory(#[source] nix::Error),
     #[error("invalid KVM prefault range or progress: gpa={gpa:#x}, size={size:#x}")]
@@ -1168,6 +1201,23 @@ impl Partition {
                 .map_err(Error::CreateGuestMemfd)?
         };
         // SAFETY: On success, KVM returns a new owned file descriptor.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    /// Create cb45796 device backing from an already bound VFIO descriptor.
+    pub fn create_device_guest_memfd(&self, size: u64, resource: BorrowedFd<'_>) -> Result<File> {
+        let mut cmd = device_guest_memfd_request(size, resource.as_raw_fd())?;
+        let supported = self
+            .check_extension(KVM_CAP_GUEST_MEMFD_FLAGS_UAPI)
+            .map_err(Error::CheckExtension)?;
+        if supported < 0 || supported as u64 & cmd.flags != cmd.flags {
+            return Err(Error::MissingCapability("device guest_memfd flags"));
+        }
+        // SAFETY: the zero-padded native request and resource fd remain live
+        // for this synchronous ioctl. No legacy retry is attempted.
+        let fd = unsafe { resource_ioctl::create(self.vm.as_raw_fd(), &mut cmd) }
+            .map_err(Error::CreateGuestMemfd)?;
+        // SAFETY: a successful create returns a new owned descriptor.
         Ok(unsafe { File::from_raw_fd(fd) })
     }
 
@@ -2539,6 +2589,31 @@ mod memory_abi_tests {
     use std::mem::offset_of;
     use test_with_tracing::test;
 
+    #[test]
+    fn guestmemfd_attributes_reject_unknown_completion_instead_of_claiming_conversion() {
+        checked_guestmemfd_completion(0).unwrap();
+        for value in [-1, 1, 4096] {
+            assert!(
+                matches!(checked_guestmemfd_completion(value), Err(Error::GuestMemfdCompletion(v)) if v == value)
+            );
+        }
+    }
+
+    #[test]
+    fn resource_request_rejects_bad_size_and_has_native_padding() {
+        for size in [0, 1, 4097] {
+            assert!(device_guest_memfd_request(size, 17).is_err());
+        }
+        let request = device_guest_memfd_request(8192, 17).unwrap();
+        assert_eq!(size_of::<ResourceGuestMemfd>(), 64);
+        assert_eq!(std::mem::offset_of!(ResourceGuestMemfd, resource_fd), 16);
+        assert_eq!(std::mem::offset_of!(ResourceGuestMemfd, reserved), 24);
+        assert_eq!(request.resource_fd, 17);
+        assert_eq!(request.flags, 15);
+        assert_eq!(request.pad, 0);
+        assert_eq!(request.reserved, [0; 5]);
+    }
+
     fn memory_fault_run() -> kvm_run {
         let mut run = kvm_run {
             exit_reason: KVM_EXIT_MEMORY_FAULT,
@@ -2738,7 +2813,7 @@ mod memory_abi_tests {
         assert_eq!(ioctl::PRE_FAULT_MEMORY as u32, 0xc040_aed5);
         assert_eq!(ioctl::ARM_RMI_INIT_RIPAS as u32, 0x4040_aed8);
         assert_eq!(KVM_CAP_GUEST_MEMFD_FLAGS_UAPI, 244);
-        assert_eq!(KVM_CAP_GUEST_MEMFD_MEMORY_ATTRIBUTES_UAPI, 250);
+        assert_eq!(KVM_CAP_GUEST_MEMFD_MEMORY_ATTRIBUTES_UAPI, 252);
         assert_eq!(GUEST_MEMFD_FLAG_MMAP_UAPI, 1);
         assert_eq!(GUEST_MEMFD_FLAG_INIT_SHARED_UAPI, 2);
     }

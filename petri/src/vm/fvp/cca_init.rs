@@ -221,6 +221,7 @@ fn build_init_script(
             config.mount_tag == "FM" && matches!(config.network, CcaHostNetwork::Dhcp { .. }),
             "Realm VFIO requires the pinned FVP host"
         );
+        let teardown = include_str!("cca_realm_vfio_teardown.sh");
         (
             format!(
                 "mkdir -p /run\n\
@@ -229,7 +230,7 @@ fn build_init_script(
                  cat > /run/incubator-cca-realm-vfio-teardown.sh <<'INCUBATOR_TEARDOWN_EOF'\n\
                  {}\nINCUBATOR_TEARDOWN_EOF\n\
                  realm_vfio_teardown_ready=1\n{}",
-                include_str!("cca_realm_vfio_teardown.sh"),
+                teardown,
                 include_str!("cca_realm_vfio.sh"),
             ),
             "if [ \"$realm_vfio_teardown_ready\" = 1 ]; then\n\
@@ -432,7 +433,7 @@ mod tests {
         assert!(output.status.success(), "{output:?}");
         assert_eq!(
             std::fs::read_to_string(state.join("operations")).unwrap(),
-            "unbind\ndriver_override\ndisconnect\n"
+            "disconnect\nunbind\ndriver_override\n"
         );
         assert!(state.join("complete").is_file());
         assert!(!fixture.path().join("run/incubator-cca-realm-vfio").exists());
@@ -440,7 +441,53 @@ mod tests {
         assert!(repeated.status.success(), "{repeated:?}");
         assert_eq!(
             std::fs::read_to_string(state.join("operations")).unwrap(),
-            "unbind\ndriver_override\ndisconnect\n"
+            "disconnect\nunbind\ndriver_override\n"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn candidate_teardown_proves_context_release_before_vfio_unbind() {
+        let fixture = realm_vfio_teardown_fixture();
+        let device = fixture.path().join("sys/bus/pci/devices/0000:01:00.0");
+        std::fs::remove_file(device.join("tsm/bound")).unwrap();
+        let script = fixture.path().join("teardown.sh");
+        let contents = std::fs::read_to_string(&script).unwrap();
+        std::fs::write(&script, contents).unwrap();
+        let output = run_realm_vfio_teardown(fixture.path(), "");
+        assert!(output.status.success(), "{output:?}");
+        let state = fixture.path().join("run/incubator-cca-realm-vfio-state");
+        assert_eq!(
+            std::fs::read_to_string(state.join("operations")).unwrap(),
+            "disconnect\nunbind\ndriver_override\n"
+        );
+        assert!(state.join("contexts-released").is_file());
+        assert!(state.join("complete").is_file());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn candidate_teardown_retains_vfio_on_failed_context_release_without_retry() {
+        let fixture = realm_vfio_teardown_fixture();
+        let script = fixture.path().join("teardown.sh");
+        let contents = std::fs::read_to_string(&script).unwrap();
+        std::fs::write(&script, contents).unwrap();
+        let output = run_realm_vfio_teardown(fixture.path(), "disconnect");
+        assert_eq!(output.status.code(), Some(7), "{output:?}");
+        let state = fixture.path().join("run/incubator-cca-realm-vfio-state");
+        assert!(!state.join("complete").exists());
+        assert!(!state.join("contexts-released").exists());
+        assert!(
+            fixture
+                .path()
+                .join("sys/bus/pci/devices/0000:01:00.0/driver")
+                .is_symlink()
+        );
+        let repeat = run_realm_vfio_teardown(fixture.path(), "");
+        assert!(!repeat.status.success(), "{repeat:?}");
+        assert_eq!(
+            std::fs::read_to_string(state.join("operations")).unwrap(),
+            "disconnect\n"
         );
     }
 
@@ -448,9 +495,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn realm_vfio_teardown_preserves_errors_and_retries_partial_release() {
         for (failure, expected) in [
-            ("unbind", "unbind\n"),
-            ("driver_override", "unbind\ndriver_override\n"),
-            ("disconnect", "unbind\ndriver_override\ndisconnect\n"),
+            ("unbind", "disconnect\nunbind\n"),
+            ("driver_override", "disconnect\nunbind\ndriver_override\n"),
         ] {
             let fixture = realm_vfio_teardown_fixture();
             let state = fixture.path().join("run/incubator-cca-realm-vfio-state");
@@ -475,7 +521,6 @@ mod tests {
             ("device", "0xffff"),
             ("class", "0x020000"),
             ("tsm/connect", "tsm1"),
-            ("tsm/bound", "tsm0"),
             ("driver_override", "ahci"),
         ] {
             let fixture = realm_vfio_teardown_fixture();

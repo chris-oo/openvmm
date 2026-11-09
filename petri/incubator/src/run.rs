@@ -526,7 +526,7 @@ mod tests {
     fn fvp_adapter_preserves_runtime_inputs_and_rejects_other_backends() {
         let input = fvp_config(include_str!("../profiles/aarch64-fvp-cca.toml"));
         let output = petri::fvp::FvpRunConfig::try_from(input).unwrap();
-        assert_eq!(output.profile.capabilities, ["cca"]);
+        assert_eq!(output.profile.capabilities, ["cca", "guest_memfd_in_place"]);
         assert_eq!(output.result_file, Some("output/result.json".into()));
         assert_eq!(output.guest_command, ["/share/command"]);
         assert_eq!(output.guest_env["TEST"], "value");

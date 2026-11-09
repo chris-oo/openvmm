@@ -35,9 +35,6 @@ if [ -f "$state/tsm" ]; then
     test "$expected_tsm" = tsm0
     connected_tsm=$(cat "$device/tsm/connect")
     test -z "$connected_tsm" || test "$connected_tsm" = "$expected_tsm"
-    # Do not use disconnect's implicit unbind to hide a leaked Realm owner.
-    step=realm-binding
-    test -z "$(cat "$device/tsm/bound")"
 fi
 if [ -f "$state/override" ]; then
     step=override-ownership
@@ -51,6 +48,27 @@ step=vfio-unbind
 if [ -f "$state/tsm" ] && [ -L "$device/driver" ]; then
     test -f "$state/bind"
     test "$(basename "$(readlink "$device/driver")")" = vfio-pci
+fi
+if [ -f "$state/tsm" ]; then
+    # cb45796 removed bound. Disconnect refuses live vDEVICE contexts under
+    # the PCI/TSM locks, so prove release before unbinding VFIO.
+    step=realm-contexts
+    if [ -f "$state/contexts-released" ]; then
+        test -z "$connected_tsm"
+    else
+        test ! -f "$state/contexts-attempted"
+        if [ -n "$connected_tsm" ]; then
+            : > "$state/contexts-attempted"
+            write_sysfs "$expected_tsm" "$device/tsm/disconnect"
+            test -z "$(cat "$device/tsm/connect")"
+        else
+            test ! -f "$state/bind"
+        fi
+        : > "$state/contexts-released"
+    fi
+fi
+step=vfio-unbind
+if [ -f "$state/tsm" ] && [ -L "$device/driver" ]; then
     write_sysfs "$bdf" "$device/driver/unbind"
     test ! -L "$device/driver"
 fi
@@ -69,12 +87,6 @@ if [ -f "$state/override" ]; then
     esac
     override=$(cat "$device/driver_override")
     test -z "$override" || test "$override" = '(null)'
-fi
-step=tsm-disconnect
-if [ -f "$state/tsm" ] && [ -n "$connected_tsm" ]; then
-    # drivers/pci/tsm/core.c disconnect_store requires the connected TSM name.
-    write_sysfs "$expected_tsm" "$device/tsm/disconnect"
-    test -z "$(cat "$device/tsm/connect")"
 fi
 step=complete
 : > "$state/complete"

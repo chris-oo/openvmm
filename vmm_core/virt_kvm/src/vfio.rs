@@ -118,6 +118,24 @@ impl KvmVfioAssignment {
 
 impl VfioVm for KvmVfioAssignment {
     #[cfg(guest_arch = "aarch64")]
+    fn create_device_memory(
+        &self,
+        rid: u32,
+        file: BorrowedFd<'_>,
+        config_offset: u64,
+        bars: Vec<pci_core::vfio::VfioDeviceBar>,
+        nonsecure: Vec<std::ops::Range<u64>>,
+    ) -> Result<Arc<dyn pci_core::vfio::VfioDeviceMemory>, VfioVmError> {
+        crate::device_memory::create(
+            self.partition.clone(),
+            rid,
+            file,
+            config_offset,
+            bars,
+            nonsecure,
+        )
+    }
+    #[cfg(guest_arch = "aarch64")]
     fn record_protected_mapping(
         &self,
         requester_id: u32,
@@ -143,6 +161,11 @@ impl VfioVm for KvmVfioAssignment {
     #[cfg(guest_arch = "aarch64")]
     fn complete_protected_unlock(&self, requester_id: u32) -> Result<(), VfioVmError> {
         with_registered_assignment(&self.partition.rhi, requester_id, || {
+            if !crate::device_memory::all_shared(&self.partition.memory.lock()) {
+                return Err(VfioVmError::new(
+                    crate::cca_in_place::CcaInPlaceError::InvalidProtectedMapping,
+                ));
+            }
             complete_unlock(&self.partition.memory, &self.partition.cca_fatal)
         })
     }

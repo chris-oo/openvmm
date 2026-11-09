@@ -8,7 +8,6 @@ use test_with_tracing::test;
 
 const DEVICE: u32 = 10;
 const IOAS: u32 = 20;
-const PARENT: u32 = 30;
 const VIOMMU: u32 = 40;
 const CHILD: u32 = 50;
 const VDEVICE: u32 = 60;
@@ -20,8 +19,7 @@ enum Call {
     Bind,
     Ioas,
     DisableHugePages(u32),
-    Parent(u32, u32),
-    Viommu(u32, u32),
+    Viommu(u32),
     Child(u32, u32),
     Vdevice(u32, u32, u32),
     Attach(u32),
@@ -97,12 +95,8 @@ impl Operations for Fake {
     fn disable_huge_pages(&mut self, ioas: u32) -> anyhow::Result<()> {
         self.record(Call::DisableHugePages(ioas))
     }
-    fn allocate_parent(&mut self, dev: u32, ioas: u32) -> anyhow::Result<u32> {
-        self.record(Call::Parent(dev, ioas))?;
-        Ok(PARENT)
-    }
-    fn allocate_viommu(&mut self, dev: u32, parent: u32) -> anyhow::Result<u32> {
-        self.record(Call::Viommu(dev, parent))?;
+    fn allocate_viommu(&mut self, dev: u32) -> anyhow::Result<u32> {
+        self.record(Call::Viommu(dev))?;
         Ok(VIOMMU)
     }
     fn allocate_child(&mut self, dev: u32, viommu: u32) -> anyhow::Result<u32> {
@@ -141,9 +135,8 @@ fn preparation() -> Vec<Call> {
         Call::Bind,
         Call::Ioas,
         Call::DisableHugePages(IOAS),
-        Call::Parent(DEVICE, IOAS),
-        Call::Viommu(DEVICE, PARENT),
-        Call::Child(DEVICE, VIOMMU),
+        Call::Viommu(DEVICE),
+        Call::Child(DEVICE, IOAS),
     ]
 }
 
@@ -153,7 +146,6 @@ fn cleanup() -> Vec<Call> {
         Call::Destroy(VDEVICE),
         Call::Destroy(CHILD),
         Call::Destroy(VIOMMU),
-        Call::Destroy(PARENT),
         Call::Destroy(IOAS),
         Call::Disassociate,
         Call::CloseFile,
@@ -245,7 +237,6 @@ fn every_prepare_failure_rolls_back_only_completed_allocations() {
         RealmOperation::Bind,
         RealmOperation::AllocateIoas,
         RealmOperation::DisableHugePages,
-        RealmOperation::AllocateParent,
         RealmOperation::AllocateViommu,
         RealmOperation::AllocateChild,
     ];
@@ -257,7 +248,7 @@ fn every_prepare_failure_rolls_back_only_completed_allocations() {
         assert!(error.error.rollback.is_none());
         assert!(error.recovery.is_none());
         let mut expected = setup[..=index].to_vec();
-        for (allocated_at, id) in [(5, VIOMMU), (4, PARENT), (2, IOAS)] {
+        for (allocated_at, id) in [(4, VIOMMU), (2, IOAS)] {
             if index > allocated_at {
                 expected.push(Call::Destroy(id));
             }
@@ -339,7 +330,6 @@ fn every_cleanup_failure_stops_and_retains_remaining_dependencies_for_retry() {
         RealmOperation::DestroyVdevice,
         RealmOperation::DestroyChild,
         RealmOperation::DestroyViommu,
-        RealmOperation::DestroyParent,
         RealmOperation::DestroyIoas,
         RealmOperation::Disassociate,
     ];
@@ -360,8 +350,7 @@ fn every_cleanup_failure_stops_and_retains_remaining_dependencies_for_retry() {
         assert_eq!(state.vdevice.is_some(), index <= 1);
         assert_eq!(state.child.is_some(), index <= 2);
         assert_eq!(state.viommu.is_some(), index <= 3);
-        assert_eq!(state.parent.is_some(), index <= 4);
-        assert_eq!(state.ioas.is_some(), index <= 5);
+        assert_eq!(state.ioas.is_some(), index <= 4);
         assert!(state.associated);
         assert!(owner.attach(RID + 1).is_err());
         assert_eq!(owner.state(), state);
@@ -394,7 +383,7 @@ fn repeated_or_closed_attachment_does_not_modify_existing_state() {
 
 #[test]
 fn preparation_failure_returns_both_errors_and_a_recoverable_owner() {
-    let (fake, model) = Fake::new(vec![Call::Child(DEVICE, VIOMMU), Call::Destroy(VIOMMU)]);
+    let (fake, model) = Fake::new(vec![Call::Child(DEVICE, IOAS), Call::Destroy(VIOMMU)]);
     let mut failure = failed(fake);
     assert_eq!(
         failure.error.primary.operation,
@@ -416,7 +405,7 @@ fn preparation_failure_returns_both_errors_and_a_recoverable_owner() {
 
 #[test]
 fn abandoning_failed_preparation_retains_the_entire_bundle() {
-    let (fake, model) = Fake::new(vec![Call::Child(DEVICE, VIOMMU), Call::Destroy(VIOMMU)]);
+    let (fake, model) = Fake::new(vec![Call::Child(DEVICE, IOAS), Call::Destroy(VIOMMU)]);
     let failure = failed(fake);
     drop(failure);
     assert!(model.lock().drops.is_empty());

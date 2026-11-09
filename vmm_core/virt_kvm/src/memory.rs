@@ -132,10 +132,10 @@ fn with_shared_buffer(
 #[derive(Debug, Inspect)]
 /// A registered KVM memory slot and its confidential-memory metadata.
 pub(crate) struct KvmMemoryRange {
-    host_addr: *mut u8,
-    range: MemoryRange,
-    guest_memfd_offset: Option<u64>,
-    private_state: Option<KvmGuestMemfdPrivateState>,
+    pub(crate) host_addr: *mut u8,
+    pub(crate) range: MemoryRange,
+    pub(crate) guest_memfd_offset: Option<u64>,
+    pub(crate) private_state: Option<KvmGuestMemfdPrivateState>,
 }
 
 unsafe impl Sync for KvmMemoryRange {}
@@ -144,6 +144,9 @@ unsafe impl Send for KvmMemoryRange {}
 #[derive(Debug, Default, Inspect)]
 /// Slot-indexed memory mappings currently registered with KVM.
 pub(crate) struct KvmMemoryRangeState {
+    #[cfg(guest_arch = "aarch64")]
+    #[inspect(skip)]
+    pub(crate) device_providers: Vec<std::sync::Weak<crate::device_memory::DeviceProvider>>,
     #[inspect(flatten, iter_by_index)]
     pub(crate) ranges: Vec<Option<KvmMemoryRange>>,
     #[cfg(any(guest_arch = "aarch64", test))]
@@ -211,6 +214,10 @@ impl tdisp::host::RamWork for AssignmentWork {
 }
 
 impl KvmMemoryRangeState {
+    #[cfg(guest_arch = "aarch64")]
+    pub(crate) fn assignment_prepared_for_device(&self) -> bool {
+        self.assignment_prepared
+    }
     #[cfg(any(guest_arch = "aarch64", test))]
     pub(crate) fn in_place_ram_slots(&self) -> Vec<MemoryRange> {
         self.ranges
@@ -403,26 +410,7 @@ impl KvmPartitionInner {
         request: crate::rhi::MappingRequest,
     ) -> Result<(), KvmError> {
         let mut state = self.memory.lock();
-        if self.cca_fatal.load(std::sync::atomic::Ordering::Acquire)
-            || !state.assignment_prepared
-            || self
-                .ram_ranges
-                .iter()
-                .any(|range| range.overlaps(&request.range))
-            || state
-                .ranges
-                .iter()
-                .flatten()
-                .any(|slot| slot.range.overlaps(&request.range))
-        {
-            return Err(crate::cca_in_place::CcaInPlaceError::InvalidProtectedMapping.into());
-        }
-        state.protected_attempts.record(
-            request.range,
-            request.pa,
-            self.shared_gpa_bit.ok_or(KvmError::InvalidCcaMemoryFault)?,
-        )?;
-        Ok(())
+        crate::device_memory::approve_mapping(self, &mut state, request)
     }
 
     #[cfg(guest_arch = "aarch64")]
@@ -588,6 +576,15 @@ impl KvmPartitionInner {
                 return Err(crate::cca_in_place::CcaInPlaceError::AmbiguousFault.into());
             }
             let range = crate::cca_in_place::checked_range(fault.gpa, fault.size)?;
+            if crate::device_memory::handle_fault(
+                &state,
+                range,
+                fault.flags,
+                tracker,
+                successful_exit,
+            )? {
+                return Ok(());
+            }
             // Validate slot coverage even for probes and no-op requests.
             if guest_memfd_range_segments(range, &state.ranges).is_err()
                 && assignment.is_some()
@@ -644,9 +641,17 @@ impl KvmPartitionInner {
             }
             Ok(())
         })();
-        if result.is_err() {
+        if let Err(error) = &result {
             // Conversion can fail after changing part of a segment. Poison
             // before releasing the memory lock; never retry from the ledger.
+            tracelimit::error_ratelimited!(
+                gpa = fault.gpa,
+                size = fault.size,
+                flags = fault.flags,
+                successful_exit,
+                error = ?error,
+                "CCA in-place memory fault failed"
+            );
             self.mark_cca_fatal();
         }
         result

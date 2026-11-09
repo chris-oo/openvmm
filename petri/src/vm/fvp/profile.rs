@@ -131,40 +131,24 @@ pub struct FvpCcaConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FvpPlatform {
-    /// CCA v15 payload and original firmware.
+    /// Current host kernel and firmware, without an assigned-device fixture.
     #[default]
-    CcaV15,
-    /// Kernel and firmware supporting in-place guest_memfd.
     GuestMemfdInPlace,
-    /// Source-built in-place host and Realm kernel, without assigned devices.
-    GuestMemfdInPlaceSourceBuilt,
-    /// AHCI fixture for Realm host-object lifecycle tests.
+    /// Current host/guest pair with the AHCI fixture.
     RealmVfio,
-    /// Source-built host and guest kernels with the explicit AHCI fixture.
-    RealmVfioSourceBuilt,
 }
 
 impl FvpPlatform {
     pub(crate) fn has_realm_vfio(self) -> bool {
-        matches!(self, Self::RealmVfio | Self::RealmVfioSourceBuilt)
+        self == Self::RealmVfio
     }
 
     pub(crate) fn payload_hashes(self) -> (&'static str, &'static str) {
         use petri_artifacts_common::cca_payload;
-        match self {
-            Self::CcaV15 => (
-                cca_payload::LINUX_IMAGE_SHA256,
-                cca_payload::BASE_INITRD_SHA256,
-            ),
-            Self::GuestMemfdInPlace | Self::RealmVfio => (
-                cca_payload::guest_memfd_in_place::LINUX_IMAGE_SHA256,
-                cca_payload::BASE_INITRD_SHA256,
-            ),
-            Self::GuestMemfdInPlaceSourceBuilt | Self::RealmVfioSourceBuilt => (
-                cca_payload::source_built_in_place::LINUX_IMAGE_SHA256,
-                cca_payload::source_built_in_place::INITRD_SHA256,
-            ),
-        }
+        (
+            cca_payload::LINUX_IMAGE_SHA256,
+            cca_payload::BASE_INITRD_SHA256,
+        )
     }
 }
 
@@ -226,10 +210,7 @@ impl FvpCcaConfig {
                 capability == "cca"
                     || (matches!(
                         self.platform,
-                        FvpPlatform::GuestMemfdInPlace
-                            | FvpPlatform::GuestMemfdInPlaceSourceBuilt
-                            | FvpPlatform::RealmVfio
-                            | FvpPlatform::RealmVfioSourceBuilt
+                        FvpPlatform::GuestMemfdInPlace | FvpPlatform::RealmVfio
                     ) && capability == "guest_memfd_in_place")
                     || (self.platform.has_realm_vfio() && capability == "cca_realm_vfio"),
                 "unsupported FVP capability: {capability}"
@@ -239,26 +220,48 @@ impl FvpCcaConfig {
                 "duplicate FVP capability: {capability}"
             );
         }
+
         Ok(())
     }
 }
 
+pub(crate) fn reject_retired_payload_selector(
+    value: Option<&std::ffi::OsStr>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        value.is_none(),
+        "PETRI_FVP_PAYLOAD is retired; use the current FVP profiles and matching artifacts"
+    );
+    Ok(())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
     use test_with_tracing::test;
 
     #[test]
-    fn source_built_platforms_keep_assignment_capabilities_explicit() {
-        let mut basic = FvpCcaConfig::from_toml(include_str!(
-            "../../../incubator/profiles/aarch64-fvp-cca-source-built.toml"
+    fn current_profiles_keep_fixture_capabilities_separate() {
+        let mut host = FvpCcaConfig::from_toml(include_str!(
+            "../../../incubator/profiles/aarch64-fvp-cca.toml"
         ))
         .unwrap();
-        basic.capabilities.push("cca_realm_vfio".into());
-        assert!(basic.validate().is_err());
+        host.capabilities.push("cca_realm_vfio".into());
+        assert!(host.validate().is_err());
         FvpCcaConfig::from_toml(include_str!(
-            "../../../incubator/profiles/aarch64-fvp-cca-realm-vfio-source-built.toml"
+            "../../../incubator/profiles/aarch64-fvp-cca-realm-vfio.toml"
         ))
         .unwrap();
+    }
+
+    #[test]
+    fn retired_payload_selectors_and_platforms_are_rejected() {
+        reject_retired_payload_selector(None).unwrap();
+        for value in ["reference", "source-built", "cca74"] {
+            assert!(reject_retired_payload_selector(Some(std::ffi::OsStr::new(value))).is_err());
+        }
+        let current = include_str!("../../../incubator/profiles/aarch64-fvp-cca-realm-vfio.toml");
+        for value in ["cca-v15", "realm-vfio-source-built", "cca74-realm-vfio"] {
+            assert!(FvpCcaConfig::from_toml(&current.replace("realm-vfio", value)).is_err());
+        }
     }
 }

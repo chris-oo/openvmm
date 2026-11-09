@@ -6,6 +6,8 @@
 #[cfg(target_os = "linux")]
 use crate::aarch64_exclusive::vm_host_emu;
 use crate::nested::vm_host;
+#[cfg(target_os = "linux")]
+use crate::nested::vm_host_fvp_basic;
 use anyhow::Context;
 use futures::AsyncBufReadExt;
 use futures::AsyncWriteExt;
@@ -267,6 +269,10 @@ async fn acpi_shutdown(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::R
 #[openvmm_test(
     nested(
         (vm_host_emu, qemu_linux_direct_aarch64[LINUX_DIRECT_TEST_KERNEL_CCA_AARCH64]),
+        (NEXTEST_VMM_TESTS_ARCHIVE_LINUX_AARCH64_MUSL, "tests", "multiarch", linux_direct_aarch64),
+    ),
+    nested(
+        (vm_host_fvp_basic, fvp_linux_direct_aarch64),
         (NEXTEST_VMM_TESTS_ARCHIVE_LINUX_AARCH64_MUSL, "tests", "multiarch", linux_direct_aarch64),
     ),
 )]

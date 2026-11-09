@@ -182,20 +182,11 @@ impl PetriVmmBackend for FvpPetriBackend {
             Self::check_compat(&config.firmware, config.arch),
             "FVP requires an AArch64 Linux L1"
         );
-        let source_built = match std::env::var_os("PETRI_FVP_PAYLOAD").as_deref() {
-            None => false,
-            Some(value) if value == "reference" => false,
-            Some(value) if value == "source-built" => true,
-            Some(_) => anyhow::bail!("PETRI_FVP_PAYLOAD must be reference or source-built"),
-        };
-        let profile = FvpCcaConfig::from_toml(if source_built && platform.realm_vfio {
-            include_str!("../../../incubator/profiles/aarch64-fvp-cca-realm-vfio-source-built.toml")
-        } else if source_built {
-            include_str!("../../../incubator/profiles/aarch64-fvp-cca-source-built.toml")
-        } else if platform.realm_vfio {
+        profile::reject_retired_payload_selector(std::env::var_os("PETRI_FVP_PAYLOAD").as_deref())?;
+        let profile = FvpCcaConfig::from_toml(if platform.realm_vfio {
             include_str!("../../../incubator/profiles/aarch64-fvp-cca-realm-vfio.toml")
         } else {
-            include_str!("../../../incubator/profiles/aarch64-fvp-cca-guest-memfd-in-place.toml")
+            include_str!("../../../incubator/profiles/aarch64-fvp-cca.toml")
         })?;
         let realm_vfio = platform.realm_vfio;
         let (watchdog_timeout, cleanup_timeout) = lifecycle_budgets(&profile.deadlines)?;

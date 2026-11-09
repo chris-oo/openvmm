@@ -18,8 +18,10 @@ open_enum! {
         FEATURES = rhi_call(0x004b),
         OBJECT_SIZE = rhi_call(0x004c),
         OBJECT_READ = rhi_call(0x004d),
+        VDEV_CONTINUE = rhi_call(0x0051),
         VDEV_GET_MEASUREMENTS = rhi_call(0x0052),
         VDEV_GET_INTERFACE_REPORT = rhi_call(0x0053),
         VDEV_SET_TDI_STATE = rhi_call(0x0054),
+        VDEV_ABORT = rhi_call(0x0056),
     }
 }

@@ -3,6 +3,8 @@
 
 //! Keep RAM region ownership alongside every Realm device association.
 
+use pci_core::vfio::VfioDeviceBar;
+use pci_core::vfio::VfioDeviceMemory;
 use pci_core::vfio::VfioVm;
 use pci_core::vfio::VfioVmError;
 use pci_core::vfio::VfioVmProvider;
@@ -30,6 +32,18 @@ struct RetainedVm<M> {
 }
 
 impl<M: Send + Sync> VfioVm for RetainedVm<M> {
+    fn create_device_memory(
+        &self,
+        rid: u32,
+        file: BorrowedFd<'_>,
+        config_offset: u64,
+        bars: Vec<VfioDeviceBar>,
+        nonsecure: Vec<std::ops::Range<u64>>,
+    ) -> Result<Arc<dyn VfioDeviceMemory>, VfioVmError> {
+        self.association
+            .create_device_memory(rid, file, config_offset, bars, nonsecure)
+    }
+
     fn record_protected_mapping(
         &self,
         requester_id: u32,
@@ -96,6 +110,24 @@ mod tests {
     struct Vm;
 
     impl VfioVm for Vm {
+        fn create_device_memory(
+            &self,
+            rid: u32,
+            _: BorrowedFd<'_>,
+            config_offset: u64,
+            bars: Vec<VfioDeviceBar>,
+            nonsecure: Vec<std::ops::Range<u64>>,
+        ) -> Result<Arc<dyn VfioDeviceMemory>, VfioVmError> {
+            assert_eq!((rid, config_offset), (0x100, 0x7000));
+            assert_eq!(bars.len(), 1);
+            assert_eq!(bars[0].guest, 0x4000..0x6000);
+            assert_eq!(bars[0].host, 0x9000);
+            assert_eq!(bars[0].file_offset, 0x1000);
+            assert_eq!(nonsecure, [0x5000..0x6000]);
+            Err(VfioVmError::new(std::io::Error::other(
+                "provider attach failure",
+            )))
+        }
         fn requires_assignment_retention(&self) -> bool {
             true
         }
@@ -180,6 +212,7 @@ mod tests {
 
     #[test]
     fn association_owns_ram_regions_after_provider_and_worker_release() {
+        use std::error::Error as _;
         let drops = Arc::new(AtomicUsize::new(0));
         let memory = Arc::new(Memory(drops.clone()));
         let calls = Arc::new(AtomicUsize::new(0));
@@ -200,6 +233,25 @@ mod tests {
         assert!(association.requires_assignment_retention());
         assert!(association.check_interrupt_routes().is_err());
         let file = std::fs::File::open("/dev/null").unwrap();
+        let error = association
+            .create_device_memory(
+                0x100,
+                file.as_fd(),
+                0x7000,
+                vec![VfioDeviceBar {
+                    guest: 0x4000..0x6000,
+                    host: 0x9000,
+                    file_offset: 0x1000,
+                }],
+                vec![0x5000..0x6000],
+            )
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.source().unwrap().to_string(),
+            "provider attach failure"
+        );
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
         assert!(association.add_file(file.as_fd()).is_err());
         association.remove_file(file.as_fd()).unwrap();
         assert_eq!(drops.load(Ordering::Relaxed), 0);

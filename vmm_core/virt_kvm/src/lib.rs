@@ -14,6 +14,8 @@ mod arch;
 mod cca;
 #[cfg(any(guest_arch = "aarch64", test))]
 mod cca_in_place;
+#[cfg(guest_arch = "aarch64")]
+mod device_memory;
 mod gsi;
 mod memory;
 #[cfg(any(guest_arch = "aarch64", test))]
@@ -58,6 +60,9 @@ use vmcore::vmtime::VmTimeAccess;
 
 #[derive(Error, Debug)]
 pub enum KvmError {
+    #[cfg(guest_arch = "aarch64")]
+    #[error("device guest_memfd operation failed")]
+    DeviceMemory(#[from] device_memory::Error),
     #[cfg(any(guest_arch = "aarch64", test))]
     #[error(transparent)]
     CcaInPlace(#[from] cca_in_place::CcaInPlaceError),

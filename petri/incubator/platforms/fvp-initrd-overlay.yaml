@@ -18,5 +18,6 @@ run:
   prerun:
     - test -f "${rtvar:INITRD}"
     - cp "${rtvar:INITRD}" "$${SEMIHOSTDIR}/initrd"
+    - CMDLINE="${rtvar:CMDLINE}"
     - >-
-      printf '%s\n' 'Image dtb=fdt.dtb initrd=initrd rdinit=/cca-init.sh console=ttyAMA0 earlycon=pl011,0x1c090000 ip=off' > "$${SEMIHOSTDIR}/startup.nsh"
+      printf '%s\n' "Image dtb=fdt.dtb initrd=initrd rdinit=/cca-init.sh console=ttyAMA0 earlycon=pl011,0x1c090000 ip=off$${CMDLINE:+ $$CMDLINE}" > "$${SEMIHOSTDIR}/startup.nsh"
