@@ -1,5 +1,112 @@
 # Linux CCA 7.4 FVP migration report
 
+## Follow-up: OpenVMM-owned guest test fixture
+
+The user requested new commits in both repositories. Test policy belongs
+in OpenVMM, not in the binary dependency producer. No previous commit will
+be amended or pushed.
+
+The follow-up keeps the full payload's `guest/Image` and `guest/initrd`
+layout, but makes its guest initrd the same pinned generic binary base as
+the host initrd. Remove the custom guest-initrd producer and its script,
+oracle and recipe pins from `openvmm-deps`; retain binary provenance and
+the existing host-only/full package roles.
+
+OpenVMM owns the AHCI guest script and injects it plus the existing expected
+disk hash with `PetriInitrd::prepare`. Keep the prepared initrd alive through
+VM teardown. Preserve the existing LOCK/accept/probe/direct-read/hash/
+unbind/UNLOCK order, checked host/RMM teardown and immutable binary hashes.
+Record the composed initrd identity separately from its pinned base.
+
+Capture a pre-teardown kernel-log baseline and complete snapshots after
+unbind and UNLOCK, before poweroff. Mark each diagnostic section so the
+host test can reject newly reported teardown errors or warnings without
+rejecting unrelated earlier boot diagnostics. Require successful commands,
+an absent bound driver, complete ordered diagnostic sections and guest exit
+zero. Do not mask failures or weaken the existing DMA/hash checks.
+
+Use focused synthetic console cases registered with Petri's native
+`test_sync!` mechanism; this test binary has no standard Rust test harness.
+Run them through `cargo xflowey vmm-tests-run`. Validate initrd injection
+with the existing Petri tests, rebuild the changed binary packages and run
+the real full TDISP/AHCI VMM test on the unchanged firmware/kernel. Run all
+modified-package check, clippy and rustdoc gates, then full fixing and
+non-fixing formatter checks. Commit the dependency change and matching
+OpenVMM change only after validation; include report results in the
+OpenVMM commit and save its own receipt externally.
+
+After both commits, investigate the DOE diagnostic in the exact pinned
+RMM source. Start with the TDISP-only cache filter accepting all vendor
+responses and distinguish legitimate IDE-KM protocol zero from malformed
+headers. Do not change firmware or launch recovery fault injection.
+
+### Follow-up review
+
+**Minor revisions**, incorporated: compose from a hash-verified private
+copy of the pinned base; retain the prepared owner through teardown;
+compare complete ordered raw-priority kernel-log records with prefix
+continuity and fail on loss or newly repeated diagnostics. Require unique,
+ordered diagnostic sections and one zero guest exit. Synthetic cases must
+cover old warnings, new/repeated warnings and errors in both windows,
+missing/reordered/duplicate sections, lost baseline, bad exit and DMA/hash
+failure. Replace the deleted producer's contract tests with strict generic
+base/role/substitution tests. Update current byte-identical-script claims
+and check the relevant VMM Guide pages.
+
+### Follow-up implementation and checks
+
+The fixture now lives beside `tdisp_ahci.rs` in OpenVMM. It records full
+raw-priority logs in the three ordered phases and verifies driver removal.
+The host checker preserves old boot warnings but rejects newly appended
+warning/error records, including identical repetitions, missing sections,
+lost baseline continuity, DMA/hash failure and missing/nonzero guest exit.
+The pinned BusyBox binary was checked through the registered ARM runner;
+its `dmesg -r` option preserves the required raw priorities.
+
+All three native Petri diagnostic cases were discovered and passed through
+Flowey. The existing initrd preparation test passed, followed by all 291
+Petri/Flowey unit tests. Both modified packages passed native and ARM
+check, clippy and rustdoc; fixing and non-fixing full formatter checks
+passed. The first real composed-guest run completed I/O, UNLOCK and clean
+native teardown, but its test failed because Petri's serial logger consumed
+the raw syslog priority prefixes before the checker read `linux.log`.
+The guest now escapes each raw record with `K:`; synthetic tests include
+the actual serial-log normalization step. No severity or continuity check
+was relaxed. Structured logs from the failed run confirm one new INFO
+record after unbind and no new records after UNLOCK.
+
+The corrected real FVP run passed: **1 test in 1680.202 seconds**,
+run ID `1c069f597cf66a88c4cd2ef97f3c2c9fe2662081062e254f19a0153d3a34ff73`,
+under `target/tdisp-fixture-owned-initrd-serial`. LOCK/RUN, the direct
+64 MiB expected hash, driver unbind, UNLOCK and all checked cleanup passed.
+The preserved logs contained 499 baseline records, one new notice after
+unbind and no new records after UNLOCK. No new teardown warning or error
+was accepted. All guest, fixture, launcher and finalization outcomes were
+zero; both journals and owned containers were absent.
+
+The composed initrd hash was
+`099f1fa6ff19125e40e18f177434eaf156eaf1379ea2c9440c4692fb4b81059b`,
+with OpenVMM script hash
+`3050802e072609b67b45ce02af8e6441f4778754ecd7f6740521faf11e0e4e2b`.
+The code inventory matched the frozen, model-tested source. This closes
+the late-log collection/checking gap described in the older sections below;
+it does not establish general failed-operation recovery.
+
+The new full binary-base payload is
+`0.3.0-fvp-base-tdisp-cb45796-local`, archive SHA-256
+`4d52713cf6dd715d8b67a64fb9432083c6fbdba64d9ec9a4e49d2cd74858ce86`.
+Two package builds produced identical archives. Its host and guest initrds
+both have the generic `74ecad46...` identity; Image and configuration pins
+are unchanged. The host-only package remains byte-identical (`084474d8...`).
+The dependency producer passed 26 remaining tests, provenance checks and
+binary source/license inventories. No test script or oracle remains in its
+guest initrd or producer recipe.
+
+The dependency correction is new change ID `qwzwplrl`, above `rylvukpl`.
+The matching OpenVMM change includes this report; its own finalized ID and
+clean-tree receipt are stored externally. These are new commits, not
+amendments, and nothing was pushed.
+
 ## Current direction: one supported CCA ABI
 
 The 2026-11-09 decision is to remove the old CCA/TDISP kernel ABI path,

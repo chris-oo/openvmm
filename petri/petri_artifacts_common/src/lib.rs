@@ -12,9 +12,8 @@ pub mod cca_payload {
     pub mod tdisp_guest {
         /// Same kernel as the CCA host.
         pub const LINUX_IMAGE_SHA256: &str = super::LINUX_IMAGE_SHA256;
-        /// Guest initializer with the direct-I/O/hash/unlock oracle.
-        pub const INITRD_SHA256: &str =
-            "b9dc5046ac739a90cf23c1c52073cf6cdedcbabcfa18481b73faa0cdec9f5e92";
+        /// Generic binary base; OpenVMM injects its test initializer.
+        pub const INITRD_SHA256: &str = super::BASE_INITRD_SHA256;
     }
     /// Frozen kernel source.
     pub const LINUX_REVISION: &str = "cb45796cb3a9483202dce8c24735fc135bb9b675";
@@ -97,7 +96,7 @@ pub mod artifacts {
         PIPETTE_LINUX_AARCH64_MUSL("pipette", LINUX_AARCH64_MUSL),
         /// Pinned FVP CCA firmware package directory.
         FVP_CCA_PLATFORM_AARCH64("fvp-cca", AARCH64),
-        /// Qualified FVP host and unchanged TDISP guest payload directory.
+        /// Pinned FVP host and generic Realm guest binary payload directory.
         FVP_CCA_PAYLOAD_AARCH64("fvp-cca-payload", AARCH64),
         /// Directory to put petri test logs in
         TEST_LOG_DIRECTORY("test_results", ANY),

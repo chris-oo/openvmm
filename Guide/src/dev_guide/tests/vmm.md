@@ -280,9 +280,9 @@ NEXTEST_TEST_THREADS=1 PYTHONDONTWRITEBYTECODE=1 \
   --fvp-payload-sha256 <PAYLOAD_ARCHIVE_SHA256>
 ```
 
-The separate payload archive provides the approved host and reference-guest
-kernel and initrd pairs. The current payload recipe imports pinned reference
-binaries for local validation; it does not rebuild or publish them.
+The separate payload archive provides pinned prebuilt host and guest kernels
+and generic base initrds. OpenVMM overlays its own guest test script and
+expected disk hash at run time; test policy is not part of `openvmm-deps`.
 Omit the local archive options only when the packages are available in the
 named `microsoft/openvmm-deps` release. Until packages are published and
 qualified, the release and both archive hashes must be explicit. A missing

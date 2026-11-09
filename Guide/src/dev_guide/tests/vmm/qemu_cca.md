@@ -60,10 +60,10 @@ NEXTEST_TEST_THREADS=1 PYTHONDONTWRITEBYTECODE=1 \
 
 The separate payload archive supplies `host/Image` and `host/initrd`, with
 its own manifest and checksums. TDISP tests also require the qualified
-`guest/Image` and `guest/initrd`; the basic CCA smoke test does not.
+`guest/Image` and generic `guest/initrd`; the basic CCA smoke test does not.
 The host-only payload recipe uses the pinned integration kernel source and
-a verified standard test initrd. The full TDISP recipe also supplies the
-matched guest kernel and initrd. Configuration and licenses travel with
+a verified standard test initrd. The full payload also supplies the matched
+guest kernel and generic base initrd. Configuration and licenses travel with
 each package; a successful build is not runtime qualification.
 Use an exact outer-test filter when checking one case. Omit the local
 archive options only when both packages are available in the named
@@ -94,10 +94,17 @@ runtime ABI selection or fallback to older binaries.
 
 The source-built guest uses the hash-pinned standard initrd from
 `openvmm-deps` release `0.3.0-139`, not a rolling local userspace rebuild.
-Its recipe bundles the corresponding sources and licenses. Fresh guest
-construction and default payload packaging produce the approved tuple
-without substituting a retained guest image. The test still checks the exact
-guest hashes; an arbitrary rebuild is not an accepted replacement.
+Its recipe bundles the corresponding sources and licenses. OpenVMM owns
+the AHCI test script and expected disk hash and injects them into a verified
+private copy of the binary base with `PetriInitrd::prepare`. The per-run
+`tdisp-initrd-identity.json` records the base, script and composed-initrd
+hashes. Changing test policy does not require rebuilding binary dependencies.
+
+The test captures complete raw-priority kernel logs before final unbind,
+after unbind and after UNLOCK. It rejects new teardown warnings or errors,
+lost log continuity, incomplete diagnostic sections and failed guest exits.
+Earlier boot warnings remain visible, rather than being silently discarded.
+Checked OpenVMM, RMM and host-fixture teardown remain required.
 
 Without `--fvp-deps-version`, artifact discovery excludes FVP
 package-dependent cases, including in `--build-only` mode. Payload-only
