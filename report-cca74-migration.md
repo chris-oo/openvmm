@@ -1,5 +1,55 @@
 # Linux CCA 7.4 FVP migration report
 
+## Follow-up: disk write/read-back coverage
+
+The user requested actual disk writes in the TDISP/AHCI test. Keep the
+initial direct 64 MiB read/hash check. Write a distinct nonzero `0xa5`
+pattern to the first 8 MiB with direct I/O and `fsync`, read it back with
+direct I/O and verify its independent hash. Then restore all 64 MiB from
+the initial saved data, flush it and directly re-read/hash the whole disk.
+The bounded changed-data buffer keeps tmpfs use below its limit in the
+256 MiB Realm. Only the run-owned copy of the disk is touched; the pinned
+dependency remains immutable.
+
+Require separate ordered read, write/read-back and restore markers before
+the final I/O-pass marker. Keep all existing driver, TDISP and diagnostic
+checks. Add focused synthetic cases for missing, bad-hash and reordered
+write/restore evidence. Run the synthetic tests and full FVP acceptance on
+the unchanged binary packages, plus the affected package and formatting
+checks. No dependency rebuild or firmware/kernel change is needed.
+
+Write/read-back review: **Minor revisions**, incorporated. Remove the
+zero-generation buffer before reading back; retain the initial 64 MiB
+buffer until restore and flush succeed. The pattern is independently
+hash-pinned and checked before writing and after direct read-back; the real
+test checks the data rather than adding a test of a hash constant. Confirm
+the exact pinned BusyBox commands before model execution, with no buffered
+fallback. Preserve named diagnostic boundaries and test missing, reordered
+or incorrect write/restore evidence.
+
+The test now requires separate read, nonzero-write/read-back and full-restore
+hash markers before reporting I/O success. All three native diagnostic cases
+passed with the new negative marker/hash cases. Native and ARM check, clippy,
+rustdoc, shell syntax and fixing/non-fixing full formatter checks passed.
+The exact pinned BusyBox successfully generated the nonzero pattern and
+performed direct write plus `fsync` and direct read-back in a private host
+probe. The real FVP run passed: **1 test in 1551.768 seconds**, under
+`target/tdisp-ahci-read-write`, run ID
+`1492448c784974e01b9c3cc695818211287d509e57f131f0ca46b0277fed6cee`.
+All read, write/read-back, restore and final I/O hashes appeared in order,
+followed by driver unbind, UNLOCK and guest exit zero. The captured
+run-owned disk and original dependency disk both matched the original
+64 MiB image hash after execution. The raw diagnostic snapshots retained
+continuity with no new teardown warnings or errors; command, fixture,
+launcher and finalization all succeeded. No ownership journals or owned
+containers remained, and the tested source inventory was unchanged.
+The binary payload and firmware were reused without rebuilding dependencies.
+The final change was reviewed with no blocking findings. The review checked
+direct I/O and flush error propagation, temporary-memory bounds, saved-buffer
+lifetime through restoration, ordered independent hashes and immutable
+dependency ownership. This report accompanies the read/write commit; its
+finalized change ID and final clean-tree checks are recorded externally.
+
 ## Follow-up: OpenVMM-owned guest test fixture
 
 The user requested new commits in both repositories. Test policy belongs

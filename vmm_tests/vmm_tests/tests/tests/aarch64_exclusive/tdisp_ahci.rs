@@ -31,6 +31,8 @@ use vmm_test_macros::vmm_test_with;
 use petri_artifacts_common::cca_payload::tdisp_guest::INITRD_SHA256 as GUEST_INITRD_SHA256;
 use petri_artifacts_common::cca_payload::tdisp_guest::LINUX_IMAGE_SHA256 as GUEST_IMAGE_SHA256;
 const DISK_SHA256: &str = "281e519df3077b557c6b03f5da83c4e8d397219259615dd7c3308f89cae8f2a6";
+const WRITE_MIB: usize = 8;
+const WRITE_SHA256: &str = "e474a45740e5efac02e9f7e0626b3f86111b293f8363e477786dfad64e98df3b";
 const GUEST_INIT: &[u8] = include_bytes!("tdisp_ahci_guest_init.sh");
 
 /// The test overlays its driver, TSM, I/O and teardown policy onto a pinned
@@ -60,6 +62,7 @@ async fn boot_linux_direct_cca_tdisp_ahci(
     private_base.flush()?;
     let _verified_base = open_pinned(private_base.path(), GUEST_INITRD_SHA256)?;
     let expected_hash = format!("{DISK_SHA256}\n");
+    let write_hash = format!("{WRITE_SHA256} {WRITE_MIB}\n");
     let prepared = PetriInitrd::prepare(
         private_base.path(),
         &[
@@ -71,6 +74,11 @@ async fn boot_linux_direct_cca_tdisp_ahci(
             InitrdFile {
                 name: "da-ahci.sha256",
                 contents: expected_hash.as_bytes(),
+                permissions: 0o644,
+            },
+            InitrdFile {
+                name: "da-ahci-write.sha256",
+                contents: write_hash.as_bytes(),
                 permissions: 0o644,
             },
         ],
@@ -92,6 +100,8 @@ async fn boot_linux_direct_cca_tdisp_ahci(
                 "base_sha256": GUEST_INITRD_SHA256,
                 "script_sha256": hex_digest(GUEST_INIT),
                 "composed_sha256": hex_digest(&std::fs::read(prepared.path.as_ref())?),
+                "write_bytes": WRITE_MIB * 1024 * 1024,
+                "write_sha256": WRITE_SHA256,
             }))?,
         )?;
     }
@@ -206,11 +216,17 @@ fn unique_line(lines: &[&str], marker: &str) -> anyhow::Result<usize> {
 fn validate_guest_console(console: &str) -> anyhow::Result<()> {
     let lines: Vec<_> = console.lines().collect();
     let io_marker = format!("DA_STAGE_A_GUEST_AHCI_IO_PASS hash={DISK_SHA256}");
+    let read_marker = format!("DA_STAGE_A_GUEST_AHCI_READ_PASS hash={DISK_SHA256}");
+    let write_marker = format!("DA_STAGE_A_GUEST_AHCI_WRITE_PASS hash={WRITE_SHA256}");
+    let restore_marker = format!("DA_STAGE_A_GUEST_AHCI_RESTORE_PASS hash={DISK_SHA256}");
     let mut positions = Vec::new();
     for marker in [
         "DA_STAGE_A_GUEST_READY",
         "DA_STAGE_A_GUEST_LOCK_PASS",
         "DA_STAGE_A_GUEST_ACCEPT_RETURNED",
+        read_marker.as_str(),
+        write_marker.as_str(),
+        restore_marker.as_str(),
         io_marker.as_str(),
         "DA_STAGE_A_GUEST_DRIVER_UNBOUND",
         "DA_STAGE_A_GUEST_UNLOCK_RETURNED",
@@ -235,11 +251,14 @@ fn validate_guest_console(console: &str) -> anyhow::Result<()> {
         !console.contains("failed to enable DMA from the device"),
         "guest reported failed RSI DMA enable"
     );
+    let [io_complete, unbound, unlocked, exited] = *positions
+        .last_chunk::<4>()
+        .context("incomplete guest stages")?;
     let mut previous: &[&str] = &[];
     for (phase, lower, upper) in [
-        ("before_unbind", positions[3], positions[4]),
-        ("after_unbind", positions[4], positions[5]),
-        ("after_unlock", positions[5], positions[6]),
+        ("before_unbind", io_complete, unbound),
+        ("after_unbind", unbound, unlocked),
+        ("after_unlock", unlocked, exited),
     ] {
         let begin = unique_line(&lines, &format!("DA_STAGE_A_DMESG_BEGIN {phase}"))?;
         let end = unique_line(&lines, &format!("DA_STAGE_A_DMESG_END {phase}"))?;
@@ -315,6 +334,19 @@ fn tdisp_diagnostics_reject_incomplete_evidence(
         valid.replace("DA_STAGE_A_GUEST_EXIT=0\n", ""),
         valid.replace("DA_STAGE_A_GUEST_EXIT=0", "DA_STAGE_A_GUEST_EXIT=1"),
         valid.replace(DISK_SHA256, "incorrect hash"),
+        valid.replace(WRITE_SHA256, "incorrect write hash"),
+        valid.replace(
+            &format!("DA_STAGE_A_GUEST_AHCI_RESTORE_PASS hash={DISK_SHA256}"),
+            "DA_STAGE_A_GUEST_AHCI_RESTORE_PASS hash=incorrect",
+        ),
+        valid.replace(
+            &format!("DA_STAGE_A_GUEST_AHCI_WRITE_PASS hash={WRITE_SHA256}\n"),
+            "",
+        ),
+        valid.replace(
+            &format!("DA_STAGE_A_GUEST_AHCI_RESTORE_PASS hash={DISK_SHA256}\n"),
+            "",
+        ),
         valid.replace(
             "DA_STAGE_A_DMESG_BEGIN after_unbind\nK:<4>[1] existing boot warning\n",
             "DA_STAGE_A_DMESG_BEGIN after_unbind\n",
@@ -338,6 +370,12 @@ fn tdisp_diagnostics_reject_incomplete_evidence(
             .replace("temporary_phase", "after_unlock"),
     );
     invalid.push(valid.replace("K:", ""));
+    invalid.push(
+        valid
+            .replace("AHCI_READ_PASS", "AHCI_TEMP_PASS")
+            .replace("AHCI_RESTORE_PASS", "AHCI_READ_PASS")
+            .replace("AHCI_TEMP_PASS", "AHCI_RESTORE_PASS"),
+    );
     for console in invalid {
         anyhow::ensure!(
             validate_guest_console(&console).is_err(),
@@ -362,6 +400,9 @@ fn diagnostic_console(unbind: &str, unlock: &str) -> String {
         "DA_STAGE_A_GUEST_READY\n\
          DA_STAGE_A_GUEST_LOCK_PASS\n\
          DA_STAGE_A_GUEST_ACCEPT_RETURNED\n\
+         DA_STAGE_A_GUEST_AHCI_READ_PASS hash={DISK_SHA256}\n\
+         DA_STAGE_A_GUEST_AHCI_WRITE_PASS hash={WRITE_SHA256}\n\
+         DA_STAGE_A_GUEST_AHCI_RESTORE_PASS hash={DISK_SHA256}\n\
          DA_STAGE_A_GUEST_AHCI_IO_PASS hash={DISK_SHA256}\n\
          DA_STAGE_A_DMESG_BEGIN before_unbind\n\
          {before}DA_STAGE_A_DMESG_END before_unbind\n\

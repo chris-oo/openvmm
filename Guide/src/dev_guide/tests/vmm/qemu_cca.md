@@ -100,6 +100,12 @@ private copy of the binary base with `PetriInitrd::prepare`. The per-run
 `tdisp-initrd-identity.json` records the base, script and composed-initrd
 hashes. Changing test policy does not require rebuilding binary dependencies.
 
+The AHCI case directly reads and hash-checks the 64 MiB fixture disk, writes
+an 8 MiB nonzero pattern with direct I/O and a flush, then directly reads it
+back and checks its hash. It restores all 64 MiB, flushes again and directly
+re-reads the whole disk to verify restoration. Writes target only the
+run-owned disk copy, never the pinned dependency image.
+
 The test captures complete raw-priority kernel logs before final unbind,
 after unbind and after UNLOCK. It rejects new teardown warnings or errors,
 lost log continuity, incomplete diagnostic sections and failed guest exits.

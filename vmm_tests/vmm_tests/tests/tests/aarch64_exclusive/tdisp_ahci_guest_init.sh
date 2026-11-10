@@ -80,12 +80,34 @@ while :; do
 done
 test "$count" -eq 1
 test "$(cat "/sys/class/block/$disk/size")" = 131072
+test "$(cat "/sys/class/block/$disk/ro")" = 0
 echo "DA_STAGE_A_DISK=$disk"
 dd if="/dev/$disk" of=/tmp/ahci-read.bin bs=1048576 count=64 iflag=direct
 sha256sum /tmp/ahci-read.bin > /tmp/actual.sha256
 read actual file < /tmp/actual.sha256
 read expected < /da-ahci.sha256
 test "$actual" = "$expected"
+echo "DA_STAGE_A_GUEST_AHCI_READ_PASS hash=$actual"
+read write_expected write_mib < /da-ahci-write.sha256
+dd if=/dev/zero of=/tmp/ahci-zero.bin bs=1048576 count="$write_mib"
+LC_ALL=C tr '\000' '\245' < /tmp/ahci-zero.bin > /tmp/ahci-write.bin
+rm /tmp/ahci-zero.bin
+sha256sum /tmp/ahci-write.bin > /tmp/write.sha256
+read actual file < /tmp/write.sha256
+test "$actual" = "$write_expected"
+dd if=/tmp/ahci-write.bin of="/dev/$disk" bs=1048576 count="$write_mib" oflag=direct conv=fsync
+dd if="/dev/$disk" of=/tmp/ahci-readback.bin bs=1048576 count="$write_mib" iflag=direct
+sha256sum /tmp/ahci-readback.bin > /tmp/write-readback.sha256
+read actual file < /tmp/write-readback.sha256
+test "$actual" = "$write_expected"
+echo "DA_STAGE_A_GUEST_AHCI_WRITE_PASS hash=$actual"
+dd if=/tmp/ahci-read.bin of="/dev/$disk" bs=1048576 count=64 oflag=direct conv=fsync
+rm /tmp/ahci-write.bin /tmp/ahci-readback.bin
+dd if="/dev/$disk" of=/tmp/ahci-read.bin bs=1048576 count=64 iflag=direct
+sha256sum /tmp/ahci-read.bin > /tmp/restored.sha256
+read actual file < /tmp/restored.sha256
+test "$actual" = "$expected"
+echo "DA_STAGE_A_GUEST_AHCI_RESTORE_PASS hash=$actual"
 echo "DA_STAGE_A_GUEST_AHCI_IO_PASS hash=$actual"
 cat /proc/interrupts
 od -Ax -tx1 -N256 "$device/config"
