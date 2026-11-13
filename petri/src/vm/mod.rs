@@ -687,7 +687,9 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
         let (guest_quirks, vmm_quirks) = T::quirks(&artifacts.firmware);
         let expected_boot_event = artifacts.firmware.expected_boot_event();
         let boot_device_type = match artifacts.firmware {
-            Firmware::LinuxDirect { .. } | Firmware::IgvmLinuxDirect { .. } => BootDeviceType::None,
+            Firmware::LinuxDirect { .. }
+            | Firmware::SnpLinuxDirect { .. }
+            | Firmware::IgvmLinuxDirect { .. } => BootDeviceType::None,
             Firmware::OpenhclLinuxDirect { .. } => BootDeviceType::None,
             Firmware::Pcat { .. } => BootDeviceType::Ide,
             Firmware::OpenhclPcat { .. } => BootDeviceType::IdeViaScsi,
@@ -703,7 +705,8 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
         };
 
         let supports_file_sharing = T::supports_file_sharing(&artifacts.firmware);
-        let external_pipette = isolated_without_paravisor && artifacts.pipette_binary.is_some();
+        let external_pipette = matches!(artifacts.firmware, Firmware::IgvmLinuxDirect { .. })
+            && artifacts.pipette_binary.is_some();
         let builder = Self {
             backend: artifacts.backend,
             config: PetriVmConfig {
@@ -1674,6 +1677,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
                 *igvm_firmware = IgvmFirmwareSource::File(artifact.erase());
             }
             Firmware::LinuxDirect { .. }
+            | Firmware::SnpLinuxDirect { .. }
             | Firmware::IgvmLinuxDirect { .. }
             | Firmware::Uefi { .. }
             | Firmware::Pcat { .. } => {
@@ -1692,6 +1696,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
                 *igvm_firmware = IgvmFirmwareSource::VmgsOrInBox;
             }
             Firmware::LinuxDirect { .. }
+            | Firmware::SnpLinuxDirect { .. }
             | Firmware::IgvmLinuxDirect { .. }
             | Firmware::Uefi { .. }
             | Firmware::Pcat { .. } => {
@@ -2223,7 +2228,9 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
         mut self,
         custom_kernel: ResolvedArtifact<impl IsLoadable>,
     ) -> Self {
-        let Firmware::LinuxDirect { kernel, .. } = &mut self.config.firmware else {
+        let (Firmware::LinuxDirect { kernel, .. } | Firmware::SnpLinuxDirect { kernel, .. }) =
+            &mut self.config.firmware
+        else {
             panic!("VM is not linux direct");
         };
         *kernel = custom_kernel.erase();
@@ -3278,6 +3285,13 @@ pub enum Firmware {
         /// The initrd to use.
         initrd: ResolvedArtifact,
     },
+    /// Boot an SNP Linux guest through the kernel/initrd loader, without IGVM.
+    SnpLinuxDirect {
+        /// The SNP-capable kernel to boot.
+        kernel: ResolvedArtifact,
+        /// The base initrd, prepared with Pipette before boot.
+        initrd: ResolvedArtifact,
+    },
     /// Boot an isolated Linux guest from an IGVM file with no paravisor.
     IgvmLinuxDirect {
         /// The IGVM file with the measured kernel, initrd, and bootshim.
@@ -3453,6 +3467,18 @@ impl Firmware {
         }
     }
 
+    /// Constructs an SNP loader-direct configuration with the SNP guest kernel.
+    ///
+    /// Unlike `linux_direct(resolver, arch, Some(IsolationType::Snp))`, this
+    /// uses separate kernel and initrd artifacts rather than an IGVM payload.
+    pub fn snp_linux_direct(resolver: &ArtifactResolver<'_>) -> Self {
+        use petri_artifacts_vmm_test::artifacts::loadable::*;
+        Firmware::SnpLinuxDirect {
+            kernel: resolver.require(SNP_LINUX_DIRECT_TEST_KERNEL_X64).erase(),
+            initrd: resolver.require(LINUX_DIRECT_TEST_INITRD_X64).erase(),
+        }
+    }
+
     /// Constructs a standard [`Firmware::OpenhclLinuxDirect`] configuration.
     pub fn openhcl_linux_direct(resolver: &ArtifactResolver<'_>, arch: MachineArch) -> Self {
         use petri_artifacts_vmm_test::artifacts::openhcl_igvm::*;
@@ -3537,6 +3563,7 @@ impl Firmware {
             | Firmware::OpenhclUefi { .. }
             | Firmware::OpenhclPcat { .. } => true,
             Firmware::LinuxDirect { .. }
+            | Firmware::SnpLinuxDirect { .. }
             | Firmware::IgvmLinuxDirect { .. }
             | Firmware::Pcat { .. }
             | Firmware::Uefi { .. } => false,
@@ -3545,6 +3572,7 @@ impl Firmware {
 
     fn isolation(&self) -> Option<IsolationType> {
         match self {
+            Firmware::SnpLinuxDirect { .. } => Some(IsolationType::Snp),
             Firmware::IgvmLinuxDirect { isolation, .. } => Some(*isolation),
             Firmware::OpenhclUefi { isolation, .. } => *isolation,
             Firmware::LinuxDirect { .. }
@@ -3563,6 +3591,7 @@ impl Firmware {
     fn is_linux_direct(&self) -> bool {
         match self {
             Firmware::LinuxDirect { .. }
+            | Firmware::SnpLinuxDirect { .. }
             | Firmware::IgvmLinuxDirect { .. }
             | Firmware::OpenhclLinuxDirect { .. } => true,
             Firmware::Pcat { .. }
@@ -3575,7 +3604,9 @@ impl Firmware {
     /// Get the initrd path for Linux direct boot firmware.
     pub fn linux_direct_initrd(&self) -> Option<&Path> {
         match self {
-            Firmware::LinuxDirect { initrd, .. } => Some(initrd.get()),
+            Firmware::LinuxDirect { initrd, .. } | Firmware::SnpLinuxDirect { initrd, .. } => {
+                Some(initrd.get())
+            }
             _ => None,
         }
     }
@@ -3586,6 +3617,7 @@ impl Firmware {
             Firmware::Uefi { .. }
             | Firmware::OpenhclUefi { .. }
             | Firmware::LinuxDirect { .. }
+            | Firmware::SnpLinuxDirect { .. }
             | Firmware::IgvmLinuxDirect { .. }
             | Firmware::OpenhclLinuxDirect { .. } => false,
         }
@@ -3594,6 +3626,7 @@ impl Firmware {
     fn os_flavor(&self) -> OsFlavor {
         match self {
             Firmware::LinuxDirect { .. }
+            | Firmware::SnpLinuxDirect { .. }
             | Firmware::OpenhclLinuxDirect { .. }
             | Firmware::Uefi {
                 guest: UefiGuest::Mshv(_),
@@ -3664,6 +3697,7 @@ impl Firmware {
     fn expected_boot_event(&self) -> Option<FirmwareEvent> {
         match self {
             Firmware::LinuxDirect { .. }
+            | Firmware::SnpLinuxDirect { .. }
             | Firmware::IgvmLinuxDirect { .. }
             | Firmware::OpenhclLinuxDirect { .. }
             | Firmware::Uefi {
@@ -3698,6 +3732,7 @@ impl Firmware {
             | Firmware::OpenhclUefi { openhcl_config, .. }
             | Firmware::OpenhclPcat { openhcl_config, .. } => Some(openhcl_config),
             Firmware::LinuxDirect { .. }
+            | Firmware::SnpLinuxDirect { .. }
             | Firmware::IgvmLinuxDirect { .. }
             | Firmware::Pcat { .. }
             | Firmware::Uefi { .. } => None,
@@ -3710,6 +3745,7 @@ impl Firmware {
             | Firmware::OpenhclUefi { openhcl_config, .. }
             | Firmware::OpenhclPcat { openhcl_config, .. } => Some(openhcl_config),
             Firmware::LinuxDirect { .. }
+            | Firmware::SnpLinuxDirect { .. }
             | Firmware::IgvmLinuxDirect { .. }
             | Firmware::Pcat { .. }
             | Firmware::Uefi { .. } => None,
@@ -3722,6 +3758,7 @@ impl Firmware {
             | Firmware::OpenhclUefi { igvm_firmware, .. }
             | Firmware::OpenhclPcat { igvm_firmware, .. } => Some(igvm_firmware),
             Firmware::LinuxDirect { .. }
+            | Firmware::SnpLinuxDirect { .. }
             | Firmware::IgvmLinuxDirect { .. }
             | Firmware::Pcat { .. }
             | Firmware::Uefi { .. } => None,
@@ -3752,6 +3789,7 @@ impl Firmware {
                 vmbus_storage_controllers,
             },
             Firmware::LinuxDirect { .. }
+            | Firmware::SnpLinuxDirect { .. }
             | Firmware::IgvmLinuxDirect { .. }
             | Firmware::Uefi { .. } => PetriVmRuntimeConfig {
                 vtl2_settings: None,
@@ -3767,6 +3805,7 @@ impl Firmware {
                 Some(uefi_config)
             }
             Firmware::LinuxDirect { .. }
+            | Firmware::SnpLinuxDirect { .. }
             | Firmware::IgvmLinuxDirect { .. }
             | Firmware::OpenhclLinuxDirect { .. }
             | Firmware::Pcat { .. }
@@ -3780,6 +3819,7 @@ impl Firmware {
                 Some(uefi_config)
             }
             Firmware::LinuxDirect { .. }
+            | Firmware::SnpLinuxDirect { .. }
             | Firmware::IgvmLinuxDirect { .. }
             | Firmware::OpenhclLinuxDirect { .. }
             | Firmware::Pcat { .. }
@@ -3807,6 +3847,7 @@ impl Firmware {
         }
         Ok(match self {
             Firmware::LinuxDirect { .. }
+            | Firmware::SnpLinuxDirect { .. }
             | Firmware::IgvmLinuxDirect { .. }
             | Firmware::OpenhclLinuxDirect { .. } => None,
             Firmware::Pcat { guest, .. } | Firmware::OpenhclPcat { guest, .. } => {

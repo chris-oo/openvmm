@@ -2278,6 +2278,7 @@ fn validate_snp_config(cfg: &Config) -> anyhow::Result<()> {
                 | "pit"
                 | "generic-ioapic"
                 | "hyperv_power_management"
+                | "acpi_power_button"
                 | "missing-dev"
         )
     });
@@ -3286,6 +3287,40 @@ mod tests {
                     assert_eq!(built, has_button, "{args:?}");
                 }
             }
+        });
+    }
+
+    #[test]
+    fn snp_linux_direct_accepts_its_default_acpi_power_button() {
+        DefaultPool::run_with(async |driver| {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let kernel = temp_dir.path().join("kernel");
+            let initrd = temp_dir.path().join("initrd");
+            File::create(&kernel).unwrap();
+            File::create(&initrd).unwrap();
+            let opt = Options::try_parse_from([
+                "openvmm",
+                "--kernel",
+                kernel.to_str().unwrap(),
+                "--initrd",
+                initrd.to_str().unwrap(),
+                "--isolation",
+                "snp",
+                "--no-vmbus",
+                "--single-process",
+            ])
+            .unwrap();
+            let mesh = VmmMesh::new(&driver, true).unwrap();
+            let (config, _) = vm_config_from_command_line(driver, &mesh, &opt)
+                .await
+                .unwrap();
+            assert!(
+                config
+                    .chipset_devices
+                    .iter()
+                    .any(|device| device.resource.id() == "acpi_power_button")
+            );
+            mesh.shutdown().await;
         });
     }
 

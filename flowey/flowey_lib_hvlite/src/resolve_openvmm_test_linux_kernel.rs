@@ -33,7 +33,7 @@ pub enum LinuxTestKernelVersion {
     /// `CONFIG_ARM_SMMU_V3`) that the emulator VFIO device-assignment tests
     /// need to exercise device-BAR P2P DMA, which predate the 6.18 test kernel.
     CcaV15,
-    /// The x86_64-only SEV-SNP guest kernel used by the SNP Linux-direct IGVM.
+    /// The x86_64-only SEV-SNP guest kernel used by SNP Linux-direct tests.
     SnpGuest,
     /// Module-free x86_64 mshv root kernel, distinct from the child test kernel.
     MshvTest,
@@ -108,7 +108,7 @@ pub const DEFAULT_LINUX_TEST_KERNEL_VERSION: LinuxTestKernelVersion =
 /// only.
 pub const CCA_LINUX_TEST_KERNEL_VERSION: LinuxTestKernelVersion = LinuxTestKernelVersion::CcaV15;
 
-/// The x86_64 SEV-SNP guest kernel used by the SNP Linux-direct IGVM.
+/// The x86_64 SEV-SNP guest kernel used by SNP loader-direct and IGVM tests.
 pub const SNP_GUEST_LINUX_TEST_KERNEL_VERSION: LinuxTestKernelVersion =
     LinuxTestKernelVersion::SnpGuest;
 

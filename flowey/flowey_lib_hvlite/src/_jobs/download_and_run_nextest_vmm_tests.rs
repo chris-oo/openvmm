@@ -142,6 +142,7 @@ impl SimpleFlowNode for Node {
                         test_linux_initrd_aarch64: true,
                         test_linux_kernel_aarch64: true,
                         test_linux_kernel_cca_aarch64: true,
+                        test_linux_kernel_snp_x64: false,
                         test_linux_bzimage_x64: true,
                         uefi_x64: true,
                         uefi_aarch64: false,

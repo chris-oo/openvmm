@@ -1,21 +1,23 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Boot the SEV-SNP Linux IGVM with virtio-vsock pipette on MSHV.
+//! Boot SEV-SNP Linux with Pipette: IGVM on KVM/MSHV and loader-direct on KVM.
 
 use petri::MemoryConfig;
 use petri::PetriVmBuilder;
 use petri::ProcessorTopology;
 use petri::openvmm::OpenVmmPetriBackend;
 use petri::pipette::cmd;
+use petri::requirements::HostContext;
+use petri::requirements::OpenVmmHypervisor;
 use vmm_test_macros::vmm_test_with;
 
-#[vmm_test_with(openvmm, configs(linux_direct_x64[snp]))]
+#[vmm_test_with(openvmm, configs(linux_direct_x64[snp], snp_linux_direct_x64))]
 async fn boot_1vp(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Result<()> {
     boot_with_vps(config, 1).await
 }
 
-#[vmm_test_with(openvmm, configs(linux_direct_x64[snp]))]
+#[vmm_test_with(openvmm, configs(linux_direct_x64[snp], snp_linux_direct_x64))]
 async fn boot_2vp(config: PetriVmBuilder<OpenVmmPetriBackend>) -> anyhow::Result<()> {
     boot_with_vps(config, 2).await
 }
@@ -24,6 +26,11 @@ async fn boot_with_vps(
     config: PetriVmBuilder<OpenVmmPetriBackend>,
     vp_count: u32,
 ) -> anyhow::Result<()> {
+    let config = if HostContext::new().await.openvmm_hypervisor == Some(OpenVmmHypervisor::Kvm) {
+        config.with_no_hv()
+    } else {
+        config
+    };
     let (vm, agent) = config
         .with_processor_topology(ProcessorTopology {
             vp_count,

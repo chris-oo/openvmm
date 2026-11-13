@@ -183,8 +183,11 @@ impl PetriVmmBackend for HyperVPetriBackend {
         properties: &PetriVmProperties,
     ) -> anyhow::Result<(Self::VmRuntime, PetriVmRuntimeConfig)> {
         anyhow::ensure!(
-            !matches!(config.firmware, Firmware::IgvmLinuxDirect { .. }),
-            "Linux-direct IGVM boot is not supported by the Hyper-V backend"
+            !matches!(
+                config.firmware,
+                Firmware::IgvmLinuxDirect { .. } | Firmware::SnpLinuxDirect { .. }
+            ),
+            "isolated Linux-direct boot is not supported by the Hyper-V backend"
         );
         let PetriVmResources {
             driver,

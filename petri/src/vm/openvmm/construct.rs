@@ -196,7 +196,7 @@ impl PetriVmConfigOpenVmm {
                 Firmware::LinuxDirect { .. } => {
                     vm_manifest_builder::BaseChipsetType::HyperVGen2LinuxDirect
                 }
-                Firmware::IgvmLinuxDirect { .. } => {
+                Firmware::SnpLinuxDirect { .. } | Firmware::IgvmLinuxDirect { .. } => {
                     vm_manifest_builder::BaseChipsetType::EnlightenedLinuxDirect
                 }
                 Firmware::OpenhclLinuxDirect { .. } => {
@@ -870,6 +870,7 @@ impl PetriVmConfigSetupCore<'_> {
 
         let serial0_log_file = logger.log_file(match self.firmware {
             Firmware::LinuxDirect { .. }
+            | Firmware::SnpLinuxDirect { .. }
             | Firmware::IgvmLinuxDirect { .. }
             | Firmware::OpenhclLinuxDirect { .. } => "linux",
             Firmware::Pcat { .. } | Firmware::OpenhclPcat { .. } => "pcat",
@@ -955,7 +956,8 @@ impl PetriVmConfigSetupCore<'_> {
                 com_serial: None,
                 personality: IgvmPersonality::LinuxDirect,
             },
-            (arch, Firmware::LinuxDirect { kernel, initrd }) => {
+            (arch, Firmware::LinuxDirect { kernel, initrd })
+            | (arch, Firmware::SnpLinuxDirect { kernel, initrd }) => {
                 let console = match (self.use_virtio_console, arch) {
                     (true, _) => "console=hvc0",
                     (false, MachineArch::X86_64) => "console=ttyS0",
@@ -987,7 +989,14 @@ impl PetriVmConfigSetupCore<'_> {
                     initrd: Some(initrd),
                     cmdline,
                     enable_serial: self.enable_serial,
-                    isolation: openvmm_defs::config::LinuxIsolationConfig::None,
+                    isolation: match self.firmware {
+                        Firmware::SnpLinuxDirect { .. } => {
+                            openvmm_defs::config::LinuxIsolationConfig::Snp {
+                                restricted_injection: false,
+                            }
+                        }
+                        _ => openvmm_defs::config::LinuxIsolationConfig::None,
+                    },
                     boot_mode: openvmm_defs::config::LinuxDirectBootMode::Acpi,
                     smbios: Default::default(),
                 }
@@ -1322,6 +1331,7 @@ impl PetriVmConfigSetupCore<'_> {
                 ))
             }
             Firmware::OpenhclLinuxDirect { .. }
+            | Firmware::SnpLinuxDirect { .. }
             | Firmware::IgvmLinuxDirect { .. }
             | Firmware::LinuxDirect { .. }
             | Firmware::Uefi { .. }
@@ -1639,4 +1649,97 @@ async fn vmbus_storage_controllers_to_openvmm(
     }
 
     Ok((vmbus_devices, vpci_devices))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::PetriVmArtifacts;
+    use crate::PetriVmBuilder;
+    use crate::vm::openvmm::OpenVmmPetriBackend;
+    use test_with_tracing::test;
+
+    #[test]
+    fn snp_loader_direct_uses_prepared_initrd_and_snp_isolation() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir_in(".")?;
+        let kernel = temp.path().join("snp-kernel");
+        let base_initrd = temp.path().join("base-initrd");
+        let prepared_initrd = temp.path().join("prepared-initrd");
+        fs_err::write(&kernel, b"SNP guest kernel")?;
+        fs_err::write(&base_initrd, b"base initrd")?;
+        fs_err::write(&prepared_initrd, b"initrd with Pipette")?;
+        let logs = PetriLogSource::file_only(temp.path())?;
+        pal_async::DefaultPool::run_with(async |driver| {
+            let builder = PetriVmBuilder::minimal(
+                "snp-loader-direct",
+                &logs,
+                PetriVmArtifacts {
+                    backend: OpenVmmPetriBackend::from_binary("unused-openvmm".into()),
+                    firmware: Firmware::SnpLinuxDirect {
+                        kernel: ResolvedArtifact::from_local_path(kernel),
+                        initrd: ResolvedArtifact::from_local_path(base_initrd),
+                    },
+                    arch: MachineArch::X86_64,
+                    agent_image: None,
+                    openhcl_agent_image: None,
+                    pipette_binary: Some(ResolvedArtifact::from_local_path(
+                        "unused-pipette".into(),
+                    )),
+                    nested_test: None,
+                },
+                &driver,
+            )?
+            .with_serial_output()
+            .with_no_hv()
+            .with_prebuilt_initrd(crate::PetriInitrd {
+                path: crate::TempOrPersistentPath::Persistent(prepared_initrd),
+                rdinit_param: "/pipette".into(),
+            });
+            let properties = builder.properties();
+            assert!(properties.uses_pipette_as_init);
+            assert!(properties.use_virtio_vsock);
+            assert!(properties.no_vmbus);
+            assert!(!properties.external_pipette);
+            let backend = PetriVmConfigOpenVmm::new(
+                &ResolvedArtifact::from_local_path("unused-openvmm".into()),
+                builder.config,
+                &builder.resources,
+                &properties,
+            )
+            .await?;
+            assert!(backend.resources.linux_direct_serial_agent.is_none());
+            assert!(backend.config.chipset.with_generic_cmos_rtc);
+            assert!(backend.config.chipset_capabilities.with_pic);
+            assert!(backend.config.chipset_capabilities.with_pit);
+            let LoadMode::Linux {
+                mut kernel,
+                initrd: Some(mut initrd),
+                cmdline,
+                isolation,
+                ..
+            } = backend.config.load_mode
+            else {
+                panic!("expected loader-direct Linux, not IGVM")
+            };
+            assert_eq!(
+                isolation,
+                openvmm_defs::config::LinuxIsolationConfig::Snp {
+                    restricted_injection: false,
+                }
+            );
+            assert!(
+                cmdline
+                    .split_whitespace()
+                    .any(|arg| arg == "rdinit=/pipette")
+            );
+            assert!(cmdline.contains("initcall_blacklist=hv_sock_init"));
+            let mut contents = Vec::new();
+            std::io::Read::read_to_end(&mut kernel, &mut contents)?;
+            assert_eq!(contents, b"SNP guest kernel");
+            contents.clear();
+            std::io::Read::read_to_end(&mut initrd, &mut contents)?;
+            assert_eq!(contents, b"initrd with Pipette");
+            Ok(())
+        })
+    }
 }

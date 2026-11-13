@@ -427,6 +427,8 @@ pub mod artifacts {
             LINUX_DIRECT_TEST_INITRD_AARCH64("initrd", AARCH64),
             /// Test linux direct bzImage kernel for x64 (from OpenVMM deps)
             LINUX_DIRECT_TEST_BZIMAGE_X64("bzImage", X64),
+            /// SNP-capable Linux direct kernel for x64 (from OpenVMM deps).
+            SNP_LINUX_DIRECT_TEST_KERNEL_X64("snp-guest-bzImage", X64),
             /// PCAT firmware DLL
             PCAT_FIRMWARE_X64("vmfirmwarepcat.dll", X64),
             /// SVGA firmware DLL
@@ -458,6 +460,10 @@ pub mod artifacts {
         }
 
         impl IsLoadable for LINUX_DIRECT_TEST_BZIMAGE_X64 {
+            const ARCH: MachineArch = MachineArch::X86_64;
+        }
+
+        impl IsLoadable for SNP_LINUX_DIRECT_TEST_KERNEL_X64 {
             const ARCH: MachineArch = MachineArch::X86_64;
         }
 

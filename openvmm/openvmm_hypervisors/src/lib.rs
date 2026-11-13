@@ -54,6 +54,48 @@ pub fn mshv_snp_available() -> bool {
     }
 }
 
+/// Returns whether KVM advertises SEV-SNP support and this process can open
+/// the SEV device. This does not create or initialize an SNP VM.
+pub fn kvm_snp_available() -> bool {
+    #[cfg(all(
+        target_os = "linux",
+        feature = "virt_kvm",
+        guest_is_native,
+        guest_arch = "x86_64"
+    ))]
+    {
+        let probe = || -> anyhow::Result<bool> {
+            if !::kvm::Kvm::new()?.is_snp_supported()? {
+                return Ok(false);
+            }
+            fs_err::File::options()
+                .read(true)
+                .write(true)
+                .open("/dev/sev")?;
+            Ok(true)
+        };
+        match probe() {
+            Ok(supported) => supported,
+            Err(err) => {
+                tracing::warn!(
+                    error = err.as_ref() as &dyn std::error::Error,
+                    "KVM SNP capability probe failed"
+                );
+                false
+            }
+        }
+    }
+    #[cfg(not(all(
+        target_os = "linux",
+        feature = "virt_kvm",
+        guest_is_native,
+        guest_arch = "x86_64"
+    )))]
+    {
+        false
+    }
+}
+
 #[expect(clippy::allow_attributes, reason = "lots of conditions")]
 #[allow(dead_code)]
 pub(crate) fn parse_bool_param(key: &str, val: &str) -> anyhow::Result<bool> {

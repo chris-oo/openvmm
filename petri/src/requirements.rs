@@ -87,7 +87,8 @@ pub enum OpenVmmHypervisor {
 }
 
 /// Information about the VM host. On Windows, petri reads it with the
-/// `Get-VMHost` PowerShell cmdlet. On Linux, petri probes MSHV for SNP support.
+/// `Get-VMHost` PowerShell cmdlet. On Linux, petri probes the selected
+/// hypervisor for SNP support.
 #[derive(Debug, Clone)]
 pub struct VmHostInfo {
     /// VBS support status
@@ -181,15 +182,20 @@ impl HostContext {
             }
             #[cfg(not(windows))]
             {
-                // MSHV has no SNP capability query, so probe by creating a
-                // temporary SNP partition. Only AMD hosts can support SNP.
-                (vendor == Vendor::Amd && openvmm_hypervisor == Some(OpenVmmHypervisor::Mshv)).then(
-                    || VmHostInfo {
-                        vbs_supported: false,
-                        snp_status: openvmm_hypervisors::mshv_snp_available(),
-                        tdx_status: false,
-                    },
-                )
+                let probe: Option<fn() -> bool> = match (vendor, openvmm_hypervisor) {
+                    (Vendor::Amd, Some(OpenVmmHypervisor::Mshv)) => {
+                        Some(openvmm_hypervisors::mshv_snp_available)
+                    }
+                    (Vendor::Amd, Some(OpenVmmHypervisor::Kvm)) => {
+                        Some(openvmm_hypervisors::kvm_snp_available)
+                    }
+                    _ => None,
+                };
+                probe.map(|probe| VmHostInfo {
+                    vbs_supported: false,
+                    snp_status: probe(),
+                    tdx_status: false,
+                })
             }
         };
 

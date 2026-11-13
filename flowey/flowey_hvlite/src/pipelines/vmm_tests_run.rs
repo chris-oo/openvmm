@@ -889,6 +889,26 @@ mod tests {
     }
 
     #[test]
+    fn snp_loader_direct_selects_kernel_without_igvm() {
+        use petri_artifacts_vmm_test::artifacts::loadable;
+
+        let mut selections =
+            ResolvedArtifactSelections::new(CommonTriple::X86_64_LINUX_GNU.as_triple(), true)
+                .unwrap();
+        for id in [
+            loadable::SNP_LINUX_DIRECT_TEST_KERNEL_X64::GLOBAL_UNIQUE_ID,
+            loadable::LINUX_DIRECT_TEST_INITRD_X64::GLOBAL_UNIQUE_ID,
+        ] {
+            selections.resolve_artifact(id).unwrap();
+        }
+        assert!(selections.prebuilt_artifacts.test_linux_kernel_snp_x64);
+        assert!(selections.prebuilt_artifacts.test_linux_initrd_x64);
+        assert!(!selections.prebuilt_artifacts.test_linux_kernel_x64);
+        assert!(!selections.prebuilt_artifacts.test_linux_bzimage_x64);
+        assert!(!selections.build.snp_linux_direct_igvm_x64);
+    }
+
+    #[test]
     fn linux_musl_bundle_selects_musl_artifacts() {
         use petri_artifacts_common::artifacts::PIPETTE_LINUX_X64_MUSL;
         use petri_artifacts_vmm_test::artifacts::*;

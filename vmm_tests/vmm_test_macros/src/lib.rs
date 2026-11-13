@@ -137,6 +137,7 @@ enum HostVendor {
 enum Firmware {
     LinuxDirect(FirmwareOptions),
     LinuxDirectBzImage,
+    SnpLinuxDirect,
     Pcat(PcatGuest),
     Uefi(UefiGuest),
     OpenhclLinuxDirect,
@@ -213,6 +214,7 @@ impl ResolvedConfig {
         let firmware_prefix = match &self.firmware {
             Firmware::LinuxDirect(_) => "linux",
             Firmware::LinuxDirectBzImage => "linux_bzimage",
+            Firmware::SnpLinuxDirect => "snp_linux",
             Firmware::Pcat(_) => "pcat",
             Firmware::Uefi(_) => "uefi",
             Firmware::OpenhclLinuxDirect => "openhcl_linux",
@@ -223,6 +225,7 @@ impl ResolvedConfig {
         let guest_prefix = match &self.firmware {
             Firmware::LinuxDirect(_)
             | Firmware::LinuxDirectBzImage
+            | Firmware::SnpLinuxDirect
             | Firmware::OpenhclLinuxDirect => None,
             Firmware::Pcat(guest) | Firmware::OpenhclPcat(guest) => Some(guest.name_prefix()),
             Firmware::Uefi(guest) | Firmware::OpenhclUefi(_, guest) => guest.name_prefix(),
@@ -230,6 +233,7 @@ impl ResolvedConfig {
 
         let options_prefix = match &self.firmware {
             Firmware::LinuxDirectBzImage
+            | Firmware::SnpLinuxDirect
             | Firmware::Pcat(_)
             | Firmware::Uefi(_)
             | Firmware::OpenhclLinuxDirect
@@ -319,6 +323,9 @@ impl ToTokens for FirmwareAndArch {
             }
             Firmware::LinuxDirectBzImage => {
                 quote!(::petri::Firmware::linux_direct_bzimage(resolver))
+            }
+            Firmware::SnpLinuxDirect => {
+                quote!(::petri::Firmware::snp_linux_direct(resolver))
             }
             Firmware::Pcat(guest) => {
                 quote!(::petri::Firmware::pcat(resolver, #guest))
@@ -563,6 +570,12 @@ impl Config {
             requires_host_vendor: overrides.requires_host_vendor,
             requires_capabilities: overrides.requires_capabilities.clone(),
         };
+        if matches!(config.firmware, Firmware::SnpLinuxDirect) && config.vmm != Vmm::OpenVmm {
+            return Err(Error::new(
+                self.span,
+                "SNP loader-direct boot requires OpenVMM",
+            ));
+        }
         if config.vmm != Vmm::OpenVmm
             && config
                 .unstable
@@ -762,6 +775,7 @@ fn parse_config(input: ParseStream<'_>, word: Ident) -> syn::Result<Config> {
             Firmware::LinuxDirect(parse_linux_direct_options(input, MachineArch::X86_64)?),
         ),
         "linux_direct_bzimage_x64" => (MachineArch::X86_64, Firmware::LinuxDirectBzImage),
+        "snp_linux_direct_x64" => (MachineArch::X86_64, Firmware::SnpLinuxDirect),
         "linux_direct_aarch64" => (
             MachineArch::Aarch64,
             Firmware::LinuxDirect(parse_linux_direct_options(input, MachineArch::Aarch64)?),
@@ -1313,6 +1327,9 @@ pub fn vmm_test(
 /// example: #[vmm_test_with(noagent, configs(linux_direct_x64, ...))]
 /// example: #[vmm_test_with(openvmm, requires(test_disk), configs(linux_direct_aarch64))]
 /// example: #[vmm_test_with(openvmm, amd, configs(linux_direct_x64))]
+///
+/// `snp_linux_direct_x64` uses OpenVMM's SNP kernel/initrd loader on KVM and
+/// prepares the initrd with Pipette. `linux_direct_x64[snp]` keeps using an SNP IGVM.
 #[proc_macro_attribute]
 pub fn vmm_test_with(
     attr: proc_macro::TokenStream,
@@ -1557,6 +1574,17 @@ fn build_requirements(
 ) -> TokenStream {
     let mut requirement_expr: TokenStream = quote!(::petri::requirements::TestRequirement::Any);
     let mut is_vbs = false;
+    if matches!(firmware, Firmware::SnpLinuxDirect) {
+        requirement_expr = quote!(#requirement_expr.and(
+            ::petri::requirements::TestRequirement::Isolation(
+                ::petri::requirements::IsolationType::Snp
+            )
+        ).and(
+            ::petri::requirements::TestRequirement::OpenVmmHypervisor(
+                ::petri::requirements::OpenVmmHypervisor::Kvm
+            )
+        ));
+    }
     // Add isolation requirement if specified
     if let Firmware::LinuxDirect(FirmwareOptions {
         isolation: Some(isolation),
@@ -1640,6 +1668,52 @@ mod tests {
         let output = make_vmm_test(args, item)?;
         syn::parse2::<syn::File>(output.clone())?;
         Ok(output.to_string())
+    }
+
+    #[test]
+    fn snp_loader_direct_is_distinct_from_igvm() {
+        let direct = expand(quote!(openvmm, configs(snp_linux_direct_x64))).unwrap();
+        let igvm = expand(quote!(openvmm, configs(linux_direct_x64[snp]))).unwrap();
+        assert!(direct.contains("openvmm_snp_linux_x64_restore"));
+        assert!(direct.contains("Firmware :: snp_linux_direct (resolver)"));
+        assert!(direct.contains("IsolationType :: Snp"));
+        assert!(!direct.contains("Firmware :: linux_direct ("));
+        assert!(igvm.contains("openvmm_linux_x64_snp_restore"));
+        assert!(igvm.contains("Firmware :: linux_direct (resolver"));
+        assert!(!igvm.contains("Firmware :: snp_linux_direct ("));
+    }
+
+    #[test]
+    fn snp_loader_direct_rejects_other_backends() {
+        for backend in [quote!(hyperv), quote!(qemu)] {
+            let err = expand(quote!(#backend, configs(snp_linux_direct_x64))).unwrap_err();
+            assert!(err.to_string().contains("requires OpenVMM"));
+        }
+    }
+
+    #[test]
+    fn snp_loader_direct_requires_kvm_even_when_snp_is_available() {
+        let output = expand(quote!(openvmm, configs(snp_linux_direct_x64))).unwrap();
+        let requirements = quote! {
+            .requirements(
+                ::petri::requirements::TestCaseRequirements::new(
+                    ::petri::requirements::TestRequirement::Any.and(
+                        ::petri::requirements::TestRequirement::Isolation(
+                            ::petri::requirements::IsolationType::Snp
+                        )
+                    ).and(
+                        ::petri::requirements::TestRequirement::OpenVmmHypervisor(
+                            ::petri::requirements::OpenVmmHypervisor::Kvm
+                        )
+                    )
+                )
+            )
+        };
+        assert!(output.contains(&requirements.to_string()));
+        for config in [quote!(linux_direct_x64), quote!(linux_direct_x64[snp])] {
+            let output = expand(quote!(openvmm, configs(#config))).unwrap();
+            assert!(!output.contains("TestRequirement :: OpenVmmHypervisor"));
+        }
     }
 
     #[test]

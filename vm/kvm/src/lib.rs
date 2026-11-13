@@ -505,22 +505,24 @@ impl Kvm {
         self.new_vm_with_type(raw_vm_type)
     }
 
+    /// Returns whether KVM advertises support for SEV-SNP VMs.
+    #[cfg(target_arch = "x86_64")]
+    pub fn is_snp_supported(&self) -> Result<bool> {
+        let supported_vm_types = self
+            .check_extension(KVM_CAP_VM_TYPES_UAPI)
+            .map_err(Error::CheckExtension)? as u64;
+        Ok(supported_vm_types & (1 << KVM_X86_SNP_VM_UAPI) != 0)
+    }
+
     fn raw_vm_type(&self, vm_type: VmType) -> Result<libc::c_int> {
         match vm_type {
             VmType::Default => Ok(self.default_vm_type()),
             #[cfg(target_arch = "x86_64")]
             VmType::Snp => {
-                let supported_vm_types =
-                    self.check_extension(KVM_CAP_VM_TYPES_UAPI)
-                        .map_err(Error::CheckExtension)? as u64;
-                let raw_vm_type = KVM_X86_SNP_VM_UAPI;
-                let vm_type_bit = 1_u64
-                    .checked_shl(raw_vm_type as u32)
-                    .ok_or(Error::UnsupportedVmType(vm_type))?;
-                if supported_vm_types & vm_type_bit == 0 {
+                if !self.is_snp_supported()? {
                     return Err(Error::UnsupportedVmType(vm_type));
                 }
-                Ok(raw_vm_type)
+                Ok(KVM_X86_SNP_VM_UAPI)
             }
             #[cfg(target_arch = "aarch64")]
             VmType::Realm { ipa_bits } => Ok((KVM_VM_TYPE_ARM_REALM_UAPI
