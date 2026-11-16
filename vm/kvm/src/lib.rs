@@ -25,6 +25,7 @@ use thiserror::Error;
 mod ioctl {
     #[cfg(target_arch = "aarch64")]
     use super::KvmArmRmiPopulate;
+    use super::KvmMemoryAttributes2;
     use kvm_bindings::*;
     #[cfg(target_arch = "x86_64")]
     use nix::errno::Errno;
@@ -119,11 +120,11 @@ mod ioctl {
     ioctl_write_ptr!(kvm_x86_setup_mce, KVMIO, 0x9c, u64);
     #[cfg(target_arch = "x86_64")]
     ioctl_read!(kvm_x86_get_mce_cap_supported, KVMIO, 0x9d, u64);
-    ioctl_write_ptr!(
-        kvm_set_memory_attributes,
+    ioctl_readwrite!(
+        kvm_set_guest_memfd_memory_attributes,
         KVMIO,
         0xd2,
-        kvm_memory_attributes
+        KvmMemoryAttributes2
     );
     ioctl_readwrite!(kvm_create_device, KVMIO, 0xe0, kvm_create_device);
     ioctl_write_ptr!(kvm_set_device_attr, KVMIO, 0xe1, kvm_device_attr);
@@ -176,6 +177,22 @@ pub const KVM_MAP_GPA_RANGE_DECRYPTED_UAPI: u64 = 0 << 4;
 const KVM_X86_SNP_VM_UAPI: libc::c_int = 4;
 
 pub const KVM_MEMORY_EXIT_FLAG_PRIVATE_UAPI: u64 = 1 << 3;
+
+pub const KVM_CAP_GUEST_MEMFD_FLAGS_UAPI: u32 = 244;
+pub const KVM_CAP_GUEST_MEMFD_MEMORY_ATTRIBUTES_UAPI: u32 = 252;
+pub const GUEST_MEMFD_FLAG_MMAP_UAPI: u64 = 1;
+pub const GUEST_MEMFD_FLAG_INIT_SHARED_UAPI: u64 = 2;
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Default, Eq, PartialEq)]
+pub struct KvmMemoryAttributes2 {
+    pub offset: u64,
+    pub size: u64,
+    pub attributes: u64,
+    pub flags: u64,
+    pub error_offset: u64,
+    pub reserved: [u64; 11],
+}
 
 #[cfg(target_arch = "aarch64")]
 pub const KVM_CAP_ARM_RMI_UAPI: u32 = 249;
@@ -250,8 +267,17 @@ pub enum Error {
     SignalMsi(#[source] nix::Error),
     #[error("SetMemoryRegion")]
     SetMemoryRegion(#[source] nix::Error),
-    #[error("SetMemoryAttributes")]
-    SetMemoryAttributes(#[source] nix::Error),
+    #[error(
+        "SetGuestMemfdMemoryAttributes(offset={offset:#x}, size={size:#x}, attributes={attributes:#x}, error_offset={error_offset:?})"
+    )]
+    SetGuestMemfdMemoryAttributes {
+        offset: u64,
+        size: u64,
+        attributes: u64,
+        error_offset: Option<u64>,
+        #[source]
+        source: nix::Error,
+    },
     #[error("CreateGuestMemfd")]
     CreateGuestMemfd(#[source] nix::Error),
     #[error("CreateVm")]
@@ -379,6 +405,38 @@ pub enum Error {
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Changes memory attributes for a range of offsets in a guest_memfd.
+///
+/// An error can leave the range partially converted. The caller must not resume
+/// the guest after a failed conversion.
+pub fn set_guest_memfd_memory_attributes(
+    file: BorrowedFd<'_>,
+    offset: u64,
+    size: u64,
+    attributes: u64,
+) -> Result<()> {
+    // Validation errors do not copy this field back. An aligned file offset
+    // cannot equal the sentinel.
+    let mut attr = KvmMemoryAttributes2 {
+        offset,
+        size,
+        attributes,
+        error_offset: u64::MAX,
+        ..Default::default()
+    };
+    // SAFETY: `attr` is a valid C ABI struct for KVM to read and write.
+    unsafe { ioctl::kvm_set_guest_memfd_memory_attributes(file.as_raw_fd(), &mut attr) }.map_err(
+        |source| Error::SetGuestMemfdMemoryAttributes {
+            offset,
+            size,
+            attributes,
+            error_offset: (attr.error_offset != u64::MAX).then_some(attr.error_offset),
+            source,
+        },
+    )?;
+    Ok(())
+}
 
 #[derive(Debug)]
 struct Vp {
@@ -997,9 +1055,10 @@ impl Partition {
         Ok(())
     }
 
-    pub fn create_guest_memfd(&self, size: u64) -> Result<File> {
+    pub fn create_guest_memfd(&self, size: u64, flags: u64) -> Result<File> {
         let mut guest_memfd = kvm_create_guest_memfd {
             size,
+            flags,
             ..Default::default()
         };
         // SAFETY: `guest_memfd` is a valid C ABI struct for KVM to read.
@@ -1009,21 +1068,6 @@ impl Partition {
         };
         // SAFETY: On success, KVM returns a new owned file descriptor.
         Ok(unsafe { File::from_raw_fd(fd) })
-    }
-
-    pub fn set_memory_attributes(&self, addr: u64, size: u64, attributes: u64) -> Result<()> {
-        let attr = kvm_memory_attributes {
-            address: addr,
-            size,
-            attributes,
-            ..Default::default()
-        };
-        // SAFETY: `attr` is a valid C ABI struct for KVM to read.
-        unsafe {
-            ioctl::kvm_set_memory_attributes(self.vm.as_raw_fd(), &attr)
-                .map_err(Error::SetMemoryAttributes)?;
-        }
-        Ok(())
     }
 
     pub fn set_gsi_routes(&self, routes: &[(u32, RoutingEntry)]) -> Result<()> {
@@ -2241,6 +2285,33 @@ pub struct DebugRegisters {
 #[cfg(all(test, target_arch = "x86_64"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guest_memfd_attributes_error_preserves_context_without_copyback() {
+        let file = File::open("/dev/null").unwrap();
+        let result = set_guest_memfd_memory_attributes(
+            file.as_fd(),
+            0x3000,
+            0x2000,
+            KVM_MEMORY_ATTRIBUTE_PRIVATE as u64,
+        );
+        match result {
+            Err(Error::SetGuestMemfdMemoryAttributes {
+                offset,
+                size,
+                attributes,
+                error_offset,
+                source,
+            }) => {
+                assert_eq!(offset, 0x3000);
+                assert_eq!(size, 0x2000);
+                assert_eq!(attributes, KVM_MEMORY_ATTRIBUTE_PRIVATE as u64);
+                assert_eq!(error_offset, None);
+                assert_eq!(source, nix::errno::Errno::ENOTTY);
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
 
     #[test]
     fn sev_snp_page_type_values_match_kvm_uapi() {

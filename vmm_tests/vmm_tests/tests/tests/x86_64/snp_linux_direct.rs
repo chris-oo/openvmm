@@ -26,11 +26,8 @@ async fn boot_with_vps(
     config: PetriVmBuilder<OpenVmmPetriBackend>,
     vp_count: u32,
 ) -> anyhow::Result<()> {
-    let config = if HostContext::new().await.openvmm_hypervisor == Some(OpenVmmHypervisor::Kvm) {
-        config.with_no_hv()
-    } else {
-        config
-    };
+    let is_kvm = HostContext::new().await.openvmm_hypervisor == Some(OpenVmmHypervisor::Kvm);
+    let config = if is_kvm { config.with_no_hv() } else { config };
     let (vm, agent) = config
         .with_processor_topology(ProcessorTopology {
             vp_count,
@@ -39,6 +36,7 @@ async fn boot_with_vps(
         })
         .with_memory(MemoryConfig {
             startup_bytes: 160 * petri::SIZE_1_MB,
+            private_memory: is_kvm.then_some(false),
             ..Default::default()
         })
         .modify_backend(|b| {

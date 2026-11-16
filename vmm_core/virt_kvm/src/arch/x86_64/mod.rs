@@ -44,6 +44,7 @@ use inspect::InspectMut;
 use kvm::KVM_CPUID_FLAG_SIGNIFCANT_INDEX;
 use kvm::kvm_ioeventfd_flag_nr_datamatch;
 use kvm::kvm_ioeventfd_flag_nr_deassign;
+use memory_range::MemoryRange;
 use pal_event::Event;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
@@ -428,12 +429,16 @@ impl virt::Hypervisor for Kvm {
             }
         };
 
-        let vm = match isolation {
-            virt::IsolationType::None => self.kvm.new_vm(kvm::VmType::Default)?,
+        let (vm, memory_backing_mode) = match isolation {
+            virt::IsolationType::None => (
+                self.kvm.new_vm(kvm::VmType::Default)?,
+                KvmMemoryBackingMode::Userspace,
+            ),
             virt::IsolationType::Snp => {
                 let vm = self.kvm.new_vm(kvm::VmType::Snp)?;
+                crate::memory::check_private_memory_extensions(&vm)?;
                 vm.enable_hypercall_exits(1 << kvm::KVM_HC_MAP_GPA_RANGE_UAPI)?;
-                vm
+                (vm, KvmMemoryBackingMode::GuestMemfd(Default::default()))
             }
             virt::IsolationType::Vbs | virt::IsolationType::Tdx | virt::IsolationType::Cca => {
                 unreachable!()
@@ -452,6 +457,7 @@ impl virt::Hypervisor for Kvm {
 
         Ok(KvmProtoPartition {
             vm,
+            memory_backing_mode,
             sev,
             snp_config,
             config,
@@ -465,6 +471,7 @@ impl virt::Hypervisor for Kvm {
 /// A prototype partition.
 pub struct KvmProtoPartition<'a> {
     vm: kvm::Partition,
+    memory_backing_mode: KvmMemoryBackingMode,
     sev: Option<std::fs::File>,
     snp_config: Option<crate::snp::KvmSnpConfig>,
     config: ProtoPartitionConfig<'a>,
@@ -482,6 +489,19 @@ impl ProtoPartition for KvmProtoPartition<'_> {
 
     fn max_physical_address_size(&self) -> u8 {
         max_physical_address_size_from_cpuid(&|eax, ecx| self.cpuid.result(eax, ecx, &[0; 4]))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn allocate_ram(
+        &mut self,
+        ranges: &[MemoryRange],
+    ) -> Result<Option<std::fs::File>, Self::Error> {
+        match &mut self.memory_backing_mode {
+            KvmMemoryBackingMode::Userspace => Ok(None),
+            KvmMemoryBackingMode::GuestMemfd(backing) => {
+                Ok(Some(backing.allocate(&self.vm, ranges)?))
+            }
+        }
     }
 
     fn build(
@@ -570,15 +590,10 @@ impl ProtoPartition for KvmProtoPartition<'_> {
             .map(|range| range.range)
             .chain(config.mem_layout.vtl2_range())
             .collect();
-        let memory_backing_mode = match self.config.isolation.isolation_type() {
-            virt::IsolationType::None => KvmMemoryBackingMode::Userspace,
-            virt::IsolationType::Snp => {
-                KvmMemoryBackingMode::guest_memfd(&self.vm, ram_ranges.iter().copied(), true)?
-            }
-            virt::IsolationType::Vbs | virt::IsolationType::Tdx | virt::IsolationType::Cca => {
-                unreachable!()
-            }
-        };
+        let memory_backing_mode = self.memory_backing_mode;
+        if let KvmMemoryBackingMode::GuestMemfd(backing) = &memory_backing_mode {
+            backing.validate_ram(&ram_ranges)?;
+        }
 
         let partition = Arc::new(KvmPartitionInner {
             kvm: self.vm,
@@ -1829,6 +1844,10 @@ impl<'p> Processor for KvmProcessor<'p> {
                                         map_attributes,
                                         "handled KVM_HC_MAP_GPA_RANGE"
                                     );
+                                }
+                                Err(err @ crate::memory::MemoryError::Conversion { .. }) => {
+                                    return Err(dev
+                                        .fatal_error(KvmRunVpError::MemoryConversion(err).into()));
                                 }
                                 Err(err) => {
                                     tracelimit::error_ratelimited!(

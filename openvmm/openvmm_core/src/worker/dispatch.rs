@@ -1227,7 +1227,8 @@ impl InitializedVm {
         let device_assignment_msi_iova_range =
             resolve_device_assignment_msi_iova_range(platform_info.device_assignment_msi_iova);
 
-        let proto = hypervisor
+        #[cfg_attr(not(target_os = "linux"), expect(unused_mut))]
+        let mut proto = hypervisor
             .new_partition(virt::ProtoPartitionConfig {
                 processor_topology: &processor_topology,
                 hv_config,
@@ -1459,6 +1460,22 @@ impl InitializedVm {
                 anyhow::bail!("node {vnode}: hugepage_size={size} requires hugepages=on");
             }
 
+            #[cfg(target_os = "linux")]
+            let backend_mappable = proto
+                .allocate_ram(&ranges)
+                .context("failed to allocate backend RAM")?
+                .map(|file| {
+                    let fd: std::os::fd::OwnedFd = file.into();
+                    membacking::Mappable::from(fd)
+                });
+            #[cfg(target_os = "linux")]
+            if backend_mappable.is_some() {
+                anyhow::ensure!(
+                    !mem.private_memory && !mem.hugepages && existing_mappable.is_none(),
+                    "backend-owned RAM does not support private anonymous memory, hugetlb memory, or existing memory backing"
+                );
+            }
+
             let mut backing = membacking::RamBackingRequest::new(ranges)
                 .prefetch(mem.prefetch_memory)
                 .private_memory(mem.private_memory)
@@ -1468,6 +1485,10 @@ impl InitializedVm {
                 backing = backing.hugepages(mem.hugepage_size);
             }
             if let Some(mappable) = existing_mappable.take() {
+                backing = backing.existing_mappable(mappable);
+            }
+            #[cfg(target_os = "linux")]
+            if let Some(mappable) = backend_mappable {
                 backing = backing.existing_mappable(mappable);
             }
 

@@ -3,8 +3,9 @@
 
 //! SEV-SNP launch support for KVM partitions.
 //!
-//! The loader writes initial private page contents into the userspace side of
-//! guestmemfd-backed slots. This module translates the loader's import types
+//! The loader writes initial contents through shared guestmemfd mappings.
+//! After all host access is complete, RAM becomes private in place. This module
+//! translates the loader's import types
 //! into SNP launch updates, constructs the firmware CPUID page from the BSP's
 //! effective KVM CPUID table, validates the initial BSP state, and finalizes
 //! the launch context. Runtime shared/private transitions are handled by the
@@ -197,6 +198,8 @@ impl KvmPartitionInner {
         pages: &[virt::InitialPageImport],
     ) -> Result<(), SnpError> {
         let sev = self.sev.as_ref().ok_or(SnpError::IsolationNotSupported)?;
+        let private_ranges =
+            initial_private_ranges(&self.ram_ranges, pages, self.snp_config.is_some())?;
         if let Some(config) = &self.snp_config {
             validate_vp_context_imports(pages, &config.generic)?;
         } else {
@@ -216,9 +219,9 @@ impl KvmPartitionInner {
         self.kvm
             .sev_snp_launch_start(sev.as_fd(), &mut launch_start)?;
 
+        let mut launch_pages = Vec::new();
         for page in pages {
             if page.import_type == InitialPageImportType::Shared {
-                self.set_initial_shared_memory(page.range)?;
                 continue;
             }
             if self.snp_config.is_some() && page.import_type == InitialPageImportType::VpContext {
@@ -229,9 +232,6 @@ impl KvmPartitionInner {
 
             let kvm_page_type = crate::arch::snp::snp_launch_page_type(page.import_type)?;
 
-            // Each import may cover a coalesced range, so this lock is taken
-            // once per import rather than once per 4-KiB page. Keep it scoped
-            // around the lookup because shared-range handling also takes it.
             let private_range = {
                 let memory = self.memory.lock();
                 private_memory_range_from_slots(page.range, &memory.ranges)
@@ -256,6 +256,16 @@ impl KvmPartitionInner {
                     xss,
                 )?;
             }
+            launch_pages.push((page, kvm_page_type));
+        }
+        self.prepare_snp_vmsa_register_state()?;
+
+        // No host memory access is allowed after this point. Include unimported
+        // RAM: KVM assigns its private pages lazily when the guest accesses them.
+        for range in private_ranges {
+            self.set_guest_memfd_attributes(range, true)?;
+        }
+        for (page, kvm_page_type) in launch_pages {
             let gpa = page.range.start();
             tracing::trace!(
                 gpa,
@@ -268,12 +278,11 @@ impl KvmPartitionInner {
             self.kvm.sev_snp_launch_update(
                 sev.as_fd(),
                 gpa / hvdef::HV_PAGE_SIZE,
-                private_range.hva as u64,
+                0,
                 page.range.len(),
                 kvm_page_type,
             )?;
         }
-        self.prepare_snp_vmsa_register_state()?;
         tracing::debug!("KVM_SEV_SNP_LAUNCH_FINISH");
         let mut finish = kvm::kvm_sev_snp_launch_finish {
             host_data: self
@@ -390,6 +399,51 @@ impl KvmPartitionInner {
 
         Ok(())
     }
+}
+
+fn initial_private_ranges(
+    ram: &[memory_range::MemoryRange],
+    pages: &[virt::InitialPageImport],
+    skip_vp_context: bool,
+) -> Result<Vec<memory_range::MemoryRange>, SnpError> {
+    let mut ram = ram.to_vec();
+    ram.sort_by_key(|range| range.start());
+    if ram.iter().any(|range| {
+        range.is_empty()
+            || !range.start().is_multiple_of(hvdef::HV_PAGE_SIZE)
+            || !range.len().is_multiple_of(hvdef::HV_PAGE_SIZE)
+    }) || ram.windows(2).any(|pair| pair[0].overlaps(&pair[1]))
+    {
+        return Err(SnpError::InvalidLaunchRange);
+    }
+
+    let mut imports = pages
+        .iter()
+        .filter(|page| !(skip_vp_context && page.import_type == InitialPageImportType::VpContext))
+        .collect::<Vec<_>>();
+    imports.sort_by_key(|page| page.range.start());
+    if imports
+        .windows(2)
+        .any(|pair| pair[0].range.overlaps(&pair[1].range))
+    {
+        return Err(SnpError::InvalidLaunchRange);
+    }
+    for page in &imports {
+        if page.range.is_empty()
+            || !page.range.start().is_multiple_of(hvdef::HV_PAGE_SIZE)
+            || !page.range.len().is_multiple_of(hvdef::HV_PAGE_SIZE)
+            || memory_range::subtract_ranges([page.range], ram.iter().copied())
+                .next()
+                .is_some()
+        {
+            return Err(SnpError::InvalidLaunchRange);
+        }
+    }
+    let shared = imports
+        .iter()
+        .filter(|page| page.import_type == InitialPageImportType::Shared)
+        .map(|page| page.range);
+    Ok(memory_range::subtract_ranges(ram, shared).collect())
 }
 
 /// Verifies that loader-generated VP-context markers match the contexts
@@ -841,6 +895,58 @@ mod tests {
             range: memory_range::MemoryRange::new(gpa..gpa + hvdef::HV_PAGE_SIZE),
             import_type,
             tag: "test",
+        }
+    }
+
+    #[test]
+    fn initial_private_ram_excludes_only_explicit_shared_imports() {
+        use memory_range::MemoryRange;
+        let ram = [
+            MemoryRange::new(0x10_000..0x14_000),
+            MemoryRange::new(0..0x8000),
+        ];
+        let pages = [
+            page_import(0x11_000, InitialPageImportType::Shared),
+            page_import(0x2000, InitialPageImportType::Cpuid),
+            page_import(KVM_SNP_VMSA_GPA, InitialPageImportType::VpContext),
+            page_import(0x1000, InitialPageImportType::Shared),
+        ];
+        assert_eq!(
+            initial_private_ranges(&ram, &pages, true).unwrap(),
+            [
+                MemoryRange::new(0..0x1000),
+                MemoryRange::new(0x2000..0x8000),
+                MemoryRange::new(0x10_000..0x11_000),
+                MemoryRange::new(0x12_000..0x14_000),
+            ],
+        );
+        assert!(initial_private_ranges(&ram, &pages, false).is_err());
+        assert_eq!(
+            initial_private_ranges(&ram, &[], false).unwrap(),
+            [ram[1], ram[0]],
+        );
+    }
+
+    #[test]
+    fn initial_private_ram_rejects_conflicting_or_outside_imports() {
+        use memory_range::MemoryRange;
+        let ram = [MemoryRange::new(0..0x4000)];
+        for pages in [
+            vec![
+                page_import(0x1000, InitialPageImportType::Shared),
+                page_import(0x1000, InitialPageImportType::Normal),
+            ],
+            vec![page_import(0x4000, InitialPageImportType::Shared)],
+            vec![virt::InitialPageImport {
+                range: MemoryRange::new(0x1000..0x1000),
+                import_type: InitialPageImportType::Shared,
+                tag: "empty",
+            }],
+        ] {
+            assert!(matches!(
+                initial_private_ranges(&ram, &pages, false),
+                Err(SnpError::InvalidLaunchRange),
+            ));
         }
     }
 

@@ -441,6 +441,22 @@ pub trait ProtoPartition {
         false
     }
 
+    /// Allocates backend-owned RAM before guest-memory mappings are created.
+    ///
+    /// A returned file backs the ranges in their supplied order, packed from
+    /// offset zero. The caller must map that file shared and use those mappings
+    /// when registering these ranges with the partition. The backend retains
+    /// its own reference until the partition is destroyed.
+    ///
+    /// `None` leaves allocation to the caller.
+    #[cfg(target_os = "linux")]
+    fn allocate_ram(
+        &mut self,
+        _ranges: &[MemoryRange],
+    ) -> Result<Option<std::fs::File>, Self::Error> {
+        Ok(None)
+    }
+
     /// Constructs the full partition.
     fn build(
         self,

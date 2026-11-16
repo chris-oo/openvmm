@@ -178,6 +178,9 @@ enum KvmRunVpError {
     #[error("unhandled KVM hypercall: nr={nr:#x}, flags={flags:#x}")]
     UnhandledHypercall { nr: u64, flags: u64 },
     #[cfg(guest_arch = "x86_64")]
+    #[error("guest_memfd conversion failed")]
+    MemoryConversion(#[source] MemoryError),
+    #[cfg(guest_arch = "x86_64")]
     #[error(
         "SEV guest requested termination: ghcb_msr={ghcb_msr:#x} reason_set={reason_set:#x} reason={reason:#x}"
     )]

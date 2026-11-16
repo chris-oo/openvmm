@@ -127,6 +127,19 @@ device tree describes host bridges.
 
 ### Launch Requirements
 
+On KVM, the host must support Linux 7.4's in-place guest_memfd model. Add
+`kvm.gmem_in_place_conversion=1` to the host kernel command line and boot
+that kernel. OpenVMM does not support the legacy guest_memfd model.
+
+Use file-backed RAM, which is the CLI default. KVM SNP does not support
+anonymous RAM (`--memory shared=off`), hugetlb RAM, or restoring RAM from an
+existing backing file.
+
+```admonish warning
+The kernel parameter changes KVM's private-memory API for all VMs. VMMs
+that require the legacy guest_memfd model cannot use it in this mode.
+```
+
 One image boots with any supported CPU count, RAM size, and NUMA layout:
 
 - Give the guest at least the RAM that the image measures, which is
