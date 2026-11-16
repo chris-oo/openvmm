@@ -756,7 +756,8 @@ fn sanitize_snp_cpuid_entry(entry: &mut kvm::kvm_cpuid_entry2) {
         }
         (0x80000008, _) => entry.ebx &= !0x02000000,
         (0x80000021, _) => {
-            entry.eax &= !0x200;
+            // NO_SMM_CTL_MSR and GP_ON_USER_CPUID can be emulated by KVM.
+            entry.eax &= !((1 << 9) | (1 << 17));
             entry.ecx = 0;
         }
         _ => {}
@@ -1063,6 +1064,23 @@ mod tests {
             u32::from_le_bytes(page[xsave + 28..xsave + 32].try_into().unwrap()),
             0x240
         );
+    }
+
+    #[test]
+    fn write_snp_cpuid_page_strips_emulated_amd_cpuid_faulting() {
+        let mut page = vec![0; hvdef::HV_PAGE_SIZE as usize];
+        let cpuid = [kvm::kvm_cpuid_entry2 {
+            function: 0x8000_0021,
+            eax: 0x1802_0245,
+            ..Default::default()
+        }];
+
+        write_snp_cpuid_page(page.as_mut_ptr(), page.len() as u64, &cpuid, 1, 0).unwrap();
+
+        let page = x86defs::snp::HvPspCpuidPage::read_from_bytes(&page).unwrap();
+        assert_eq!(page.count, 1);
+        assert_eq!(page.cpuid_leaf_info[0].eax_in, 0x8000_0021);
+        assert_eq!(page.cpuid_leaf_info[0].eax_out, 0x1800_0045);
     }
 
     #[test]
